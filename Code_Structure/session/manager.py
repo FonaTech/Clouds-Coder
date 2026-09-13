@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=632 original-lines=6859-6864 hash=86ab07aacf89e33f
+# split-source: order=723 original-lines=7474-7479 hash=86ab07aacf89e33f
 
 
 class SessionCreationLimitExceeded(RuntimeError):
@@ -13,7 +13,7 @@ class SessionCreationLimitExceeded(RuntimeError):
         self.status = dict(status or {})
         super().__init__(str(self.status.get("message", "daily session limit reached")))
 
-# split-source: order=955 original-lines=82593-83972 hash=f2c63bcdee6ee050
+# split-source: order=1060 original-lines=89566-91908 hash=dfc9e4509cd94f45
 
 class SessionManager:
     def __init__(
@@ -67,6 +67,9 @@ class SessionManager:
         shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
         shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         process_manager: UserProcessManager | None = None,
+        kernel_registry=None,
+        kernel_runtime=None,
+        skills_snapshot: SkillStore | None = None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -74,6 +77,7 @@ class SessionManager:
         self.ollama_base = ollama_base
         self.model = model
         self.skills_root = skills_root
+        self.skills_snapshot = skills_snapshot
         self.js_lib_root = js_lib_root.resolve()
         self.js_lib_download_enabled = bool(js_lib_download_enabled)
         self.crypto = crypto
@@ -83,6 +87,8 @@ class SessionManager:
         self.collaboration_context_provider = collaboration_context_provider
         self.collaboration_write_coordinator = collaboration_write_coordinator
         self.process_manager = process_manager
+        self.kernel_registry = kernel_registry
+        self.kernel_runtime = kernel_runtime
         self.thinking = False
         self.mcp_manager = mcp_manager
         self.default_llm_config = default_llm_config or {}
@@ -154,11 +160,28 @@ class SessionManager:
         self.ollama_env_available = False
         self.ollama_env_tags: list[str] = []
         self.run_finished_callback = run_finished_callback
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.sessions: dict[str, SessionState] = {}
         self.session_index: dict[str, dict] = {}
         self.user_root = self.root.parent
         self.user_root.mkdir(parents=True, exist_ok=True)
+        self.session_index_path = self.user_root / "session_index.json"
+        self.session_index_journal_path = self.user_root / "session_index.journal"
+        self.catalog_revision = 0
+        self._session_catalog_cache_revision = -1
+        self._session_catalog_cache: list[dict] = []
+        self._session_catalog_recent: dict[str, dict] = {}
+        self._session_catalog_deleted_ids: set[str] = set()
+        self._session_catalog_rebuild_pending = False
+        self._session_index_persist_lock = threading.Lock()
+        self._session_index_write_lock = threading.Lock()
+        self._session_index_written_revision = -1
+        self._session_index_persist_pending = False
+        self._session_index_dirty = False
+        self._session_index_pending_changes: dict[str, dict] = {}
+        self._session_index_journal_records = 0
+        self._session_index_journal_bytes = 0
+        self._session_index_compact_requested = False
         self.user_prefs_path = self.user_root / "user_prefs.json"
         self.user_memory_store = UserMemoryStore(self.user_root, user_id=self.user_id)
         self.user_interaction_optimizer = UserInteractionOptimizer()
@@ -468,7 +491,13 @@ class SessionManager:
         sess.updated_at = now_ts()
         sess._persist()
 
-    def _apply_user_defaults_to_session(self, sess: SessionState, *, clear_cap_cache: bool = False):
+    def _apply_user_defaults_to_session(
+        self,
+        sess: SessionState,
+        *,
+        clear_cap_cache: bool = False,
+        persist: bool = True,
+    ):
         sess.model_profiles = {}
         for pid, profile in self.user_model_profiles.items():
             row = dict(profile)
@@ -541,7 +570,8 @@ class SessionManager:
         )
         sess._apply_active_profile()
         sess.updated_at = now_ts()
-        sess._persist()
+        if persist:
+            sess._persist()
 
     def _sync_from_session(self, sess: SessionState, *, apply_to_all: bool):
         synced: dict[str, dict] = {}
@@ -675,21 +705,61 @@ class SessionManager:
         self._persist_user_prefs()
         return {"ok": True, "user_memory_mode": self.user_memory_mode}
 
+    @staticmethod
+    def _normalize_workspace_id(value: object, fallback: str) -> str:
+        default = trim(str(fallback or "").strip(), 160)
+        candidate = trim(str(value or "").strip(), 160)
+        if (
+            not candidate
+            or candidate in {".", ".."}
+            or "/" in candidate
+            or "\\" in candidate
+            or "\x00" in candidate
+        ):
+            return default
+        return candidate
+
+    def _session_workspace_spec(self, session_id: str, workspace_id: object) -> tuple[str, Path | None]:
+        sid = str(session_id or "").strip()
+        wid = self._normalize_workspace_id(workspace_id, sid)
+        if self.workspace_root is not None:
+            return wid, self.workspace_root
+        if wid == sid:
+            return wid, None
+        owner = self.root / wid
+        try:
+            owner.resolve(strict=False).relative_to(self.root.resolve(strict=False))
+        except (OSError, ValueError):
+            return sid, None
+        if not owner.is_dir() or owner.is_symlink():
+            return sid, None
+        return wid, owner / "files"
+
     def _session_summary_from_disk(self, path: Path) -> dict:
         sid = str(path.name or "").strip()
         title = sid
+        workspace_id = sid
+        title_origin = ""
+        title_revision = 0
         updated_at = 0.0
+        created_at = 0.0
         message_count = 0
         ui_language = self.user_language
+        kernel_version = ""
         meta = path / "meta.json"
         if meta.exists():
             try:
                 raw = self.crypto.read_json(meta, {})
                 if isinstance(raw, dict):
                     title = str(raw.get("title", sid) or sid)
+                    workspace_id = self._normalize_workspace_id(raw.get("workspace_id"), sid)
+                    title_origin = str(raw.get("title_origin", "") or "")
+                    title_revision = max(0, int(raw.get("title_revision", 0) or 0))
+                    created_at = float(raw.get("created_at", 0.0) or 0.0)
                     updated_at = float(raw.get("updated_at", 0.0) or 0.0)
                     message_count = max(0, int(raw.get("message_count", 0) or 0))
                     ui_language = normalize_ui_language(raw.get("ui_language", ui_language))
+                    kernel_version = str(raw.get("kernel_version", "") or "")
             except Exception:
                 pass
         if updated_at <= 0:
@@ -698,9 +768,24 @@ class SessionManager:
                 updated_at = float((state if state.exists() else path).stat().st_mtime)
             except Exception:
                 updated_at = 0.0
+        if created_at <= 0:
+            try:
+                state = path / "state.json"
+                if state.exists():
+                    raw_state = self.crypto.read_json(state, {})
+                    if isinstance(raw_state, dict):
+                        created_at = float(raw_state.get("created_at", 0.0) or 0.0)
+            except Exception:
+                created_at = 0.0
+        if created_at <= 0:
+            created_at = float(updated_at or 0.0)
         return {
             "id": sid,
+            "workspace_id": workspace_id,
             "title": title,
+            "title_origin": title_origin,
+            "title_revision": title_revision,
+            "created_at": float(created_at or 0.0),
             "running": False,
             "degraded": False,
             "recovered_at": 0.0,
@@ -708,10 +793,20 @@ class SessionManager:
             "ui_language": ui_language,
             "updated_at": float(updated_at or 0.0),
             "message_count": int(message_count),
+            "kernel_version": kernel_version,
             "loaded": False,
         }
 
-    def _make_session_state(self, sid: str, title: str) -> SessionState:
+    def _make_session_state(self, sid: str, title: str, workspace_id: str = "") -> SessionState:
+        kernel_version = ""
+        if self.kernel_registry is not None:
+            try:
+                kernel_version = self.kernel_registry.choose_version(self.user_id, sid)
+            except Exception:
+                kernel_version = ""
+        resolved_workspace_id, session_workspace_root = self._session_workspace_spec(
+            sid, workspace_id
+        )
         sess = SessionState(
                 session_id=sid,
                 title=title,
@@ -754,14 +849,21 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
-                workspace_root=self.workspace_root,
+                workspace_root=session_workspace_root,
+                workspace_id=resolved_workspace_id,
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
                 shell_timeout_mode=self.shell_timeout_mode,
                 shell_async_handoff_seconds=self.shell_async_handoff_seconds,
                 process_manager=self.process_manager,
+                deferred_start_prepare_callback=self.prepare_user_intent_for_session,
+                summary_update_callback=self._on_session_summary,
+                kernel_version=kernel_version,
+                kernel_runtime=self.kernel_runtime,
+                skills_snapshot=self.skills_snapshot,
             )
+        sess.workspace_metadata_callback = self._workspace_metadata_for_session
         sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
@@ -774,14 +876,585 @@ class SessionManager:
             self._apply_user_defaults_to_session(sess)
         return sess
 
-    def _load_existing(self):
-        for path in sorted(self.root.glob("*")):
-            if not path.is_dir():
+    def _schedule_session_catalog_rebuild_locked(self) -> None:
+        if bool(getattr(self, "_session_catalog_rebuild_pending", False)):
+            return
+        self._session_catalog_rebuild_pending = True
+
+        def worker() -> None:
+            time.sleep(0.2)
+            for _ in range(3):
+                with self.lock:
+                    revision = int(getattr(self, "catalog_revision", 0) or 0)
+                    rows = [dict(row) for row in self.session_index.values() if isinstance(row, dict)]
+                rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+                with self.lock:
+                    if revision == int(getattr(self, "catalog_revision", 0) or 0):
+                        self._session_catalog_cache = rows
+                        self._session_catalog_cache_revision = revision
+                        self._session_catalog_recent = {}
+                        self._session_catalog_deleted_ids = set()
+                        self._session_catalog_rebuild_pending = False
+                        return
+                time.sleep(0.1)
+            with self.lock:
+                self._session_catalog_rebuild_pending = False
+
+        threading.Thread(
+            target=worker,
+            name=f"session-catalog-{getattr(self, 'user_id', '') or 'local'}",
+            daemon=True,
+        ).start()
+
+    def _session_catalog_changed_locked(self, session_id: str = "", *, deleted: bool = False) -> None:
+        self.catalog_revision = max(0, int(getattr(self, "catalog_revision", 0) or 0)) + 1
+        self._session_index_dirty = True
+        sid = str(session_id or "").strip()
+        if not sid:
+            self._session_catalog_cache_revision = -1
+            self._session_catalog_recent = {}
+            self._session_catalog_deleted_ids = set()
+            return
+        if int(getattr(self, "_session_catalog_cache_revision", -1) or -1) < 0:
+            return
+        recent = getattr(self, "_session_catalog_recent", None)
+        if not isinstance(recent, dict):
+            recent = {}
+            self._session_catalog_recent = recent
+        deleted_ids = getattr(self, "_session_catalog_deleted_ids", None)
+        if not isinstance(deleted_ids, set):
+            deleted_ids = set()
+            self._session_catalog_deleted_ids = deleted_ids
+        if deleted:
+            recent.pop(sid, None)
+            deleted_ids.add(sid)
+        else:
+            deleted_ids.discard(sid)
+            row = self.session_index.get(sid)
+            if isinstance(row, dict):
+                recent[sid] = dict(row)
+        if len(recent) + len(deleted_ids) >= SESSION_CATALOG_RECENT_MAX:
+            self._schedule_session_catalog_rebuild_locked()
+
+    def _session_index_summary_payload(self, summary: dict) -> dict:
+        allowed = {
+            "id", "workspace_id", "title", "title_origin", "title_revision", "running", "degraded", "recovered_at",
+            "recovered_reason", "ui_language", "created_at", "updated_at", "message_count", "kernel_version",
+        }
+        return {key: value for key, value in dict(summary or {}).items() if key in allowed}
+
+    def _session_index_payload_locked(self) -> dict:
+        return {
+            "version": 1,
+            "catalog_revision": int(self.catalog_revision or 0),
+            "sessions": {
+                str(session_id): self._session_index_summary_payload(summary)
+                for session_id, summary in self.session_index.items()
+                if isinstance(summary, dict)
+            },
+        }
+
+    def _write_session_index_payload(self, payload: dict) -> bool:
+        revision = max(0, int(payload.get("catalog_revision", 0) or 0)) if isinstance(payload, dict) else 0
+        if not hasattr(self, "_session_index_write_lock"):
+            self._session_index_write_lock = threading.Lock()
+        try:
+            with self._session_index_write_lock:
+                last_written = int(getattr(self, "_session_index_written_revision", -1) or -1)
+                if revision < last_written:
+                    return True
+                self.crypto.write_json(self.session_index_path, payload)
+                self._session_index_written_revision = revision
+            return True
+        except Exception:
+            return False
+
+    def _session_index_journal_entries(self) -> list[tuple[dict, str]]:
+        path = getattr(self, "session_index_journal_path", None)
+        if not isinstance(path, Path) or not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+        entries: list[tuple[dict, str]] = []
+        for line in lines:
+            raw_line = str(line or "").strip()
+            if not raw_line:
                 continue
-            sid = str(path.name or "").strip()
+            try:
+                record = json.loads(self.crypto.decrypt_text(raw_line))
+            except Exception:
+                continue
+            if isinstance(record, dict):
+                entries.append((record, raw_line))
+        return entries
+
+    def _append_session_index_journal_record_locked(self, record: dict) -> bool:
+        path = getattr(self, "session_index_journal_path", None)
+        if not isinstance(path, Path) or not getattr(self, "crypto", None):
+            return False
+        if not hasattr(self, "_session_index_write_lock"):
+            self._session_index_write_lock = threading.Lock()
+        try:
+            line = self.crypto.encrypt_text(json_dumps(record)) + "\n"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._session_index_write_lock:
+                with path.open("a", encoding="utf-8") as fileobj:
+                    fileobj.write(line)
+                    fileobj.flush()
+                    self.crypto._fsync_json_file(fileobj)
+            self._session_index_journal_records = max(
+                0, int(getattr(self, "_session_index_journal_records", 0) or 0)
+            ) + 1
+            self._session_index_journal_bytes = max(
+                0, int(getattr(self, "_session_index_journal_bytes", 0) or 0)
+            ) + len(line.encode("utf-8"))
+            return True
+        except Exception:
+            return False
+
+    def _queue_session_index_change_locked(self, session_id: str, *, deleted: bool = False) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        pending = getattr(self, "_session_index_pending_changes", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._session_index_pending_changes = pending
+        revision = int(getattr(self, "catalog_revision", 0) or 0)
+        record = {
+            "version": 1,
+            "revision": revision,
+            "op": "delete" if deleted else "upsert",
+            "session_id": sid,
+        }
+        if not deleted:
+            row = self.session_index.get(sid)
+            if not isinstance(row, dict):
+                return
+            record["summary"] = self._session_index_summary_payload(row)
+        pending[sid] = record
+        self._schedule_session_index_persist_locked()
+
+    def _rewrite_session_index_journal_locked(self, through_revision: int) -> None:
+        path = getattr(self, "session_index_journal_path", None)
+        if not isinstance(path, Path):
+            return
+        retained = [
+            line
+            for record, line in self._session_index_journal_entries()
+            if int(record.get("revision", 0) or 0) > int(through_revision or 0)
+        ]
+        if not hasattr(self, "_session_index_write_lock"):
+            self._session_index_write_lock = threading.Lock()
+        with self._session_index_write_lock:
+            if not retained:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            else:
+                tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    with tmp.open("w", encoding="utf-8") as fileobj:
+                        fileobj.write("\n".join(retained) + "\n")
+                        fileobj.flush()
+                        self.crypto._fsync_json_file(fileobj)
+                    os.replace(tmp, path)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        self._session_index_journal_records = len(retained)
+        self._session_index_journal_bytes = sum(len(line.encode("utf-8")) + 1 for line in retained)
+
+    def _compact_session_index_snapshot(self) -> bool:
+        with self.lock:
+            payload = self._session_index_payload_locked()
+            revision = int(payload.get("catalog_revision", 0) or 0)
+        if not self._write_session_index_payload(payload):
+            return False
+        with self.lock:
+            self._rewrite_session_index_journal_locked(revision)
+            self._session_index_dirty = bool(
+                int(getattr(self, "catalog_revision", 0) or 0) > revision
+                or getattr(self, "_session_index_pending_changes", {})
+            )
+        return True
+
+    def _persist_session_index_change_now_locked(self, session_id: str, *, deleted: bool = False) -> None:
+        sid = str(session_id or "").strip()
+        pending = getattr(self, "_session_index_pending_changes", None)
+        if isinstance(pending, dict):
+            pending.pop(sid, None)
+        journal_count = max(0, int(getattr(self, "_session_index_journal_records", 0) or 0))
+        if len(self.session_index) <= SESSION_INDEX_SYNC_SNAPSHOT_MAX and journal_count == 0:
+            self._persist_session_index_now_locked()
+            return
+        revision = int(getattr(self, "catalog_revision", 0) or 0)
+        record = {
+            "version": 1,
+            "revision": revision,
+            "op": "delete" if deleted else "upsert",
+            "session_id": sid,
+        }
+        if not deleted:
+            row = self.session_index.get(sid)
+            if isinstance(row, dict):
+                record["summary"] = self._session_index_summary_payload(row)
+        if not self._append_session_index_journal_record_locked(record):
+            self._persist_session_index_now_locked()
+            return
+        self._session_index_dirty = False
+        if (
+            int(getattr(self, "_session_index_journal_records", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_RECORDS
+            or int(getattr(self, "_session_index_journal_bytes", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_BYTES
+        ):
+            self._session_index_compact_requested = True
+            self._schedule_session_index_persist_locked()
+
+    def _persist_session_index_now_locked(self) -> None:
+        payload = self._session_index_payload_locked()
+        if self._write_session_index_payload(payload):
+            self._rewrite_session_index_journal_locked(int(payload.get("catalog_revision", 0) or 0))
+            self._session_index_dirty = False
+            return
+        self._session_index_compact_requested = True
+        self._schedule_session_index_persist_locked()
+
+    def _schedule_session_index_persist_locked(self) -> None:
+        self._session_index_dirty = True
+        if not getattr(self, "session_index_path", None) or not getattr(self, "crypto", None):
+            return
+        if not hasattr(self, "_session_index_persist_lock"):
+            self._session_index_persist_lock = threading.Lock()
+        if not hasattr(self, "_session_index_persist_pending"):
+            self._session_index_persist_pending = False
+        with self._session_index_persist_lock:
+            if self._session_index_persist_pending:
+                return
+            self._session_index_persist_pending = True
+
+        def worker() -> None:
+            while True:
+                time.sleep(0.15)
+                with self.lock:
+                    pending = list(getattr(self, "_session_index_pending_changes", {}).values())
+                    self._session_index_pending_changes = {}
+                    append_ok = True
+                    for record in pending:
+                        append_ok = self._append_session_index_journal_record_locked(record) and append_ok
+                    compact = not append_ok or bool(getattr(self, "_session_index_compact_requested", False)) or (
+                        int(getattr(self, "_session_index_journal_records", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_RECORDS
+                        or int(getattr(self, "_session_index_journal_bytes", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_BYTES
+                    )
+                    self._session_index_compact_requested = False
+                    self._session_index_dirty = False
+                compact_ok = True
+                if compact:
+                    compact_ok = self._compact_session_index_snapshot()
+                with self.lock:
+                    if not compact_ok:
+                        self._session_index_dirty = True
+                        self._session_index_compact_requested = True
+                    if self._session_index_dirty or getattr(self, "_session_index_pending_changes", {}):
+                        continue
+                    with self._session_index_persist_lock:
+                        self._session_index_persist_pending = False
+                return
+
+        threading.Thread(
+            target=worker,
+            name=f"session-index-{self.user_id or 'local'}",
+            daemon=True,
+        ).start()
+
+    def _sync_workspace_metadata_locked(self, workspace_id: str) -> dict:
+        metadata = {}
+        for row_id, raw in self.session_index.items():
+            if not isinstance(raw, dict):
+                continue
+            if self._normalize_workspace_id(raw.get("workspace_id"), row_id) != str(workspace_id or ""):
+                continue
+            loaded = self.sessions.get(row_id)
+            created = float(
+                (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                or raw.get("created_at", 0.0)
+                or raw.get("updated_at", 0.0)
+                or 0.0
+            )
+            title = str(
+                getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+            ).strip() or row_id
+            prior = metadata.get("_first_created", 0.0)
+            if "workspace_name" not in metadata or (created > 0 and (not prior or created < prior)):
+                metadata.update(
+                    {
+                        "workspace_name": title,
+                        "workspace_created_at": created,
+                        "_first_created": created,
+                    }
+                )
+        metadata.pop("_first_created", None)
+        metadata["workspace_id"] = str(workspace_id or "")
+        metadata["workspace_label"] = str(metadata.get("workspace_name", "") or workspace_id or "")
+        for row_id, peer in self.session_index.items():
+            if not isinstance(peer, dict) or self._normalize_workspace_id(peer.get("workspace_id"), row_id) != str(workspace_id or ""):
+                continue
+            peer.update(metadata)
+        return metadata
+
+    def _workspace_metadata_for_session(self, session_id: str) -> dict:
+        """Return the stable display metadata shared by sessions in a workspace."""
+        sid = str(session_id or "").strip()
+        with self.lock:
+            source = self.sessions.get(sid)
+            source_row = self.session_index.get(sid, {})
+            workspace_id = self._normalize_workspace_id(
+                getattr(source, "workspace_id", "") if source is not None else source_row.get("workspace_id"),
+                sid,
+            )
+            first_title = ""
+            first_created = 0.0
+            for row_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                row_workspace = self._normalize_workspace_id(raw.get("workspace_id"), row_id)
+                if row_workspace != workspace_id:
+                    continue
+                loaded = self.sessions.get(row_id)
+                created = float(
+                    (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("created_at", 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ).strip() or row_id
+                if (
+                    not first_title
+                    or (created > 0 and (first_created <= 0 or created < first_created))
+                ):
+                    first_title, first_created = title, created
+            name = first_title or str(getattr(source, "title", "") if source is not None else source_row.get("title", "") or sid)
+            workspace_names: dict[str, str] = {}
+            workspace_created: dict[str, float] = {}
+            for row_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                wid = self._normalize_workspace_id(raw.get("workspace_id"), row_id)
+                loaded = self.sessions.get(row_id)
+                created = float(
+                    (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("created_at", 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ).strip() or row_id
+                prior_created = workspace_created.get(wid, 0.0)
+                if wid not in workspace_names or (created > 0 and (prior_created <= 0 or created < prior_created)):
+                    workspace_names[wid] = title
+                    workspace_created[wid] = created
+            duplicate_count: dict[str, int] = {}
+            for workspace_name in workspace_names.values():
+                key = workspace_name.casefold()
+                duplicate_count[key] = duplicate_count.get(key, 0) + 1
+            label = name
+            if duplicate_count.get(name.casefold(), 0) > 1 and first_created > 0:
+                try:
+                    label = f"{name} · {datetime.fromtimestamp(first_created).strftime('%Y-%m-%d')}"
+                except Exception:
+                    label = name
+            return {
+                "workspace_id": workspace_id,
+                "workspace_name": name,
+                "workspace_created_at": first_created,
+                "workspace_label": label,
+            }
+
+    def _on_session_summary(self, summary: dict) -> None:
+        if not isinstance(summary, dict):
+            return
+        session_id = str(summary.get("id", "") or "").strip()
+        if not session_id:
+            return
+        with self.lock:
+            if session_id not in self.session_index and session_id not in self.sessions:
+                return
+            previous = dict(self.session_index.get(session_id, {}))
+            row = {
+                **previous,
+                "id": session_id,
+                "workspace_id": self._normalize_workspace_id(
+                    summary.get("workspace_id", previous.get("workspace_id")), session_id
+                ),
+                "title": str(summary.get("title", previous.get("title", session_id)) or session_id),
+                "title_origin": str(summary.get("title_origin", previous.get("title_origin", "")) or ""),
+                "title_revision": max(0, int(summary.get("title_revision", previous.get("title_revision", 0)) or 0)),
+                "created_at": float(summary.get("created_at", previous.get("created_at", 0.0)) or 0.0),
+                "running": bool(summary.get("running", previous.get("running", False))),
+                "degraded": False,
+                "recovered_at": float(summary.get("recovered_at", previous.get("recovered_at", 0.0)) or 0.0),
+                "recovered_reason": str(summary.get("recovered_reason", previous.get("recovered_reason", "")) or ""),
+                "ui_language": normalize_ui_language(summary.get("ui_language", previous.get("ui_language", self.user_language))),
+                "updated_at": float(summary.get("updated_at", previous.get("updated_at", 0.0)) or 0.0),
+                "message_count": max(0, int(summary.get("message_count", previous.get("message_count", 0)) or 0)),
+                "kernel_version": str(summary.get("kernel_version", previous.get("kernel_version", "")) or ""),
+                "loaded": True,
+            }
+            comparable_keys = (
+                "workspace_id", "title", "title_origin", "title_revision", "running", "recovered_at", "recovered_reason",
+                "ui_language", "created_at", "updated_at", "message_count",
+                "kernel_version",
+            )
+            if all(previous.get(key) == row.get(key) for key in comparable_keys):
+                self.session_index[session_id] = row
+                self._sync_workspace_metadata_locked(row["workspace_id"])
+                return
+            self.session_index[session_id] = row
+            self._sync_workspace_metadata_locked(row["workspace_id"])
+            self._session_catalog_changed_locked(session_id)
+            self._queue_session_index_change_locked(session_id)
+
+    def _load_existing(self):
+        loaded_index = False
+        snapshot_revision = 0
+        if self.session_index_path.exists():
+            try:
+                payload = self.crypto.read_json(self.session_index_path, {})
+                raw_sessions = payload.get("sessions", {}) if isinstance(payload, dict) else {}
+                if isinstance(raw_sessions, dict):
+                    for session_id, raw in raw_sessions.items():
+                        if not isinstance(raw, dict):
+                            continue
+                        sid = str(session_id or raw.get("id", "") or "").strip()
+                        if not sid:
+                            continue
+                        self.session_index[sid] = {
+                            "workspace_id": sid,
+                            "title": sid,
+                            "running": False,
+                            "degraded": False,
+                            "recovered_at": 0.0,
+                            "recovered_reason": "",
+                            "ui_language": self.user_language,
+                            "updated_at": 0.0,
+                            "created_at": 0.0,
+                            "message_count": 0,
+                            **dict(raw),
+                            "id": sid,
+                            "loaded": False,
+                        }
+                    self.catalog_revision = max(0, int(payload.get("catalog_revision", 0) or 0))
+                    snapshot_revision = int(self.catalog_revision)
+                    self._session_index_written_revision = int(self.catalog_revision)
+                    loaded_index = True
+            except Exception:
+                loaded_index = False
+        if not loaded_index:
+            for path in sorted(self.root.glob("*")):
+                if not path.is_dir() or (path / ".workspace_retained").exists():
+                    continue
+                sid = str(path.name or "").strip()
+                if not sid:
+                    continue
+                self.session_index[sid] = self._session_summary_from_disk(path)
+            if self.session_index:
+                self.catalog_revision = 1
+        journal_entries = self._session_index_journal_entries()
+        for record, _line in journal_entries:
+            revision = max(0, int(record.get("revision", 0) or 0))
+            if revision <= snapshot_revision:
+                continue
+            sid = str(record.get("session_id", "") or "").strip()
             if not sid:
                 continue
-            self.session_index[sid] = self._session_summary_from_disk(path)
+            if str(record.get("op", "") or "").strip().lower() == "delete":
+                self.session_index.pop(sid, None)
+            else:
+                summary = record.get("summary", {})
+                if not isinstance(summary, dict):
+                    continue
+                self.session_index[sid] = {
+                    "workspace_id": sid,
+                    "title": sid,
+                    "running": False,
+                    "degraded": False,
+                    "recovered_at": 0.0,
+                    "recovered_reason": "",
+                    "ui_language": self.user_language,
+                    "updated_at": 0.0,
+                    "created_at": 0.0,
+                    "message_count": 0,
+                    **dict(summary),
+                    "id": sid,
+                    "loaded": False,
+                }
+            self.catalog_revision = max(int(self.catalog_revision or 0), revision)
+        self._session_index_journal_records = len(journal_entries)
+        try:
+            self._session_index_journal_bytes = int(self.session_index_journal_path.stat().st_size)
+        except Exception:
+            self._session_index_journal_bytes = 0
+        if not loaded_index and self.session_index:
+            self._write_session_index_payload(self._session_index_payload_locked())
+            self._rewrite_session_index_journal_locked(int(self.catalog_revision or 0))
+        elif (
+            self._session_index_journal_records >= SESSION_INDEX_JOURNAL_COMPACT_RECORDS
+            or self._session_index_journal_bytes >= SESSION_INDEX_JOURNAL_COMPACT_BYTES
+        ):
+            self._session_index_compact_requested = True
+            self._schedule_session_index_persist_locked()
+
+    def _session_catalog_rows_locked(self) -> list[dict]:
+        revision = int(getattr(self, "catalog_revision", 0) or 0)
+        if int(getattr(self, "_session_catalog_cache_revision", -1) or -1) < 0:
+            rows = [dict(row) for row in self.session_index.values() if isinstance(row, dict)]
+            rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+            self._session_catalog_cache = rows
+            self._session_catalog_cache_revision = revision
+            self._session_catalog_recent = {}
+            self._session_catalog_deleted_ids = set()
+        recent = getattr(self, "_session_catalog_recent", {})
+        deleted_ids = getattr(self, "_session_catalog_deleted_ids", set())
+        if not recent and not deleted_ids:
+            return getattr(self, "_session_catalog_cache", [])
+        recent_rows = [dict(row) for row in recent.values() if isinstance(row, dict)]
+        recent_rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+        recent_ids = {str(row.get("id", "") or "") for row in recent_rows}
+        return recent_rows + [
+            row
+            for row in getattr(self, "_session_catalog_cache", [])
+            if str(row.get("id", "") or "") not in recent_ids
+            and str(row.get("id", "") or "") not in deleted_ids
+        ]
+
+    def _session_catalog_page_locked(self, offset: int, limit: int) -> tuple[list[dict], int]:
+        if int(getattr(self, "_session_catalog_cache_revision", -1) or -1) < 0:
+            self._session_catalog_rows_locked()
+        off = max(0, int(offset or 0))
+        lim = max(1, int(limit or SESSION_LIST_DEFAULT_LIMIT))
+        recent = getattr(self, "_session_catalog_recent", {})
+        deleted_ids = getattr(self, "_session_catalog_deleted_ids", set())
+        recent_rows = [dict(row) for row in recent.values() if isinstance(row, dict)]
+        recent_rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+        recent_ids = {str(row.get("id", "") or "") for row in recent_rows}
+        needed = off + lim
+        merged: list[dict] = recent_rows[:needed]
+        if len(merged) < needed:
+            for row in getattr(self, "_session_catalog_cache", []):
+                sid = str(row.get("id", "") or "")
+                if sid in recent_ids or sid in deleted_ids:
+                    continue
+                merged.append(row)
+                if len(merged) >= needed:
+                    break
+        return merged[off:needed], len(self.session_index)
 
     def _load_session_locked(self, session_id: str) -> SessionState | None:
         sid = str(session_id or "").strip()
@@ -791,43 +1464,80 @@ class SessionManager:
         if existing:
             return existing
         session_dir = self.root / sid
-        if not session_dir.exists() or not session_dir.is_dir():
+        if (
+            not session_dir.exists()
+            or not session_dir.is_dir()
+            or (session_dir / ".workspace_retained").exists()
+        ):
             return None
         summary = self.session_index.get(sid) or self._session_summary_from_disk(session_dir)
         title = str(summary.get("title", sid) or sid)
-        sess = self._make_session_state(sid, title)
+        sess = self._make_session_state(
+            sid,
+            title,
+            self._normalize_workspace_id(summary.get("workspace_id"), sid),
+        )
         self.sessions[sid] = sess
         self.session_index[sid] = {
             **summary,
+            "workspace_id": str(getattr(sess, "workspace_id", sid) or sid),
             "title": str(getattr(sess, "title", title) or title),
+            "title_origin": str(getattr(sess, "title_origin", summary.get("title_origin", "")) or ""),
+            "title_revision": int(getattr(sess, "auto_title_revision", summary.get("title_revision", 0)) or 0),
+            "created_at": float(getattr(sess, "created_at", summary.get("created_at", 0.0)) or 0.0),
             "running": bool(getattr(sess, "running", False)),
             "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
             "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
             "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
             "updated_at": float(getattr(sess, "updated_at", summary.get("updated_at", 0.0)) or 0.0),
             "message_count": int(self._session_message_count(sess)),
+            "kernel_version": str(getattr(sess, "kernel_version", summary.get("kernel_version", "")) or ""),
             "loaded": True,
         }
         return sess
 
     def _session_message_count(self, sess: SessionState) -> int:
         try:
-            count = sum(
-                1 for row in getattr(sess, "messages", [])
-                if isinstance(row, dict) and str(row.get("role", "")).strip() != "tool"
-            )
-            count += sum(
-                1 for row in getattr(sess, "scheduler_visible_inputs", [])
-                if isinstance(row, dict) and str(row.get("content", "") or "").strip()
-            )
-            return max(0, int(count))
+            if not bool(getattr(sess, "_ui_runtime_state_ready", False)):
+                with sess.lock:
+                    sess._ensure_ui_runtime_state_locked()
+            return max(0, int(getattr(sess, "ui_message_count", 0) or 0))
         except Exception:
             return 0
 
-    def create(self, title: str | None = None) -> SessionState:
+    def create(
+        self,
+        title: str | None = None,
+        *,
+        title_origin: str | None = None,
+        workspace_session_id: str = "",
+    ) -> SessionState:
         with self.lock:
             sid = make_id("sess")
             name = title.strip() if title else sid
+            source_id = str(workspace_session_id or "").strip()
+            source = self._load_session_locked(source_id) if source_id else None
+            if source_id and source is None:
+                raise KeyError(source_id)
+            workspace_id = (
+                self._normalize_workspace_id(getattr(source, "workspace_id", ""), source.id)
+                if source is not None
+                else self._normalize_workspace_id(
+                    self.collaboration_context.get("project_id") if self.workspace_root is not None else "",
+                    sid,
+                )
+            )
+            session_workspace_root = (
+                self.workspace_root
+                if self.workspace_root is not None
+                else (source.files_root if source is not None else None)
+            )
+            kernel_version = ""
+            if self.kernel_registry is not None:
+                try:
+                    kernel_version = self.kernel_registry.choose_version(self.user_id, sid)
+                except Exception:
+                    kernel_version = ""
             sess = SessionState(
                 session_id=sid,
                 title=name,
@@ -870,20 +1580,38 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
-                workspace_root=self.workspace_root,
+                workspace_root=session_workspace_root,
+                workspace_id=workspace_id,
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
                 shell_timeout_mode=self.shell_timeout_mode,
                 shell_async_handoff_seconds=self.shell_async_handoff_seconds,
                 process_manager=self.process_manager,
+                deferred_start_prepare_callback=self.prepare_user_intent_for_session,
+                summary_update_callback=None,
+                kernel_version=kernel_version,
+                kernel_runtime=self.kernel_runtime,
+                skills_snapshot=self.skills_snapshot,
+                defer_initial_persist=True,
             )
+            sess.workspace_metadata_callback = self._workspace_metadata_for_session
+            requested_origin = str(title_origin or "").strip().lower()
+            if requested_origin in {"default", "auto", "application", "manual", "legacy"}:
+                sess.title_origin = requested_origin
+            elif title:
+                sess.title_origin = "default" if sess._is_default_session_title(name) else "manual"
             sess.set_telemetry_callback(self.telemetry_callback)
-            self._apply_user_defaults_to_session(sess)
+            self._apply_user_defaults_to_session(sess, persist=True)
+            sess.summary_update_callback = self._on_session_summary
             self.sessions[sid] = sess
             self.session_index[sid] = {
                 "id": sid,
+                "workspace_id": str(getattr(sess, "workspace_id", sid) or sid),
                 "title": str(getattr(sess, "title", name) or name),
+                "title_origin": str(getattr(sess, "title_origin", "") or ""),
+                "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+                "created_at": float(getattr(sess, "created_at", 0.0) or 0.0),
                 "running": bool(getattr(sess, "running", False)),
                 "degraded": False,
                 "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
@@ -891,8 +1619,11 @@ class SessionManager:
                 "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
                 "updated_at": float(getattr(sess, "updated_at", now_ts()) or now_ts()),
                 "message_count": int(self._session_message_count(sess)),
+                "kernel_version": str(getattr(sess, "kernel_version", "") or ""),
                 "loaded": True,
             }
+            self._session_catalog_changed_locked(sid)
+            self._persist_session_index_change_now_locked(sid)
             return sess
 
     def get(self, session_id: str) -> SessionState | None:
@@ -904,20 +1635,61 @@ class SessionManager:
             sess = self._load_session_locked(session_id)
             if not sess:
                 raise KeyError(session_id)
+        session_lock = getattr(sess, "lock", None)
+        guard = session_lock if session_lock is not None else contextlib.nullcontext()
+        with guard:
             sess.title = title.strip() or sess.id
             sess.title_origin = "manual"
             sess.last_auto_title_source = ""
+            sess.auto_title_revision = int(getattr(sess, "auto_title_revision", 0) or 0) + 1
+            sess.auto_title_refine_generation = int(getattr(sess, "auto_title_refine_generation", 0) or 0) + 1
+            sess.auto_title_refine_pending = False
             sess.updated_at = now_ts()
             sess._persist()
+        with self.lock:
             row = dict(self.session_index.get(sess.id, {}))
             row.update({
                 "id": sess.id,
                 "title": sess.title,
+                "title_origin": "manual",
+                "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
                 "updated_at": float(sess.updated_at or now_ts()),
                 "message_count": int(self._session_message_count(sess)),
+                "kernel_version": str(getattr(sess, "kernel_version", "") or ""),
                 "loaded": True,
             })
             self.session_index[sess.id] = row
+            self._session_catalog_changed_locked(sess.id)
+            self._persist_session_index_change_now_locked(sess.id)
+            emit = getattr(sess, "_emit", None)
+            if callable(emit):
+                payload = {
+                    "summary": f"session renamed: '{trim(title, 36)}'",
+                    "session_title": sess.title,
+                    "title_origin": "manual",
+                    "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+                    "title_source": "manual",
+                }
+                metadata_callback = getattr(sess, "workspace_metadata_callback", None)
+                if callable(metadata_callback):
+                    try:
+                        metadata = metadata_callback(sess.id)
+                        if isinstance(metadata, dict):
+                            payload.update(
+                                {
+                                    key: metadata[key]
+                                    for key in (
+                                        "workspace_id",
+                                        "workspace_name",
+                                        "workspace_created_at",
+                                        "workspace_label",
+                                    )
+                                    if key in metadata
+                                }
+                            )
+                    except Exception:
+                        pass
+                emit("status", payload)
             return sess
 
     def delete(self, session_id: str) -> bool:
@@ -926,17 +1698,61 @@ class SessionManager:
             return False
         with self.lock:
             sess = self.sessions.pop(sid, None)
+            summary = dict(self.session_index.get(sid, {}))
             existed = bool(sess or sid in self.session_index or (self.root / sid).exists())
+            workspace_id = self._normalize_workspace_id(
+                getattr(sess, "workspace_id", "") if sess is not None else summary.get("workspace_id"),
+                sid,
+            )
+            workspace_peers = [
+                row_id
+                for row_id, row in self.session_index.items()
+                if row_id != sid
+                and isinstance(row, dict)
+                and self._normalize_workspace_id(row.get("workspace_id"), row_id) == workspace_id
+            ]
+            retain_workspace = bool(
+                self.workspace_root is None and workspace_id == sid and workspace_peers
+            )
             self.session_index.pop(sid, None)
+            if existed:
+                self._session_catalog_changed_locked(sid, deleted=True)
+                self._persist_session_index_change_now_locked(sid, deleted=True)
         if not existed:
             return False
         if sess:
             # Note: sess.mcp is the SHARED global manager — never shut it down on
             # per-session delete (that would kill MCP for all other sessions).
             sess.interrupt()
-            shutil.rmtree(sess.root, ignore_errors=True)
+        session_root = sess.root if sess is not None else self.root / sid
+        if retain_workspace:
+            session_root.mkdir(parents=True, exist_ok=True)
+            for child in list(session_root.iterdir()):
+                if child.name in {"files", ".workspace_retained"}:
+                    continue
+                try:
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                (session_root / ".workspace_retained").write_text(workspace_id, encoding="utf-8")
+            except OSError:
+                pass
         else:
-            shutil.rmtree(self.root / sid, ignore_errors=True)
+            shutil.rmtree(session_root, ignore_errors=True)
+        if self.workspace_root is None:
+            with self.lock:
+                workspace_still_used = any(
+                    isinstance(row, dict)
+                    and self._normalize_workspace_id(row.get("workspace_id"), row_id) == workspace_id
+                    for row_id, row in self.session_index.items()
+                )
+            retained_root = self.root / workspace_id
+            if not workspace_still_used and (retained_root / ".workspace_retained").exists():
+                shutil.rmtree(retained_root, ignore_errors=True)
         return True
 
     def _user_profile_is_runnable(self, profile: dict) -> bool:
@@ -1292,12 +2108,8 @@ class SessionManager:
         lang = normalize_ui_language(language)
         with self.lock:
             self.user_language = lang
-            for sess in self.sessions.values():
-                sess._set_ui_language(lang, relabel_todos=True)
-                sess.updated_at = now_ts()
-                sess._persist()
             self._persist_user_prefs()
-        return {"ok": True, "language": lang}
+        return {"ok": True, "language": lang, "existing_sessions_unchanged": True}
 
     def set_session_language(self, session_id: str, language: str, set_user_default: bool = False) -> dict:
         lang = normalize_ui_language(language)
@@ -1330,67 +2142,218 @@ class SessionManager:
         return self.apply_llm_config(session_id, cfg, source=str(LLM_CONFIG_PATH))
 
     def list(self, *, limit: int | None = None, offset: int = 0, search: str = "", status: str = "") -> list[dict] | dict:
-        with self.lock:
-            rows_by_id = {str(k): dict(v) for k, v in self.session_index.items() if isinstance(v, dict)}
-            loaded_sessions = list(self.sessions.values())
-            for sess in loaded_sessions:
-                sid = str(getattr(sess, "id", "") or "")
-                if not sid:
-                    continue
-                # Session summaries are a hot path for both IDE polling and the
-                # traditional session list. Never lock a live session or rescan its
-                # complete message history here. Mutations update the index through
-                # the normal manager APIs; the selected session's live snapshot is
-                # responsible for immediate message-count updates in the UI.
-                cached = rows_by_id.get(sid, {})
-                rows_by_id[sid] = {
-                    **cached,
-                    "id": sid,
-                    "title": str(getattr(sess, "title", "") or cached.get("title", sid) or sid),
-                    "running": bool(getattr(sess, "running", cached.get("running", False))),
-                    "degraded": False,
-                    "recovered_at": float(getattr(sess, "run_recovered_at", cached.get("recovered_at", 0.0)) or 0.0),
-                    "recovered_reason": str(getattr(sess, "run_recovered_reason", cached.get("recovered_reason", "")) or ""),
-                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", cached.get("ui_language", self.user_language))),
-                    "updated_at": float(getattr(sess, "updated_at", cached.get("updated_at", 0.0)) or 0.0),
-                    "message_count": int(cached.get("message_count", 0) or 0),
-                    "loaded": True,
-                }
-        rows: list[dict] = []
         needle = str(search or "").strip().lower()
         status_key = str(status or "").strip().lower()
-        for raw in rows_by_id.values():
+
+        def public_row(raw: dict) -> dict:
             sid = str(raw.get("id", "") or "")
             title = str(raw.get("title", "") or sid)
-            running = bool(raw.get("running", False))
-            if needle and needle not in title.lower() and needle not in sid.lower():
+            return {
+                "id": sid,
+                "workspace_id": self._normalize_workspace_id(raw.get("workspace_id"), sid),
+                "title": title,
+                "created_at": float(raw.get("created_at", 0.0) or 0.0),
+                "running": bool(raw.get("running", False)),
+                "degraded": bool(raw.get("degraded", False)),
+                "recovered_at": float(raw.get("recovered_at", 0.0) or 0.0),
+                "recovered_reason": str(raw.get("recovered_reason", "") or ""),
+                "ui_language": normalize_ui_language(raw.get("ui_language", self.user_language)),
+                "updated_at": float(raw.get("updated_at", 0.0) or 0.0),
+                "message_count": int(raw.get("message_count", 0) or 0),
+                "kernel_version": str(raw.get("kernel_version", "") or ""),
+            }
+
+        off = max(0, int(offset or 0))
+        lim = max(1, min(2000, int(limit or SESSION_LIST_DEFAULT_LIMIT))) if limit is not None else 0
+        plain_catalog = not needle and status_key not in {"running", "active", "idle", "stopped"}
+        with self.lock:
+            catalog_revision = int(getattr(self, "catalog_revision", 0) or 0)
+            if plain_catalog and limit is not None:
+                selected, total = self._session_catalog_page_locked(off, lim)
+                catalog_rows = []
+            else:
+                catalog_rows = self._session_catalog_rows_locked()
+                total = len(catalog_rows)
+                selected = catalog_rows if limit is None else catalog_rows[off: off + lim]
+        if plain_catalog:
+            filtered_rows = [public_row(raw) for raw in selected]
+        else:
+            matched: list[dict] = []
+            for raw in catalog_rows:
+                sid = str(raw.get("id", "") or "")
+                title = str(raw.get("title", "") or sid)
+                running = bool(raw.get("running", False))
+                if needle and needle not in title.lower() and needle not in sid.lower():
+                    continue
+                if status_key in {"running", "active"} and not running:
+                    continue
+                if status_key in {"idle", "stopped"} and running:
+                    continue
+                matched.append(raw)
+            total = len(matched)
+            selected = matched if limit is None else matched[off: off + lim]
+            filtered_rows = [public_row(raw) for raw in selected]
+        if limit is None:
+            return filtered_rows
+        page_rows = filtered_rows
+        with self.lock:
+            loaded_by_id = {
+                str(row.get("id", "") or ""): self.sessions.get(str(row.get("id", "") or ""))
+                for row in page_rows
+            }
+        for row in page_rows:
+            sess = loaded_by_id.get(str(row.get("id", "") or ""))
+            if sess is None:
                 continue
-            if status_key in {"running", "active"} and not running:
-                continue
-            if status_key in {"idle", "stopped"} and running:
-                continue
-            rows.append(
+            row.update(
                 {
-                    "id": sid,
-                    "title": title,
-                    "running": running,
-                    "degraded": bool(raw.get("degraded", False)),
-                    "recovered_at": float(raw.get("recovered_at", 0.0) or 0.0),
-                    "recovered_reason": str(raw.get("recovered_reason", "") or ""),
-                    "ui_language": normalize_ui_language(raw.get("ui_language", self.user_language)),
-                    "updated_at": float(raw.get("updated_at", 0.0) or 0.0),
-                    "message_count": int(raw.get("message_count", 0) or 0),
+                    "workspace_id": str(getattr(sess, "workspace_id", row.get("workspace_id", sess.id)) or sess.id),
+                    "title": str(getattr(sess, "title", row.get("title", "")) or row.get("title", "")),
+                    "running": bool(getattr(sess, "running", False) or getattr(sess, "scheduler_starting", False)),
+                    "degraded": False,
+                    "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
+                    "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
+                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", row.get("ui_language", self.user_language))),
+                    "created_at": float(getattr(sess, "created_at", row.get("created_at", 0.0)) or 0.0),
+                    "updated_at": float(getattr(sess, "updated_at", row.get("updated_at", 0.0)) or 0.0),
+                    "message_count": int(row.get("message_count", 0) or 0),
+                    "kernel_version": str(getattr(sess, "kernel_version", row.get("kernel_version", "")) or ""),
                 }
             )
-        rows.sort(key=lambda x: x["updated_at"], reverse=True)
-        if limit is None:
-            return rows
-        off = max(0, int(offset or 0))
-        lim = max(1, min(2000, int(limit or SESSION_LIST_DEFAULT_LIMIT)))
+        with self.lock:
+            workspace_counts: dict[str, int] = {}
+            workspace_meta: dict[str, dict] = {}
+            for session_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                wid = self._normalize_workspace_id(raw.get("workspace_id"), session_id)
+                workspace_counts[wid] = workspace_counts.get(wid, 0) + 1
+                created = float(raw.get("created_at", 0.0) or 0.0)
+                if created <= 0:
+                    created = float(raw.get("updated_at", 0.0) or 0.0)
+                title = str(raw.get("title", "") or session_id).strip() or session_id
+                prior = workspace_meta.get(wid)
+                if prior is None or created < float(prior.get("created_at", 0.0) or 0.0):
+                    workspace_meta[wid] = {
+                        "name": title,
+                        "created_at": created,
+                    }
+            duplicate_names: dict[str, int] = {}
+            for meta in workspace_meta.values():
+                key = str(meta.get("name", "") or "").casefold()
+                duplicate_names[key] = duplicate_names.get(key, 0) + 1
+            workspace_labels: dict[str, str] = {}
+            for wid, meta in workspace_meta.items():
+                name = str(meta.get("name", "") or wid)
+                created = float(meta.get("created_at", 0.0) or 0.0)
+                label = name
+                if duplicate_names.get(name.casefold(), 0) > 1 and created > 0:
+                    try:
+                        label = f"{name} · {datetime.fromtimestamp(created).strftime('%Y-%m-%d')}"
+                    except Exception:
+                        label = name
+                workspace_labels[wid] = label
+        for row in page_rows:
+            wid = self._normalize_workspace_id(row.get("workspace_id"), str(row.get("id", "") or ""))
+            meta = workspace_meta.get(wid, {})
+            workspace_name = str(meta.get("name", "") or row.get("title", "") or row.get("id", ""))
+            row["workspace_session_count"] = int(workspace_counts.get(wid, 1))
+            row["workspace_name"] = workspace_name
+            row["workspace_created_at"] = float(meta.get("created_at", row.get("created_at", 0.0)) or 0.0)
+            row["workspace_label"] = workspace_labels.get(wid, workspace_name)
         return {
-            "sessions": rows[off: off + lim],
-            "total": len(rows),
+            "sessions": page_rows,
+            "total": total,
             "offset": off,
             "limit": lim,
-            "has_more": off + lim < len(rows),
+            "has_more": off + len(page_rows) < total,
+            "catalog_revision": catalog_revision,
+        }
+
+    def workspace_history(self, session_id: str, *, limit: int = 60) -> dict:
+        sid = str(session_id or "").strip()
+        lim = max(0, min(120, int(limit or 0)))
+        with self.lock:
+            active = self.sessions.get(sid)
+            source = self.session_index.get(sid)
+            if active is None and not isinstance(source, dict):
+                raise KeyError(sid)
+            workspace_id = self._normalize_workspace_id(
+                getattr(active, "workspace_id", "") if active is not None else source.get("workspace_id"),
+                sid,
+            )
+            matches: list[dict] = []
+            workspace_first: dict | None = None
+            for raw in self.session_index.values():
+                if not isinstance(raw, dict):
+                    continue
+                row_id = str(raw.get("id", "") or "").strip()
+                if not row_id:
+                    continue
+                loaded = self.sessions.get(row_id)
+                row_workspace_id = self._normalize_workspace_id(
+                    getattr(loaded, "workspace_id", "") if loaded is not None else raw.get("workspace_id"),
+                    row_id,
+                )
+                if row_workspace_id != workspace_id:
+                    continue
+                row_created_at = float(
+                    raw.get("created_at", 0.0)
+                    or (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                row_title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ) or row_id
+                first_created_at = float((workspace_first or {}).get("created_at", 0.0) or 0.0)
+                if (
+                    workspace_first is None
+                    or (row_created_at > 0 and (first_created_at <= 0 or row_created_at < first_created_at))
+                ):
+                    workspace_first = {"title": row_title, "created_at": row_created_at}
+                row = {
+                    "id": row_id,
+                    "workspace_id": row_workspace_id,
+                    "title": str(
+                        getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                    )
+                    or row_id,
+                    "running": bool(
+                        (getattr(loaded, "running", False) or getattr(loaded, "scheduler_starting", False))
+                        if loaded is not None
+                        else raw.get("running", False)
+                    ),
+                    "updated_at": float(
+                        getattr(loaded, "updated_at", 0.0) if loaded is not None else raw.get("updated_at", 0.0)
+                    ),
+                    "created_at": row_created_at,
+                    "workspace_name": str((workspace_first or {}).get("title", "") or row_title),
+                    "workspace_created_at": float((workspace_first or {}).get("created_at", 0.0) or 0.0),
+                    "message_count": max(0, int(raw.get("message_count", 0) or 0)),
+                    "current": row_id == sid,
+                }
+                matches.append(row)
+            matches.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+            catalog_revision = int(getattr(self, "catalog_revision", 0) or 0)
+            workspace_name = str((workspace_first or {}).get("title", "") or sid)
+            workspace_created_at = float((workspace_first or {}).get("created_at", 0.0) or 0.0)
+            for row in matches:
+                row["workspace_name"] = workspace_name
+                row["workspace_created_at"] = workspace_created_at
+        total = len(matches)
+        for row in matches:
+            row["workspace_session_count"] = total
+            row["workspace_label"] = workspace_name
+        return {
+            "ok": True,
+            "session_id": sid,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "workspace_created_at": workspace_created_at,
+            "sessions": matches[:lim] if lim else [],
+            "total": total,
+            "has_history": total > 1,
+            "truncated": bool(lim and total > lim),
+            "catalog_revision": catalog_revision,
         }

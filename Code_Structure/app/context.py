@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1060 original-lines=108508-118277 hash=af020c4faf8839ed
+# split-source: order=1173 original-lines=117384-128100 hash=27c44b14c80da282
 
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.
@@ -73,6 +73,279 @@ class AppContext:
         if base:
             self.base_url = base
 
+    def _liquid_kernel_profile(self, profile_id: str = "") -> dict:
+        requested = sanitize_profile_id(str(profile_id or ""))
+        if requested and requested in self.global_profiles:
+            return dict(self.global_profiles[requested])
+        active = dict(self.global_profiles.get(self.global_active_profile_id, {}))
+        if active:
+            return active
+        return {
+            "provider": "ollama",
+            "model": self.model,
+            "base_url": self.base_url,
+            "temperature": 0.1,
+        }
+
+    def _liquid_kernel_model_call(self, system: str, prompt: str, profile_id: str, max_tokens: int) -> dict:
+        profile = self._liquid_kernel_profile(profile_id)
+        client = OllamaClient(
+            base_url=str(profile.get("base_url", self.base_url) or self.base_url),
+            model=str(profile.get("model", self.model) or self.model),
+            timeout=max(DEFAULT_REQUEST_TIMEOUT, min(MAX_TIMEOUT_SECONDS, 900)),
+            provider=str(profile.get("provider", "ollama") or "ollama"),
+            endpoint=str(profile.get("endpoint", "") or ""),
+            api_key=str(profile.get("api_key", "") or ""),
+            headers=profile.get("headers", {}) if isinstance(profile.get("headers"), dict) else {},
+            payload_template=str(profile.get("payload_template", "") or ""),
+            thinking_stream=False,
+            response_stream=False,
+        )
+        client.apply_profile(profile)
+        client.set_telemetry(self.telemetry.record, context_provider=lambda: {}, name="liquid_kernel_evolution")
+        response = client.chat(
+            [{"role": "user", "content": str(prompt or "")}],
+            system=str(system or ""),
+            max_tokens=max(512, min(int(max_tokens or 4096), 32_000)),
+            temperature=max(0.0, min(0.3, float(profile.get("temperature", 0.1) or 0.1))),
+            think=False,
+            response_stream=False,
+        )
+        text = str(response.get("content", "") or "")
+        parsed = parse_json_object(text, {})
+        if not isinstance(parsed, dict) or not parsed:
+            raise LiquidKernelError(
+                "invalid_model_output",
+                "evolution model must return a JSON object",
+                details={"output": trim(text, 1200)},
+            )
+        return parsed
+
+    def _liquid_kernel_judge_call(self, payload: dict, profile_id: str, max_tokens: int) -> dict:
+        profile = str(profile_id or "").strip()
+        order = ["incumbent", "candidate"]
+        random.SystemRandom().shuffle(order)
+        source_a = str(payload.get(f"{order[0]}_source", "") or "")
+        source_b = str(payload.get(f"{order[1]}_source", "") or "")
+        judge_prompt = json_dumps(
+            {
+                "task": (
+                    "Blindly compare Kernel A and Kernel B for correctness, robustness, tool selection, "
+                    "task progression, recovery behavior, and maintainability across the randomized cases."
+                ),
+                "kernel_a": source_a,
+                "kernel_b": source_b,
+                "randomized_cases": payload.get("cases", []),
+                "rules": [
+                    "Do not infer which kernel is incumbent or candidate.",
+                    "Score each from 0 to 100.",
+                    "Do not reward changes merely for being different or longer.",
+                    "Return JSON only with score_a, score_b, rationale, and confidence.",
+                ],
+            },
+            indent=2,
+        )
+        result = self._liquid_kernel_model_call(
+            "You are an independent blind evaluator. Do not modify code and do not reveal hidden reasoning.",
+            judge_prompt,
+            profile,
+            max_tokens,
+        )
+        score_a = max(0.0, min(100.0, float(result.get("score_a", 50) or 50)))
+        score_b = max(0.0, min(100.0, float(result.get("score_b", 50) or 50)))
+        mapped = {order[0]: score_a, order[1]: score_b}
+        return {
+            "incumbent": mapped["incumbent"],
+            "candidate": mapped["candidate"],
+            "rationale": trim(str(result.get("rationale", "") or ""), 4000),
+            "confidence": max(0.0, min(1.0, float(result.get("confidence", 0.5) or 0.5))),
+            "blind_order": ["A", "B"],
+        }
+
+    @staticmethod
+    def _liquid_kernel_redact_text(value: object) -> str:
+        text = str(value or "")
+        for pattern in _COLLAB_PUBLIC_SECRET_PATTERNS:
+            text = pattern.sub("[secret redacted]", text)
+        return text
+
+    def _liquid_kernel_experience(self, config: dict, incumbent: str, versions: list[str]) -> dict:
+        allowed_versions = {str(item) for item in versions if str(item)}
+        user_scope = {str(item) for item in config.get("user_scope", ["*"]) if str(item)}
+        session_scope = {str(item) for item in config.get("session_scope", ["*"]) if str(item)}
+        timezone_name = str(config.get("timezone", "Asia/Shanghai") or "Asia/Shanghai")
+        try:
+            tz = ZoneInfo(timezone_name)
+        except Exception:
+            tz = ZoneInfo("Asia/Shanghai")
+
+        def date_boundary(raw: object, *, end: bool) -> float:
+            text = str(raw or "").strip()
+            if not text:
+                return float("inf") if end else 0.0
+            try:
+                parsed = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=tz)
+                if end:
+                    parsed += timedelta(days=1)
+                return parsed.timestamp()
+            except Exception:
+                return float("inf") if end else 0.0
+
+        start_ts = date_boundary(config.get("history_start_date"), end=False)
+        end_ts = date_boundary(config.get("history_end_date"), end=True)
+        history_access = str(config.get("history_access", "full") or "full").strip().lower()
+        char_budget = max(200_000, min(4_000_000, int(config.get("budget", {}).get("max_tokens", 0) or 0) * 12))
+        version_counts: Counter = Counter()
+        history_by_version: dict[str, dict] = {
+            str(version): {"kernel_version": str(version), "records": [], "record_count": 0, "message_count": 0}
+            for version in versions
+        }
+        scanned_sessions = 0
+        record_count = 0
+        prompt_record_count = 0
+        included_chars = 0
+        truncated = False
+        run_id = re.sub(r"[^A-Za-z0-9_.-]+", "", str(config.get("_run_id", "") or ""))[:160]
+        archive_root = None
+        archive_handles: dict[str, object] = {}
+        archive_hashes: dict[str, object] = {}
+        archive_meta: dict[str, dict] = {}
+        if run_id and getattr(self, "liquid_kernel", None) is not None:
+            archive_root = self.liquid_kernel.registry.experience_root / run_id / "history"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(archive_root, 0o700)
+            except Exception:
+                pass
+
+        def archive_record(version: str, record: dict) -> None:
+            if archive_root is None:
+                return
+            handle = archive_handles.get(version)
+            if handle is None:
+                archive_path = archive_root / f"{re.sub(r'[^A-Za-z0-9_.-]+', '_', version)[:140] or 'unknown'}.jsonl"
+                handle = archive_path.open("ab")
+                archive_handles[version] = handle
+                archive_hashes[version] = hashlib.sha256()
+                archive_meta[version] = {"path": str(archive_path), "bytes": 0, "records": 0, "sha256": ""}
+            line = safe_utf8_bytes(json_dumps(record) + "\n")
+            handle.write(line)
+            archive_hashes[version].update(line)
+            archive_meta[version]["bytes"] = int(archive_meta[version]["bytes"]) + len(line)
+            archive_meta[version]["records"] = int(archive_meta[version]["records"]) + 1
+        try:
+            user_dirs = [path for path in self.codes_root.iterdir() if path.is_dir() and not path.name.startswith(".")]
+        except Exception:
+            user_dirs = []
+        try:
+            for user_dir in sorted(user_dirs, key=lambda path: path.name):
+                user_id = user_dir.name
+                if "*" not in user_scope and user_id not in user_scope:
+                    continue
+                sessions_root = user_dir / "sessions"
+                if not sessions_root.is_dir():
+                    continue
+                for session_dir in sorted(sessions_root.iterdir(), key=lambda path: path.name):
+                    if not session_dir.is_dir():
+                        continue
+                    session_id = session_dir.name
+                    if "*" not in session_scope and session_id not in session_scope:
+                        continue
+                    scanned_sessions += 1
+                    state = self.crypto.read_json(session_dir / "state.json", {})
+                    if not isinstance(state, dict):
+                        continue
+                    version = str(state.get("kernel_version", "") or incumbent)
+                    if version not in allowed_versions:
+                        continue
+                    updated_at = float(state.get("updated_at", 0.0) or 0.0)
+                    full_messages: list[dict] = []
+                    for raw_message in state.get("messages", []) if isinstance(state.get("messages"), list) else []:
+                        if not isinstance(raw_message, dict):
+                            continue
+                        role = str(raw_message.get("role", "") or "")
+                        if role not in {"user", "assistant", "tool", "system"}:
+                            continue
+                        message_ts = float(raw_message.get("ts", 0.0) or updated_at or 0.0)
+                        if message_ts < start_ts or message_ts >= end_ts:
+                            continue
+                        message = {"role": role, "ts": message_ts}
+                        if history_access == "full":
+                            message["content"] = self._liquid_kernel_redact_text(raw_message.get("content", ""))
+                        full_messages.append(message)
+                    if not full_messages and (updated_at < start_ts or updated_at >= end_ts):
+                        continue
+                    title = self._liquid_kernel_redact_text(state.get("title", session_id))
+                    full_record = {
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "kernel_version": version,
+                        "title": title,
+                        "updated_at": updated_at,
+                        "messages": full_messages,
+                        "message_count": len(full_messages),
+                        "total_message_count": len(state.get("messages", []) if isinstance(state.get("messages"), list) else []),
+                    }
+                    archive_record(version, full_record)
+                    version_counts[version] += 1
+                    record_count += 1
+                    version_history = history_by_version.setdefault(
+                        version,
+                        {"kernel_version": version, "records": [], "record_count": 0, "message_count": 0},
+                    )
+                    version_history["record_count"] = int(version_history.get("record_count", 0) or 0) + 1
+                    version_history["message_count"] = int(version_history.get("message_count", 0) or 0) + len(full_messages)
+                    if truncated:
+                        continue
+                    prompt_record = {**full_record, "messages": []}
+                    for message in full_messages:
+                        encoded_size = len(_json(message))
+                        if included_chars + encoded_size > char_budget:
+                            truncated = True
+                            break
+                        included_chars += encoded_size
+                        prompt_record["messages"].append(message)
+                    if prompt_record["messages"] or history_access == "metadata":
+                        version_history["records"].append(prompt_record)
+                        prompt_record_count += 1
+        finally:
+            for version, handle in archive_handles.items():
+                try:
+                    handle.flush()
+                    handle.close()
+                except Exception:
+                    pass
+                archive_meta[version]["sha256"] = archive_hashes[version].hexdigest()
+                try:
+                    os.chmod(archive_meta[version]["path"], 0o600)
+                except Exception:
+                    pass
+        return {
+            "incumbent_version": incumbent,
+            "versions": list(versions),
+            "version_counts": dict(version_counts),
+            "history_by_version": history_by_version,
+            "records": [],
+            "records_grouped_by_version": True,
+            "record_count": record_count,
+            "prompt_record_count": prompt_record_count,
+            "scanned_sessions": scanned_sessions,
+            "included_chars": included_chars,
+            "truncated_by_budget": truncated,
+            "full_history_archive": archive_meta,
+            "history_start_date": str(config.get("history_start_date", "") or ""),
+            "history_end_date": str(config.get("history_end_date", "") or ""),
+            "history_access": history_access,
+            "full_history_scope": bool(
+                "*" in user_scope
+                and "*" in session_scope
+                and not str(config.get("history_start_date", "") or "")
+                and not str(config.get("history_end_date", "") or "")
+            ),
+            "secrets_redacted": True,
+            "created_at": now_ts(),
+        }
+
     def __init__(
         self,
         workspace: Path,
@@ -112,6 +385,7 @@ class AppContext:
         ide_password_login_enabled: bool = False,
         shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
         shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+        liquid_kernel_startup_policy: str = "inherit",
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -232,6 +506,9 @@ class AppContext:
         self.js_lib_download_enabled = bool(js_lib_download_enabled)
         self._task_queue: deque[dict] = deque()
         self._task_queue_seq = 0
+        self._task_submission_recent: deque[dict] = deque(maxlen=SCHEDULER_SUBMISSION_DEDUPE_MAX)
+        self._scheduler_active_sessions: set[tuple[str, str]] = set()
+        self._scheduler_active_initialized = True
         self.tool_specs = filter_tool_specs_for_runtime(
             TOOLS,
             web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
@@ -291,6 +568,33 @@ class AppContext:
         self.admin_initial_config = _admin_factory_config()
         self.admin_active_config = dict(self.admin_initial_config)
         self.telemetry = TelemetryStore(self.admin_state_root / ADMIN_TELEMETRY_FILENAME)
+        self.liquid_kernel_startup_policy = normalize_liquid_kernel_startup_policy(liquid_kernel_startup_policy)
+        self.liquid_kernel_bootstrap = prepare_liquid_kernel_runtime(
+            self.admin_state_root / "liquid_kernel",
+            self.liquid_kernel_startup_policy,
+        )
+        self.liquid_kernel = LiquidKernelControlPlane(
+            Path(self.liquid_kernel_bootstrap["runtime_root"]),
+            experience_provider=self._liquid_kernel_experience,
+            model_callback=self._liquid_kernel_model_call,
+            judge_callback=self._liquid_kernel_judge_call,
+        )
+        if self.liquid_kernel_startup_policy == "inject":
+            injection = self.liquid_kernel.inject_embedded_kernel()
+            self.liquid_kernel_bootstrap.update(
+                {
+                    "history_action": "injected_embedded_kernel",
+                    "effective_policy": "inject",
+                    "injected_version": str(injection.get("version", "") or ""),
+                    "previous_version": str(injection.get("previous_version", "") or ""),
+                    "injected": bool(injection.get("injected", False)),
+                }
+            )
+            self.liquid_kernel_bootstrap = _persist_liquid_kernel_bootstrap(
+                Path(self.liquid_kernel_bootstrap["runtime_root"]),
+                self.liquid_kernel_bootstrap,
+            )
+        self.liquid_kernel.start_scheduler()
         self.applications = ApplicationRegistry(self, self.admin_state_root / ADMIN_APPS_FILENAME)
         self.restart_callback = None
         self.restart_pending = False
@@ -1191,13 +1495,37 @@ class AppContext:
         self._ide_save_mounts(user_id, mounts)
         return {"ok": True, "mounts": mounts}
 
-    def ide_session_payload(self, user_id: str, client_ip: str = "", *, limit: int = 80, offset: int = 0) -> dict:
+    def ide_session_payload(
+        self,
+        user_id: str,
+        client_ip: str = "",
+        *,
+        limit: int = IDE_SESSION_LIST_DEFAULT_LIMIT,
+        offset: int = 0,
+        search: str = "",
+        status: str = "",
+    ) -> dict:
         mgr = self.manager_for_user(user_id)
-        sessions = mgr.list(limit=max(1, min(200, int(limit or 80))), offset=max(0, int(offset or 0)))
+        sessions = mgr.list(
+            limit=max(1, min(200, int(limit or IDE_SESSION_LIST_DEFAULT_LIMIT))),
+            offset=max(0, int(offset or 0)),
+            search=search,
+            status=status,
+        )
         if isinstance(sessions, dict):
             rows = list(sessions.get("sessions", []))
+            total = int(sessions.get("total", len(rows)) or len(rows))
+            page_offset = int(sessions.get("offset", offset) or 0)
+            page_limit = int(sessions.get("limit", limit) or limit)
+            has_more = bool(sessions.get("has_more", False))
+            catalog_revision = int(sessions.get("catalog_revision", 0) or 0)
         else:
             rows = list(sessions)
+            total = len(rows)
+            page_offset = 0
+            page_limit = len(rows)
+            has_more = False
+            catalog_revision = 0
         latest_id = ""
         if rows:
             latest = max(rows, key=lambda x: float((x or {}).get("updated_at", 0.0) or 0.0))
@@ -1206,7 +1534,7 @@ class AppContext:
             {
                 "enabled": False,
                 "limit": 0,
-                "used": len(rows),
+                "used": total,
                 "remaining": None,
                 "display_value": "collaboration",
                 "user_id": str(user_id or ""),
@@ -1217,6 +1545,11 @@ class AppContext:
         )
         return {
             "sessions": rows,
+            "total": total,
+            "offset": page_offset,
+            "limit": page_limit,
+            "has_more": has_more,
+            "catalog_revision": catalog_revision,
             "active_session_id": latest_id,
             "session_creation_limit": quota,
         }
@@ -1484,7 +1817,7 @@ class AppContext:
                     pass
             raise
 
-    def ide_config(self, user_id: str, client_ip: str = "") -> dict:
+    def ide_config(self, user_id: str, client_ip: str = "", *, lite: bool = False) -> dict:
         if str(client_ip or "").strip() and not str(user_id or "").startswith("collab:"):
             self._sync_ordinary_ide_llm_source(user_id, client_ip)
         sessions = self.ide_session_payload(user_id, client_ip=client_ip)
@@ -1501,10 +1834,18 @@ class AppContext:
             "toolchains": self.ide_toolchains(),
             "mounts": self._ide_load_mounts(user_id),
             "sessions": sessions.get("sessions", []),
+            "session_total": int(sessions.get("total", 0) or 0),
+            "session_offset": int(sessions.get("offset", 0) or 0),
+            "session_limit": int(sessions.get("limit", IDE_SESSION_LIST_DEFAULT_LIMIT) or IDE_SESSION_LIST_DEFAULT_LIMIT),
+            "session_has_more": bool(sessions.get("has_more", False)),
+            "session_catalog_revision": int(sessions.get("catalog_revision", 0) or 0),
             "active_session_id": str(sessions.get("active_session_id", "") or ""),
             "session_creation_limit": sessions.get("session_creation_limit", {}),
             "password_login_enabled": bool(self.ide_password_login_enabled),
-            "shared_resources": self.shared_resource_manifest(user_id),
+            "shared_resources": {} if lite else self.shared_resource_manifest(user_id),
+            "deferred_resources": bool(lite),
+            "active_kernel_version": self.liquid_kernel.registry.active_version(),
+            "kernel_canary": self.liquid_kernel.registry.active_state().get("canary"),
         }
         principal = self._collaboration_principal_for_ide_user(user_id)
         if principal is not None:
@@ -1521,7 +1862,7 @@ class AppContext:
                     if bool(getattr(self, "collaboration_insecure_http", False))
                     else ""
                 ),
-                "shared_resources": self.collaboration_resource_manifest(user_id),
+                "shared_resources": {} if lite else self.collaboration_resource_manifest(user_id),
             })
         return out
 
@@ -1718,18 +2059,53 @@ class AppContext:
     def collaboration_resource_manifest(self, user_id: str) -> dict:
         return self.shared_resource_manifest(user_id, collaboration=True)
 
-    def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
+    def ide_create_session(
+        self,
+        user_id: str,
+        title: str | None = None,
+        client_ip: str = "",
+        *,
+        workspace_session_id: str = "",
+    ) -> dict:
+        requested_title = str(title or "").strip()
+        source_session_id = str(workspace_session_id or "").strip()
+        initial_title = requested_title or (
+            "Shared workspace" if str(user_id or "").startswith("collab:") else "IDE Workspace"
+        )
+        title_origin = "manual" if requested_title else "default"
         if str(user_id or "").startswith("collab:"):
             mgr = self.manager_for_user(user_id)
-            sess = mgr.create(title or "Shared workspace")
+            sess = mgr.create(
+                initial_title,
+                title_origin=title_origin,
+                workspace_session_id=source_session_id,
+            )
             sess.ide_remote_sandbox_required = True
             quota = self.ide_session_payload(user_id, client_ip=client_ip).get("session_creation_limit", {})
         else:
-            sess, quota = self.create_session_for_user(user_id, title or "IDE Workspace", client_ip=client_ip)
+            sess, quota = self.create_session_for_user(
+                user_id,
+                initial_title,
+                client_ip=client_ip,
+                title_origin=title_origin,
+                workspace_session_id=source_session_id,
+            )
+            mgr = self.manager_for_user(user_id)
+        history = mgr.workspace_history(sess.id, limit=0)
         return {
             "ok": True,
             "id": sess.id,
+            "workspace_id": str(getattr(sess, "workspace_id", sess.id) or sess.id),
+            "workspace_session_count": int(history.get("total", 1) or 1),
+            "workspace_name": str(history.get("workspace_name", sess.title) or sess.title),
+            "workspace_created_at": float(history.get("workspace_created_at", getattr(sess, "created_at", 0.0)) or 0.0),
+            "created_at": float(getattr(sess, "created_at", 0.0) or 0.0),
+            "workspace_inherited": bool(source_session_id),
+            "new_workspace": not bool(source_session_id),
+            "workspace_shared": bool(getattr(mgr, "workspace_root", None) is not None),
             "title": sess.title,
+            "title_origin": str(getattr(sess, "title_origin", "") or ""),
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
             "ui_language": sess.ui_language,
             "session_creation_limit": quota,
             "roots": self.ide_workspace_roots(user_id, sess.id),
@@ -1740,7 +2116,23 @@ class AppContext:
         if not clean:
             raise ValueError("title required")
         sess = self.manager_for_user(user_id).rename(str(session_id or "").strip(), clean)
-        return {"ok": True, "id": sess.id, "title": sess.title}
+        return {
+            "ok": True,
+            "id": sess.id,
+            "title": sess.title,
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+        }
+
+    def ide_delete_session(self, user_id: str, session_id: str) -> dict:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise ValueError("session id required")
+        manager = self.manager_for_user(user_id)
+        if manager.get(sid) is None:
+            raise KeyError(sid)
+        if not manager.delete(sid):
+            raise KeyError(sid)
+        return {"ok": True, "id": sid}
 
     def _ide_session(self, user_id: str, session_id: str) -> SessionState:
         sess = self.manager_for_user(user_id).get(str(session_id or "").strip())
@@ -1775,6 +2167,18 @@ class AppContext:
             )
         return roots
 
+    def ide_workspace_session_history(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        limit: int = 60,
+    ) -> dict:
+        mgr = self.manager_for_user(user_id)
+        if mgr.get(str(session_id or "").strip()) is None:
+            raise KeyError("session not found")
+        return mgr.workspace_history(session_id, limit=limit)
+
     def ide_resolve_workspace(self, user_id: str, session_id: str, root_id: str, rel: str = "") -> tuple[Path, Path, dict]:
         rid = str(root_id or "session").strip() or "session"
         if rid == "session":
@@ -1802,6 +2206,57 @@ class AppContext:
         rel_norm = normalize_rel_preview_path(rel)
         target = safe_path(rel_norm or ".", root)
         return root, target, meta
+
+    def ide_issue_preview_token(
+        self,
+        user_id: str,
+        session_id: str,
+        root_id: str = "session",
+        *,
+        ttl_seconds: int = 600,
+    ) -> str:
+        """Issue a short-lived, read-only capability for HTML preview resources."""
+        self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        payload = {
+            "u": str(user_id or ""),
+            "s": str(session_id or ""),
+            "r": str(root_id or "session"),
+            "e": int(now_ts()) + max(30, min(900, int(ttl_seconds or 600))),
+            "n": secrets.token_urlsafe(8),
+        }
+        body = base64.urlsafe_b64encode(
+            json_dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        signature = hmac.new(self.crypto.key, body.encode("ascii"), hashlib.sha256).hexdigest()
+        return f"{body}.{signature}"
+
+    def ide_verify_preview_token(
+        self,
+        token: object,
+        session_id: str,
+        root_id: str = "session",
+    ) -> str | None:
+        """Validate a preview capability and return its bound IDE user id."""
+        raw = str(token or "").strip()
+        body, sep, signature = raw.rpartition(".")
+        if not sep or not body or not re.fullmatch(r"[A-Fa-f0-9]{64}", signature):
+            return None
+        expected = hmac.new(self.crypto.key, body.encode("ascii", errors="ignore"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        try:
+            padded = body + "=" * (-len(body) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict) or float(payload.get("e", 0) or 0) <= now_ts():
+            return None
+        if not hmac.compare_digest(str(payload.get("s", "") or ""), str(session_id or "")):
+            return None
+        if not hmac.compare_digest(str(payload.get("r", "") or "session"), str(root_id or "session")):
+            return None
+        user_id = str(payload.get("u", "") or "").strip()
+        return user_id or None
 
     def _ide_file_stat(self, root: Path, fp: Path) -> dict:
         try:
@@ -2893,7 +3348,7 @@ document.addEventListener('DOMContentLoaded', function(){{
 
     def ide_upload(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
-        dest = normalize_rel_preview_path(str(payload.get("dest", payload.get("dir", "")) or ""))
+        dest = normalize_upload_rel_path(str(payload.get("dest", payload.get("dir", "")) or ""))
         items = payload.get("items", [])
         directories = payload.get("directories", [])
         if not isinstance(items, list):
@@ -2909,13 +3364,13 @@ document.addEventListener('DOMContentLoaded', function(){{
         created_directories: list[dict] = []
         total = 0
         for raw_directory in directories:
-            rel_directory = normalize_rel_preview_path(
+            rel_directory = normalize_upload_rel_path(
                 str(raw_directory.get("path", "") if isinstance(raw_directory, dict) else raw_directory or "")
             )
             if not rel_directory:
                 continue
             target_dir = safe_path(
-                normalize_rel_preview_path(f"{dest}/{rel_directory}" if dest else rel_directory), root
+                normalize_upload_rel_path(f"{dest}/{rel_directory}" if dest else rel_directory), root
             )
             self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target_dir)
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -2923,7 +3378,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         for item in items:
             if not isinstance(item, dict):
                 continue
-            rel_item = normalize_rel_preview_path(str(item.get("path", item.get("filename", "")) or ""))
+            rel_item = normalize_upload_rel_path(str(item.get("path", item.get("filename", "")) or ""))
             if not rel_item:
                 continue
             raw = base64.b64decode(str(item.get("content_b64", "") or ""), validate=True)
@@ -2932,7 +3387,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             total += len(raw)
             if total > IDE_UPLOAD_TOTAL_MAX_BYTES:
                 raise ValueError("upload batch is too large")
-            target = safe_path(normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item), root)
+            target = safe_path(normalize_upload_rel_path(f"{dest}/{rel_item}" if dest else rel_item), root)
             self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
             target.parent.mkdir(parents=True, exist_ok=True)
             principal = self._collaboration_principal_for_ide_user(user_id)
@@ -2973,8 +3428,8 @@ document.addEventListener('DOMContentLoaded', function(){{
     def ide_upload_chunk(self, user_id: str, session_id: str, payload: dict) -> dict:
         """Append one validated chunk and atomically publish a completed upload."""
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
-        dest = normalize_rel_preview_path(str(payload.get("dest", payload.get("dir", "")) or ""))
-        rel_item = normalize_rel_preview_path(
+        dest = normalize_upload_rel_path(str(payload.get("dest", payload.get("dir", "")) or ""))
+        rel_item = normalize_upload_rel_path(
             str(payload.get("path", payload.get("filename", "")) or "")
         )
         if not rel_item:
@@ -2986,7 +3441,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             user_id,
             session_id,
             root_id,
-            normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item),
+            normalize_upload_rel_path(f"{dest}/{rel_item}" if dest else rel_item),
         )
         self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if target.exists() and target.is_dir():
@@ -4260,7 +4715,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             self._sync_ordinary_ide_llm_source(user_id, client_ip)
         sid = str(session_id or "").strip()
         if not sid:
-            created = self.ide_create_session(user_id, "IDE Workspace", client_ip=client_ip)
+            created = self.ide_create_session(user_id, None, client_ip=client_ip)
             sid = str(created.get("id", "") or "")
         message = str(payload.get("message", payload.get("content", "")) or "").strip()
         if not message:
@@ -5568,13 +6023,30 @@ document.addEventListener('DOMContentLoaded', function(){{
         result.update({"session_id": session_id, "question_id": expected_id, "answer": answer})
         return result
 
-    def ide_agent_state(self, user_id: str, session_id: str) -> dict:
+    def ide_agent_state(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        after_feed_seq: int = 0,
+        after_operation_seq: int = 0,
+        known_snapshot_revision: int = 0,
+    ) -> dict:
         sess = self._ide_session(user_id, session_id)
+        after_feed_seq = max(0, int(after_feed_seq or 0))
+        after_operation_seq = max(0, int(after_operation_seq or 0))
+        known_snapshot_revision = max(0, int(known_snapshot_revision or 0))
         snap = sess.snapshot_safe(lite=True, lock_timeout=0.35)
-        raw_operations = list(snap.get("operations", []) or []) if isinstance(snap, dict) else []
+        snapshot_revision = int(
+            snap.get("snapshot_revision", snap.get("event_seq", 0)) or 0
+        ) if isinstance(snap, dict) else 0
+        unchanged = bool(known_snapshot_revision and known_snapshot_revision == snapshot_revision)
+        raw_operations = [] if unchanged else (
+            list(snap.get("operations", []) or []) if isinstance(snap, dict) else []
+        )
         acquired = False
         try:
-            acquired = bool(sess.lock.acquire(timeout=0.08))
+            acquired = bool((not unchanged) and sess.lock.acquire(timeout=0.08))
             if acquired:
                 raw_operations = list(sess.operations[-500:])
         except Exception:
@@ -5584,9 +6056,60 @@ document.addEventListener('DOMContentLoaded', function(){{
                 sess.lock.release()
 
         feed: list[dict] = []
-        for raw in snap.get("conversation_feed", []) if isinstance(snap, dict) else []:
+        seen_feed_ids: set[str] = set()
+        raw_feed = [] if unchanged else (
+            list(snap.get("conversation_feed", []) or []) if isinstance(snap, dict) else []
+        )
+        feed_sequences = sorted(
+            int(row.get("seq", 0) or 0)
+            for row in raw_feed
+            if isinstance(row, dict) and int(row.get("seq", 0) or 0) > 0
+        )
+        operation_sequences = sorted(
+            int(row.get("seq", 0) or 0)
+            for row in raw_operations
+            if isinstance(row, dict) and int(row.get("seq", 0) or 0) > 0
+        )
+        feed_cursor_expired = bool(
+            after_feed_seq and feed_sequences and after_feed_seq < feed_sequences[0] - 1
+        )
+        operation_cursor_expired = bool(
+            after_operation_seq
+            and operation_sequences
+            and after_operation_seq < operation_sequences[0] - 1
+        )
+        reset_required = bool(feed_cursor_expired or operation_cursor_expired)
+        if reset_required:
+            raw_feed = []
+            raw_operations = []
+        elif after_feed_seq:
+            raw_feed = [
+                row
+                for row in raw_feed
+                if isinstance(row, dict) and int(row.get("seq", 0) or 0) > after_feed_seq
+            ]
+        if not reset_required and after_operation_seq:
+            raw_operations = [
+                row
+                for row in raw_operations
+                if isinstance(row, dict) and int(row.get("seq", 0) or 0) > after_operation_seq
+            ]
+        incremental_request = bool(after_feed_seq or after_operation_seq or known_snapshot_revision)
+        for raw in raw_feed:
             if not isinstance(raw, dict):
                 continue
+            is_hidden = getattr(sess, "_is_ui_hidden_runtime_message", None)
+            if callable(is_hidden) and bool(is_hidden(raw)):
+                continue
+            runtime_projection = None
+            project_runtime = getattr(sess, "_runtime_message_ui_projection", None)
+            is_runtime = getattr(sess, "_is_runtime_internal_message", None)
+            if callable(project_runtime):
+                runtime_projection = project_runtime(raw)
+            if callable(is_runtime) and bool(is_runtime(raw)):
+                if runtime_projection is None:
+                    continue
+                raw = runtime_projection
             role = str(raw.get("role", "system") or "system").strip().lower()
             public_text = str(raw.get("text", "") or "")
             if role == "user" and public_text.startswith("IDE programming request."):
@@ -5597,12 +6120,36 @@ document.addEventListener('DOMContentLoaded', function(){{
             ):
                 public_text = ""
             row = {
+                "id": trim(str(raw.get("id", "") or ""), 160),
+                "seq": max(0, int(raw.get("seq", 0) or 0)),
                 "role": role,
                 "type": trim(str(raw.get("type", "message") or "message"), 40),
                 "text": trim(public_text, 6000),
                 "ts": float(raw.get("ts", 0.0) or 0.0),
                 "agent_role": trim(str(raw.get("agent_role", "") or ""), 40),
             }
+            # Thinking-only assistant turns are private reasoning, not a public
+            # message.  Keep structured tool/plan rows even when their text is
+            # intentionally empty.
+            if role == "assistant" and not row["text"].strip() and row["type"] not in {
+                "tool_calls",
+                "plan_notice",
+                "plan_proposal",
+                "plan_approved_handoff",
+                "step_verified",
+                "todo_focus",
+                "runtime_hint",
+            }:
+                continue
+            if not row["id"]:
+                # Older persisted sessions may lack ids; snapshot() supplies a
+                # deterministic fallback, but keep a defensive key for custom
+                # SessionState implementations used by integrations/tests.
+                fallback = f"{row['ts']:.6f}|{role}|{row['type']}|{row['text']}"
+                row["id"] = f"feed:{hashlib.sha256(fallback.encode('utf-8', errors='ignore')).hexdigest()[:16]}"
+            if row["id"] in seen_feed_ids:
+                continue
+            seen_feed_ids.add(row["id"])
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             if data:
                 public_data = ide_public_operation_data(data)
@@ -5618,15 +6165,48 @@ document.addEventListener('DOMContentLoaded', function(){{
                 continue
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             public_data = ide_public_operation_data(data)
+            operation_id = str(raw.get("id", "") or "").strip()
+            operation_seq = int(raw.get("seq", 0) or 0)
+            if not operation_id:
+                if operation_seq > 0:
+                    operation_id = f"operation:{operation_seq}"
+                else:
+                    operation_id = "operation:" + hashlib.sha256(
+                        f"{raw.get('ts', 0)}|{kind}|{json_dumps(public_data)}".encode(
+                            "utf-8", errors="ignore"
+                        )
+                    ).hexdigest()[:16]
             operations.append(
                 {
-                    "id": str(raw.get("id", "") or ""),
-                    "seq": int(raw.get("seq", 0) or 0),
+                    "id": operation_id,
+                    "seq": operation_seq,
                     "ts": float(raw.get("ts", 0.0) or 0.0),
                     "type": kind,
                     "data": public_data,
                 }
             )
+        raw_feed_count = len(feed)
+        raw_operation_count = len(operations)
+        feed, feed_truncated = _bounded_ui_rows(
+            feed,
+            max_rows=180,
+            byte_budget=IDE_AGENT_FEED_BYTES,
+            text_limit=3600,
+            data_text_limit=1200,
+            collection_limit=20,
+            keep="head" if incremental_request else "tail",
+        )
+        operations, operations_truncated = _bounded_ui_rows(
+            operations,
+            max_rows=500,
+            byte_budget=IDE_AGENT_OPERATIONS_BYTES,
+            text_limit=2200,
+            data_text_limit=1200,
+            collection_limit=20,
+            keep="head" if incremental_request else "tail",
+        )
+        incremental_feed_more = bool(incremental_request and feed_truncated)
+        incremental_operation_more = bool(incremental_request and operations_truncated)
         pending_question = None
         raw_question = snap.get("pending_user_question") if isinstance(snap, dict) else None
         if isinstance(raw_question, dict):
@@ -5654,17 +6234,43 @@ document.addEventListener('DOMContentLoaded', function(){{
                 )
             except Exception:
                 pass
-        return {
+        feed_cursor_values = [after_feed_seq] + [int(row.get("seq", 0) or 0) for row in feed]
+        operation_cursor_values = [after_operation_seq] + [int(row.get("seq", 0) or 0) for row in operations]
+        if not incremental_feed_more:
+            feed_cursor_values.append(int(snap.get("feed_revision", 0) or 0))
+        if not incremental_operation_more:
+            operation_cursor_values.append(int(snap.get("operation_revision", 0) or 0))
+        response = {
             "ok": True,
             "session_id": str(session_id or ""),
             "title": trim(str(getattr(sess, "title", "") or ""), 160),
             "title_origin": trim(str(getattr(sess, "title_origin", "") or ""), 20),
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
             "running": bool(snap.get("running", False)),
+            "scheduler_starting": bool(snap.get("scheduler_starting", False)),
             "phase": str(snap.get("agent_phase", "idle") or "idle"),
             "active_role": str(snap.get("agent_active_role", "") or ""),
             "active_tool": str(snap.get("agent_active_tool", "") or ""),
             "live_response_text": trim(str(snap.get("live_response_text", "") or ""), 8000),
             "event_seq": int(snap.get("event_seq", 0) or 0),
+            "snapshot_revision": snapshot_revision,
+            "feed_revision": int(snap.get("feed_revision", snapshot_revision) or 0),
+            "operation_revision": int(snap.get("operation_revision", snapshot_revision) or 0),
+            "todo_revision": int(snap.get("todo_revision", snapshot_revision) or 0),
+            "reset_required": reset_required,
+            "incremental": bool(
+                (after_feed_seq or after_operation_seq or known_snapshot_revision)
+                and not reset_required
+            ),
+            "feed_cursor": max(feed_cursor_values),
+            "operation_cursor": max(operation_cursor_values),
+            "feed_window_start": feed_sequences[0] if feed_sequences else 0,
+            "operation_window_start": operation_sequences[0] if operation_sequences else 0,
+            "feed_available": raw_feed_count,
+            "operation_available": raw_operation_count,
+            "feed_truncated": bool(feed_truncated),
+            "operations_truncated": bool(operations_truncated),
+            "incremental_has_more": bool(incremental_feed_more or incremental_operation_more),
             "message_count": int(snap.get("message_count", 0) or 0),
             "queued_inputs": int(snap.get("queued_user_inputs_count", 0) or 0),
             "scheduler_queued": int(snap.get("scheduler_queued_inputs_count", 0) or 0),
@@ -5678,9 +6284,35 @@ document.addEventListener('DOMContentLoaded', function(){{
             "agent_contexts": list(snap.get("agent_contexts", []) or [])[:12],
             "todos": list(snap.get("todos", []) or [])[:40],
             "tasks": list(snap.get("tasks", []) or [])[:80],
-            "feed": feed[-180:],
+            "feed": feed,
             "operations": operations[-500:],
         }
+        response["agent_contexts"], _ = _bounded_ui_rows(
+            response.get("agent_contexts", []),
+            max_rows=12,
+            byte_budget=16 * 1024,
+            text_limit=1200,
+            data_text_limit=800,
+            collection_limit=16,
+        )
+        response["todos"], _ = _bounded_ui_rows(
+            response.get("todos", []),
+            max_rows=40,
+            byte_budget=24 * 1024,
+            text_limit=1200,
+            data_text_limit=700,
+            collection_limit=16,
+        )
+        response["tasks"], _ = _bounded_ui_rows(
+            response.get("tasks", []),
+            max_rows=80,
+            byte_budget=32 * 1024,
+            text_limit=1200,
+            data_text_limit=700,
+            collection_limit=16,
+        )
+        response["ui_payload_limit_bytes"] = int(IDE_AGENT_STATE_MAX_BYTES)
+        return _enforce_ui_payload_budget(response, IDE_AGENT_STATE_MAX_BYTES)
 
     def ide_agent_models(
         self,
@@ -6139,7 +6771,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             for row in (result.get("results", []) or []):
                 if not isinstance(row, dict):
                     continue
-                patched = dict(row)
+                patched = _rag_normalize_evidence_record(row)
                 if source_route and not str(patched.get("source_route", "") or "").strip():
                     patched["source_route"] = source_route
                 rows.append(patched)
@@ -6199,9 +6831,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "high_recall_min_pool": RAG_HIGH_RECALL_MIN_POOL,
             }
         )
+        candidates = [_rag_normalize_evidence_record(row) for row in deduped]
         return {
             "query": query,
             "results": selected,
+            "candidate_results": candidates,
             "summary": "\n".join(summaries[:3]) or "\n".join(f"{r.get('citation')} {r.get('title','')}: {trim(r.get('text',''), 160)}" for r in selected[:4]),
             "community_cards": [],
             "query_entities": sorted(query_entities),
@@ -6265,47 +6899,26 @@ document.addEventListener('DOMContentLoaded', function(){{
         return any(term in low for term in terms)
 
     def _rag_evidence_metrics(self, result: dict) -> dict:
-        rows = [dict(x) for x in (result.get("results", []) or []) if isinstance(x, dict)]
+        rows = [dict(x) for x in (result.get("candidate_results", result.get("results", [])) or []) if isinstance(x, dict)]
+        validated = [_rag_validate_evidence_record(row, str(result.get("query", "") or "")) for row in rows]
         def _row_score(row: dict) -> float:
-            if bool(row.get("weak_match", False)):
-                return min(RAG_WEAK_MATCH_SCORE_CAP, float(row.get("score", 0.0) or 0.0))
-            evidence = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "")
-            try:
-                score = float(row.get("score", 0.0) or 0.0)
-            except Exception:
-                score = 0.0
-            try:
-                fusion = float(row.get("fusion_score", 0.0) or 0.0)
-            except Exception:
-                fusion = 0.0
-            try:
-                lexical = float(row.get("lexical_score", 0.0) or 0.0)
-            except Exception:
-                lexical = 0.0
-            try:
-                graph = float(row.get("graph_score", 0.0) or 0.0)
-            except Exception:
-                graph = 0.0
-            if evidence in {"community_reduce", "community_map", "community_bridge", "community_report"}:
-                supporting = row.get("evidence_citations", [])
-                if not isinstance(supporting, list):
-                    supporting = []
-                if lexical < 0.04 and len([x for x in supporting if str(x).strip()]) <= 0:
-                    return min(score, RAG_WEAK_MATCH_SCORE_CAP)
-            return max(score, fusion, lexical * 0.85 + graph * 0.30)
+            strength = str(row.get("evidence_strength", "unverified") or "unverified")
+            if strength not in {"direct", "derived"}:
+                return 0.0
+            return _rag_float(row.get("grounded_score"))
 
-        best = max((_row_score(row) for row in rows), default=0.0)
-        strong = sum(1 for row in rows if _row_score(row) >= RAG_MIN_SYNTHESIS_SCORE)
+        best = max((_row_score(row) for row in validated), default=0.0)
+        strong = sum(1 for row in validated if _row_score(row) >= RAG_MIN_SYNTHESIS_SCORE)
         doc_ids = {
             str(row.get("doc_id", "") or "").strip()
             for row in rows
             if str(row.get("doc_id", "") or "").strip()
         }
-        layers = Counter(str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "unknown") for row in rows)
+        layers = Counter(str(row.get("evidence_strength", "unverified") or "unverified") for row in validated)
         status = "miss"
         if rows and best >= RAG_NO_EVIDENCE_THRESHOLD and strong > 0:
             status = "hit"
-        elif rows:
+        elif any(int((row.get("validation", {}) or {}).get("lexical_overlap", 0) or 0) > 0 for row in validated):
             status = "weak"
         confidence = min(1.0, max(0.0, best + min(0.24, 0.04 * max(0, strong - 1)) + min(0.12, 0.03 * max(0, len(doc_ids) - 1))))
         return {
@@ -6350,6 +6963,7 @@ document.addEventListener('DOMContentLoaded', function(){{
     def _trim_rag_result_to_budget(self, result: dict, *, budget_key: str, budget: dict) -> dict:
         out = dict(result or {})
         rows = [dict(x) for x in (out.get("results", []) or []) if isinstance(x, dict)]
+        candidates = [dict(x) for x in (out.get("candidate_results", rows) or []) if isinstance(x, dict)]
         max_chars = max(1200, int(budget.get("chars", 7200) or 7200))
         max_rows = max(1, int(budget.get("evidence", 6) or 6))
         used = 0
@@ -6366,10 +6980,175 @@ document.addEventListener('DOMContentLoaded', function(){{
             used += len(str(row.get("text", "") or ""))
             kept.append(row)
         out["results"] = kept
+        out["candidate_results"] = candidates
         out = self._annotate_rag_result(out, budget_key=budget_key, budget=budget)
         if out.get("evidence_status") == "miss":
             out["results"] = []
         return out
+
+    def _rag_prepare_evidence(self, query: str, result: dict) -> tuple[list[dict], list[dict], dict]:
+        candidates = result.get("candidate_results", result.get("results", [])) if isinstance(result, dict) else []
+        source_docs: dict[str, dict] = {}
+        for store_name in ("rag_store", "code_store"):
+            store = getattr(self, store_name, None)
+            for doc_id, doc in getattr(store, "documents", {}).items():
+                if isinstance(doc, dict):
+                    source_docs[str(doc_id)] = doc
+        normalized = []
+        for row in candidates:
+            if not isinstance(row, dict):
+                continue
+            doc = source_docs.get(str(row.get("doc_id", "") or ""), {})
+            normalized.append(_rag_validate_evidence_record(_rag_normalize_evidence_record(row, source_document=doc), query))
+        grounded = [row for row in normalized if row.get("evidence_strength") in {"direct", "derived"}]
+        grounded.sort(
+            key=lambda row: (
+                1 if row.get("evidence_strength") == "direct" else 0,
+                _rag_float(row.get("grounded_score")),
+                _rag_float(row.get("fusion_score")),
+            ),
+            reverse=True,
+        )
+        counts = Counter(str(row.get("evidence_strength", "unverified")) for row in normalized)
+        duplicate_groups: dict[str, list[dict]] = defaultdict(list)
+        for row in normalized:
+            group = str(row.get("duplicate_group", "") or "").strip()
+            if not group:
+                group = _digest(str(row.get("text", "") or "").strip())[:16]
+                row["duplicate_group"] = group
+            duplicate_groups[group].append(row)
+        conflicts: list[dict] = []
+        for group, group_rows in duplicate_groups.items():
+            statements = {str(row.get("text", "") or "").strip() for row in group_rows if row.get("text")}
+            if len(group_rows) > 1 and len(statements) > 1:
+                conflicts.append({"group": group, "citations": [row.get("citation", "") for row in group_rows]})
+        trace = {
+            "candidate_count": len(normalized),
+            "validated_count": len(grounded),
+            "evidence_strength_counts": dict(counts),
+            "conflict_count": len(conflicts),
+        }
+        return normalized, grounded, {"trace": trace, "conflicts": conflicts}
+
+    @staticmethod
+    def _rag_group_evidence(rows: list[dict]) -> dict[str, list[dict]]:
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for row in rows or []:
+            group = str(row.get("duplicate_group", "") or "").strip()
+            if not group:
+                group = _digest(str(row.get("text", "") or "").strip())[:16]
+            groups[group].append(row)
+        return groups
+
+    def rag_evidence_batches(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
+        result = self.rag_query(user_id, {**body, "synthesize": False, "evaluation_mode": "none"})
+        candidates = result.get("candidate_results", result.get("results", []))
+        validated = [_rag_validate_evidence_record(row, query) for row in candidates if isinstance(row, dict)]
+        batches = _rag_evidence_batches(validated, max_chars=int(body.get("batch_chars", RAG_EVIDENCE_BATCH_CHARS) or RAG_EVIDENCE_BATCH_CHARS))
+        return {
+            "query": query,
+            "batches": [{"batch_id": idx + 1, "evidence": batch} for idx, batch in enumerate(batches)],
+            "candidate_count": len(validated),
+            "batch_count": len(batches),
+            "coverage": {"candidate_count": len(validated), "batched_count": sum(len(x) for x in batches), "complete": sum(len(x) for x in batches) == len(validated)},
+            "retrieval": result,
+        }
+
+    def _rag_parse_evaluation(self, value: object, batch: list[dict]) -> dict:
+        text = str(value or "").strip()
+        parsed = {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            match = re.search(r"\{.*\}", text, re.S)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except Exception:
+                    parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        evaluations = parsed.get("evaluations", [])
+        if not isinstance(evaluations, list):
+            evaluations = []
+        by_id = {str(row.get("chunk_id") or row.get("citation") or idx): row for idx, row in enumerate(batch)}
+        cleaned = []
+        for item in evaluations:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("evidence_id", item.get("chunk_id", item.get("citation", ""))) or "")
+            if key not in by_id:
+                continue
+            cleaned.append({
+                "evidence_id": key,
+                "supported_facts": [str(x) for x in item.get("supported_facts", []) if str(x).strip()][:16] if isinstance(item.get("supported_facts", []), list) else [],
+                "unsupported": [str(x) for x in item.get("unsupported", []) if str(x).strip()][:16] if isinstance(item.get("unsupported", []), list) else [],
+                "importance": max(0.0, min(1.0, _rag_float(item.get("importance")))),
+                "keep": bool(item.get("keep", False)),
+                "reason": str(item.get("reason", "") or "")[:500],
+                "conflict_group": str(item.get("conflict_group", "") or "")[:120],
+                "citations": [str(x) for x in item.get("citations", []) if str(x).strip()][:16] if isinstance(item.get("citations", []), list) else [by_id[key].get("citation", "")],
+            })
+        return {"evaluations": cleaned, "facts": parsed.get("facts", []) if isinstance(parsed.get("facts", []), list) else [], "uncertainties": parsed.get("uncertainties", []) if isinstance(parsed.get("uncertainties", []), list) else []}
+
+    def _rag_evaluate_batches(self, session: SessionState | None, query: str, rows: list[dict], *, batch_chars: int = RAG_EVIDENCE_BATCH_CHARS) -> dict:
+        batches = _rag_evidence_batches(rows, max_chars=batch_chars)
+        all_evaluations: list[dict] = []
+        failures: list[dict] = []
+        for batch_id, batch in enumerate(batches, 1):
+            fallback = [{"evidence_id": str(row.get("chunk_id") or row.get("citation") or idx), "supported_facts": [], "unsupported": [], "importance": round(_rag_float(row.get("grounded_score")), 4), "keep": row.get("evidence_strength") == "direct", "reason": "deterministic grounding", "conflict_group": "", "citations": [row.get("citation", "")]} for idx, row in enumerate(batch)]
+            if not isinstance(session, SessionState) or not hasattr(getattr(session, "ollama", None), "chat"):
+                all_evaluations.extend(fallback)
+                continue
+            prompt = "Evaluate ONLY this evidence batch. Do not use prior conversation or outside knowledge. Return JSON only with keys evaluations, facts, uncertainties. Each evaluation must use an evidence_id from the batch.\n\n" + json_dumps({"query": query, "evidence": batch}, indent=2)
+            try:
+                response = session.ollama.chat(
+                    [{"role": "user", "content": prompt}],
+                    system="/no_think\nYou are a stateless evidence verifier. Cite only supplied evidence.",
+                    max_tokens=1800,
+                    temperature=0.0,
+                    think=False,
+                    stream_thinking=False,
+                )
+                parsed = self._rag_parse_evaluation((response or {}).get("content", ""), batch)
+                if not parsed.get("evaluations"):
+                    raise ValueError("empty or invalid evaluation JSON")
+                all_evaluations.extend(parsed["evaluations"])
+            except Exception as exc:
+                failures.append({"batch_id": batch_id, "error": str(exc)[:240]})
+                all_evaluations.extend(fallback)
+        return {"evaluations": all_evaluations, "batch_count": len(batches), "failed_batches": failures, "coverage": {"candidate_count": len(rows), "evaluated_count": len(all_evaluations), "complete": len(all_evaluations) >= len(rows)}}
+
+    def rag_synthesize_evaluations(self, user_id: str, payload: dict) -> dict:
+        body = dict(payload or {})
+        query = str(body.get("query", "") or "").strip()
+        rows = body.get("evidence", body.get("candidate_results", []))
+        rows = [_rag_validate_evidence_record(row, query) for row in rows if isinstance(row, dict)]
+        evaluations = body.get("evaluations") if isinstance(body.get("evaluations"), list) else self._rag_evaluate_batches(self._resolve_session_for_user(user_id, str(body.get("session_id", "") or "")), query, rows).get("evaluations", [])
+        session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        final = {"query": query, "evaluations": evaluations, "answer": "", "answerability": "insufficient", "uncertainties": []}
+        if isinstance(session, SessionState) and hasattr(getattr(session, "ollama", None), "chat") and evaluations:
+            prompt = "Synthesize only from these independent evidence evaluations. Do not use conversation history or outside knowledge. Cite exact citations. Return JSON with answer, answerability, uncertainties.\n\n" + json_dumps({"query": query, "evaluations": evaluations}, indent=2)
+            try:
+                response = session.ollama.chat([{"role": "user", "content": prompt}], system="/no_think\nYou are a stateless grounded answer synthesizer.", max_tokens=1200, temperature=0.0, think=False, stream_thinking=False)
+                raw = str((response or {}).get("content", "") or "").strip()
+                try:
+                    parsed_answer = json.loads(raw)
+                except Exception:
+                    parsed_answer = {}
+                if isinstance(parsed_answer, dict):
+                    final["answer"] = trim(str(parsed_answer.get("answer", "") or ""), 6000)
+                    final["answerability"] = str(parsed_answer.get("answerability", "insufficient") or "insufficient")
+                    final["uncertainties"] = parsed_answer.get("uncertainties", []) if isinstance(parsed_answer.get("uncertainties", []), list) else []
+            except Exception:
+                pass
+        if not final["answer"]:
+            direct = [row for row in rows if row.get("evidence_strength") == "direct"]
+            final["answerability"] = "grounded" if direct else "partial" if rows else "miss"
+            final["uncertainties"] = ["LLM unavailable; deterministic evidence validation only"]
+        return final
 
     def _row_synthesis_score(self, row: dict) -> float:
         if bool(row.get("weak_match", False)):
@@ -6402,56 +7181,24 @@ document.addEventListener('DOMContentLoaded', function(){{
     def _rag_synthesize_with_session(self, session: SessionState | None, query: str, rows: list[dict]) -> str:
         if not isinstance(session, SessionState) or not rows:
             return ""
-        evidence_rows = [
-            row
-            for row in rows
-            if str(row.get("route_evidence", "") or "") in {"chunk", "document", "wiki_page", "workflow", "community_reduce", "community_map", "community_bridge"}
-        ]
-        if not evidence_rows:
-            evidence_rows = list(rows)
-
-        # Confidence filtering — drop weak evidence before LLM synthesis
-        best_score = max((self._row_synthesis_score(r) for r in evidence_rows), default=0.0)
-        if best_score < RAG_NO_EVIDENCE_THRESHOLD:
-            return RAG_NO_EVIDENCE_MESSAGE
-        qualified = [r for r in evidence_rows if self._row_synthesis_score(r) >= RAG_MIN_SYNTHESIS_SCORE]
-        if not qualified:
-            return RAG_NO_EVIDENCE_MESSAGE
-
-        evidence = []
-        _syn_doc_counts: dict[str, int] = {}
-        for row in qualified:
-            if len(evidence) >= 5:
-                break
-            _doc_id = str(row.get("doc_id", "") or "")
-            if _doc_id and _syn_doc_counts.get(_doc_id, 0) >= RAG_SYNTHESIS_MAX_PER_DOC:
-                continue
-            if _doc_id:
-                _syn_doc_counts[_doc_id] = _syn_doc_counts.get(_doc_id, 0) + 1
-            idx = len(evidence) + 1
-            score_pct = int(min(99, self._row_synthesis_score(row) * 100))
-            evidence.append(
-                f"[{idx}] citation={row.get('citation','')} title={row.get('title','')} (relevance:{score_pct}%)\n"
-                f"{trim(row.get('text',''), RAG_QUERY_CONTEXT_CHARS)}"
-            )
+        prepared = [_rag_validate_evidence_record(row, query) for row in rows if isinstance(row, dict)]
+        evaluations = self._rag_evaluate_batches(session, query, prepared)
+        if not evaluations.get("evaluations"):
+            return RAG_NO_EVIDENCE_MESSAGE if not prepared else RAG_WEAK_EVIDENCE_MESSAGE
         prompt = (
-            "You are a precise knowledge retrieval assistant.\n"
-            "STRICT GROUNDING RULE: ONLY use information explicitly stated in the numbered evidence blocks below. "
-            "For any information NOT present in the evidence, output the word UNKNOWN. "
-            "Do NOT infer, extrapolate, hallucinate, or draw on prior knowledge beyond what is given. "
-            "Cite every factual claim using the provided citation strings exactly as given.\n"
-            "If the evidence is insufficient to answer the query, state exactly: "
-            "'知识库中暂无足够证据回答此问题'\n\n"
-            f"Query:\n{query}\n\nEvidence:\n" + "\n\n".join(evidence)
+            "Synthesize an answer from independent evidence evaluations only. "
+            "Do not use conversation history or outside knowledge. Cite exact supplied citations. "
+            "If evidence is insufficient, say: 知识库中暂无足够证据回答此问题.\n\n"
+            + json_dumps({"query": query, "evaluations": evaluations["evaluations"]}, indent=2)
         )
         try:
             rsp = session.ollama.chat(
                 [{"role": "user", "content": prompt}],
                 system=session._helper_system_prompt(
-                    "/no_think\nSynthesize only from the numbered evidence and preserve exact citations."
+                    "/no_think\nYou are a stateless grounded answer synthesizer."
                 ),
-                max_tokens=900,
-                temperature=0.1,
+                max_tokens=1200,
+                temperature=0.0,
                 think=False,
                 stream_thinking=False,
             )
@@ -6582,9 +7329,9 @@ document.addEventListener('DOMContentLoaded', function(){{
         raw_route = "hybrid" if requested_route in {"auto", "wiki", "raw"} else requested_route
         pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
         if requested_route == "wiki":
-            result = self.rag_wiki.query(retrieval_query, top_k=top_k, category=category, kind=kind)
+            result = self.rag_wiki.query(retrieval_query, top_k=pool_k, category=category, kind=kind)
         elif requested_route in {"raw", "fast", "global", "hybrid"}:
-            result = self.rag_store.index.query(retrieval_query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            result = self.rag_store.index.query(retrieval_query, top_k=pool_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
             if requested_route == "raw":
                 result["route"] = "raw"
                 result.setdefault("route_meta", {})
@@ -6653,6 +7400,22 @@ document.addEventListener('DOMContentLoaded', function(){{
             meta["context_budget"] = budget_key
             result["route_meta"] = meta
         result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        candidate_rows, grounded_rows, validation_meta = self._rag_prepare_evidence(query, result)
+        result["candidate_results"] = candidate_rows
+        result["results"] = grounded_rows[:top_k]
+        result["evidence_groups"] = [
+            {
+                "duplicate_group": group,
+                "citations": [str(row.get("citation", "") or "") for row in grouped if str(row.get("citation", "") or "")],
+                "source_count": len({str(row.get("doc_id", "") or row.get("source_path", "")) for row in grouped}),
+            }
+            for group, grouped in self._rag_group_evidence(candidate_rows).items()
+        ]
+        result["conflicts"] = validation_meta.get("conflicts", [])
+        result["uncertainties"] = []
+        result["coverage"] = validation_meta.get("trace", {})
+        result["grounding_status"] = "grounded" if grounded_rows else "miss" if not candidate_rows else "unverified"
+        result = self._annotate_rag_result(result, budget_key=budget_key, budget=budget)
         meta = result.get("route_meta", {})
         if not isinstance(meta, dict):
             meta = {}
@@ -6671,11 +7434,33 @@ document.addEventListener('DOMContentLoaded', function(){{
         result["embedding_used"] = bool(embedding_used)
         # Keep the user's original query as the display value (retrieval used the augmented one).
         result["query"] = query
+        evaluation_mode = str(body.get("evaluation_mode", "") or "").strip().lower()
         synthesize = bool(body.get("synthesize", False))
-        if synthesize:
-            answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
-            if answer:
-                result["answer"] = answer
+        if synthesize or evaluation_mode == "batched":
+            evaluation = self._rag_evaluate_batches(
+                session,
+                query,
+                candidate_rows,
+                batch_chars=int(body.get("batch_chars", RAG_EVIDENCE_BATCH_CHARS) or RAG_EVIDENCE_BATCH_CHARS),
+            )
+            result["evaluated_results"] = evaluation.get("evaluations", [])
+            result["evaluation_trace"] = evaluation
+            if synthesize:
+                summary = self.rag_synthesize_evaluations(
+                    user_id,
+                    {
+                        "query": query,
+                        "session_id": str(body.get("session_id", "") or ""),
+                        "evidence": candidate_rows,
+                        "evaluations": evaluation.get("evaluations", []),
+                    },
+                )
+                result.update({"answer": summary.get("answer", ""), "answerability": summary.get("answerability", "insufficient"), "uncertainties": summary.get("uncertainties", [])})
+        else:
+            result["evaluated_results"] = []
+            result["evaluation_trace"] = {"mode": "not_requested", "batch_count": 0}
+        if "answerability" not in result:
+            result["answerability"] = "grounded" if grounded_rows else "miss" if not candidate_rows else "insufficient"
         result["requested_route"] = requested_route
         return result
 
@@ -6935,11 +7720,11 @@ document.addEventListener('DOMContentLoaded', function(){{
         raw_route = "hybrid" if requested_route in {"auto", "wiki", "workflow", "raw"} else requested_route
         pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
         if requested_route == "wiki":
-            result = self.code_wiki.query(query, top_k=top_k, category="code", kind="")
+            result = self.code_wiki.query(query, top_k=pool_k, category="code", kind="")
         elif requested_route == "workflow":
-            result = self.workflow_memory.query(query, top_k=top_k, accepted_only=True)
+            result = self.workflow_memory.query(query, top_k=pool_k, accepted_only=True)
         elif requested_route in {"raw", "fast", "global", "hybrid"}:
-            result = self.code_store.index.query(query, top_k=top_k, category="code", route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            result = self.code_store.index.query(query, top_k=pool_k, category="code", route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
             if requested_route == "raw":
                 result["route"] = "raw"
                 result.setdefault("route_meta", {})
@@ -7023,6 +7808,22 @@ document.addEventListener('DOMContentLoaded', function(){{
             meta["context_budget"] = budget_key
             result["route_meta"] = meta
         result = self._trim_rag_result_to_budget(result, budget_key=budget_key, budget=budget)
+        candidate_rows, grounded_rows, validation_meta = self._rag_prepare_evidence(query, result)
+        result["candidate_results"] = candidate_rows
+        result["results"] = grounded_rows[:top_k]
+        result["evidence_groups"] = [
+            {
+                "duplicate_group": group,
+                "citations": [str(row.get("citation", "") or "") for row in grouped if str(row.get("citation", "") or "")],
+                "source_count": len({str(row.get("doc_id", "") or row.get("source_path", "")) for row in grouped}),
+            }
+            for group, grouped in self._rag_group_evidence(candidate_rows).items()
+        ]
+        result["conflicts"] = validation_meta.get("conflicts", [])
+        result["uncertainties"] = []
+        result["coverage"] = validation_meta.get("trace", {})
+        result["grounding_status"] = "grounded" if grounded_rows else "miss" if not candidate_rows else "unverified"
+        result = self._annotate_rag_result(result, budget_key=budget_key, budget=budget)
         meta = result.get("route_meta", {})
         if not isinstance(meta, dict):
             meta = {}
@@ -7038,11 +7839,19 @@ document.addEventListener('DOMContentLoaded', function(){{
         result["retrieval_mode"] = retrieval_mode
         result["embedding_used"] = bool(embedding_used)
         synthesize = bool(body.get("synthesize", False))
+        evaluation_mode = str(body.get("evaluation_mode", "") or "").strip().lower()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
-        if synthesize:
-            answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
-            if answer:
-                result["answer"] = answer
+        if synthesize or evaluation_mode == "batched":
+            evaluation = self._rag_evaluate_batches(session, query, candidate_rows, batch_chars=int(body.get("batch_chars", RAG_EVIDENCE_BATCH_CHARS) or RAG_EVIDENCE_BATCH_CHARS))
+            result["evaluated_results"] = evaluation.get("evaluations", [])
+            result["evaluation_trace"] = evaluation
+            if synthesize:
+                summary = self.rag_synthesize_evaluations(user_id, {"query": query, "session_id": str(body.get("session_id", "") or ""), "evidence": candidate_rows, "evaluations": evaluation.get("evaluations", [])})
+                result.update({"answer": summary.get("answer", ""), "answerability": summary.get("answerability", "insufficient"), "uncertainties": summary.get("uncertainties", [])})
+        else:
+            result["evaluated_results"] = []
+            result["evaluation_trace"] = {"mode": "not_requested", "batch_count": 0}
+        result.setdefault("answerability", "grounded" if grounded_rows else "miss" if not candidate_rows else "insufficient")
         result["requested_route"] = requested_route
         return result
 
@@ -7498,6 +8307,10 @@ document.addEventListener('DOMContentLoaded', function(){{
 
     def shutdown_services(self):
         try:
+            self.liquid_kernel.stop_scheduler()
+        except Exception:
+            pass
+        try:
             self.process_manager.stop_all(actor="system", reason="service shutdown")
         except Exception:
             pass
@@ -7657,31 +8470,53 @@ document.addEventListener('DOMContentLoaded', function(){{
         with self._lock:
             return self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
 
-    def create_session_for_user(self, user_id: str, title: str | None = None, client_ip: str = "") -> tuple[SessionState, dict]:
+    def create_session_for_user(
+        self,
+        user_id: str,
+        title: str | None = None,
+        client_ip: str = "",
+        *,
+        title_origin: str | None = None,
+        workspace_session_id: str = "",
+    ) -> tuple[SessionState, dict]:
         mgr = self.manager_for_user(user_id)
+        reserved_window = ""
         with self._lock:
             status_before = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
             if bool(status_before.get("enabled")) and int(status_before.get("remaining", 0) or 0) <= 0:
                 raise SessionCreationLimitExceeded(status_before)
-            sess = mgr.create(title)
+            state = self._load_session_daily_limit_state_locked(user_id)
+            reserved_window = str(status_before.get("window_key", "") or "")
+            if str(state.get("window_key", "") or "") != reserved_window:
+                state = {"window_key": reserved_window, "used": 0}
+            state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
+            state["window_key"] = reserved_window
+            self._save_session_daily_limit_state_locked(user_id, state)
+            status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+        try:
             try:
-                state = self._load_session_daily_limit_state_locked(user_id)
-                if str(state.get("window_key", "") or "") != str(status_before.get("window_key", "")):
-                    state = {"window_key": str(status_before.get("window_key", "")), "used": 0}
-                state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
-                state["window_key"] = str(status_before.get("window_key", ""))
-                self._save_session_daily_limit_state_locked(user_id, state)
-                status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
-            except Exception:
+                sess = mgr.create(
+                    title,
+                    title_origin=title_origin,
+                    workspace_session_id=workspace_session_id,
+                )
+            except TypeError as exc:
+                # Keep lightweight/legacy manager implementations usable while
+                # the production manager accepts the lineage keywords.
+                message = str(exc).lower()
+                if "unexpected keyword" not in message and "keyword argument" not in message:
+                    raise
+                sess = mgr.create(title)
+        except Exception:
+            with self._lock:
                 try:
-                    mgr.delete(sess.id)
+                    state = self._load_session_daily_limit_state_locked(user_id)
+                    if str(state.get("window_key", "") or "") == reserved_window:
+                        state["used"] = max(0, int(state.get("used", 0) or 0) - 1)
+                        self._save_session_daily_limit_state_locked(user_id, state)
                 except Exception:
-                    # Force local cleanup so a failed quota write cannot materialize a hidden session.
-                    with mgr.lock:
-                        mgr.sessions.pop(sess.id, None)
-                        mgr.session_index.pop(sess.id, None)
-                    shutil.rmtree(sess.root, ignore_errors=True)
-                raise
+                    pass
+            raise
         try:
             self.telemetry.record("session_create", user_id=user_id, session_id=sess.id, status="success")
         except Exception:
@@ -7748,7 +8583,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             requested_title = str(title or "").strip()
             app_name = str(app_row.get("name", "") or "Application")
             sess, quota_status = self.create_session_for_user(
-                user_id, requested_title or app_name, client_ip=client_ip,
+                user_id,
+                requested_title or app_name,
+                client_ip=client_ip,
+                title_origin="manual" if requested_title else "application",
             )
             try:
                 with sess.lock:
@@ -7858,25 +8696,41 @@ document.addEventListener('DOMContentLoaded', function(){{
             return int(len(self._task_queue))
 
     def _running_counts_locked(self) -> tuple[int, dict[str, int]]:
-        total = 0
-        per_user: dict[str, int] = {}
-        for uid, mgr in list(self._session_mgrs.items()):
-            try:
-                with mgr.lock:
-                    sessions = list(mgr.sessions.values())
-            except Exception:
-                sessions = []
-            running = 0
-            for sess in sessions:
+        active = getattr(self, "_scheduler_active_sessions", None)
+        initialized = bool(getattr(self, "_scheduler_active_initialized", False))
+        if not isinstance(active, set):
+            active = set()
+            self._scheduler_active_sessions = active
+        if not initialized:
+            for uid, mgr in list(getattr(self, "_session_mgrs", {}).items()):
                 try:
-                    if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
-                        running += 1
+                    with mgr.lock:
+                        sessions = list(mgr.sessions.values())
                 except Exception:
-                    continue
-            if running > 0:
-                per_user[uid] = running
-                total += running
-        return int(total), per_user
+                    sessions = []
+                for sess in sessions:
+                    if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+                        active.add((str(uid or ""), str(getattr(sess, "id", "") or "")))
+            self._scheduler_active_initialized = True
+        stale: list[tuple[str, str]] = []
+        per_user: dict[str, int] = {}
+        for uid, sid in list(active):
+            mgr = getattr(self, "_session_mgrs", {}).get(uid)
+            sess = None
+            if mgr is not None:
+                try:
+                    sess = mgr.sessions.get(sid)
+                except Exception:
+                    sess = None
+            if sess is None or not (
+                bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False))
+            ):
+                stale.append((uid, sid))
+                continue
+            per_user[uid] = int(per_user.get(uid, 0) or 0) + 1
+        for key in stale:
+            active.discard(key)
+        return int(sum(per_user.values())), per_user
 
     def _can_start_for_user_locked(self, user_id: str) -> tuple[bool, str, int, dict[str, int]]:
         total_running, per_user = self._running_counts_locked()
@@ -7890,6 +8744,9 @@ document.addEventListener('DOMContentLoaded', function(){{
     def _emit_scheduler_started(self, rows: list[dict]):
         for row in rows:
             req = row.get("request", {}) if isinstance(row, dict) else {}
+            result = row.get("result", {}) if isinstance(row, dict) else {}
+            if isinstance(result, dict) and result.get("ok") is False:
+                continue
             sess = row.get("session")
             if not isinstance(sess, SessionState):
                 continue
@@ -7950,6 +8807,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                 setattr(sess, "scheduler_starting", True)
             except Exception:
                 pass
+            active = getattr(self, "_scheduler_active_sessions", None)
+            if not isinstance(active, set):
+                active = set()
+                self._scheduler_active_sessions = active
+            active.add(session_key)
             started.append({"request": req, "session": sess})
             selected_sessions.add(session_key)
             total_running += 1
@@ -8091,24 +8953,63 @@ document.addEventListener('DOMContentLoaded', function(){{
                     sess.update_scheduler_visible_message(int(req.get("id", 0) or 0), status="failed")
                 except Exception:
                     pass
+                try:
+                    sess._emit(
+                        "error",
+                        {"summary": f"scheduler failed to start queued task: {trim(str(exc), 220)}"},
+                    )
+                except Exception:
+                    pass
             finally:
                 try:
-                    if not bool(getattr(sess, "running", False)):
+                    running = bool(getattr(sess, "running", False))
+                    queued_start = bool(isinstance(out, dict) and out.get("queued"))
+                    if running or not queued_start:
                         setattr(sess, "scheduler_starting", False)
                 except Exception:
                     pass
             running = bool(getattr(sess, "running", False))
+            queued = bool(isinstance(out, dict) and out.get("queued"))
+            if not running and not bool(getattr(sess, "scheduler_starting", False)):
+                with self._lock:
+                    active = getattr(self, "_scheduler_active_sessions", None)
+                    if isinstance(active, set):
+                        active.discard((str(req.get("user_id", "") or ""), str(req.get("session_id", "") or "")))
             self._publish_collaboration_agent_state(
                 sess,
-                "running" if running else "idle",
+                "running" if running else ("queued" if queued else "idle"),
                 result_summary=(
                     "Agent run started"
                     if running
+                    else "Agent task queued for background start"
+                    if queued
                     else trim(str((out or {}).get("error", "") if isinstance(out, dict) else ""), 800)
                 ),
             )
             started.append({"request": req, "result": out, "session": sess})
         return started
+
+    def _dispatch_scheduler_rows(self, rows: list[dict]) -> None:
+        pending = [row for row in rows if isinstance(row, dict)]
+        if not pending:
+            return
+
+        def worker(initial_rows: list[dict]) -> None:
+            next_rows = initial_rows
+            while next_rows:
+                started_rows = self._start_scheduler_rows(next_rows)
+                self._refresh_scheduler_visible_positions()
+                if started_rows:
+                    self._emit_scheduler_started(started_rows)
+                with self._lock:
+                    next_rows = self._drain_task_queue_locked()
+
+        threading.Thread(
+            target=worker,
+            args=(pending,),
+            name="session-scheduler-start",
+            daemon=True,
+        ).start()
 
     def _refresh_scheduler_visible_positions(self):
         queue_rows: list[dict] = []
@@ -8128,6 +9029,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                 continue
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        with self._lock:
+            active = getattr(self, "_scheduler_active_sessions", None)
+            if isinstance(active, set):
+                active.discard((str(user_id or ""), str(session_id or "")))
         sess = None
         try:
             mgr = self.manager_for_user(user_id)
@@ -8163,15 +9068,30 @@ document.addEventListener('DOMContentLoaded', function(){{
                 mgr.capture_user_memory_from_session(sess)
             except Exception:
                 pass
+            try:
+                started_at = float(getattr(sess, "run_started_at", 0.0) or 0.0)
+                duration = max(0.0, now_ts() - started_at) if started_at > 0 else float(getattr(sess, "run_model_active_seconds", 0.0) or 0.0)
+                recent_errors = [
+                    row for row in list(getattr(sess, "activity", []) or [])[-40:]
+                    if isinstance(row, dict)
+                    and str(row.get("type", "") or "").lower() in {"error", "failed"}
+                    and float(row.get("ts", 0.0) or 0.0) >= started_at
+                ]
+                kernel_degraded = bool(getattr(sess, "kernel_runtime_degraded", False))
+                self.liquid_kernel.observe_session_result(
+                    str(getattr(sess, "kernel_version", "") or self.liquid_kernel.registry.active_version()),
+                    success=not bool(recent_errors) and not kernel_degraded,
+                    duration_seconds=duration,
+                    error=bool(recent_errors) or kernel_degraded,
+                )
+            except Exception:
+                pass
         if not self.scheduler_limits_enabled():
             return
         started_rows: list[dict] = []
         with self._lock:
             started_rows = self._drain_task_queue_locked()
-        started_rows = self._start_scheduler_rows(started_rows)
-        self._refresh_scheduler_visible_positions()
-        if started_rows:
-            self._emit_scheduler_started(started_rows)
+        self._dispatch_scheduler_rows(started_rows)
 
     def scheduler_status(self, user_id: str = "") -> dict:
         with self._lock:
@@ -8208,8 +9128,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         except Exception:
             pass
         if not self.scheduler_limits_enabled():
-            mgr.prepare_user_intent_for_session(sess, text)
-            response = sess.submit_user_message(text)
+            response = sess.accept_user_message(text)
             running = bool(getattr(sess, "running", False)) or bool(
                 isinstance(response, dict) and response.get("running")
             )
@@ -8228,14 +9147,53 @@ document.addEventListener('DOMContentLoaded', function(){{
         queue_id = 0
         record_visible = False
         with self._lock:
+            now_value = now_ts()
+            fingerprint = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:24]
+            recent_rows = [
+                row
+                for row in list(getattr(self, "_task_submission_recent", []) or [])
+                if now_value - float(row.get("accepted_at", 0.0) or 0.0) < SESSION_SUBMISSION_DEDUPE_SECONDS
+            ]
+            self._task_submission_recent = deque(
+                recent_rows[-SCHEDULER_SUBMISSION_DEDUPE_MAX:],
+                maxlen=SCHEDULER_SUBMISSION_DEDUPE_MAX,
+            )
+            for recent in reversed(recent_rows):
+                if (
+                    str(recent.get("user_id", "") or "") == str(user_id or "")
+                    and str(recent.get("session_id", "") or "") == str(session_id or "")
+                    and str(recent.get("fingerprint", "") or "") == fingerprint
+                ):
+                    running = bool(getattr(sess, "running", False))
+                    selected = bool(recent.get("selected", False))
+                    return {
+                        "ok": True,
+                        "accepted": True,
+                        "queued": not running,
+                        "running": running,
+                        "duplicate": True,
+                        "scheduler_started": bool(selected and not running),
+                        "queue_id": int(recent.get("queue_id", 0) or 0),
+                        "queue_position": 0 if selected else int(recent.get("queue_position", 1) or 1),
+                    }
             self._task_queue_seq = int(self._task_queue_seq) + 1
             queue_id = int(self._task_queue_seq)
+            recent_row = {
+                "user_id": str(user_id or ""),
+                "session_id": str(session_id or ""),
+                "fingerprint": fingerprint,
+                "accepted_at": now_value,
+                "queue_id": queue_id,
+                "queue_position": 1,
+                "selected": False,
+            }
+            self._task_submission_recent.append(recent_row)
             req = {
                 "id": queue_id,
                 "user_id": str(user_id or ""),
                 "session_id": str(session_id or ""),
                 "content": text,
-                "queued_at": now_ts(),
+                "queued_at": now_value,
             }
             self._task_queue.append(req)
             selected_rows = self._drain_task_queue_locked()
@@ -8246,11 +9204,21 @@ document.addEventListener('DOMContentLoaded', function(){{
                     started_self = row
                     break
             if started_self is not None:
-                response["queue_id"] = queue_id
-                response["queue_position"] = 0
-                response["limits"] = {
-                    "max_user": int(self.max_user),
-                    "max_user_sessions": int(self.max_user_sessions),
+                recent_row["selected"] = True
+                recent_row["queue_position"] = 0
+                response = {
+                    "ok": True,
+                    "accepted": True,
+                    "queued": True,
+                    "running": False,
+                    "scheduler_started": True,
+                    "scheduler_starting": True,
+                    "queue_id": queue_id,
+                    "queue_position": 0,
+                    "limits": {
+                        "max_user": int(self.max_user),
+                        "max_user_sessions": int(self.max_user_sessions),
+                    },
                 }
             else:
                 queue_position = 1
@@ -8275,6 +9243,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "running_user": int(per_user.get(str(user_id or ""), 0)),
                     },
                 }
+                recent_row["queue_position"] = int(queue_position)
                 record_visible = True
         if record_visible:
             try:
@@ -8288,32 +9257,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 )
             except Exception:
                 pass
-        started_rows = self._start_scheduler_rows(selected_rows)
-        self._refresh_scheduler_visible_positions()
-        started_self_result = None
-        for row in started_rows:
-            row_req = row.get("request", {}) if isinstance(row, dict) else {}
-            if int(row_req.get("id", 0) or 0) == queue_id:
-                started_self_result = row
-                break
-        if started_self_result is not None:
-            out = started_self_result.get("result")
-            if isinstance(out, dict):
-                response = dict(out)
-            else:
-                response = {"ok": True, "result": out}
-            response.setdefault("ok", True)
-            response["queued"] = bool(response.get("queued", False))
-            response["running"] = bool(response.get("running", True))
-            response["scheduler_started"] = True
-            response["queue_id"] = queue_id
-            response["queue_position"] = 0
-            response["limits"] = {
-                "max_user": int(self.max_user),
-                "max_user_sessions": int(self.max_user_sessions),
-            }
-        if started_rows:
-            self._emit_scheduler_started(started_rows)
+        self._dispatch_scheduler_rows(selected_rows)
         if bool(response.get("queued")) and not bool(response.get("scheduler_started")):
             self._publish_collaboration_agent_state(
                 sess,
@@ -8427,6 +9371,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 knowledge_library_status_callback=self._knowledge_library_status_for_session,
                 mcp_manager=getattr(self, "mcp", None),
                 js_lib_download_enabled=bool(getattr(self, "js_lib_download_enabled", True)),
+                kernel_registry=self.liquid_kernel.registry,
+                kernel_runtime=self.liquid_kernel.runtime,
+                skills_snapshot=self.skills_store,
             )
             mgr.read_context_policy = normalize_read_context_policy(
                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -9124,7 +10071,7 @@ document.addEventListener('DOMContentLoaded', function(){{
     def _ensure_skills_store(self, force: bool = False) -> SkillStore:
         now = now_ts()
         with self._lock:
-            if force or (now - float(self.skills_store_refresh_ts or 0.0)) >= SKILL_REFRESH_MIN_INTERVAL_SECONDS:
+            if force or (now - float(self.skills_store_refresh_ts or 0.0)) >= SKILL_CATALOG_FULL_REFRESH_SECONDS:
                 if force:
                     ensure_runtime_skills(self.skills_root)
                 self.skills_store.reload(force=force)

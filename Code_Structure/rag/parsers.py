@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=975 original-lines=95256-95270 hash=f15af64ee0ad858d
+# split-source: order=1081 original-lines=103641-103675 hash=c2633677113d7d7b
 
 
 # ============================================================================
@@ -17,12 +17,191 @@ from __future__ import annotations
 
 # Core RAG helpers: normalize document names, extract structure, chunk content,
 # and score retrieval candidates before they are surfaced to the model.
+@dataclass
+class EvidenceRecord:
+    source_type: str = "legacy"
+    doc_id: str = ""
+    chunk_id: str = ""
+    citation: str = ""
+    source_path: str = ""
+    text: str = ""
+    title: str = ""
+    section_path: list[str] | None = None
+    line_start: int = 0
+    line_end: int = 0
+    lexical_score: float = 0.0
+    graph_score: float = 0.0
+    fusion_score: float = 0.0
+    evidence_strength: str = "unverified"
+    provenance: dict = dataclass_field(default_factory=dict)
+    supporting_citations: list[str] = dataclass_field(default_factory=list)
+    conflicts: list[str] = dataclass_field(default_factory=list)
+    duplicate_group: str = ""
+    validation: dict = dataclass_field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+# split-source: order=1082 original-lines=103676-103682 hash=46f6fd237ad775dd
+
+
+def _rag_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+# split-source: order=1083 original-lines=103683-103699 hash=ea43f876f146604f
+
+
+def _rag_evidence_source_type(row: dict) -> str:
+    explicit = str(row.get("source_type", "") or "").strip().lower()
+    if explicit in {"raw_chunk", "wiki", "community", "workflow", "legacy"}:
+        return explicit
+    layer = str(row.get("evidence_layer", "") or row.get("route_evidence", "") or "").lower()
+    route = str(row.get("source_route", "") or row.get("route", "")).lower()
+    if "workflow" in layer or "workflow" in route:
+        return "workflow"
+    if "community" in layer or "community" in route:
+        return "community"
+    if "wiki" in layer or "wiki" in route or row.get("wiki_page"):
+        return "wiki"
+    if layer in {"chunk", "document", "raw_chunk"} or row.get("chunk_id"):
+        return "raw_chunk"
+    return "legacy"
+
+# split-source: order=1084 original-lines=103700-103755 hash=762cc7217b6aa9b3
+
+
+def _rag_normalize_evidence_record(row: object, *, source_document: dict | None = None) -> dict:
+    """Convert legacy retrieval rows into the additive evidence contract."""
+    raw = dict(row) if isinstance(row, dict) else {"text": str(row or "")}
+    doc = source_document if isinstance(source_document, dict) else {}
+    source_type = _rag_evidence_source_type(raw)
+    text = str(raw.get("text", "") or raw.get("summary", "") or "").strip()
+    source_path = str(
+        raw.get("source_path", "")
+        or raw.get("relative_path", "")
+        or raw.get("path", "")
+        or doc.get("source_path", "")
+        or doc.get("source_rel_path", "")
+        or ""
+    ).strip()
+    doc_id = str(raw.get("doc_id", "") or raw.get("document_id", "") or doc.get("id", "") or "").strip()
+    chunk_id = str(raw.get("chunk_id", "") or "").strip()
+    citation = str(raw.get("citation", "") or "").strip()
+    if not citation and source_path:
+        line_start = int(_rag_float(raw.get("line_start", 0), 0))
+        line_end = int(_rag_float(raw.get("line_end", line_start), line_start))
+        citation = f"[{source_path}:{line_start}-{max(line_start, line_end)}]" if line_start else f"[{source_path}]"
+    supporting = raw.get("supporting_citations", raw.get("evidence_citations", []))
+    if not isinstance(supporting, list):
+        supporting = [supporting] if supporting else []
+    supporting = [str(x).strip() for x in supporting if str(x).strip()]
+    provenance = raw.get("provenance", {})
+    if not isinstance(provenance, dict):
+        provenance = {}
+    provenance = dict(provenance)
+    provenance.setdefault("source_hash", str(raw.get("source_hash", "") or doc.get("sha256", "") or ""))
+    provenance.setdefault("parser_version", str(raw.get("understanding_version", "") or ""))
+    provenance.setdefault("source_time", raw.get("updated_at", doc.get("updated_at", 0.0)))
+    normalized = dict(raw)
+    normalized.update({
+        "source_type": source_type,
+        "doc_id": doc_id,
+        "chunk_id": chunk_id,
+        "citation": citation,
+        "source_path": source_path,
+        "text": text,
+        "title": str(raw.get("title", "") or doc.get("title", "") or source_path).strip(),
+        "section_path": list(raw.get("section_path", []) or [])[:24],
+        "line_start": int(_rag_float(raw.get("line_start", 0), 0)),
+        "line_end": int(_rag_float(raw.get("line_end", 0), 0)),
+        "lexical_score": _rag_float(raw.get("lexical_score", raw.get("score", 0.0))),
+        "graph_score": _rag_float(raw.get("graph_score", 0.0)),
+        "fusion_score": _rag_float(raw.get("fusion_score", raw.get("score", 0.0))),
+        "provenance": provenance,
+        "supporting_citations": supporting,
+        "conflicts": list(raw.get("conflicts", []) or []) if isinstance(raw.get("conflicts", []), list) else [],
+        "duplicate_group": str(raw.get("duplicate_group", "") or "").strip(),
+        "evidence_schema_version": RAG_EVIDENCE_SCHEMA_VERSION,
+    })
+    return normalized
+
+# split-source: order=1085 original-lines=103756-103798 hash=5682c8736506a8b0
+
+
+def _rag_validate_evidence_record(row: dict, query: str = "") -> dict:
+    """Apply deterministic grounding checks without deleting legacy candidates."""
+    record = _rag_normalize_evidence_record(row)
+    text = str(record.get("text", "") or "").strip()
+    source_type = str(record.get("source_type", "legacy") or "legacy")
+    query_tokens = set(_rag_tokenize(query, max_terms=160))
+    text_tokens = set(_rag_tokenize(text, max_terms=2500))
+    lexical_overlap = len(query_tokens.intersection(text_tokens)) if query_tokens else 0
+    has_source = bool(str(record.get("source_path", "") or "").strip() or str(record.get("doc_id", "") or "").strip())
+    has_text = len(text) >= 24
+    placeholder = bool(re.search(r"(?i)^(summary|暂无|no content|not available|n/?a)\s*[:：.-]?\s*$", text))
+    weak_match = bool(record.get("weak_match", False))
+    graph_only = source_type == "community" and not record.get("supporting_citations") and lexical_overlap == 0
+    if has_text and has_source and not placeholder and source_type in {"raw_chunk", "workflow"} and lexical_overlap:
+        strength = "direct"
+    elif has_text and has_source and (lexical_overlap or record.get("supporting_citations")):
+        strength = "derived" if source_type in {"wiki", "community"} else "direct"
+    elif has_text and has_source:
+        strength = "weak"
+    else:
+        strength = "unverified"
+    if weak_match or graph_only or placeholder:
+        strength = "weak" if has_text and has_source else "unverified"
+    grounding = "grounded" if strength == "direct" else "partial" if strength == "derived" else "unverified"
+    validation = {
+        "has_source": has_source,
+        "has_text": has_text,
+        "placeholder": placeholder,
+        "lexical_overlap": lexical_overlap,
+        "weak_match": weak_match,
+        "graph_only": graph_only,
+        "grounding_status": grounding,
+    }
+    record["evidence_strength"] = strength
+    record["grounding_status"] = grounding
+    record["grounded_score"] = round(
+        min(1.0, _rag_float(record.get("lexical_score")) * 0.65 + (0.35 if strength == "direct" else 0.18 if strength == "derived" else 0.0)),
+        6,
+    )
+    record["validation"] = validation
+    return record
+
+# split-source: order=1086 original-lines=103799-103816 hash=7b6192e61e1eb394
+
+
+def _rag_evidence_batches(rows: list[dict], *, max_chars: int = RAG_EVIDENCE_BATCH_CHARS) -> list[list[dict]]:
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    used = 0
+    limit = max(1200, int(max_chars or RAG_EVIDENCE_BATCH_CHARS))
+    for row in rows or []:
+        normalized = _rag_normalize_evidence_record(row)
+        cost = len(str(normalized.get("text", "") or "")) + 420
+        if current and used + cost > limit:
+            batches.append(current)
+            current, used = [], 0
+        current.append(normalized)
+        used += min(cost, limit)
+    if current:
+        batches.append(current)
+    return batches
+
+# split-source: order=1087 original-lines=103817-103822 hash=adced9dcb9234d72
+
+
 def _rag_safe_name(name: str, fallback: str = "document") -> str:
     raw = Path(str(name or fallback)).name
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
     return safe or fallback
 
-# split-source: order=976 original-lines=95271-95287 hash=8256f8af0f0c3e33
+# split-source: order=1088 original-lines=103823-103839 hash=8256f8af0f0c3e33
 
 
 def _rag_detect_language(text: str) -> str:
@@ -41,7 +220,7 @@ def _rag_detect_language(text: str) -> str:
         return "en"
     return "unknown"
 
-# split-source: order=977 original-lines=95288-95302 hash=ae335b203709f25e
+# split-source: order=1089 original-lines=103840-103854 hash=ae335b203709f25e
 
 
 def _rag_cjk_ngrams(seq: str, *, min_n: int = 2, max_n: int = 4, limit: int = 120) -> list[str]:
@@ -58,7 +237,7 @@ def _rag_cjk_ngrams(seq: str, *, min_n: int = 2, max_n: int = 4, limit: int = 12
                 break
     return out
 
-# split-source: order=978 original-lines=95303-95324 hash=a509f4e26bf3379b
+# split-source: order=1090 original-lines=103855-103876 hash=a509f4e26bf3379b
 
 
 def _rag_is_noise_token(token: object) -> bool:
@@ -82,7 +261,7 @@ def _rag_is_noise_token(token: object) -> bool:
         return True
     return False
 
-# split-source: order=979 original-lines=95325-95339 hash=49c94bd89926670a
+# split-source: order=1091 original-lines=103877-103891 hash=49c94bd89926670a
 
 
 def _rag_entity_allowed(token: object) -> bool:
@@ -99,7 +278,7 @@ def _rag_entity_allowed(token: object) -> bool:
         return False
     return True
 
-# split-source: order=980 original-lines=95340-95356 hash=8f77ad80b84a7ae2
+# split-source: order=1092 original-lines=103892-103908 hash=8f77ad80b84a7ae2
 
 
 def _rag_filter_entities(values: list[object], limit: int = 32) -> list[str]:
@@ -118,7 +297,7 @@ def _rag_filter_entities(values: list[object], limit: int = 32) -> list[str]:
             break
     return out
 
-# split-source: order=981 original-lines=95357-95392 hash=d4f514f469978213
+# split-source: order=1093 original-lines=103909-103944 hash=d4f514f469978213
 
 
 def _rag_filename_entity_aliases(filename: object, source_rel_path: object = "", limit: int = 24) -> list[str]:
@@ -156,7 +335,7 @@ def _rag_filename_entity_aliases(filename: object, source_rel_path: object = "",
         pieces.extend(split_tokens)
     return _rag_filter_entities(pieces, limit=limit)
 
-# split-source: order=982 original-lines=95393-95425 hash=2b67aafb5ee5a63a
+# split-source: order=1094 original-lines=103945-103977 hash=2b67aafb5ee5a63a
 
 
 def _rag_apply_filename_entity_policy(
@@ -191,7 +370,7 @@ def _rag_apply_filename_entity_policy(
         return merged[:limit]
     return filtered[:limit]
 
-# split-source: order=983 original-lines=95426-95465 hash=10463c89f0201e79
+# split-source: order=1095 original-lines=103978-104017 hash=10463c89f0201e79
 
 
 def _rag_choose_community(category: object, language: object, entities: list[object], raw_community: object = "") -> str:
@@ -233,7 +412,7 @@ def _rag_choose_community(category: object, language: object, entities: list[obj
         return f"{cat}:{first}"
     return f"{cat}:{lang}"
 
-# split-source: order=987 original-lines=95534-95587 hash=5f2e46a51c494145
+# split-source: order=1099 original-lines=104086-104139 hash=5f2e46a51c494145
 
 
 def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
@@ -289,7 +468,7 @@ def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
             return out
     return out
 
-# split-source: order=988 original-lines=95588-95611 hash=a906665e32db82b6
+# split-source: order=1100 original-lines=104140-104163 hash=a906665e32db82b6
 
 
 def _rag_expand_tokens(tokens: list[str]) -> list[str]:
@@ -315,7 +494,7 @@ def _rag_expand_tokens(tokens: list[str]) -> list[str]:
                 out.append(part)
     return out
 
-# split-source: order=989 original-lines=95612-95630 hash=704c7d12a398a746
+# split-source: order=1101 original-lines=104164-104182 hash=704c7d12a398a746
 
 
 def _rag_extract_entities(text: str, limit: int = 32) -> list[str]:
@@ -336,7 +515,7 @@ def _rag_extract_entities(text: str, limit: int = 32) -> list[str]:
             counter[token] += freq
     return _rag_filter_entities([name for name, _ in counter.most_common(limit * 3)], limit=limit)
 
-# split-source: order=990 original-lines=95631-95667 hash=e0a07466be3508a1
+# split-source: order=1102 original-lines=104183-104219 hash=e0a07466be3508a1
 
 
 def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
@@ -375,7 +554,48 @@ def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
         labels.append("office")
     return {"category": category, "labels": sorted({str(x) for x in labels if str(x).strip()})}
 
-# split-source: order=998 original-lines=95920-95999 hash=b684cb74bf98083c
+# split-source: order=1110 original-lines=104472-104510 hash=d9d71b5674446a4d
+
+
+def _rag_structure_outline(text: str, *, max_items: int = 64, max_chars: int = 3600) -> list[str]:
+    """Return a bounded, deterministic outline for durable long-source memory.
+
+    This intentionally uses no completion call: ingestion can seed navigation
+    immediately, while exact claims remain recoverable from source chunks.
+    Markdown headings are preferred; numbered/labelled section lines are used
+    as a fallback for plain technical documents.
+    """
+    rows: list[str] = []
+    seen: set[str] = set()
+    for raw in str(text or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            item = f"{'  ' * (len(match.group(1)) - 1)}{match.group(2).strip()}"
+        elif re.match(r"^(?:\d+(?:\.\d+)*[.)]|(?:chapter|section|part)\s+\w+)\s+.+", line, re.I):
+            item = line
+        else:
+            continue
+        item = trim(item, 180)
+        key = item.casefold()
+        if item and key not in seen:
+            seen.add(key)
+            if rows and len("\n".join(rows)) + len(item) + 1 > max(240, int(max_chars or 3600)):
+                break
+            rows.append(item)
+            if len(rows) >= max(1, int(max_items or 64)):
+                break
+    if not rows:
+        first = [trim(str(x).strip(), 180) for x in str(text or "").splitlines() if str(x).strip()][:4]
+        for item in first:
+            if rows and len("\n".join(rows)) + len(item) + 1 > max(240, int(max_chars or 3600)):
+                break
+            rows.append(item)
+    return [trim(x, 180) for x in rows if x][: max(1, int(max_items or 64))]
+
+# split-source: order=1111 original-lines=104511-104597 hash=146d8a047e11c0e8
 
 
 def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
@@ -393,6 +613,7 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
     current_text = ""
     current_heading = ""
     current_depth = 0
+    heading_stack: dict[int, str] = {}
 
     def _flush(txt: str, heading: str, depth: int, is_code: bool = False) -> None:
         txt = txt.strip()
@@ -402,12 +623,15 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
         preview = trim(first_line, 120)
         if heading:
             preview = f"[{heading}] {preview}"
+        section_path = [heading_stack[level] for level in sorted(heading_stack) if level <= max(1, depth)]
         chunks.append({
             "text": txt,
             "anchor": preview,
             "parent_heading": heading,
+            "section_path": section_path,
             "is_code_block": is_code,
             "section_depth": depth,
+            "segment_id": f"s{len(chunks) + 1:04d}",
         })
 
     for seg_type, seg_depth, seg_heading, seg_body in segments:
@@ -420,6 +644,9 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
                 current_text = ""
             current_heading = seg_heading
             current_depth = seg_depth
+            heading_stack[seg_depth] = seg_heading
+            for level in [level for level in heading_stack if level > seg_depth]:
+                heading_stack.pop(level, None)
         elif seg_type == "code_block":
             # Flush prose buffer, then emit code/table atomically (up to 2500 chars)
             if current_text:
@@ -457,7 +684,7 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
         _flush(current_text, current_heading, current_depth)
     return chunks[:RAG_MAX_CHUNKS_PER_DOC]
 
-# split-source: order=1002 original-lines=96074-96092 hash=72f6c82513a4c799
+# split-source: order=1115 original-lines=104672-104690 hash=72f6c82513a4c799
 
 
 def _code_language_from_name(name: str, text: str = "") -> str:
@@ -478,14 +705,14 @@ def _code_language_from_name(name: str, text: str = "") -> str:
             return "shell"
     return "text"
 
-# split-source: order=1003 original-lines=96093-96097 hash=28e4542ecc7f6d38
+# split-source: order=1116 original-lines=104691-104695 hash=28e4542ecc7f6d38
 
 
 def _code_is_test_path(rel_path: str) -> bool:
     low = str(rel_path or "").strip().lower()
     return any(token in low for token in ("/tests/", "/test/", "_test.", ".spec.", ".test.", "/__tests__/"))
 
-# split-source: order=1007 original-lines=96140-96154 hash=66418ff2b69e755d
+# split-source: order=1120 original-lines=104738-104752 hash=66418ff2b69e755d
 
 
 class _CallCollector(ast.NodeVisitor):
@@ -502,21 +729,21 @@ class _CallCollector(ast.NodeVisitor):
             self.calls.append(func.id)
         self.generic_visit(node)
 
-# split-source: order=1008 original-lines=96155-96157 hash=a19cb208aec4ce1c
+# split-source: order=1121 original-lines=104753-104755 hash=a19cb208aec4ce1c
 
 
 _ALGO_COMPLEXITY_RE = re.compile(r"O\s*\(\s*(?:n|log|1|n\^2|n²|n\s*\*)", re.IGNORECASE)
 
-# split-source: order=1009 original-lines=96158-96158 hash=4a246044d3169bfe
+# split-source: order=1122 original-lines=104756-104756 hash=4a246044d3169bfe
 _ALGO_STEP_RE = re.compile(r"#\s*(?:step|phase|algorithm|算法|步骤)\s*\d*[:：\s]", re.IGNORECASE)
 
-# split-source: order=1010 original-lines=96159-96159 hash=11a327683a15c351
+# split-source: order=1123 original-lines=104757-104757 hash=11a327683a15c351
 _ALGO_MATH_VARS = frozenset(["alpha", "beta", "gamma", "epsilon", "theta", "delta", "lambda", "mu", "sigma", "omega"])
 
-# split-source: order=1011 original-lines=96160-96160 hash=247850f225a77823
+# split-source: order=1124 original-lines=104758-104758 hash=247850f225a77823
 _ALGO_DOC_KEYWORDS = frozenset(["algorithm", "complexity", "iterate", "convergence", "converge", "算法", "复杂度", "迭代"])
 
-# split-source: order=1012 original-lines=96161-96186 hash=f4c89ff5d85d4942
+# split-source: order=1125 original-lines=104759-104784 hash=f4c89ff5d85d4942
 
 
 def _detect_algo_chunk(text: str) -> bool:
@@ -544,7 +771,7 @@ def _detect_algo_chunk(text: str) -> bool:
         score += 1
     return score >= 2
 
-# split-source: order=1013 original-lines=96187-96696 hash=801414aaa33e2e5f
+# split-source: order=1126 original-lines=104785-105351 hash=1b8a52529802fdad
 
 
 class CodeContentParser:
@@ -717,6 +944,21 @@ class CodeContentParser:
             end = int(getattr(node, "end_lineno", start) or start)
             if start < 1 or end < start:
                 return
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                # Preserve the locator entry without materializing the full
+                # body or running call/algorithm extraction for every later
+                # declaration in a huge AST.
+                signature = str(lines[start - 1] or "").strip() if start <= len(lines) else symbol
+                symbols.append(
+                    {
+                        "name": symbol,
+                        "kind": kind,
+                        "line_start": start,
+                        "line_end": end,
+                        "signature": trim(signature, 180),
+                    }
+                )
+                return
             chunk_lines = lines[start - 1 : end]
             if not chunk_lines:
                 return
@@ -802,7 +1044,9 @@ class CodeContentParser:
                         walk(child, name, depth + 1)
 
         walk(tree, "", 0)
-        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:160]
+        # Keep prompt chunks bounded while retaining a complete locator index
+        # for symbols near the end of very large source files.
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX]
 
     def _decl_matchers(self, language: str) -> list[tuple[re.Pattern[str], str]]:
         common = [
@@ -879,6 +1123,19 @@ class CodeContentParser:
                 break
         out: list[dict] = []
         symbols: list[dict] = []
+        # Compute declaration boundaries in one monotonic stack pass. The
+        # previous per-candidate suffix scan was O(n^2) on large files.
+        end_indices: list[int] = [len(lines) - 1] * len(candidates)
+        active: list[int] = []
+        for idx, cand in enumerate(candidates):
+            depth = int(cand.get("depth", 0) or 0)
+            while active and depth <= int(candidates[active[-1]].get("depth", 0) or 0):
+                previous = active.pop()
+                end_indices[previous] = max(
+                    int(candidates[previous].get("index", 0) or 0),
+                    int(cand.get("index", 0) or 0) - 1,
+                )
+            active.append(idx)
         if candidates and candidates[0]["index"] > 0:
             prelude = "\n".join(lines[: int(candidates[0]["index"])]).strip()
             if prelude:
@@ -895,17 +1152,29 @@ class CodeContentParser:
                 )
         for pos, cand in enumerate(candidates):
             start_idx = int(cand["index"] or 0)
-            end_idx = len(lines) - 1
-            for nxt in candidates[pos + 1 :]:
-                if int(nxt["depth"] or 0) <= int(cand["depth"] or 0):
-                    end_idx = max(start_idx, int(nxt["index"] or 0) - 1)
-                    break
+            end_idx = max(start_idx, int(end_indices[pos] or start_idx))
+            line_start = start_idx + 1
+            line_end = end_idx + 1
+            # Once the prompt chunk budget is full, avoid materializing each
+            # remaining function body. Its locator only needs the declaration
+            # line and computed boundary; this keeps indexing near O(file size)
+            # in both time and temporary memory.
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                signature = str(lines[start_idx] or "").strip() if 0 <= start_idx < len(lines) else str(cand.get("name", ""))
+                symbols.append(
+                    {
+                        "name": str(cand.get("name", "") or ""),
+                        "kind": str(cand.get("kind", "") or ""),
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "signature": trim(signature, 180),
+                    }
+                )
+                continue
             chunk_lines = lines[start_idx : end_idx + 1]
             chunk_text = "\n".join(chunk_lines).strip()
             if not chunk_text:
                 continue
-            line_start = start_idx + 1
-            line_end = end_idx + 1
             symbols.append(
                 {
                     "name": str(cand.get("name", "") or ""),
@@ -915,6 +1184,11 @@ class CodeContentParser:
                     "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), str(cand.get("name", ""))), 180),
                 }
             )
+            # Chunk text is prompt/RAG-facing and capped independently from
+            # the complete symbol locator table. Avoid constructing more
+            # chunks once the budget is full, while still retaining symbols.
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                continue
             if len(chunk_text) <= CODE_CHUNK_CHARS:
                 out.append(
                     {
@@ -935,9 +1209,9 @@ class CodeContentParser:
                         kind=str(cand.get("kind", "") or "symbol"),
                     )
                 )
-            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
-                break
-        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:200]
+            # Continue collecting declarations after the prompt chunk budget
+            # is reached; symbols form the source-addressable locator index.
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX]
 
     def _fallback_chunks(self, text: str) -> list[dict]:
         rows = _rag_chunk_text(text, max_chars=CODE_CHUNK_CHARS, overlap=CODE_CHUNK_OVERLAP)
@@ -977,14 +1251,14 @@ class CodeContentParser:
         return trim(" ".join(x for x in picked if x), 320)
 
     def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
-        raw_text = trim(str(text_override or ""), 300_000)
+        raw_text = trim(str(text_override or ""), CODE_SOURCE_ANALYSIS_MAX_CHARS)
         raw_bytes: bytes | None = None
         if not raw_text:
             try:
                 raw_bytes = fp.read_bytes()
             except Exception:
                 raw_bytes = None
-            raw_text = trim(self._decode_text_bytes(raw_bytes or b""), 300_000)
+            raw_text = trim(self._decode_text_bytes(raw_bytes or b""), CODE_SOURCE_ANALYSIS_MAX_CHARS)
         language = self.detect_language(fp, text=raw_text)
         imports = self._extract_imports(raw_text, language)
         if language == "python":
@@ -1042,6 +1316,16 @@ class CodeContentParser:
             "text": raw_text,
             "text_chars": len(raw_text),
             "summary": trim(" | ".join(bit for bit in summary_bits if bit), 1600),
+            "understanding_outline": [
+                trim(
+                    f"{row.get('kind', 'symbol')} {row.get('name', '')} "
+                    f"L{int(row.get('line_start', 0) or 0)}-{int(row.get('line_end', 0) or 0)}",
+                    180,
+                )
+                for row in symbols[:64]
+                if str(row.get("name", "") or "").strip()
+            ],
+            "understanding_version": LONG_CONTENT_MEMORY_VERSION,
             "entities": entities,
             "category": "code",
             "labels": sorted({str(x).strip() for x in labels if str(x).strip()}),
@@ -1050,13 +1334,13 @@ class CodeContentParser:
                 "symbol_count": len(symbols),
                 "import_count": len(imports),
             },
-            "symbols": symbols[:200],
+            "symbols": symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX],
             "imports": imports[:64],
             "exports": exports[:64],
             "chunks": chunks[:CODE_MAX_CHUNKS_PER_DOC],
         }
 
-# split-source: order=1014 original-lines=96697-97202 hash=73dfc1f3dbb3b48a
+# split-source: order=1127 original-lines=105352-105867 hash=45693a92274f4b77
 
 
 class RAGContentParser:
@@ -1547,6 +1831,14 @@ class RAGContentParser:
             allow_filename_entities=self.include_filename_entities,
             limit=32,
         )
+        outline = _rag_structure_outline(text)
+        lead_parts = [str(x).strip() for x in text.splitlines() if str(x).strip()]
+        lead = " ".join(lead_parts[:8])
+        summary_parts = []
+        if outline:
+            summary_parts.append("Structure: " + " > ".join(outline[:8]))
+        if lead:
+            summary_parts.append(lead)
         return {
             "filename": fp.name,
             "path": str(fp),
@@ -1557,7 +1849,9 @@ class RAGContentParser:
             "language": lang,
             "text": text,
             "text_chars": len(text),
-            "summary": trim(text, 1200),
+            "summary": trim(" | ".join(summary_parts) or text, 1600),
+            "understanding_outline": outline,
+            "understanding_version": LONG_CONTENT_MEMORY_VERSION,
             "entities": entities,
             "category": str(cls.get("category", "document")),
             "labels": list(cls.get("labels", [])),

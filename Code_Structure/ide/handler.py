@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1070 original-lines=122439-123913 hash=f5f31c2f57493c36
+# split-source: order=1183 original-lines=132410-134065 hash=c4ad9cebbb7f8185
 
 
 class IdeHandler(BaseHTTPRequestHandler):
@@ -155,6 +155,38 @@ class IdeHandler(BaseHTTPRequestHandler):
             raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
         return None
 
+    def _preview_user(self, session_id: str, root_id: str) -> str:
+        """Resolve normal IDE auth or a short-lived read-only preview capability."""
+        try:
+            context = self._auth_context(required=False)
+        except IDEAuthError:
+            # A stale/foreign browser cookie must not mask a valid capability
+            # carried by a sandboxed iframe resource request.
+            context = None
+        if context:
+            try:
+                self._require_root_capability(context, root_id)
+                user_id = str(context["account"].get("user_id", "") or "")
+                # Verify that this authenticated account actually owns the
+                # requested session before accepting its cookie. If not, fall
+                # through to the capability token supplied by the preview.
+                self.app.ide_resolve_workspace(user_id, session_id, root_id, ".")
+                return user_id
+            except Exception:
+                context = None
+        token = str((parse_qs(urlparse(self.path).query).get("preview_token", [""]) or [""])[0] or "")
+        if not token:
+            cookies = str(self.headers.get("Cookie", "") or "")
+            for item in cookies.split(";"):
+                key, sep, value = item.strip().partition("=")
+                if sep and key == "clouds_ide_preview":
+                    token = unquote(value.strip())
+                    break
+        user_id = self.app.ide_verify_preview_token(token, session_id, root_id)
+        if not user_id:
+            raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
+        return user_id
+
     def _require_root_capability(self, context: dict, root_id: object) -> None:
         if str(root_id or "session").strip() not in {"", "session"}:
             self.app.ide_require_capability(context.get("capabilities", {}), "mounts")
@@ -271,13 +303,15 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return
             raise
 
-    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200, *, cookies: list[str] | None = None):
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Content-Disposition", "inline")
             self.send_header("Cache-Control", "no-store")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
@@ -583,7 +617,19 @@ class IdeHandler(BaseHTTPRequestHandler):
         if path == "/api/ide/config":
             try:
                 context = self._auth_context(required=True)
-                out = self.app.ide_config(str(context["account"].get("user_id", "")), client_ip=self._client_ip())
+                lite = _to_bool_like((query.get("lite", ["0"]) or ["0"])[0], default=False)
+                config_user_id = str(context["account"].get("user_id", ""))
+                if lite:
+                    out = self.app.ide_config(
+                        config_user_id,
+                        client_ip=self._client_ip(),
+                        lite=True,
+                    )
+                else:
+                    out = self.app.ide_config(
+                        config_user_id,
+                        client_ip=self._client_ip(),
+                    )
                 out["account"] = self._public_auth_account(context["account"])
                 out["csrf_token"] = context["account"].get("csrf_token", "")
                 out["capabilities"] = context["capabilities"]
@@ -594,16 +640,29 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_exception(exc)
+        if path == "/api/ide/kernel/update-notice":
+            try:
+                context = self._auth_context(required=True)
+                user_id = str(context["account"].get("user_id", "") or "")
+                device_id = trim(str((query.get("device_id", [""]) or [""])[0] or context["account"].get("device_digest", "") or "ide-default"), 160)
+                notice = self.app.liquid_kernel.registry.notice(user_id, device_id, "ide")
+                return self._send_json({"ok": True, "notice": notice, "active_kernel_version": self.app.liquid_kernel.registry.active_version()})
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/sessions":
             try:
-                requested_limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+                requested_limit = int((query.get("limit", [str(IDE_SESSION_LIST_DEFAULT_LIMIT)]) or [str(IDE_SESSION_LIST_DEFAULT_LIMIT)])[0] or IDE_SESSION_LIST_DEFAULT_LIMIT)
                 requested_offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+                search = str((query.get("search", [""]) or [""])[0] or "")
+                status = str((query.get("status", [""]) or [""])[0] or "")
                 return self._send_json(
                     self.app.ide_session_payload(
                         self._user_id(),
                         client_ip=self._client_ip(),
                         limit=requested_limit,
                         offset=requested_offset,
+                        search=search,
+                        status=status,
                     )
                 )
             except Exception as exc:
@@ -616,6 +675,20 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._stream_ide_events(sess)
             except Exception as exc:
                 return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/history$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                requested_limit = int((query.get("limit", ["60"]) or ["60"])[0] or 0)
+                return self._send_json(
+                    self.app.ide_workspace_session_history(
+                        str(context["account"].get("user_id", "")),
+                        m.group(1),
+                        limit=requested_limit,
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/roots$", path)
         if m:
             try:
@@ -624,6 +697,18 @@ class IdeHandler(BaseHTTPRequestHandler):
                 if not context["capabilities"].get("mounts"):
                     roots = [row for row in roots if str(row.get("kind", "")) == "session"]
                 return self._send_json({"ok": True, "session_id": m.group(1), "roots": roots})
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/preview-token$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                token = self.app.ide_issue_preview_token(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id
+                )
+                return self._send_json({"preview_token": token, "expires_in": 600})
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/tree$", path)
@@ -685,10 +770,9 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 _, target, _ = self.app.ide_resolve_workspace(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                    user_id, m.group(1), root_id, rel
                 )
                 if not target.exists() or not target.is_file():
                     raise FileNotFoundError("file not found")
@@ -765,10 +849,9 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 data, content_type = self.app.ide_image_preview(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel
+                    user_id, m.group(1), root_id=root_id, rel=rel
                 )
                 return self._send_inline_bytes(data, content_type)
             except Exception as exc:
@@ -778,17 +861,81 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str(m.group(2) or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 _, target, _ = self.app.ide_resolve_workspace(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                    user_id, m.group(1), root_id, rel
                 )
                 if not target.exists() or not target.is_file():
                     raise FileNotFoundError("file not found")
                 content_type = guess_mime_from_name(target.name, "application/octet-stream")
                 if content_type.startswith("text/") and "charset=" not in content_type.lower():
                     content_type = f"{content_type}; charset=utf-8"
-                return self._send_inline_bytes(target.read_bytes(), content_type)
+                data = target.read_bytes()
+                token = str((query.get("preview_token", [""]) or [""])[0] or "")
+                if token and content_type.startswith("text/html"):
+                    text = data.decode("utf-8", errors="replace")
+                    # Carry the capability to same-workspace relative resources
+                    # and links so a sandboxed LAN iframe never falls into login.
+                    token_q = quote(token, safe="")
+                    base = f"/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/html/"
+                    def _preview_attr(match):
+                        attr, value = match.group(1), match.group(2)
+                        raw = value.strip()
+                        low = raw.lower()
+                        if not raw or raw.startswith(('#', '?')) or low.startswith(("http:", "https:", "data:", "javascript:", "mailto:", "tel:")):
+                            return match.group(0)
+                        if raw.startswith('/'):
+                            if raw.startswith('/api/') or raw.startswith('/assets/'):
+                                return match.group(0)
+                            raw = raw.lstrip('/')
+                        clean = raw.split('#', 1)[0]
+                        fragment = ('#' + raw.split('#', 1)[1]) if '#' in raw else ''
+                        target_path = posixpath.normpath(posixpath.join(posixpath.dirname(rel), clean))
+                        if target_path.startswith('../') or target_path == '..':
+                            return match.group(0)
+                        return f'{attr}="{base}{quote(target_path, safe="/")}?root_id={quote(root_id, safe="")}&preview_token={token_q}{fragment}"'
+                    text = re.sub(r'\b(href|src)=["\']([^"\']+)["\']', _preview_attr, text, flags=re.IGNORECASE)
+                    token_js = json.dumps(token, ensure_ascii=False)
+                    resource_base_js = json.dumps(base, ensure_ascii=False)
+                    bridge = (
+                        "<script>(function(){const t=" + token_js + ";const b=" + resource_base_js + ";"
+                        "const add=function(v){try{const u=new URL(String(v),location.href);"
+                        "if(u.origin===location.origin&&u.pathname.indexOf(b)===0&&!u.searchParams.has('preview_token'))u.searchParams.set('preview_token',t);"
+                        "return u.href}catch(_){return v}};"
+                        "const f=window.fetch;if(f)window.fetch=function(i,o){if(typeof i==='string'||i instanceof URL)i=add(i);else if(i&&i.url)i=new Request(add(i.url),i);return f.call(this,i,o)};"
+                        "const x=window.XMLHttpRequest;if(x){const open=x.prototype.open;x.prototype.open=function(m,u){arguments[1]=add(u);return open.apply(this,arguments)}}"
+                        "})();</script>"
+                    )
+                    head_match = re.search(r"<head[^>]*>", text, flags=re.IGNORECASE)
+                    if head_match:
+                        at = head_match.end()
+                        text = text[:at] + bridge + text[at:]
+                    else:
+                        text = bridge + text
+                    data = text.encode("utf-8")
+                elif token and content_type.startswith("text/css"):
+                    text = data.decode("utf-8", errors="replace")
+                    token_q = quote(token, safe="")
+                    base = f"/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/html/"
+                    def _css_url(match):
+                        raw = match.group(1).strip().strip('"\'')
+                        low = raw.lower()
+                        if not raw or raw.startswith(('#', '/', '?')) or low.startswith(("http:", "https:", "data:", "javascript:", "mailto:")):
+                            return match.group(0)
+                        clean = raw.split('#', 1)[0]
+                        fragment = ('#' + raw.split('#', 1)[1]) if '#' in raw else ''
+                        target_path = posixpath.normpath(posixpath.join(posixpath.dirname(rel), clean))
+                        if target_path.startswith('../') or target_path == '..':
+                            return match.group(0)
+                        return f"url('{base}{quote(target_path, safe='/')}?root_id={quote(root_id, safe='')}&preview_token={token_q}{fragment}')"
+                    data = re.sub(r'url\(\s*([^)]*?)\s*\)', _css_url, text, flags=re.IGNORECASE).encode("utf-8")
+                preview_cookie = ""
+                if token:
+                    preview_cookie = (
+                        f"clouds_ide_preview={quote(token, safe='')}; Path=/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/; "
+                        "HttpOnly; SameSite=Lax; Max-Age=600"
+                    )
+                return self._send_inline_bytes(data, content_type, cookies=[preview_cookie] if preview_cookie else None)
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/preview$", path)
@@ -825,7 +972,18 @@ class IdeHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/ide/v2/sessions/([^/]+)/agent-state$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_agent_state(self._user_id(), m.group(1)))
+                after_feed_seq = int((query.get("after_feed_seq", ["0"]) or ["0"])[0] or 0)
+                after_operation_seq = int((query.get("after_operation_seq", ["0"]) or ["0"])[0] or 0)
+                known_snapshot_revision = int((query.get("known_snapshot_revision", ["0"]) or ["0"])[0] or 0)
+                return self._send_json(
+                    self.app.ide_agent_state(
+                        self._user_id(),
+                        m.group(1),
+                        after_feed_seq=after_feed_seq,
+                        after_operation_seq=after_operation_seq,
+                        known_snapshot_revision=known_snapshot_revision,
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/v2/sessions/([^/]+)/code-history(?:/stage)?$", path)
@@ -1001,6 +1159,14 @@ class IdeHandler(BaseHTTPRequestHandler):
         if not context:
             return
         user_id = str(context["account"].get("user_id", "") or "")
+        if path == "/api/ide/kernel/update-notice/ack":
+            try:
+                payload = self._read_json()
+                device_id = trim(str(payload.get("device_id", "") or context["account"].get("device_digest", "") or "ide-default"), 160)
+                version = trim(str(payload.get("version", "") or self.app.liquid_kernel.registry.active_version()), 160)
+                return self._send_json(self.app.liquid_kernel.registry.acknowledge_notice(user_id, device_id, "ide", version))
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/v2/applications":
             try:
                 if bool(context["account"].get("collaboration_mode", False)):
@@ -1109,11 +1275,15 @@ class IdeHandler(BaseHTTPRequestHandler):
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
+                workspace_session_id = ""
+                if not _to_bool_like(payload.get("new_workspace"), default=False):
+                    workspace_session_id = str(payload.get("workspace_session_id", "") or "").strip()
                 return self._send_json(
                     self.app.ide_create_session(
                         user_id,
                         str(payload.get("title", "") or "").strip() or None,
                         client_ip=self._client_ip(),
+                        workspace_session_id=workspace_session_id,
                     ),
                     status=201,
                 )
@@ -1450,6 +1620,17 @@ class IdeHandler(BaseHTTPRequestHandler):
                 if not deleted:
                     raise KeyError(m_application.group(1))
                 return self._send_json({"ok": True})
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_session = re.match(r"^/api/ide/sessions/([^/]+)$", path)
+        if m_session:
+            try:
+                return self._send_json(
+                    self.app.ide_delete_session(
+                        str(context["account"].get("user_id", "") or ""),
+                        m_session.group(1),
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=852 original-lines=15289-15335 hash=0c0a7a26e52e023f
+# split-source: order=957 original-lines=16316-16370 hash=8f3e8f16ab9530cf
 
 class EventHub:
     _MAXSIZE = 512
@@ -27,8 +27,16 @@ class EventHub:
 
     def publish(self, event: dict):
         with self._lock:
-            self._seq += 1
-            seq = self._seq
+            supplied_seq = int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
+            if supplied_seq > 0:
+                # Session event cursors survive reloads. Replacing them with
+                # this process-local hub counter makes every later delta look
+                # older than the cursor restored from disk.
+                self._seq = max(self._seq, supplied_seq)
+                seq = supplied_seq
+            else:
+                self._seq += 1
+                seq = self._seq
             subs = list(self._subs)
         if isinstance(event, dict):
             event["seq"] = seq

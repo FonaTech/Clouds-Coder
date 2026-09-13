@@ -5,13 +5,34 @@
 
 from __future__ import annotations
 
-# split-source: order=1075 original-lines=124694-126580 hash=22ab5dc6515a18fe
+# split-source: order=1188 original-lines=134846-136794 hash=80545b1ab8734ed1
 
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone Web Session Agent")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=8080, type=int)
+    parser.add_argument(
+        "--liquid-kernel-mode",
+        dest="liquid_kernel_mode",
+        default=None,
+        choices=list(EVOLUTION_MODES),
+        help="Liquid agent kernel evolution mode: Off, Tuning, Thinking, or Aggressive.",
+    )
+    parser.add_argument(
+        "--evolution-schedule",
+        dest="evolution_schedule",
+        default=None,
+        choices=["off", "hourly", "daily", "every_3_days", "weekly"],
+        help="Automatic liquid-kernel evolution schedule.",
+    )
+    parser.add_argument(
+        "--liquid-kernel-startup-policy",
+        dest="liquid_kernel_startup_policy",
+        default=None,
+        choices=list(LIQUID_KERNEL_STARTUP_POLICIES),
+        help="On restart, inherit the persisted kernel history or inject the embedded kernel.",
+    )
     parser.add_argument(
         "--ctx_limit",
         default=DEFAULT_CONTEXT_TOKEN_LIMIT,
@@ -1113,6 +1134,34 @@ def main():
         default=RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT,
     )
     print(f"[web-agent] RAG_File_Name={'on' if resolved_rag_include_filename_entities else 'off'}")
+    external_evolution = external_config.get("liquid_kernel", {}) if isinstance(external_config.get("liquid_kernel"), dict) else {}
+    web_evolution = web_ui_config.get("liquid_kernel", {}) if isinstance(web_ui_config.get("liquid_kernel"), dict) else {}
+    resolved_liquid_kernel_mode = str(
+        getattr(args, "liquid_kernel_mode", "")
+        or external_config.get("liquid_kernel_mode", "")
+        or external_evolution.get("mode", "")
+        or web_ui_config.get("liquid_kernel_mode", "")
+        or web_evolution.get("mode", "")
+        or ""
+    ).strip()
+    resolved_evolution_schedule = str(
+        getattr(args, "evolution_schedule", "")
+        or external_config.get("evolution_schedule", "")
+        or external_evolution.get("schedule", "")
+        or web_ui_config.get("evolution_schedule", "")
+        or web_evolution.get("schedule", "")
+        or ""
+    ).strip().lower()
+    resolved_liquid_kernel_startup_policy = normalize_liquid_kernel_startup_policy(
+        getattr(args, "liquid_kernel_startup_policy", "")
+        or external_config.get("liquid_kernel_startup_policy", "")
+        or external_evolution.get("startup_policy", "")
+        or external_evolution.get("restart_policy", "")
+        or web_ui_config.get("liquid_kernel_startup_policy", "")
+        or web_evolution.get("startup_policy", "")
+        or web_evolution.get("restart_policy", "")
+        or "inherit"
+    )
     resolved_language = normalize_ui_language(getattr(args, "language", DEFAULT_UI_LANGUAGE))
     skills_root, skills_root_source = select_preferred_skills_root(
         WORKDIR,
@@ -1185,8 +1234,18 @@ def main():
             )
             else ""
         ),
+        liquid_kernel_startup_policy=resolved_liquid_kernel_startup_policy,
         ide_password_login_enabled=bool(getattr(args, "ide_password_login_enabled", False)),
     )
+    try:
+        startup_evolution = app.liquid_kernel.apply_startup_config(
+            resolved_liquid_kernel_mode,
+            resolved_evolution_schedule,
+        )
+        active_evolution_config = dict(startup_evolution.get("config", {}) or app.liquid_kernel.config())
+    except LiquidKernelError as exc:
+        print(f"[web-agent] invalid liquid-kernel startup configuration: {exc}")
+        sys.exit(2)
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
@@ -1335,6 +1394,9 @@ def main():
         "max_user": int(resolved_max_user),
         "max_user_sessions": int(resolved_max_user_sessions),
         "rag_file_name": bool(resolved_rag_include_filename_entities),
+        "liquid_kernel_mode": str(active_evolution_config.get("mode", "Off") or "Off"),
+        "evolution_schedule": str(active_evolution_config.get("schedule", "off") or "off"),
+        "liquid_kernel_startup_policy": str(getattr(app, "liquid_kernel_startup_policy", "inherit") or "inherit"),
     })
     app.configure_admin_runtime(active_admin_config)
     setattr(app, "agent_port", int(args.port))
@@ -1894,7 +1956,7 @@ def main():
             error_path=app.admin_restart_error_path,
         )
 
-# split-source: order=1076 original-lines=126581-126583 hash=032e6922518465de
+# split-source: order=1189 original-lines=136795-136797 hash=032e6922518465de
 
 if __name__ == "__main__":
     main()

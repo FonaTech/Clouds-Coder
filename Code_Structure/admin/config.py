@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=818 original-lines=14137-14254 hash=17976d61369fbde7
+# split-source: order=922 original-lines=15126-15246 hash=6db42547dfc7c5cd
 
 
 def _admin_config_schema() -> list[dict]:
@@ -47,6 +47,9 @@ def _admin_config_schema() -> list[dict]:
         row("shell_command_timeout", "runtime", "Shell timeout (seconds)", "integer", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, "--shell_command_timeout", minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS, maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS),
         row("shell_timeout_mode", "runtime", "Shell timeout mode", "enum", DEFAULT_SHELL_TIMEOUT_MODE, "--shell-timeout-mode", choices=list(SHELL_TIMEOUT_MODES)),
         row("shell_async_handoff_seconds", "runtime", "Shell async handoff (seconds)", "integer", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS, "--shell-async-handoff", minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS, maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS),
+        row("liquid_kernel_mode", "evolution", "Liquid kernel mode", "enum", "Off", "--liquid-kernel-mode", choices=list(EVOLUTION_MODES)),
+        row("evolution_schedule", "evolution", "Evolution schedule", "enum", "off", "--evolution-schedule", choices=["off", "hourly", "daily", "every_3_days", "weekly"]),
+        row("liquid_kernel_startup_policy", "evolution", "Liquid kernel restart policy", "enum", "inherit", "--liquid-kernel-startup-policy", choices=list(LIQUID_KERNEL_STARTUP_POLICIES)),
         row("live_input_delay_write", "live_input", "Write-phase delay rounds", "integer", LIVE_INPUT_DELAY_WRITE_ROUNDS, "--live_input_delay_write", minimum=0, maximum=20),
         row("live_input_delay_tool", "live_input", "Tool-phase delay rounds", "integer", LIVE_INPUT_DELAY_TOOL_ROUNDS, "--live_input_delay_tool", minimum=0, maximum=20),
         row("live_input_delay_normal", "live_input", "Normal-phase delay rounds", "integer", LIVE_INPUT_DELAY_NORMAL_ROUNDS, "--live_input_delay_normal", minimum=0, maximum=20),
@@ -125,13 +128,13 @@ def _admin_config_schema() -> list[dict]:
         row("rag_file_name", "runtime", "Use filenames as RAG entities", "boolean", False, true_flag="--RAG_File_Name=on", false_flag="--RAG_File_Name=off"),
     ]
 
-# split-source: order=819 original-lines=14255-14258 hash=40890890ea051821
+# split-source: order=923 original-lines=15247-15250 hash=40890890ea051821
 
 
 def _admin_factory_config() -> dict:
     return {row["key"]: row.get("factory_default") for row in _admin_config_schema()}
 
-# split-source: order=820 original-lines=14259-14414 hash=e4ee3c750cce4f1e
+# split-source: order=924 original-lines=15251-15406 hash=e4ee3c750cce4f1e
 
 
 def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
@@ -289,7 +292,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
     out["_effective_ports"] = effective_ports
     return out, errors
 
-# split-source: order=821 original-lines=14415-14451 hash=80095834e40509e0
+# split-source: order=925 original-lines=15407-15443 hash=80095834e40509e0
 
 
 def _admin_config_to_argv(config: dict) -> list[str]:
@@ -328,7 +331,7 @@ def _admin_config_to_argv(config: dict) -> list[str]:
                 argv.extend([flag, value_text])
     return argv
 
-# split-source: order=822 original-lines=14452-14467 hash=12dc636b75f461e9
+# split-source: order=926 original-lines=15444-15459 hash=12dc636b75f461e9
 
 
 def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot_id: str) -> str:
@@ -346,7 +349,7 @@ def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot
     )
     return f"http://{host}:{port}/api/health?{query}"
 
-# split-source: order=823 original-lines=14468-14554 hash=0c9904b7a02980a4
+# split-source: order=927 original-lines=15460-15546 hash=0c9904b7a02980a4
 
 
 def _admin_supervised_restart(
@@ -434,7 +437,7 @@ def _admin_supervised_restart(
     )
     return False
 
-# split-source: order=824 original-lines=14555-14576 hash=1bc6ac699682e60b
+# split-source: order=928 original-lines=15547-15568 hash=1bc6ac699682e60b
 
 def _admin_argparse_defaults(config: dict) -> dict:
     """Map canonical Admin config keys to argparse destinations."""
@@ -458,7 +461,7 @@ def _admin_argparse_defaults(config: dict) -> dict:
         out.pop(key, None)
     return out
 
-# split-source: order=825 original-lines=14577-14597 hash=77b9b0b9223e21aa
+# split-source: order=929 original-lines=15569-15589 hash=77b9b0b9223e21aa
 
 def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
     values = _admin_factory_config()

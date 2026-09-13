@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=711 original-lines=8319-8365 hash=937fe8b64e5c61ac
+# split-source: order=809 original-lines=9209-9260 hash=b7fe1c15b54aa534
 
 def ide_public_operation_data(data: object) -> dict:
     """Project a runtime event into the safe fields used by IDE history and SSE."""
@@ -18,7 +18,9 @@ def ide_public_operation_data(data: object) -> dict:
         "output": 12000, "diff": 12000, "diff_numbered": 12000,
         "change_type": 80, "agent_role": 80, "mode": 80,
         "tool_call_id": 240, "query": 2000, "pattern": 2000, "url": 2000,
-        "reason": 240, "archive_segment": 240, "next_call_label": 240,
+        "reason": 600, "archive_segment": 240, "next_call_label": 240,
+        "control_tag": 120, "origin": 80, "title": 240, "details": 8000,
+        "session_title": 240, "title_origin": 40,
         "public_progress": 4000,
     }
     for key, limit in text_limits.items():
@@ -36,12 +38,15 @@ def ide_public_operation_data(data: object) -> dict:
         "round", "tier", "archived_messages", "context_limit_before",
         "context_used_before", "context_left_before", "context_left_percent_before",
         "context_used_after", "context_left_after", "context_left_percent_after",
-        "context_used_reduction",
+        "context_used_reduction", "matched_rows", "returned", "total_rows",
+        "title_revision",
     ):
         if key in source:
             public[key] = source.get(key)
     if "effective" in source:
         public["effective"] = bool(source.get("effective"))
+    if "default_collapsed" in source:
+        public["default_collapsed"] = bool(source.get("default_collapsed"))
     for key in ("changed_files", "tools"):
         if isinstance(source.get(key), list):
             public[key] = [trim(str(value or ""), 1200) for value in source[key][:80]]

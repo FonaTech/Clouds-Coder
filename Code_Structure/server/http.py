@@ -5,7 +5,310 @@
 
 from __future__ import annotations
 
-# split-source: order=1061 original-lines=118278-118317 hash=72f9d812840a61ba
+# split-source: order=688 original-lines=6314-6325 hash=6073888fd5937940
+
+
+def admin_language_payload(manager: object) -> dict:
+    language = normalize_ui_language(getattr(manager, "user_language", DEFAULT_UI_LANGUAGE))
+    return {
+        "ok": True,
+        "language": language,
+        "default_language": language,
+        "source": "webui_user_preference",
+        "sync_with_webui": True,
+        "supported_languages": supported_ui_languages_payload(),
+    }
+
+# split-source: order=801 original-lines=8914-8916 hash=ad30cdd414ee4b37
+
+
+_UI_TRUNCATION_MARKER = "\n…(truncated for UI)"
+
+# split-source: order=802 original-lines=8917-8925 hash=aba447d2c530d053
+
+
+def _ui_trim_text(value: object, limit: int) -> tuple[str, bool]:
+    text = str(value or "")
+    limit = max(32, int(limit or 0))
+    if len(text) <= limit:
+        return text, False
+    keep = max(1, limit - len(_UI_TRUNCATION_MARKER))
+    return text[:keep] + _UI_TRUNCATION_MARKER, True
+
+# split-source: order=803 original-lines=8926-8986 hash=7ab38ccadacd41cf
+
+
+def _bounded_ui_value(
+    value: object,
+    *,
+    text_limit: int = 1200,
+    collection_limit: int = 24,
+    depth: int = 4,
+    _seen: set[int] | None = None,
+) -> tuple[object, bool]:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    if isinstance(value, str):
+        return _ui_trim_text(value, text_limit)
+    if isinstance(value, bytes):
+        return f"<{len(value)} bytes omitted from UI>", True
+    if depth <= 0:
+        return "…", True
+    seen = _seen if _seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return "<recursive value omitted>", True
+    if isinstance(value, dict):
+        seen.add(identity)
+        out: dict[str, object] = {}
+        truncated = False
+        rows = list(value.items())
+        for raw_key, raw_value in rows[: max(1, collection_limit)]:
+            key, key_truncated = _ui_trim_text(raw_key, 160)
+            child, child_truncated = _bounded_ui_value(
+                raw_value,
+                text_limit=text_limit,
+                collection_limit=collection_limit,
+                depth=depth - 1,
+                _seen=seen,
+            )
+            out[key] = child
+            truncated = bool(truncated or key_truncated or child_truncated)
+        if len(rows) > collection_limit:
+            out["ui_omitted_items"] = len(rows) - collection_limit
+            truncated = True
+        seen.discard(identity)
+        return out, truncated
+    if isinstance(value, (list, tuple, set, deque)):
+        seen.add(identity)
+        source = list(value)
+        out_list: list[object] = []
+        truncated = len(source) > collection_limit
+        for item in source[: max(1, collection_limit)]:
+            child, child_truncated = _bounded_ui_value(
+                item,
+                text_limit=text_limit,
+                collection_limit=collection_limit,
+                depth=depth - 1,
+                _seen=seen,
+            )
+            out_list.append(child)
+            truncated = bool(truncated or child_truncated)
+        seen.discard(identity)
+        return out_list, truncated
+    return _ui_trim_text(value, text_limit)
+
+# split-source: order=804 original-lines=8987-9038 hash=9ea54ca7928bbed7
+
+
+def _bounded_ui_row(
+    row: object,
+    *,
+    text_limit: int,
+    data_text_limit: int,
+    collection_limit: int,
+) -> dict:
+    source = row if isinstance(row, dict) else {"text": str(row or "")}
+    projected: dict[str, object] = {}
+    row_truncated = False
+    for raw_key, raw_value in source.items():
+        key = str(raw_key or "")
+        if key in {"text", "content", "body", "question", "public_progress"}:
+            projected[key], truncated = _ui_trim_text(raw_value, text_limit)
+            if truncated:
+                projected[f"{key}_truncated"] = True
+            row_truncated = bool(row_truncated or truncated)
+            continue
+        if key in {"thinking", "live_thinking"}:
+            projected[key], truncated = _ui_trim_text(raw_value, min(text_limit, 1800))
+            if truncated:
+                projected[f"{key}_truncated"] = True
+            row_truncated = bool(row_truncated or truncated)
+            continue
+        if key == "data":
+            projected[key], truncated = _bounded_ui_value(
+                raw_value,
+                text_limit=data_text_limit,
+                collection_limit=collection_limit,
+                depth=4,
+            )
+            if truncated:
+                projected["data_truncated"] = True
+            row_truncated = bool(row_truncated or truncated)
+            continue
+        if isinstance(raw_value, str):
+            projected[key], truncated = _ui_trim_text(raw_value, 1200)
+        elif isinstance(raw_value, (dict, list, tuple, set, deque, bytes)):
+            projected[key], truncated = _bounded_ui_value(
+                raw_value,
+                text_limit=data_text_limit,
+                collection_limit=collection_limit,
+                depth=3,
+            )
+        else:
+            projected[key], truncated = raw_value, False
+        row_truncated = bool(row_truncated or truncated)
+    if row_truncated:
+        projected["ui_truncated"] = True
+    return projected
+
+# split-source: order=805 original-lines=9039-9087 hash=6a2ea4d9d7a02580
+
+
+def _bounded_ui_rows(
+    rows: object,
+    *,
+    max_rows: int,
+    byte_budget: int,
+    text_limit: int = 2800,
+    data_text_limit: int = 1200,
+    collection_limit: int = 24,
+    keep: str = "tail",
+) -> tuple[list[dict], bool]:
+    source = [row for row in (list(rows) if isinstance(rows, (list, tuple, deque)) else []) if isinstance(row, dict)]
+    max_rows = max(1, int(max_rows or 1))
+    byte_budget = max(4096, int(byte_budget or 4096))
+    candidates = source[-max_rows:] if keep != "head" else source[:max_rows]
+    ordered = list(reversed(candidates)) if keep != "head" else candidates
+    selected: list[dict] = []
+    used = 2
+    for raw in ordered:
+        projected = _bounded_ui_row(
+            raw,
+            text_limit=text_limit,
+            data_text_limit=data_text_limit,
+            collection_limit=collection_limit,
+        )
+        row_size = len(json_dumps(projected).encode("utf-8")) + 1
+        if row_size > byte_budget and not selected:
+            projected = _bounded_ui_row(
+                raw,
+                text_limit=512,
+                data_text_limit=384,
+                collection_limit=8,
+            )
+            row_size = len(json_dumps(projected).encode("utf-8")) + 1
+            if row_size > byte_budget:
+                projected["data"] = {"ui_truncated": True}
+                projected["data_truncated"] = True
+                if "text" in projected:
+                    projected["text"], _ = _ui_trim_text(projected.get("text", ""), 256)
+                    projected["text_truncated"] = True
+                row_size = len(json_dumps(projected).encode("utf-8")) + 1
+        if used + row_size > byte_budget:
+            break
+        selected.append(projected)
+        used += row_size
+    if keep != "head":
+        selected.reverse()
+    return selected, len(selected) < len(source)
+
+# split-source: order=806 original-lines=9088-9132 hash=3b11e1a68491cd75
+
+
+def _enforce_ui_payload_budget(payload: dict, byte_budget: int) -> dict:
+    byte_budget = max(64 * 1024, int(byte_budget or 0))
+    try:
+        if len(json_dumps(payload).encode("utf-8")) <= byte_budget:
+            return payload
+    except Exception:
+        pass
+    payload["ui_payload_truncated"] = True
+    minimums = {
+        "messages": 0,
+        "activity": 0,
+        "background": 0,
+        "teammates": 0,
+        "tasks": 8,
+        "todos": 4,
+        "operations": 8,
+        "conversation_feed": 12,
+        "feed": 12,
+    }
+    for _ in range(32):
+        try:
+            if len(json_dumps(payload).encode("utf-8")) <= byte_budget:
+                return payload
+        except Exception:
+            break
+        candidates: list[tuple[int, str]] = []
+        for key, minimum in minimums.items():
+            value = payload.get(key)
+            if isinstance(value, list) and len(value) > minimum:
+                candidates.append((len(json_dumps(value).encode("utf-8")), key))
+        if not candidates:
+            break
+        _, key = max(candidates)
+        value = list(payload.get(key, []))
+        minimum = minimums[key]
+        remove = max(1, (len(value) - minimum + 1) // 2)
+        payload[key] = value[remove:]
+    for key in ("live_thinking", "live_response_text", "live_truncation_text", "recovered_reason"):
+        if key in payload:
+            payload[key], truncated = _ui_trim_text(payload.get(key, ""), 512)
+            if truncated:
+                payload[f"{key}_truncated"] = True
+    return payload
+
+# split-source: order=807 original-lines=9133-9188 hash=02abec25163d8472
+
+
+def _apply_lite_snapshot_bounds(payload: dict) -> dict:
+    payload = dict(payload)
+    windows = (
+        ("messages", 72, LITE_SNAPSHOT_MESSAGES_BYTES, 2400, 900, 18),
+        ("conversation_feed", 120, LITE_SNAPSHOT_FEED_BYTES, 3000, 1000, 20),
+        ("operations", 60, LITE_SNAPSHOT_OPERATIONS_BYTES, 1800, 900, 18),
+        ("activity", 40, 16 * 1024, 1200, 700, 14),
+        ("uploads", 12, 12 * 1024, 800, 600, 12),
+        ("todos", 40, 20 * 1024, 1200, 700, 16),
+        ("tasks", 80, 28 * 1024, 1200, 700, 16),
+        ("background", 24, 12 * 1024, 900, 600, 12),
+        ("teammates", 24, 12 * 1024, 900, 600, 12),
+        ("agent_contexts", 12, 12 * 1024, 900, 600, 12),
+    )
+    window_meta: dict[str, dict] = {}
+    for key, max_rows, budget, text_limit, data_limit, collection_limit in windows:
+        source = payload.get(key, [])
+        bounded, truncated = _bounded_ui_rows(
+            source,
+            max_rows=max_rows,
+            byte_budget=budget,
+            text_limit=text_limit,
+            data_text_limit=data_limit,
+            collection_limit=collection_limit,
+        )
+        payload[key] = bounded
+        window_meta[key] = {
+            "returned": len(bounded),
+            "available": len(source) if isinstance(source, list) else 0,
+            "truncated": bool(truncated),
+        }
+    for key, limit in (
+        ("live_thinking", 4000),
+        ("live_response_text", 8000),
+        ("live_truncation_text", 2000),
+        ("live_run_notice_label", 600),
+    ):
+        if key in payload:
+            payload[key], truncated = _ui_trim_text(payload.get(key, ""), limit)
+            if truncated:
+                payload[f"{key}_truncated"] = True
+    for key in ("render_bridge", "pending_user_question", "app_binding", "mcp_servers"):
+        if key in payload:
+            payload[key], truncated = _bounded_ui_value(
+                payload.get(key),
+                text_limit=1200,
+                collection_limit=24,
+                depth=4,
+            )
+            if truncated:
+                payload[f"{key}_truncated"] = True
+    payload["ui_windows"] = window_meta
+    payload["ui_payload_limit_bytes"] = int(LITE_SNAPSHOT_MAX_BYTES)
+    return _enforce_ui_payload_budget(payload, LITE_SNAPSHOT_MAX_BYTES)
+
+# split-source: order=1174 original-lines=128101-128140 hash=72f9d812840a61ba
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -47,7 +350,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
-# split-source: order=1064 original-lines=119504-121135 hash=6357bd493df55e3a
+# split-source: order=1177 original-lines=129327-131094 hash=2b1b6922ad7fec45
 
 
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
@@ -339,6 +642,8 @@ class Handler(BaseHTTPRequestHandler):
             if not kind:
                 return self._send_json({"error": "admin authentication required", "code": "unauthorized"}, status=401)
             return self._send_json({"ok": True, "auth_kind": kind})
+        if path == "/api/admin/language":
+            return self._send_json(admin_language_payload(self._session_mgr()))
         if path == "/api/apps/skills":
             return self._send_json(self.app.applications.skill_catalog())
         if path == "/api/apps/personal":
@@ -371,6 +676,52 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin(query):
                 return
             return self._send_json(self.app.admin_config_payload())
+        if path == "/api/admin/evolution":
+            if not self._require_admin(query):
+                return
+            dashboard = self.app.liquid_kernel.dashboard()
+            dashboard["bootstrap"] = dict(getattr(self.app, "liquid_kernel_bootstrap", {}) or {})
+            dashboard["startup_policy"] = str(getattr(self.app, "liquid_kernel_startup_policy", "inherit") or "inherit")
+            return self._send_json(dashboard)
+        if path == "/api/admin/evolution/runs":
+            if not self._require_admin(query):
+                return
+            return self._send_json(self.app.liquid_kernel.registry.list_runs(
+                limit=int((query.get("limit", ["100"]) or ["100"])[0] or 100),
+                offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+            ))
+        m_evolution_run = re.match(r"^/api/admin/evolution/runs/([^/]+)$", path)
+        if m_evolution_run:
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json(self.app.liquid_kernel.registry.run_detail(m_evolution_run.group(1)))
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        if path == "/api/admin/evolution/events":
+            if not self._require_admin(query):
+                return
+            return self._send_json(self.app.liquid_kernel.registry.events_since(
+                after_event_id=int((query.get("after", ["0"]) or ["0"])[0] or 0),
+                limit=int((query.get("limit", ["200"]) or ["200"])[0] or 200),
+            ))
+        if path == "/api/admin/evolution/versions":
+            if not self._require_admin(query):
+                return
+            return self._send_json(self.app.liquid_kernel.registry.list_versions(
+                limit=int((query.get("limit", ["100"]) or ["100"])[0] or 100),
+                offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+            ))
+        m_evolution_version = re.match(r"^/api/admin/evolution/versions/([^/]+)(?:/(diff))?$", path)
+        if m_evolution_version:
+            if not self._require_admin(query):
+                return
+            try:
+                if m_evolution_version.group(2) == "diff":
+                    return self._send_json(self.app.liquid_kernel.registry.diff(m_evolution_version.group(1)))
+                return self._send_json(self.app.liquid_kernel.registry.version_detail(m_evolution_version.group(1)))
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
         if path == "/api/admin/processes":
             if not self._require_admin(query):
                 return
@@ -468,6 +819,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/webui/validate":
             reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
             return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
+        if path == "/api/kernel/update-notice":
+            device_id = trim(str((query.get("device_id", [""]) or [""])[0] or ""), 160)
+            notice = self.app.liquid_kernel.registry.notice(self._user_id(), device_id or "web-default", "webui")
+            return self._send_json({"ok": True, "notice": notice, "active_kernel_version": self.app.liquid_kernel.registry.active_version()})
         mgr = self._session_mgr()
         if path == "/api/config":
             config_lite = _to_bool_like((query.get("lite", ["0"]) or ["0"])[0], default=False)
@@ -601,6 +956,8 @@ class Handler(BaseHTTPRequestHandler):
                     "session_creation_limit": session_creation_limit,
                     "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
                     "chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS),
+                    "active_kernel_version": self.app.liquid_kernel.registry.active_version(),
+                    "kernel_canary": self.app.liquid_kernel.registry.active_state().get("canary"),
                 }
             )
         if path == "/api/user-memory":
@@ -760,24 +1117,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/skills/protocol-examples":
             return self._send_json(self.app.skill_protocol_examples())
         if path == "/api/sessions":
-            page_like = any(k in query for k in ("limit", "offset", "page", "page_size", "search", "status", "paged"))
-            if page_like:
-                try:
-                    page_size = int((query.get("page_size", query.get("limit", [str(SESSION_LIST_DEFAULT_LIMIT)])) or [str(SESSION_LIST_DEFAULT_LIMIT)])[0] or SESSION_LIST_DEFAULT_LIMIT)
-                except Exception:
-                    page_size = SESSION_LIST_DEFAULT_LIMIT
-                try:
-                    page = int((query.get("page", ["1"]) or ["1"])[0] or 1)
-                except Exception:
-                    page = 1
-                try:
-                    offset = int((query.get("offset", [str(max(0, page - 1) * page_size)]) or [str(max(0, page - 1) * page_size)])[0] or 0)
-                except Exception:
-                    offset = max(0, page - 1) * page_size
-                search = str((query.get("search", [""]) or [""])[0] or "")
-                status = str((query.get("status", [""]) or [""])[0] or "")
-                return self._send_json(mgr.list(limit=page_size, offset=offset, search=search, status=status))
-            return self._send_json(mgr.list())
+            try:
+                page_size = int((query.get("page_size", query.get("limit", [str(SESSION_LIST_DEFAULT_LIMIT)])) or [str(SESSION_LIST_DEFAULT_LIMIT)])[0] or SESSION_LIST_DEFAULT_LIMIT)
+            except Exception:
+                page_size = SESSION_LIST_DEFAULT_LIMIT
+            try:
+                page = int((query.get("page", ["1"]) or ["1"])[0] or 1)
+            except Exception:
+                page = 1
+            try:
+                offset = int((query.get("offset", [str(max(0, page - 1) * page_size)]) or [str(max(0, page - 1) * page_size)])[0] or 0)
+            except Exception:
+                offset = max(0, page - 1) * page_size
+            search = str((query.get("search", [""]) or [""])[0] or "")
+            status = str((query.get("status", [""]) or [""])[0] or "")
+            return self._send_json(mgr.list(limit=page_size, offset=offset, search=search, status=status))
         if path == "/api/export/source.zip":
             return self._send_json({"error": "Use /api/sessions/{id}/export.zip for current user session export."}, status=400)
         m = re.match(r"^/api/sessions/([^/]+)/files-tree$", path)
@@ -1049,6 +1403,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(self.app.applications.save_personal(self._user_id(), self._read_json()), status=201)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/kernel/update-notice/ack":
+            payload = self._read_json()
+            return self._send_json(self.app.liquid_kernel.registry.acknowledge_notice(
+                self._user_id(),
+                trim(str(payload.get("device_id", "") or "web-default"), 160),
+                "webui",
+                trim(str(payload.get("version", "") or self.app.liquid_kernel.registry.active_version()), 160),
+            ))
         m = re.match(r"^/api/apps/([^/]+)/submit$", path)
         if m:
             try:
@@ -1081,6 +1443,63 @@ class Handler(BaseHTTPRequestHandler):
                 expected_revision=str(payload.get("revision", "") or ""),
             )
             return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
+        if path == "/api/admin/evolution/config":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.liquid_kernel.save_config(
+                    payload.get("values", payload), expected_revision=int(payload.get("revision", 0) or 0)
+                ))
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        if path == "/api/admin/evolution/emergency-off":
+            if not self._require_admin():
+                return
+            try:
+                self._read_json()
+                return self._send_json(self.app.liquid_kernel.emergency_off())
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        if path == "/api/admin/evolution/runs":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.liquid_kernel.trigger(str(payload.get("trigger", "manual") or "manual")), status=202)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_evolution_run_action = re.match(r"^/api/admin/evolution/runs/([^/]+)/(approve|reject|cancel)$", path)
+        if m_evolution_run_action:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                action = m_evolution_run_action.group(2)
+                if action == "approve":
+                    out = self.app.liquid_kernel.approve(m_evolution_run_action.group(1))
+                elif action == "reject":
+                    out = self.app.liquid_kernel.reject(m_evolution_run_action.group(1), str(payload.get("reason", "") or ""))
+                else:
+                    out = self.app.liquid_kernel.cancel(m_evolution_run_action.group(1))
+                return self._send_json(out)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_evolution_version_action = re.match(r"^/api/admin/evolution/versions/([^/]+)/(promote|rollback)$", path)
+        if m_evolution_version_action:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                if m_evolution_version_action.group(2) == "promote":
+                    out = self.app.liquid_kernel.registry.promote(m_evolution_version_action.group(1))
+                else:
+                    out = self.app.liquid_kernel.registry.rollback(
+                        m_evolution_version_action.group(1), reason=str(payload.get("reason", "manual rollback") or "manual rollback")
+                    )
+                return self._send_json(out)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
         if path == "/api/admin/config/sync-active":
             if not self._require_admin():
                 return
@@ -1317,6 +1736,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/admin/language":
+            payload = self._read_json()
+            language = str(payload.get("language", payload.get("lang", ""))).strip()
+            if not language:
+                return self._send_json({"error": "language required"}, status=400)
+            try:
+                self._session_mgr().set_user_language(language)
+                return self._send_json(admin_language_payload(self._session_mgr()))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/user-memory/config":
             payload = self._read_json()
             mode = normalize_user_memory_mode(payload.get("mode", payload.get("user_memory_mode", DEFAULT_USER_MEMORY_MODE)))
@@ -1427,10 +1856,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             payload = self._read_json()
             try:
+                requested_origin = None
+                if "user_named" in payload:
+                    requested_origin = "manual" if bool(payload.get("user_named")) else "default"
                 sess, quota_status = self.app.create_session_for_user(
                     self._user_id(),
                     payload.get("title"),
                     client_ip=self._client_ip(),
+                    title_origin=requested_origin,
                 )
             except SessionCreationLimitExceeded as exc:
                 return self._send_json(
@@ -1444,6 +1877,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "id": sess.id,
                     "title": sess.title,
+                    "title_origin": str(getattr(sess, "title_origin", "") or ""),
+                    "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
                     "ui_language": sess.ui_language,
                     "session_creation_limit": quota_status,
                 },
@@ -1605,7 +2040,11 @@ class Handler(BaseHTTPRequestHandler):
             sess = mgr.rename(sid, title)
         except KeyError:
             return self._send_json({"error": "session not found"}, status=404)
-        return self._send_json({"id": sess.id, "title": sess.title})
+        return self._send_json({
+            "id": sess.id,
+            "title": sess.title,
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+        })
 
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
@@ -1681,7 +2120,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             sess.events.unsubscribe(sub)
 
-# split-source: order=1067 original-lines=121937-122050 hash=79a78cd04af97eeb
+# split-source: order=1180 original-lines=131896-132009 hash=79a78cd04af97eeb
 
 
 class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
@@ -1797,7 +2236,7 @@ class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
         if not self._handle_admin_auth_post(path):
             return self._send_json({"error": "not found"}, 404)
 
-# split-source: order=1071 original-lines=123914-124384 hash=e5c3c84a1d0a44ec
+# split-source: order=1184 original-lines=134066-134536 hash=e5c3c84a1d0a44ec
 
 class CollaborationHandler(IdeHandler):
     server_version = "CloudsCoderCollaboration/1.0"

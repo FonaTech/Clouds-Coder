@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=891 original-lines=19497-19605 hash=745fa615d6fc251e
+# split-source: order=996 original-lines=20532-20640 hash=745fa615d6fc251e
 
 # ---------------------------------------------------------------------------
 # Built-in skill guides injected into SkillStore on reload.
@@ -116,7 +116,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
     },
 }
 
-# split-source: order=892 original-lines=19606-21411 hash=2c4c8e28c6ee5311
+# split-source: order=997 original-lines=20641-22534 hash=fff1f3f777fe87dd
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -126,7 +126,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
 # ============================================================================
 
 class SkillStore:
-    def __init__(self, skills_root: Path):
+    def __init__(self, skills_root: Path, snapshot: SkillStore | None = None):
         self.skills_root = skills_root
         self.skills: dict[str, dict] = {}
         self.aliases: dict[str, str] = {}
@@ -135,7 +135,27 @@ class SkillStore:
         self.warnings: list[str] = []
         self.fingerprint = ""
         self.last_reload_ts = 0.0
-        self.reload(force=True)
+        adopted = False
+        if snapshot is not None:
+            try:
+                same_root = self.skills_root.resolve() == snapshot.skills_root.resolve()
+            except Exception:
+                same_root = str(self.skills_root) == str(snapshot.skills_root)
+            if same_root and snapshot.skills:
+                self.skills = copy.deepcopy(snapshot.skills)
+                self.aliases = dict(snapshot.aliases)
+                self.ambiguous = {
+                    str(key): list(value)
+                    for key, value in snapshot.ambiguous.items()
+                    if isinstance(value, list)
+                }
+                self.providers = copy.deepcopy(snapshot.providers)
+                self.warnings = list(snapshot.warnings)
+                self.fingerprint = str(snapshot.fingerprint or "")
+                self.last_reload_ts = now_ts()
+                adopted = True
+        if not adopted:
+            self.reload(force=True)
 
     def _sanitize_provider_id(self, raw: str, fallback: str) -> str:
         pid = re.sub(r"[^A-Za-z0-9._-]+", "-", (raw or "").strip().lower()).strip("-")
@@ -1610,6 +1630,9 @@ class SkillStore:
             "fallback": "none",
             "fallback_type": "none",
             "duration_ms": 0,
+            "confidence": 0.0,
+            "confidence_level": "low",
+            "dependency_order": [],
         }
         query_text = re.sub(r"\s+", " ", f"{focus or ''} {step or ''} {phase or ''}").casefold()
         for key, data in self.skills.items():
@@ -1732,8 +1755,73 @@ class SkillStore:
         if not result["selected"] and result["fallback_type"] == "none":
             result["fallback"] = result["fallback_type"] = "metadata"
         result["selection_order"] = [row["id"] for row in result["selected"]]
+        # Confidence combines the strongest local match with the margin over
+        # the next candidate.  It is exposed to the runtime so automatic
+        # loading can remain conservative while the model still sees useful
+        # medium-confidence candidates.
+        scores = [float(row.get("score", 0) or 0) for row in candidates]
+        top = scores[0] if scores else 0.0
+        second = scores[1] if len(scores) > 1 else 0.0
+        margin = max(0.0, top - second)
+        confidence = min(1.0, (top / 12.0) * 0.7 + min(1.0, margin / 6.0) * 0.3)
+        # A single explicit trigger match is unambiguous even when its raw
+        # score is below the generic 12-point ceiling.
+        if len(candidates) == 1 and top >= 6.0:
+            confidence = max(confidence, 0.8)
+        if result["selected"] and result.get("fallback_type") in {"none", "metadata"}:
+            confidence = max(confidence, 0.55 if result.get("fallback_type") == "metadata" else 0.65)
+        result["confidence"] = round(confidence, 4)
+        result["confidence_level"] = "high" if confidence >= SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD else ("medium" if confidence >= 0.45 else "low")
         result["duration_ms"] = int((time.monotonic() - started) * 1000)
         return result
+
+    def dependency_closure(self, selected_ids: Iterable[str], *, max_depth: int = SKILL_DEPENDENCY_MAX_DEPTH) -> dict:
+        """Resolve requires/depends_on metadata into a deterministic load order."""
+        roots: list[str] = []
+        for raw in selected_ids or []:
+            resolved = self.canonicalize_id(raw)
+            if resolved.get("ok") and resolved.get("canonical_id") not in roots:
+                roots.append(str(resolved["canonical_id"]))
+        order: list[str] = []
+        missing: list[dict] = []
+        cycles: list[list[str]] = []
+        visiting: list[str] = []
+        visited: set[str] = set()
+
+        def visit(cid: str, depth: int):
+            if cid in visiting:
+                cycles.append(visiting[visiting.index(cid):] + [cid])
+                return
+            if cid in visited:
+                return
+            if depth > max_depth:
+                missing.append({"id": cid, "reason": "max_depth"})
+                return
+            data = self.skills.get(cid)
+            if not isinstance(data, dict):
+                missing.append({"id": cid, "reason": "unknown"})
+                return
+            visiting.append(cid)
+            meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+            reqs = self._skill_relation_list(meta, "requires") + self._skill_relation_list(meta, "depends_on")
+            seen_req: set[str] = set()
+            for req in reqs:
+                resolved = self.canonicalize_id(req)
+                dep = str(resolved.get("canonical_id", "")) if resolved.get("ok") else ""
+                if not dep:
+                    missing.append({"id": cid, "dependency": req, "reason": "unknown"})
+                    continue
+                if dep in seen_req:
+                    continue
+                seen_req.add(dep)
+                visit(dep, depth + 1)
+            visiting.pop()
+            visited.add(cid)
+            order.append(cid)
+
+        for root in roots:
+            visit(root, 0)
+        return {"roots": roots, "order": order, "missing": missing, "cycles": cycles}
 
     select_for_focus = select_skills
 

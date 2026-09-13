@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1016 original-lines=98880-99465 hash=4bc5e1fae18af394
+# split-source: order=1129 original-lines=107563-108201 hash=24e360fed0ba3751
 
 
 # ============================================================================
@@ -83,6 +83,31 @@ class RAGLibraryStore:
         self.content_updated_at = float(
             raw.get("content_updated_at", raw.get("updated_at", self.content_updated_at)) or self.content_updated_at
         )
+        # Older library shards predate structure metadata. Populate only the
+        # bounded navigation fields in-place; raw source/chunk text remains the
+        # durable evidence and is never duplicated here.
+        changed = False
+        for row in self.documents.values():
+            if not isinstance(row, dict):
+                continue
+            try:
+                understanding_version = int(row.get("understanding_version", 0) or 0)
+            except Exception:
+                understanding_version = 0
+            # Upgrade missing/older structure metadata in-place.  The raw
+            # document/chunk evidence remains untouched, so this is safe for
+            # every legacy RAG database format.
+            if understanding_version >= LONG_CONTENT_MEMORY_VERSION and row.get("understanding_outline") is not None:
+                continue
+            outline = _rag_structure_outline(str(row.get("summary", "") or ""), max_items=32)
+            row["understanding_outline"] = outline
+            row["understanding_version"] = LONG_CONTENT_MEMORY_VERSION
+            changed = True
+        if changed:
+            try:
+                self._save_locked(write_chunks=False, write_tasks=False)
+            except Exception:
+                pass
 
     def _save_locked(
         self,
@@ -516,18 +541,39 @@ class RAGLibraryStore:
             "",
         )
         chunks = _rag_chunk_text(semantic_text)
+        understanding_outline = [
+            trim(str(x), 180)
+            for x in (parse_result.get("understanding_outline", []) or [])[:64]
+            if str(x).strip()
+        ] or _rag_structure_outline(semantic_text)
         chunk_ids: list[str] = []
         with self.lock:
             stamp = now_ts()
             for chunk_idx, chunk in enumerate(chunks, 1):
                 chunk_id = f"{doc_id}_c{chunk_idx:03d}"
                 chunk_text = str(chunk.get("text", "") or "")
+                chunk_hash = _sha256_bytes(chunk_text.encode("utf-8"))
                 row = {
                     "id": chunk_id,
                     "doc_id": doc_id,
                     "seq": chunk_idx,
                     "anchor": str(chunk.get("anchor", "") or ""),
+                    "segment_id": str(chunk.get("segment_id", "") or f"s{chunk_idx:04d}"),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": [
+                        trim(str(x), 180)
+                        for x in (chunk.get("section_path", []) or [])[:12]
+                        if str(x).strip()
+                    ],
+                    "section_depth": int(chunk.get("section_depth", 0) or 0),
+                    "is_code_block": bool(chunk.get("is_code_block", False)),
                     "text": chunk_text,
+                    "content_hash": chunk_hash,
+                    "source_hash": sha256,
+                    "parent_chunk_id": f"{doc_id}_c{chunk_idx - 1:03d}" if chunk_idx > 1 else "",
+                    "next_chunk_id": f"{doc_id}_c{chunk_idx + 1:03d}" if chunk_idx < len(chunks) else "",
+                    "line_start": int(chunk.get("line_start", 0) or 0),
+                    "line_end": int(chunk.get("line_end", 0) or 0),
                     "entities": _rag_apply_filename_entity_policy(
                         _rag_extract_entities(chunk_text),
                         safe_name,
@@ -549,12 +595,19 @@ class RAGLibraryStore:
                 "mime": str(parse_result.get("mime", "") or ""),
                 "size": int(parse_result.get("size", len(raw_bytes or b"")) or 0),
                 "sha256": sha256,
+                "source_hash": sha256,
+                "metadata_version": RAG_EVIDENCE_SCHEMA_VERSION,
                 "source_mode": str(source_mode or "manual"),
                 "source_path": str(source_fp or ""),
                 "source_rel_path": rel_path_clean,
                 "backup_path": self._rel(backup_path),
                 "parsed_text_path": self._rel(parsed_path),
                 "summary": trim(mm_summary or str(parse_result.get("summary", "") or semantic_text), 1600),
+                "understanding_outline": understanding_outline,
+                "understanding_version": int(
+                    parse_result.get("understanding_version", LONG_CONTENT_MEMORY_VERSION)
+                    or LONG_CONTENT_MEMORY_VERSION
+                ),
                 "entities": combined_entities,
                 "community": community,
                 "chunk_count": len(chunk_ids),
@@ -593,7 +646,7 @@ class RAGLibraryStore:
             "chunk_count": len(chunk_ids),
         }
 
-# split-source: order=1017 original-lines=99466-99997 hash=bf1eadb7273af0f2
+# split-source: order=1130 original-lines=108202-108757 hash=f5da3359003ac050
 
 
 class WikiStore:
@@ -772,8 +825,32 @@ class WikiStore:
         if summary:
             parts.append("\n## Summary\n\n" + summary + "\n")
         if chunks:
+            outline = [
+                trim(str(x), 180)
+                for x in (doc.get("understanding_outline", []) or [])[:64]
+                if str(x).strip()
+            ]
+            if not outline:
+                for chunk in chunks:
+                    anchor = trim(str(chunk.get("anchor", "") or ""), 180)
+                    if anchor and anchor not in outline:
+                        outline.append(anchor)
+                    if len(outline) >= 64:
+                        break
+            if outline:
+                parts.append("\n## Structure Map\n\n")
+                parts.extend(f"- {item}\n" for item in outline)
             parts.append("\n## Evidence Excerpts\n\n")
-            for chunk in chunks[:10]:
+            # Sample across the entire source instead of permanently remembering
+            # only its first ten chunks. The complete structure map above stays
+            # compact; these excerpts remain direct evidence, bounded to 12.
+            sample_count = min(12, len(chunks))
+            if len(chunks) <= sample_count:
+                sampled = chunks
+            else:
+                indexes = sorted({round(i * (len(chunks) - 1) / (sample_count - 1)) for i in range(sample_count)})
+                sampled = [chunks[idx] for idx in indexes]
+            for chunk in sampled:
                 anchor = trim(str(chunk.get("anchor", "") or f"chunk {chunk.get('seq', '')}"), 120)
                 text = trim(str(chunk.get("text", "") or ""), 900)
                 if text:
@@ -1127,7 +1204,7 @@ class WikiStore:
             "query_entities": sorted(qentities),
         }
 
-# split-source: order=1018 original-lines=99998-100675 hash=e22aa0b3692247d3
+# split-source: order=1131 original-lines=108758-109435 hash=e22aa0b3692247d3
 
 
 class UserMemoryStore:
@@ -1807,7 +1884,7 @@ class UserMemoryStore:
             self._write_profile_locked(self._empty_profile())
         return {"ok": True, "cleared": True, "user_id": self.user_id}
 
-# split-source: order=1019 original-lines=100676-100744 hash=471225095db9809e
+# split-source: order=1132 original-lines=109436-109504 hash=471225095db9809e
 
 
 class UserInteractionOptimizer:
@@ -1878,7 +1955,7 @@ class UserInteractionOptimizer:
         }
         return capsule, meta
 
-# split-source: order=1020 original-lines=100745-100786 hash=dd27ec5fa754e903
+# split-source: order=1133 original-lines=109505-109546 hash=dd27ec5fa754e903
 
 
 class UserIntentProfiler:
@@ -1922,7 +1999,7 @@ class UserIntentProfiler:
             "memory_count": int(meta.get("memory_count", 0) or 0),
         }
 
-# split-source: order=1021 original-lines=100787-101187 hash=fcbd83fa2e87370f
+# split-source: order=1134 original-lines=109547-109947 hash=22d67e1665d9f089
 
 
 class WorkflowMemoryStore:
@@ -2084,7 +2161,7 @@ class WorkflowMemoryStore:
             "title": title,
             "objective": trim(str(getattr(sess, "runtime_direct_objective", "") or title), 800),
             "created_at": now_ts(),
-            "operations": operations,
+            "operations": operations[-500:],
             "operation_summaries": op_summaries[-48:],
             "todos": [dict(x) for x in todos[-40:] if isinstance(x, dict)],
             "message_tail": self._extract_text_tail(getattr(sess, "agent_messages", []), limit=12, chars=420),
@@ -2325,7 +2402,7 @@ class WorkflowMemoryStore:
             "route_meta": {"mode": "workflow", "card_count": len(cards), "candidate_count": len(rows), "accepted_only": bool(accepted_only)},
         }
 
-# split-source: order=1025 original-lines=102573-102838 hash=f9d7e75f3c65db6f
+# split-source: order=1138 original-lines=111336-111626 hash=971d1b95ce465d60
 
 
 class CodeLibraryStore(RAGLibraryStore):
@@ -2478,6 +2555,11 @@ class CodeLibraryStore(RAGLibraryStore):
         language = str(parse_result.get("language", "unknown") or "unknown")
         module_name = _code_module_name(rel_path_clean or safe_name, language)
         community = _code_choose_community(rel_path_clean or safe_name, language, labels)
+        understanding_outline = [
+            trim(str(x), 180)
+            for x in (parse_result.get("understanding_outline", []) or [])[:64]
+            if str(x).strip()
+        ]
         entity_candidates = list(parse_result.get("entities", []) or [])
         entity_candidates.extend(str(row.get("name", "") or "") for row in symbols[:24])
         entity_candidates.extend(imports[:24])
@@ -2522,7 +2604,20 @@ class CodeLibraryStore(RAGLibraryStore):
                     "doc_id": doc_id,
                     "seq": chunk_idx,
                     "anchor": str(chunk.get("anchor", "") or symbol or f"chunk {chunk_idx}"),
+                    "segment_id": str(chunk.get("segment_id", "") or f"s{chunk_idx:04d}"),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": [
+                        trim(str(x), 180)
+                        for x in (chunk.get("section_path", []) or [])[:12]
+                        if str(x).strip()
+                    ],
+                    "section_depth": int(chunk.get("section_depth", 0) or 0),
+                    "is_code_block": bool(chunk.get("is_code_block", False)),
                     "text": chunk_text,
+                    "content_hash": _sha256_bytes(chunk_text.encode("utf-8")),
+                    "source_hash": sha256,
+                    "parent_chunk_id": f"{doc_id}_c{chunk_idx - 1:03d}" if chunk_idx > 1 else "",
+                    "next_chunk_id": f"{doc_id}_c{chunk_idx + 1:03d}" if chunk_idx < len(chunk_rows) else "",
                     "entities": chunk_entities,
                     "line_start": int(chunk.get("line_start", 0) or 0),
                     "line_end": int(chunk.get("line_end", 0) or 0),
@@ -2545,17 +2640,24 @@ class CodeLibraryStore(RAGLibraryStore):
                 "mime": str(parse_result.get("mime", guess_mime_from_name(safe_name, "text/plain")) or ""),
                 "size": int(parse_result.get("size", len(raw_bytes or b"")) or 0),
                 "sha256": sha256,
+                "source_hash": sha256,
+                "metadata_version": RAG_EVIDENCE_SCHEMA_VERSION,
                 "source_mode": str(source_mode or "manual"),
                 "source_path": str(source_fp or ""),
                 "source_rel_path": rel_path_clean,
                 "backup_path": self._rel(backup_path),
                 "parsed_text_path": self._rel(parsed_path),
                 "summary": summary,
+                "understanding_outline": understanding_outline,
+                "understanding_version": int(
+                    parse_result.get("understanding_version", LONG_CONTENT_MEMORY_VERSION)
+                    or LONG_CONTENT_MEMORY_VERSION
+                ),
                 "entities": combined_entities,
                 "community": community,
                 "chunk_count": len(chunk_ids),
                 "chunk_ids": chunk_ids,
-                "symbols": symbols[:200],
+                "symbols": symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX],
                 "imports": imports[:64],
                 "exports": exports[:64],
                 "line_count": int(parse_result.get("metadata", {}).get("line_count", 0) or 0)

@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-# split-source: order=112 original-lines=3467-3467 hash=bc447feb3084cf2f
+# split-source: order=122 original-lines=3786-3786 hash=bc447feb3084cf2f
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# split-source: order=137 original-lines=3561-3570 hash=6d198870996eb061
+# split-source: order=147 original-lines=3880-3889 hash=6d198870996eb061
 
 def _resolve_default_agent_workdir() -> Path:
     raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
@@ -20,13 +20,13 @@ def _resolve_default_agent_workdir() -> Path:
         return (base / "workspace").resolve()
     return SCRIPT_DIR
 
-# split-source: order=138 original-lines=3571-3574 hash=57424d297e3b5457
+# split-source: order=148 original-lines=3890-3893 hash=57424d297e3b5457
 
 def _is_installed_python_runtime(path: Path) -> bool:
     parts = {part.casefold() for part in Path(path).parts}
     return bool(parts.intersection({"site-packages", "dist-packages"}))
 
-# split-source: order=139 original-lines=3575-3581 hash=b115426f390ac524
+# split-source: order=149 original-lines=3894-3900 hash=b115426f390ac524
 
 def _runtime_storage_mode() -> str:
     if str(os.getenv("AGENT_WORKDIR", "") or "").strip():
@@ -35,7 +35,7 @@ def _runtime_storage_mode() -> str:
         return "pip-stable-workspace"
     return "script-local"
 
-# split-source: order=140 original-lines=3582-3587 hash=27b43b29779e59bb
+# split-source: order=150 original-lines=3901-3906 hash=27b43b29779e59bb
 
 def _runtime_tree_has_content(path: Path) -> bool:
     try:
@@ -43,7 +43,7 @@ def _runtime_tree_has_content(path: Path) -> bool:
     except Exception:
         return False
 
-# split-source: order=141 original-lines=3588-3653 hash=db2d36f9a5257fbd
+# split-source: order=151 original-lines=3907-3977 hash=1b33ee0d8c588a79
 
 def _copy_runtime_tree_with_crypto_migration(
     source: Path,
@@ -91,9 +91,14 @@ def _copy_runtime_tree_with_crypto_migration(
             if encrypted_box:
                 raw = item.read_text(encoding="utf-8")
                 box = json.loads(raw)
+                try:
+                    box_version = int(box.get("v", 1) or 1) if isinstance(box, dict) else 0
+                except Exception:
+                    box_version = 0
                 encrypted_box = bool(
                     isinstance(box, dict)
-                    and {"v", "n", "c", "m"}.issubset(box)
+                    and {"v", "n", "c"}.issubset(box)
+                    and (box_version == 2 or (box_version == 1 and "m" in box))
                 )
                 if encrypted_box:
                     plain = source_crypto.decrypt_text(raw)
@@ -111,7 +116,7 @@ def _copy_runtime_tree_with_crypto_migration(
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
 
-# split-source: order=142 original-lines=3654-3719 hash=22f466bd12b905a1
+# split-source: order=152 original-lines=3978-4043 hash=22f466bd12b905a1
 
 def _merge_legacy_codes_root(source: Path, target: Path) -> dict:
     """Import missing users/sessions from a legacy Codes root without overwrites."""
@@ -179,7 +184,7 @@ def _merge_legacy_codes_root(source: Path, target: Path) -> dict:
                 )
     return result
 
-# split-source: order=143 original-lines=3720-3810 hash=122908774e0cb307
+# split-source: order=153 original-lines=4044-4134 hash=122908774e0cb307
 
 def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
     root = Path(workspace).resolve()
@@ -272,17 +277,17 @@ def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
         "errors": errors,
     }
 
-# split-source: order=144 original-lines=3811-3812 hash=ade2cecdb185f771
+# split-source: order=154 original-lines=4135-4136 hash=ade2cecdb185f771
 
 WORKDIR = _resolve_default_agent_workdir()
 
-# split-source: order=145 original-lines=3813-3813 hash=3e4d58d57d1e261b
+# split-source: order=155 original-lines=4137-4137 hash=3e4d58d57d1e261b
 CODES_ROOT = WORKDIR / "Codes"
 
-# split-source: order=146 original-lines=3814-3814 hash=29dd970e5b14e924
+# split-source: order=156 original-lines=4138-4138 hash=29dd970e5b14e924
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 
-# split-source: order=683 original-lines=7695-7709 hash=1c8289e3f7ac60a2
+# split-source: order=774 original-lines=8310-8324 hash=1c8289e3f7ac60a2
 
 def detect_repo_root(cwd: Path) -> Path | None:
     try:
@@ -299,6 +304,6 @@ def detect_repo_root(cwd: Path) -> Path | None:
     except Exception:
         return None
 
-# split-source: order=684 original-lines=7710-7711 hash=abb03f0e9fd37533
+# split-source: order=775 original-lines=8325-8326 hash=abb03f0e9fd37533
 
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR

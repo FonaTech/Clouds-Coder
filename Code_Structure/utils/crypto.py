@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
-# split-source: order=805 original-lines=12677-12795 hash=52f15e0137e7d774
+# split-source: order=903 original-lines=13573-13726 hash=35831c64a3af33b5
 
 class CryptoBox:
+    _V2_AAD = b"CloudsCoder:CryptoBox:v2"
+
     def __init__(self, codes_root: Path):
         self.codes_root = codes_root
         self.codes_root.mkdir(parents=True, exist_ok=True)
@@ -31,18 +33,19 @@ class CryptoBox:
 
     def _stream_xor(self, data: bytes, nonce: bytes) -> bytes:
         out = bytearray(len(data))
+        source = memoryview(data)
         counter = 0
         offset = 0
         while offset < len(data):
             block = hashlib.sha256(self.key + nonce + counter.to_bytes(8, "big")).digest()
             n = min(32, len(data) - offset)
-            for i in range(n):
-                out[offset + i] = data[offset + i] ^ block[i]
+            mixed = int.from_bytes(source[offset : offset + n], "big") ^ int.from_bytes(block[:n], "big")
+            out[offset : offset + n] = mixed.to_bytes(n, "big")
             offset += n
             counter += 1
         return bytes(out)
 
-    def encrypt_text(self, text: str) -> str:
+    def _encrypt_text_v1(self, text: str) -> str:
         payload = text.encode("utf-8")
         nonce = os.urandom(16)
         ct = self._stream_xor(payload, nonce)
@@ -55,17 +58,49 @@ class CryptoBox:
         }
         return json_dumps(box)
 
+    def encrypt_text(self, text: str) -> str:
+        if _AESGCM is None:
+            return self._encrypt_text_v1(text)
+        payload = text.encode("utf-8")
+        nonce = os.urandom(12)
+        ciphertext = _AESGCM(self.key).encrypt(nonce, payload, self._V2_AAD)
+        return json_dumps(
+            {
+                "v": 2,
+                "n": base64.b64encode(nonce).decode("ascii"),
+                "c": base64.b64encode(ciphertext).decode("ascii"),
+            }
+        )
+
     def decrypt_text(self, box_text: str) -> str:
         box = json.loads(box_text)
-        if not isinstance(box, dict) or "n" not in box or "c" not in box or "m" not in box:
+        if not isinstance(box, dict) or "n" not in box or "c" not in box:
+            return box_text
+        try:
+            version = int(box.get("v", 1) or 1)
+        except Exception:
+            version = 1
+        if version == 2:
+            if _AESGCM is None:
+                raise ValueError("AES-GCM support is unavailable; install the cryptography package")
+            try:
+                nonce = base64.b64decode(str(box["n"]), validate=True)
+                ciphertext = base64.b64decode(str(box["c"]), validate=True)
+                plaintext = _AESGCM(self.key).decrypt(nonce, ciphertext, self._V2_AAD)
+            except Exception as exc:
+                raise ValueError("Encrypted payload integrity check failed") from exc
+            return plaintext.decode("utf-8")
+        if version != 1:
+            raise ValueError(f"Unsupported encrypted payload version: {version}")
+        if "m" not in box:
             return box_text
         nonce = base64.b64decode(box["n"])
-        ct = base64.b64decode(box["c"])
-        mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
+        ciphertext = base64.b64decode(box["c"])
+        mac = hmac.new(self.key, nonce + ciphertext, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(mac, box["m"]):
             raise ValueError("Encrypted payload integrity check failed")
-        pt = self._stream_xor(ct, nonce)
-        return pt.decode("utf-8")
+        plaintext = self._stream_xor(ciphertext, nonce)
+        return plaintext.decode("utf-8")
 
     def _fsync_json_file(self, fileobj) -> None:
         if not self.json_fsync_enabled:

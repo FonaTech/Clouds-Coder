@@ -5,13 +5,13 @@
 
 from __future__ import annotations
 
-# split-source: order=107 original-lines=3462-3462 hash=34fee98dbda2c56a
+# split-source: order=117 original-lines=3781-3781 hash=34fee98dbda2c56a
 _URL_OPEN_ORIGINAL = urlopen
 
-# split-source: order=108 original-lines=3463-3463 hash=d0b8577f025ef0b5
+# split-source: order=118 original-lines=3782-3782 hash=d0b8577f025ef0b5
 _HTTP_SSL_CONTEXT = None
 
-# split-source: order=135 original-lines=3527-3550 hash=7a1e316af503fc49
+# split-source: order=145 original-lines=3846-3869 hash=7a1e316af503fc49
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -37,7 +37,7 @@ def _shared_http_ssl_context():
     _HTTP_SSL_CONTEXT = ctx
     return ctx
 
-# split-source: order=136 original-lines=3551-3560 hash=4d63800588472a20
+# split-source: order=146 original-lines=3870-3879 hash=4d63800588472a20
 
 def urlopen(url, *args, **kwargs):
     if "context" not in kwargs:
@@ -49,12 +49,12 @@ def urlopen(url, *args, **kwargs):
                 pass
     return _URL_OPEN_ORIGINAL(url, *args, **kwargs)
 
-# split-source: order=678 original-lines=7657-7659 hash=45f4d1c3ae2bda86
+# split-source: order=769 original-lines=8272-8274 hash=45f4d1c3ae2bda86
 
 def json_response_bytes(obj: object) -> bytes:
     return safe_utf8_bytes(json_dumps(obj))
 
-# split-source: order=679 original-lines=7660-7673 hash=b8e0fcf45e3a740c
+# split-source: order=770 original-lines=8275-8288 hash=b8e0fcf45e3a740c
 
 def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0") or "0")
@@ -70,7 +70,7 @@ def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     parsed = sanitize_utf8_surrogates(parsed)
     return parsed if isinstance(parsed, dict) else {}
 
-# split-source: order=680 original-lines=7674-7687 hash=d097208eea9ea225
+# split-source: order=771 original-lines=8289-8302 hash=d097208eea9ea225
 
 def close_if_http_request_body_unread(handler: BaseHTTPRequestHandler) -> bool:
     """Prevent an unread write body from becoming the next keep-alive request line."""

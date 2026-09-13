@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=956 original-lines=83973-84224 hash=8cc6f200b44c635a
+# split-source: order=1061 original-lines=91909-92168 hash=c6bb02f751e979bd
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -76,6 +76,13 @@ window.MathJax={
       </div>
     </div>
   </div>
+  <div id="kernelUpdateModal" class="llm-modal-overlay" style="display:none">
+    <div class="llm-modal">
+      <div class="llm-modal-header"><span class="llm-modal-title">Liquid Kernel Updated</span><button id="kernelUpdateClose" class="llm-modal-close" type="button">&times;</button></div>
+      <div class="llm-modal-body"><div id="kernelUpdateMeta" class="llm-hint"></div><pre id="kernelUpdateChangelog" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:52vh;overflow:auto;background:#f8fafc;border:1px solid var(--line);border-radius:9px;padding:12px"></pre></div>
+      <div class="llm-modal-footer"><button id="kernelUpdateConfirm" type="button" class="llm-modal-btn-primary">Got it</button></div>
+    </div>
+  </div>
 </header>
 <div class="status-cards" id="topStats"></div>
 <main>
@@ -86,6 +93,7 @@ window.MathJax={
       <button id="appsSideTab" class="side-tab" type="button">应用商店</button>
     </div>
     <div id="sessionsSideView" class="app-side-view">
+      <input id="sessionSearch" class="session-search" type="search" placeholder="Search sessions" autocomplete="off">
       <div id="sessionList"></div>
       <div id="sessionsControls" class="sessions-controls">
         <button id="newSessionBtn">New Session</button>
@@ -259,7 +267,7 @@ window.MathJax={
 </html>
 """
 
-# split-source: order=957 original-lines=84225-84761 hash=3108fd3626893185
+# split-source: order=1062 original-lines=92169-92709 hash=5d636c8f694f791c
 
 APP_CSS = """@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
 :root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b}
@@ -298,6 +306,7 @@ main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) 
 body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-shadow:0 6px 18px rgba(14,30,62,.05);border-color:#dfe7f2}
 .panel-title{font-weight:700;margin-bottom:8px}
 #sessionList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
+.session-search{width:100%;margin:0 0 8px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--text)}
 .sessions-controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
 .session-item{padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:pointer;box-sizing:border-box;height:80px;min-height:80px;flex:0 0 80px;display:flex;flex-direction:column;justify-content:flex-start;gap:6px;overflow:hidden}
 .session-item strong{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.25;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
@@ -473,6 +482,9 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-event-card-web{background:linear-gradient(180deg,#fbfffe 0%,#ebf8f5 100%);border-color:#bfe5dd}
 .msg-event-card-adjustment{background:linear-gradient(180deg,#fffefd 0%,#fff3e7 100%);border-color:#ffd1a5}
 .msg-event-card-feedback{background:linear-gradient(180deg,#fffaff 0%,#f5edff 100%);border-color:#dec7ff}
+.msg-event-card-runtime{background:var(--panel,#fff);border-color:#d8e1ec;box-shadow:none}
+.msg-event-card-runtime.warning{border-left:3px solid #d69a31}.msg-event-card-runtime.notice{border-left:3px solid #4f9b75}.msg-event-card-runtime.instruction{border-left:3px solid #8067bf}
+.msg-runtime-details{margin-top:7px;border-top:1px solid rgba(100,116,139,.18);padding-top:6px}.msg-runtime-details summary{cursor:pointer;color:#627790;font-size:.74rem;font-weight:700;user-select:none}.msg-runtime-details pre{max-height:320px;margin:7px 0 0;padding:8px;overflow:auto;border-radius:7px;background:rgba(15,23,42,.045);color:#40536b;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .plan-proposal-card{position:relative;border:1px solid #d8c3f4;border-radius:16px;background:linear-gradient(145deg,#fff 0%,#fff8f5 42%,#f6f1ff 100%);box-shadow:0 14px 34px rgba(73,42,116,.12);padding:14px;overflow:hidden}
 .plan-proposal-card::before{content:"";position:absolute;inset:0 0 auto;height:4px;background:linear-gradient(90deg,#f27b65,#b76de1,#4f87e8)}
 .plan-proposal-hero{display:flex;align-items:center;gap:10px;margin:2px 0 10px}
@@ -798,10 +810,10 @@ h3{font-size:.96rem;margin:10px 0 6px}
 @media (max-width:720px){.application-editor-body{grid-template-columns:1fr}.application-skill-catalog{min-height:240px}.application-dialog{max-height:94vh}}
 """
 
-# split-source: order=958 original-lines=84762-89414 hash=84dfe1d15f99139c
+# split-source: order=1063 original-lines=92710-97433 hash=f2f79d40215de27f
 
 APP_JS = """/* clouds-coder-app-store-v1 */
-const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
+const S={sessions:[],sessionById:new Map(),sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionCatalogRevision:0,sessionSearch:'',sessionSearchTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},submissionBySession:new Map(),submissionRenderRaf:0,previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
 const USER_PROCESS_STATE={rows:[],counts:{},inFlight:false,lastLoadedAt:0,detailId:'',detail:null,timer:0};
 const APP_STORE={view:'sessions',scope:'personal',personal:[],shared:[],catalog:[],loaded:false,loading:false,editingId:'',selectedSkillIds:[]};
 const MD_CACHE=new Map();
@@ -811,8 +823,13 @@ const SNAPSHOT_DELAY_VISIBLE_MS=300;
 const SNAPSHOT_DELAY_HIDDEN_MS=2400;
 const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
-const SESSION_BOOT_LIMIT=80;
+const SESSION_BOOT_LIMIT=120;
 const SESSION_REFRESH_LIMIT=120;
+const SESSION_CLIENT_CACHE_MAX=600;
+const SUBMISSION_STATE_MAX=48;
+const SUBMISSION_START_GRACE_MS=15000;
+const SUBMISSION_STATE_TTL_MS=2*60*60*1000;
+const SUBMISSION_FAILURE_VISIBLE_MS=10000;
 const CHAT_UPLOAD_HANDOFF_WAIT_MS=250;
 const PANEL_SCROLL_ACTIVE_MS=1100;
 const CHAT_SCROLL_ACTIVE_MS=180;
@@ -871,6 +888,7 @@ function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;m
 const COMPACT_AUTO_REFRESH_COUNT=3;
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
 const E=id=>document.getElementById(id);
+const PREVIEW_TOKENS=new Map();
 const I18N={
   'en':{
     app_title:'Clouds Coder',app_subtitle:'WebUI-driven conversational coding agent platform',powered_by:'Powered By Fona',
@@ -889,7 +907,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'Files',sec_catalog:'Catalog',
     stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_global_tasks:'Global Tasks',stat_daily_sessions:'Daily Sessions',stat_model:'Model',
     no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_current_subtasks:'No subtasks for the current plan step yet',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_files:'No files',no_catalog:'No catalog',no_uploads:'No uploads',
-    running:'running',idle:'idle',open:'open',completed:'completed',blocked:'blocked',
+    running:'running',idle:'idle',submitting:'Submitting',accepted:'Accepted',starting:'Starting',queued:'Queued',checking:'Checking',submit_failed:'Submit failed',open:'open',completed:'completed',blocked:'blocked',
     status_pending:'PENDING',status_in_progress:'IN PROGRESS',status_completed:'COMPLETED',status_blocked:'BLOCKED',status_deleted:'DELETED',
     owner_unassigned:'owner=unassigned',
     session_title_prompt:'Session title',web_session:'Web Session',rename_session_prompt:'Rename session',session_default:'Session',
@@ -928,7 +946,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'文件',sec_catalog:'Catalog',
     stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_global_tasks:'全局任务',stat_daily_sessions:'每日会话',stat_model:'模型',
     no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_current_subtasks:'当前计划步骤尚未生成子任务',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_files:'暂无文件',no_catalog:'暂无目录',no_uploads:'暂无上传',
-    running:'运行中',idle:'空闲',open:'未完成',completed:'已完成',blocked:'阻塞',
+    running:'运行中',idle:'空闲',submitting:'正在提交',accepted:'已接收',starting:'正在启动',queued:'排队中',checking:'正在确认',submit_failed:'提交失败',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待处理',status_in_progress:'进行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已删除',
     owner_unassigned:'owner=未分配',
     session_title_prompt:'会话标题',web_session:'Web 会话',rename_session_prompt:'重命名会话',session_default:'会话',
@@ -967,7 +985,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'檔案',sec_catalog:'Catalog',
     stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_global_tasks:'全域任務',stat_daily_sessions:'每日會話',stat_model:'模型',
     no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_current_subtasks:'目前計劃步驟尚未產生子任務',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_files:'尚無檔案',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
-    running:'執行中',idle:'閒置',open:'未完成',completed:'已完成',blocked:'阻塞',
+    running:'執行中',idle:'閒置',submitting:'正在提交',accepted:'已接收',starting:'正在啟動',queued:'排隊中',checking:'正在確認',submit_failed:'提交失敗',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待處理',status_in_progress:'進行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已刪除',
     owner_unassigned:'owner=未指派',
     session_title_prompt:'會話標題',web_session:'Web 會話',rename_session_prompt:'重新命名會話',session_default:'會話',
@@ -1006,7 +1024,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'ファイル',sec_catalog:'Catalog',
     stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_global_tasks:'タスク',stat_daily_sessions:'日次セッション',stat_model:'モデル',
     no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_current_subtasks:'現在の計画ステップにはまだサブタスクがありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_files:'ファイルなし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
-    running:'実行中',idle:'待機中',open:'未完了',completed:'完了',blocked:'ブロック',
+    running:'実行中',idle:'待機中',submitting:'送信中',accepted:'受付済み',starting:'起動中',queued:'待機列',checking:'確認中',submit_failed:'送信失敗',open:'未完了',completed:'完了',blocked:'ブロック',
     status_pending:'未着手',status_in_progress:'進行中',status_completed:'完了',status_blocked:'ブロック',status_deleted:'削除済み',
     owner_unassigned:'owner=未割り当て',
     session_title_prompt:'セッション名',web_session:'Web セッション',rename_session_prompt:'セッション名を変更',session_default:'セッション',
@@ -1050,7 +1068,7 @@ Object.assign(I18N['en'],{
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
       event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
-  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',event_query:'query',event_archive:'archive',event_details:'Details',event_matches:'matches',event_returned:'returned',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
@@ -1079,7 +1097,7 @@ Object.assign(I18N['zh-CN'],{
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
       event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
-  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',event_query:'查询',event_archive:'归档',event_details:'详细内容',event_matches:'条匹配',event_returned:'条召回',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
@@ -1111,7 +1129,7 @@ Object.assign(I18N['zh-TW'],{
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
       event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
-  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',event_query:'查詢',event_archive:'歸檔',event_details:'詳細內容',event_matches:'筆匹配',event_returned:'筆召回',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
@@ -1141,7 +1159,7 @@ Object.assign(I18N['ja'],{
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
       event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
-  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',event_query:'検索',event_archive:'アーカイブ',event_details:'詳細',event_matches:'件一致',event_returned:'件取得',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
@@ -1158,7 +1176,7 @@ function currentUserMemoryMode(){const raw=String(S.config?.user_memory_mode||S.
 function renderMemoryModeAction(){const el=E('memoryModeAction');if(!el)return;const mode=currentUserMemoryMode();el.textContent=t('btn_memory_mode',{mode:t('memory_mode_'+mode)});el.classList.toggle('disabled',!!S.config?.user_memory_setting_locked)}
 function applyMainI18n(){document.documentElement.lang=currentLang();const h1=document.querySelector('header h1');if(h1)h1.textContent=t('app_title');const hp=document.querySelectorAll('header p');if(hp&&hp[0])hp[0].textContent=t('app_subtitle');if(hp&&hp[1])hp[1].textContent=t('powered_by');setText('applyModelBtn','apply_model');setText('llmConfigBtn','upload_llm_config');setText('llmModalTitle','llm_fill_config');setText('llmProviderLabel','llm_provider');setText('llmConfigConfirm','llm_confirm');setText('llmConfigImport','llm_import_config');setText('newSessionBtn','btn_new_session');setText('renameSessionBtn','btn_rename');setText('deleteSessionBtn','btn_delete');setText('sendBtn','btn_send');setText('interruptBtn','btn_interrupt');setText('toolsMenuBtn','btn_tools');setText('compactAction','btn_compact_action');setText('refreshAction','btn_refresh_action');setText('memoryExportAction','btn_memory_export');setText('memoryClearAction','btn_memory_clear');renderMemoryModeAction();setText('previewReloadBtn','btn_refresh');setText('previewCopyBtn','copy_code');setText('downloadSessionBtn','btn_export_session');setText('clearStaleTodosBtn','btn_clear_stale_todos');setText('refreshFilesBtn','btn_refresh');setPlaceholder('prompt','prompt_placeholder');const up=E('uploadDrop');if(up)up.textContent=t('upload_drop');const pfht=E('promptFileHintText');if(pfht)pfht.textContent=t('upload_file_hint');const pfpk=E('promptFilePick');if(pfpk)pfpk.textContent=t('upload_pick_file');const pdol=E('promptDropOverlay');if(pdol)pdol.textContent=t('upload_drop_release');const ctxLive=E('ctxLive');if(ctxLive)ctxLive.setAttribute('title',t('rt_ctx_live_title'));const panels=document.querySelectorAll('.panel-title');if(panels&&panels[0])panels[0].textContent=t('panel_sessions');if(panels&&panels[1])panels[1].textContent=t('panel_conversation');if(panels&&panels[2])panels[2].textContent=t('panel_runtime');const hs=document.querySelectorAll('#runtimeScroll h3');const keys=['sec_todos','sec_tasks','sec_activity','sec_commands','sec_diffs','sec_files','sec_catalog'];for(let i=0;i<hs.length&&i<keys.length;i++){hs[i].textContent=t(keys[i])}const _lvl2=S.snap?.user_task_level||0;updateLevelBtn(_lvl2);renderPreviewTabs()}
 function renderLanguageControls(){const sel=E('langSelect');if(!sel)return;const langs=Array.isArray(S.config?.supported_languages)?S.config.supported_languages:[];const cur=String(S.config?.language||currentLang());const active=document.activeElement===sel;if(!langs.length){setHtmlIfChanged('langSelect','','langSelect');return}const html=langs.map(row=>{const code=String(row?.code||'').trim();if(!code)return'';return `<option value=\"${esc(code)}\">${esc(String(row?.label||code))}</option>`}).join('');setHtmlIfChanged('langSelect',html,'langSelect');if(cur&&sel.value!==cur&&!active)sel.value=cur}
-async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;if(S.mdWorker){try{S.mdWorker.terminate()}catch(_){}S.mdWorker=null}applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderBoards();scheduleRenderChat('language');renderSkillsEntryLink()}
+async function setLanguage(lang){const code=String(lang||'').trim();if(!code)return;await api('/api/config/language',{method:'POST',body:JSON.stringify({language:code})});if(S.activeId)await api('/api/sessions/'+encodeURIComponent(S.activeId)+'/config/language',{method:'POST',body:JSON.stringify({language:code,set_user_default:false})});S.config=S.config||{};S.config.language=code;if(S.snap)S.snap.ui_language=code;applyMainI18n();renderLanguageControls();renderStats();renderSessions();renderRuntimeStatus();renderTodoTaskPanels();renderActivityPanel();scheduleRenderChat('language');renderSkillsEntryLink()}
 function globalApiTimeoutMs(){const vals=[S.snap?.max_run_seconds,S.config?.request_timeout_default,S.config?.run_timeout];for(const raw of vals){const n=Number(raw);if(Number.isFinite(n)&&n>0)return Math.max(1000,Math.min(86400000,Math.round(n*1000)))}return 45000}
 async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{};const explicit=Number(o.timeoutMs);const timeoutMs=(Number.isFinite(explicit)&&explicit>0)?Math.max(1000,Math.min(86400000,Math.round(explicit))):globalApiTimeoutMs();delete o.timeoutMs;const ctl=(typeof AbortController==='function')?new AbortController():null;let timer=0;try{if(ctl){timer=setTimeout(()=>{try{ctl.abort()}catch(_){ }},timeoutMs)}const hdr={...(o.headers||{}), 'Content-Type':'application/json'};const r=await fetch(path,{...o,headers:hdr,signal:(ctl?ctl.signal:o.signal)});const t=await r.text();if(!r.ok){let msg=t;try{msg=JSON.parse(t).error||t}catch(_){}throw new Error(msg||'request failed')}return t?JSON.parse(t):{}}catch(err){if(err&&err.name==='AbortError'){throw new Error('request timeout')}throw err}finally{if(timer)clearTimeout(timer)}}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
@@ -1512,11 +1530,26 @@ function _deltaConsumeSeq(evt){
   if(S.snap&&typeof S.snap==='object')S.snap.event_seq=seq;
   return{ok:true,stale:false,gap:false};
 }
+function _applySessionTitleEvent(data,evt={}){
+  const payload=(data&&typeof data==='object')?data:{},sid=String(payload.session_id||evt.session_id||'').trim();
+  if(!sid)return false;
+  const rev=Number(payload.title_revision||0),title=String(payload.session_title||'').trim(),rows=Array.isArray(S.sessions)?S.sessions:[];
+  let changed=false,workspaceId=String(payload.workspace_id||'').trim();
+  const target=S.sessionById?.get(sid)||rows.find(row=>String(row?.id||'')===sid);
+  if(target){workspaceId=workspaceId||String(target.workspace_id||'').trim();if(title&&rev>=Number(target.title_revision||0)&&(target.title!==title||target.title_origin!==payload.title_origin)){target.title=title;target.title_origin=payload.title_origin||target.title_origin;target.title_revision=rev;changed=true}}
+  if(workspaceId){
+    const peers=rows.filter(row=>String(row?.workspace_id||'').trim()===workspaceId),first=peers.slice().sort((a,b)=>Number(a?.created_at||a?.updated_at||0)-Number(b?.created_at||b?.updated_at||0))[0],name=String(payload.workspace_name||first?.title||'').trim();
+    for(const row of peers){if(name&&row.workspace_name!==name){row.workspace_name=name;changed=true}if(payload.workspace_created_at!=null&&Number(row.workspace_created_at||0)!==Number(payload.workspace_created_at||0)){row.workspace_created_at=Number(payload.workspace_created_at||0);changed=true}if(payload.workspace_label&&row.workspace_label!==payload.workspace_label){row.workspace_label=String(payload.workspace_label);changed=true}}
+  }
+  if(changed){S.lastSessionsSig='';_deltaScheduleRender({sessions:true});}
+  return changed;
+}
 function _deltaApplyRuntimeEvent(evt){
   if(!_deltaEnsureSnapshot())return{handled:false,needsSnapshot:true};
   const typ=String(evt?.type||'').trim();
   const data=(evt&&typeof evt.data==='object')?evt.data:{};
   _deltaAdoptAgentRole(data);
+  if(data.session_title)_applySessionTitleEvent(data,evt);
   const ts=Number(evt?.ts||Date.now()/1000);
   if(Number.isFinite(ts)&&ts>0){
     const prevTs=Number(S.snap.updated_at||0);
@@ -1538,6 +1571,7 @@ function _deltaApplyRuntimeEvent(evt){
       S.snap.live_run_notice_started_at=Number(ts||Date.now()/1000)||Date.now()/1000;
       S.snap.live_run_notice_elapsed=0;
       S.snap.running=true;
+      _setSubmissionState(S.activeId,'running',{seenRunning:true});
     }else if(state==='tick'){
       S.snap.live_run_notice_active=true;
       S.snap.live_run_notice_label=label;
@@ -1688,7 +1722,8 @@ function _deltaApplyRuntimeEvent(evt){
     const schedulerQueueId=Number(data.scheduler_queue_id||0);
     const removedScheduler=(schedulerQueueId&&['started','cancelled','failed'].includes(schedulerStatus))?_deltaRemoveSchedulerQueued(schedulerQueueId,''):0;
     const summaryLow=String(data.summary||'').trim().toLowerCase();
-    if(summaryLow==='run finished')S.snap.running=false;
+    if(typ==='tool_start')_setSubmissionState(S.activeId,'running',{seenRunning:true});
+    if(summaryLow==='run finished'){S.snap.running=false;_setSubmissionState(S.activeId,'complete')}
     _deltaScheduleRender({chat:removedScheduler>0||typ==='tool_start'||typ==='tool_result',boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
@@ -1735,11 +1770,17 @@ function _deltaStartWatchdog(){
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function openProgram(){const port=Number(S.config?.ide_port||0);if(!S.config?.ide_enabled||!Number.isFinite(port)||port<=0){showError('Program IDE is disabled.');return}location.href=`${location.protocol}//${location.hostname||'127.0.0.1'}:${port}/`}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
-function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
+function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${String(row?.id||'')}:${Number(row?.seq||0)}:${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');const scope=snap?.todo_task_scope||{};const todoRows=Array.isArray(snap?.todos)?snap.todos:[];const taskRows=Array.isArray(snap?.tasks)?snap.tasks:[];const todoSig=todoRows.map(row=>`${String(row?.key||row?.plan_step_id||'')}:${String(row?.status||'')}:${String(row?.content||'')}`).join('~');const taskSig=taskRows.map(row=>`${String(row?.subtask_id||row?.id||'')}:${String(row?.status||'')}:${String(row?.subject||'')}`).join('~');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),String(scope.kind||'default'),String(scope.task_epoch||''),String(scope.plan_epoch||''),String(scope.parent_step_id||''),todoSig,taskSig,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
-function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
-function mergeSessionRows(base,incoming){const map=new Map();for(const row of Array.isArray(base)?base:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...row})}for(const row of Array.isArray(incoming)?incoming:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...(map.get(id)||{}),...row})}return Array.from(map.values()).sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0))}
-function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{};const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]);const append=!!opt.append;const keepExisting=append||Number(S.sessions?.length||0)>rows.length;S.sessions=keepExisting?mergeSessionRows(S.sessions,rows):rows;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=S.sessions.length?total:S.sessions.length;const offset=Number(payload.offset||0);const limit=Number(payload.limit||rows.length||0);const next=Number.isFinite(offset)&&Number.isFinite(limit)?offset+rows.length:S.sessions.length;S.sessionNextOffset=Math.max(Number(S.sessionNextOffset||0),next,S.sessions.length);const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
+function sessionsSignature(list){const rows=Array.isArray(list)?list:[],aid=String(S.activeId||'').trim(),activeRow=aid?S.sessionById.get(aid):null,activeSig=activeRow?`${aid}:${String(activeRow.title||'')}:${Number(activeRow.title_revision||0)}:${activeRow.running?1:0}:${Number(activeRow.message_count||0)}:${Number(activeRow.updated_at||0)}`:`missing:${aid||'-'}`,first=String(rows[0]?.id||''),last=String(rows[rows.length-1]?.id||'');return `${Number(S.sessionCatalogRevision||0)}|${rows.length}|${first}|${last}|active=${activeSig}`}
+function _scheduleSubmissionStatusRender(){if(S.submissionRenderRaf)return;S.submissionRenderRaf=requestAnimationFrame(()=>{S.submissionRenderRaf=0;renderRuntimeStatus()})}
+function _pruneSubmissionStates(){const now=Date.now();for(const [sid,row] of S.submissionBySession){const age=now-Number(row?.updatedAt||row?.createdAt||0);if((row?.status==='failed'&&age>SUBMISSION_FAILURE_VISIBLE_MS)||age>SUBMISSION_STATE_TTL_MS)S.submissionBySession.delete(sid)}while(S.submissionBySession.size>SUBMISSION_STATE_MAX){const oldest=S.submissionBySession.keys().next().value;if(oldest===undefined)break;S.submissionBySession.delete(oldest)}}
+function _setSubmissionState(sessionId,status,extra={}){const sid=String(sessionId||'').trim();if(!sid)return null;_pruneSubmissionStates();if(status==='idle'||status==='complete'){S.submissionBySession.delete(sid);_scheduleSubmissionStatusRender();return null}const previous=S.submissionBySession.get(sid)||{};const now=Date.now();const row={...previous,...extra,status:String(status||previous.status||'checking'),createdAt:Number(previous.createdAt||now),updatedAt:now,seenRunning:!!(previous.seenRunning||extra.seenRunning||status==='running')};S.submissionBySession.delete(sid);S.submissionBySession.set(sid,row);_pruneSubmissionStates();_scheduleSubmissionStatusRender();return row}
+function _submissionStateFromAck(sessionId,out){const payload=(out&&typeof out==='object')?out:{};if(payload.running||payload.live_input)return _setSubmissionState(sessionId,'running',{seenRunning:true,queueId:Number(payload.queue_id||0)});if(payload.queued){const starting=!!(payload.scheduler_started||payload.scheduler_starting||payload.deferred_start);return _setSubmissionState(sessionId,starting?'starting':'queued',{queueId:Number(payload.queue_id||0),queuePosition:Number(payload.queue_position||0),queueSize:Number(payload.queue_size||0)})}return _setSubmissionState(sessionId,payload.accepted?'accepted':'checking',{queueId:Number(payload.queue_id||0)})}
+function _reconcileSubmissionState(sessionId,snap){const sid=String(sessionId||'').trim();if(!sid)return null;_pruneSubmissionStates();let row=S.submissionBySession.get(sid)||null;if(snap?.running){if(!row||row.status!=='running')row=_setSubmissionState(sid,'running',{seenRunning:true});return row}if(snap?.scheduler_starting){if(!row||row.status!=='starting')row=_setSubmissionState(sid,'starting');return row}if(!row)return null;if(row.seenRunning){S.submissionBySession.delete(sid);return null}const age=Date.now()-Number(row.createdAt||Date.now());if((row.status==='submitting'||row.status==='accepted'||row.status==='starting')&&age>SUBMISSION_START_GRACE_MS){row={...row,status:'checking',updatedAt:Date.now()};S.submissionBySession.set(sid,row)}return row}
+function _submissionStatusLabel(row){if(!row)return'';const status=String(row.status||'checking');if(status==='queued'){const pos=Number(row.queuePosition||0);const size=Number(row.queueSize||0);return `${t('queued')}${pos?` #${pos}${size?`/${size}`:''}`:''}`}return t(status==='failed'?'submit_failed':status)}
+function mergeSessionRows(base,incoming,opt={}){const current=Array.isArray(base)?base:[],rows=Array.isArray(incoming)?incoming:[],append=!!opt.append;if(!S.sessionById.size)for(const row of current){const id=String(row?.id||'').trim();if(id)S.sessionById.set(id,row)}const incomingIds=new Set(),head=[];for(const raw of rows){const id=String(raw?.id||'').trim();if(!id)continue;incomingIds.add(id);const row={...(S.sessionById.get(id)||{}),...raw};S.sessionById.set(id,row);head.push(row)}let merged;if(append){merged=current.slice();const present=new Set(merged.map(row=>String(row?.id||'')));for(const row of head){if(!present.has(row.id)){merged.push(row);present.add(row.id)}}}else{merged=head.concat(current.filter(row=>!incomingIds.has(String(row?.id||''))))}if(merged.length>SESSION_CLIENT_CACHE_MAX){const active=String(S.activeId||''),kept=merged.slice(0,SESSION_CLIENT_CACHE_MAX);if(active&&!kept.some(row=>row.id===active)){const activeRow=S.sessionById.get(active);if(activeRow)kept[kept.length-1]=activeRow}merged=kept;const keptIds=new Set(merged.map(row=>String(row?.id||'')));for(const id of [...S.sessionById.keys()])if(!keptIds.has(id))S.sessionById.delete(id)}return merged}
+function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{},rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]),append=!!opt.append,offset=Math.max(0,Number(payload.offset||0)||0);if(!append&&offset===0&&opt.reset){S.sessions=[];S.sessionById.clear();S.sessionNextOffset=0}S.sessions=mergeSessionRows(S.sessions,rows,{append});const revision=Number(payload.catalog_revision);if(Number.isFinite(revision))S.sessionCatalogRevision=revision;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=rows.length?total:Math.max(S.sessions.length,rows.length);const next=offset+rows.length;S.sessionNextOffset=append?Math.max(Number(S.sessionNextOffset||0),next):next;const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'shell_timeout_mode'))S.config.shell_timeout_mode=String(cfg.shell_timeout_mode||'auto');if(Object.prototype.hasOwnProperty.call(cfg,'shell_async_handoff_seconds'))S.config.shell_async_handoff_seconds=cfg.shell_async_handoff_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
 function renderStats(){const sessions=Math.max(Number(S.sessionTotal||0),S.sessions.length);const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
@@ -1774,7 +1815,7 @@ function renderSessions(){
     },{passive:true});
   }
 }
-function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!snap?.running;let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){rows.push({id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount});idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed)return false;rows[idx]=next}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
+function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!(snap?.running||snap?.scheduler_starting);let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim(),titleRevision=Number(snap?.title_revision||0);if(idx<0){const next={id:sid,title:title||sid,title_revision:titleRevision,running:running,updated_at:updatedAt,message_count:msgCount};rows.push(next);S.sessionById.set(sid,next);idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&titleRevision>=Number(cur.title_revision||0)&&String(cur.title||'')!==title){next.title=title;next.title_revision=titleRevision;changed=true}if(!changed){S.sessionById.set(sid,cur);return false}rows[idx]=next;S.sessionById.set(sid,next)}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
 function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮'||t.startsWith('⋮ '))return 'diff-line-hunk';return ''}
 function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"diff-row ${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
 function _scrollContainerToNodeCenter(container,target){
@@ -3143,7 +3184,7 @@ function renderActivePreview(forceReload=false){
   body.setAttribute('data-preview-ticket',ticket);
   fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<article class=\"preview-md msg-md\">${renderMarkdownCached(txt,`pv:${key}:${txt.length}`)}</article>`;const article=body.querySelector('article.preview-md');if(article){_mathTypeset(article,`pv:${key}:${txt.length}`)}}).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`})
 }
-function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
+function _chatVirtRowKey(row,idx){const r=row||{};const id=String(r.id||'').trim(),seq=Number(r.seq||r.event_seq||0);if(id)return`id:${id}`;if(seq>0)return`seq:${seq}`;const txt=String(r.text||''),th=String(r.thinking||'');const fingerprint=`${Number(r.ts||0).toFixed(6)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt}:${th}`;return`fp:${fingerprint}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
 const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_proposal','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge','runtime_hint']);
@@ -3552,14 +3593,17 @@ function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.
 function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
-  const rows=[];
+  const rows=[],seen=new Set();
   for(let i=0;i<feed.length;i++){
     const r=feed[i]||{};
     const txt=String(r.text||'').trim();
     if(/^\\[SKILL EXECUTION GUIDE:\\s*[^\\]]+\\]/i.test(txt))continue;
     const syntheticText=isSyntheticPublicProgress(txt),syntheticData=isSyntheticPublicProgress(r.data?.public_progress);
     if((syntheticText||syntheticData)&&String(r.type||'message')!=='tool_calls')continue;
-    const clean={...r,_vk:_chatVirtRowKey(r,i)};
+    const key=_chatVirtRowKey(r,i);
+    if(seen.has(key))continue;
+    seen.add(key);
+    const clean={...r,_vk:key};
     if(syntheticText)clean.text='';
     if(syntheticData){clean.data={...(r.data||{})};delete clean.data.public_progress}
     rows.push(clean);
@@ -3794,6 +3838,21 @@ function _chatVirtParseRuntimeHint(raw){
   const meta=RUNTIME_HINT_RENDER_META[name]||{labelKey:'event_reminder',tone:'notice'};
   return {name,body:String(m[2]||'').trim(),meta:{label:t(String(meta.labelKey||'event_reminder')),tone:String(meta.tone||'notice')}};
 }
+function _chatVirtRuntimeHintFromMessage(m){
+  const data=(m&&typeof m.data==='object')?m.data:{};
+  const structured=String(m?.type||'').toLowerCase()==='runtime_hint';
+  const name=String(data.control_tag||'').trim().toLowerCase();
+  if(structured){
+    const renderMeta=RUNTIME_HINT_RENDER_META[name]||{labelKey:'event_reminder',tone:'notice'};
+    return {
+      name:name||'runtime',
+      body:String(data.details||m?.text||'').trim(),
+      data,
+      meta:{label:String(data.title||t(String(renderMeta.labelKey||'event_reminder'))),tone:String(renderMeta.tone||'notice')},
+    };
+  }
+  return (m?.role==='user')?_chatVirtParseRuntimeHint(String(m?.text||'')):null;
+}
 function _chatVirtBuildMessageNode(m){
       let kind='assistant_text';
       const rawTextForKind=String(m?.text||'');
@@ -3805,7 +3864,7 @@ function _chatVirtBuildMessageNode(m){
       const parsedToolEventText=_chatVirtParseToolEventText(rawTextForKind);
       const parsedLiveUserAdjustment=_chatVirtParseLiveUserAdjustment(rawTextForKind);
       const parsedUserFeedbackMerge=_chatVirtParseUserFeedbackMerge(rawTextForKind);
-      const parsedRuntimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(rawTextForKind):null;
+      const parsedRuntimeHint=_chatVirtRuntimeHintFromMessage(m);
       if(m.type==='manager_delegate')kind='manager_delegate';
       else if(m.type==='agent_bus')kind='agent_bus';
       else if(m.type==='tool_calls')kind='tool_calls';
@@ -4346,9 +4405,21 @@ function _chatVirtBuildMessageNode(m){
     const hintLabel=String(runtimeHint.meta?.label||'Runtime Hint');
     const hintTone=String(runtimeHint.meta?.tone||'notice');
     const bodyKey=`${textKey}:runtime-hint`;
-    const hintBody=runtimeHint.body||finalText;
-    const plainHtml=`<div class=\"msg-md\"><div class=\"md-callout ${esc(hintTone)}\"><div class=\"md-callout-head\">${esc(hintLabel)}</div><div class=\"md-callout-body\">${renderMarkdownCached(hintBody,bodyKey)}</div></div></div>`;
-    d.innerHTML=`${plainHtml}`;
+    const hintBody=String(runtimeHint.body||finalText||'').trim();
+    const info=(runtimeHint.data&&typeof runtimeHint.data==='object')?runtimeHint.data:{};
+    const pills=[
+      info.returned!==undefined?_chatVirtEventPillHtml(`${Number(info.returned)||0} ${t('event_returned')}`,'ok'):'',
+      info.matched_rows!==undefined?_chatVirtEventPillHtml(`${Number(info.matched_rows)||0} ${t('event_matches')}`,'info'):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml(t('event_query'),String(info.query||''),{mono:true}),
+      _chatVirtEventCellHtml(t('event_reason'),String(info.reason||''),{}),
+      _chatVirtEventCellHtml(t('event_archive'),String(info.archive_segment||''),{mono:true}),
+    ];
+    const summary=String(m?.text||'').trim();
+    const details=hintBody?`<details class=\"msg-runtime-details\"${info.default_collapsed===false?' open':''}><summary>${esc(t('event_details'))}</summary><pre>${esc(hintBody)}</pre></details>`:'';
+    const bodyHtml=`<div class=\"msg-event-body\">${summary?`<div class=\"msg-event-note\">${esc(summary)}</div>`:''}${details}</div>`;
+    d.innerHTML=_chatVirtEventCardHtml(hintLabel,'',pills,grid,bodyHtml,`msg-event-card-runtime ${esc(hintTone)}`);
     d.setAttribute('data-math-request',bodyKey);
     return d;
   }
@@ -4911,7 +4982,7 @@ function fmtCompactAge(ts){const n=Number(ts||0);if(!n)return '';const secs=Math
 function fmtLastCompact(snap){const reason=snap?.last_compact_reason||'';if(!reason)return '-';const age=fmtCompactAge(snap?.last_compact_ts);return age?(reason+' · '+age):reason;}
 function answerAskUser(text){const val=String(text||'').trim();if(!val||!S.activeId)return;const promptEl=E('prompt');if(promptEl){promptEl.value=val;}sendMessage();}
 function renderAskUserCard(){const card=E('askUserCard');if(!card)return;const pq=S.snap?.pending_user_question;const show=!S.snap?.running&&pq&&String(pq.question||'').trim();if(!show){if(card.style.display!=='none'){card.style.display='none';card.innerHTML='';}return;}const q=String(pq.question||'').trim();const opts=Array.isArray(pq.options)?pq.options.filter(o=>String(o||'').trim()):[];const allowFree=pq.allow_free_text!==false;const role=String(pq.role||'agent');const roleLabel=role&&role!=='agent'?_chatVirtAgentRoleLabel(role):'';let btns='';if(opts.length){btns='<div class="ask-user-options">'+opts.map((o,i)=>`<button type="button" class="ask-user-opt" data-ask-idx="${i}">${esc(String(o))}</button>`).join('')+'</div>';}const hint=allowFree?esc(t('ask_user_free_hint')):esc(t('ask_user_pick_hint'));const html=`<div class="ask-user-head"><span class="ask-user-badge">${esc(t('ask_user_title'))}</span>${roleLabel?`<span class="ask-user-role">${esc(roleLabel)}</span>`:''}</div><div class="ask-user-q">${esc(q)}</div>${btns}<div class="ask-user-hint">${hint}</div>`;if(card.innerHTML!==html){card.innerHTML=html;card.querySelectorAll('.ask-user-opt').forEach(b=>{b.addEventListener('click',()=>{const idx=parseInt(b.getAttribute('data-ask-idx')||'-1',10);if(idx>=0&&idx<opts.length)answerAskUser(opts[idx]);});});}card.style.display='';}
-function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const _awaitingUser=!S.snap?.running&&S.snap?.pending_user_question&&String(S.snap?.pending_user_question?.question||'').trim();const _stateVal=_awaitingUser?t('rt_awaiting_user'):(S.snap?.running?t('running'):t('idle'));const _stateTone=_awaitingUser?'state-awaiting':(S.snap?.running?'state-running':'state-idle');const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:fmtLastCompact(S.snap)},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:_stateVal,tone:_stateTone}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
+function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const _awaitingUser=!S.snap?.running&&S.snap?.pending_user_question&&String(S.snap?.pending_user_question?.question||'').trim();const _submission=_reconcileSubmissionState(S.activeId,S.snap);const _stateVal=S.snap?.running?t('running'):(S.snap?.scheduler_starting?t('starting'):(_submission?_submissionStatusLabel(_submission):(_awaitingUser?t('rt_awaiting_user'):t('idle'))));const _stateTone=_awaitingUser&&!_submission?'state-awaiting':((S.snap?.running||S.snap?.scheduler_starting||_submission)?'state-running':'state-idle');const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:fmtLastCompact(S.snap)},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:_stateVal,tone:_stateTone}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
 function renderPlanLevelControls(){const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';setTextIfChanged(_pmBtn,'Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1))}updateLevelBtn(S.snap?.user_task_level||0)}
 function renderTodoTaskPanels(){const scope=S.snap?.todo_task_scope||{kind:'default'};const scopeSig=_safeJsonSig(scope);const todoSig=currentLang()+'|'+String(S.snap?.plan_mode_preference||'auto')+'|'+scopeSig+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+scopeSig+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[],scope))}}
 function renderActivityPanel(){const rows=(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));const sig=currentLang()+'|'+rows.map(a=>`${Number(a.ts||0)}:${String(a.summary||'')}`).join('|');if(S.renderSigs.activitySig===sig)return;S.renderSigs.activitySig=sig;setPanelHtml('activity',rows.map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`)}
@@ -4981,10 +5052,11 @@ async function refreshSessions(opt={}){
   const autoSelect=opt.autoSelect!==false;
   const limit=Math.max(20,Math.min(500,Number(opt.limit||SESSION_REFRESH_LIMIT)||SESSION_REFRESH_LIMIT));
   const cfgPromise=useProvidedCfg?Promise.resolve(opt.statsConfig):api('/api/config?stats=1').catch(()=>null);
-  const rowsPromise=useProvidedRows?Promise.resolve(opt.sessions):api('/api/sessions?limit='+limit);
+  const search=String(S.sessionSearch||'').trim();
+  const rowsPromise=useProvidedRows?Promise.resolve(opt.sessions):api('/api/sessions?limit='+limit+'&offset=0'+(search?'&search='+encodeURIComponent(search):''));
   const [cfg,rowsRaw]=await Promise.all([cfgPromise,rowsPromise]);
   applyRuntimeConfigStats(cfg);
-  const page=applySessionPage(rowsRaw,{append:!!opt.append});
+  const page=applySessionPage(rowsRaw,{append:!!opt.append,reset:!!opt.reset});
   const sig=sessionsSignature(S.sessions);
   if(sig!==S.lastSessionsSig){S.lastSessionsSig=sig;renderSessions()}
   renderStats();
@@ -5002,7 +5074,8 @@ async function loadMoreSessions(opt={}){
   const offset=Math.max(0,Number(S.sessionNextOffset||S.sessions.length)||0);
   S.sessionLoadingMore=true;
   try{
-    const payload=await api('/api/sessions?limit='+limit+'&offset='+offset);
+    const search=String(S.sessionSearch||'').trim();
+    const payload=await api('/api/sessions?limit='+limit+'&offset='+offset+(search?'&search='+encodeURIComponent(search):''));
     const before=S.sessions.length;
     applySessionPage(payload,{append:true});
     const sig=sessionsSignature(S.sessions);
@@ -5013,16 +5086,7 @@ async function loadMoreSessions(opt={}){
     S.sessionLoadingMore=false;
   }
 }
-function scheduleLoadRemainingSessions(delayMs=450){
-  if(S.sessionLoadAllTimer||!S.sessionHasMore)return;
-  const delay=Math.max(120,Number(delayMs)||450);
-  S.sessionLoadAllTimer=setTimeout(async()=>{
-    S.sessionLoadAllTimer=0;
-    if(document.visibilityState==='hidden')return;
-    try{await loadMoreSessions({limit:SESSION_REFRESH_LIMIT})}catch(_){}
-    if(S.sessionHasMore)scheduleLoadRemainingSessions(650);
-  },delay);
-}
+function scheduleSessionSearch(value){clearTimeout(S.sessionSearchTimer);S.sessionSearchTimer=setTimeout(async()=>{S.sessionSearch=String(value||'').trim();S.sessionNextOffset=0;S.sessionHasMore=false;try{await refreshSessions({limit:SESSION_BOOT_LIMIT,reset:true,autoSelect:false})}catch(error){showError(error.message||String(error))}},220)}
 async function refreshDeferredCatalogs(){
   if(S.catalogRefreshInFlight)return;
   S.catalogRefreshInFlight=true;
@@ -5149,10 +5213,15 @@ async function refreshSnapshot(opt={}){
     return;
   }
   S.refreshInFlight=true;
+  const requestedSessionId=String(S.activeId||'');
   try{
-    ensurePreviewState(S.activeId);
+    ensurePreviewState(requestedSessionId);
     const q=forceFull?'?lite=0':'?lite=1';
-    S.snap=await api('/api/sessions/'+S.activeId+q);
+    const nextSnapshot=await api('/api/sessions/'+requestedSessionId+q);
+    // A session switch can happen while the network request is in flight.  Do
+    // not let the old response overwrite the newly selected session's state.
+    if(String(S.activeId||'')!==requestedSessionId)return;
+    S.snap=nextSnapshot;
     if(S.deltaRenderRaf){cancelAnimationFrame(S.deltaRenderRaf);S.deltaRenderRaf=0}
     S.deltaRenderChat=false;S.deltaRenderBoards=false;S.deltaRenderSessions=false;
     const snapSeq=Number(S.snap?.event_seq||0);
@@ -5325,8 +5394,12 @@ function _chatVirtResetScrollState(chatEl){
   chatEl._virtLastWinStart=-1;
   chatEl._virtLastWinEnd=-1;
 }
+function _initialSessionSnapshot(row){const src=(row&&typeof row==='object')?row:{};const now=Number(src.updated_at||Date.now()/1000),running=!!src.running;return{id:String(src.id||''),title:String(src.title||src.id||''),running:running,scheduler_starting:false,created_at:Number(src.created_at||now),updated_at:now,message_count:Math.max(0,Number(src.message_count||0)),model:_modelNameFromSelection(String(S.config?.model||''))||'',ui_language:String(src.ui_language||S.config?.language||currentLang()),execution_mode:String(S.config?.execution_mode||'sync'),thinking:false,thinking_stream:false,response_stream:false,conversation_feed:[],messages:[],operations:[],activity:[],todos:[],tasks:[],uploads:[],event_seq:0,agent_phase:running?'busy':'idle',queued_user_inputs_count:0}}
 async function selectSession(id,opt={}){
+  const catalogRow=S.sessionById.get(String(id||''))||(Array.isArray(S.sessions)?S.sessions.find(row=>String(row?.id||'')===String(id||'')):null)||{id};
+  const initialSnapshot=(opt.initialSnapshot&&typeof opt.initialSnapshot==='object')?opt.initialSnapshot:_initialSessionSnapshot(catalogRow);
   S.activeId=id;
+  if(initialSnapshot)S.snap=initialSnapshot;
   S.frozen=false;
   S.lastEventSeq=0;
   S.deltaGapCount=0;
@@ -5344,16 +5417,17 @@ async function selectSession(id,opt={}){
   ensurePreviewState(id);
   bindEvents(id);
   _deltaStartWatchdog();
-  pullRenderState(id,true);
   const immediateFull=!!opt.forceFullImmediate;
-  await refreshSnapshot({forceFull:immediateFull,allowWhenFrozen:true});
+  S.lastFeedSig='';
+  S.lastBoardsSig='';
+  scheduleRenderChat('session-shell');
+  renderBoards();
+  S.bootRendered=true;
+  scheduleSnapshot({forceFull:immediateFull,delayMs:0,allowWhenFrozen:true});
   renderPreviewTabs();
   renderPreviewVisibility();
   renderActivePreview(false);
-  if(!immediateFull&&String(S.activeId||'')===String(id||'')){
-    S.deferredFullSnapshotTimer=setTimeout(()=>{S.deferredFullSnapshotTimer=0;if(String(S.activeId||'')===String(id||''))scheduleSnapshot({forceFull:true,delayMs:0,allowWhenFrozen:true})},520);
-    S.deferredFileExplorerTimer=setTimeout(()=>{S.deferredFileExplorerTimer=0;S.fileExplorerDeferUntil=0;if(String(S.activeId||'')===String(id||''))refreshFileExplorer(false).catch(()=>{})},1700);
-  }
+  if(String(S.activeId||'')===String(id||''))S.deferredFileExplorerTimer=setTimeout(()=>{S.deferredFileExplorerTimer=0;S.fileExplorerDeferUntil=0;if(String(S.activeId||'')===String(id||''))refreshFileExplorer(false).catch(()=>{})},1700);
   showError('');
 }
 async function createSession(opt={}){
@@ -5361,13 +5435,15 @@ async function createSession(opt={}){
   const usePrompt=opt.prompt!==false;
   const defaultTitle=t('web_session');
   let title=String(opt.title||'').trim()||defaultTitle;
+  let userNamed=opt.userNamed===true||(!!String(opt.title||'').trim()&&opt.userNamed!==false);
   if(usePrompt){
     const input=prompt(t('session_title_prompt'),defaultTitle);
     if(input===null)return;
     title=String(input||'').trim()||defaultTitle;
+    userNamed=title!==defaultTitle;
   }
   try{
-    const out=await api('/api/sessions',{method:'POST',body:JSON.stringify({title})});
+    const out=await api('/api/sessions',{method:'POST',body:JSON.stringify({title,user_named:userNamed})});
     applyRuntimeConfigStats({session_creation_limit:out?.session_creation_limit});
     const sid=String(out?.id||'').trim();
     if(!sid){
@@ -5377,25 +5453,28 @@ async function createSession(opt={}){
     const row={
       id:sid,
       title:String(out?.title||title||defaultTitle),
+      title_origin:String(out?.title_origin||(userNamed?'manual':'default')),
+      title_revision:Number(out?.title_revision||0),
       running:false,
       updated_at:(Date.now()/1000),
       message_count:0,
       ui_language:String(out?.ui_language||S.config?.language||currentLang()),
     };
+    S.sessionById.set(sid,row);
     S.sessions=[row,...(Array.isArray(S.sessions)?S.sessions:[]).filter(x=>String(x?.id||'')!==sid)];
     const sig=sessionsSignature(S.sessions);
     if(sig!==S.lastSessionsSig){S.lastSessionsSig=sig;renderSessions()}
     renderStats();
-    await selectSession(sid);
+    await selectSession(sid,{initialSnapshot:_initialSessionSnapshot(row)});
   }catch(err){showError(err.message||String(err))}
 }
 async function renameSession(){if(!S.activeId){showError(t('select_session_first'));return}const old=S.sessions.find(x=>x.id===S.activeId)?.title||t('session_default');const s=prompt(t('rename_session_prompt'),old);if(!s)return;await api('/api/sessions/'+S.activeId,{method:'PATCH',body:JSON.stringify({title:s})});await refreshSessions();await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
-async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions();if(S.sessions.length)await selectSession(S.sessions[0].id)}
+async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.submissionBySession.delete(String(deletingId||''));S.sessionById.delete(deletingId);S.sessions=S.sessions.filter(row=>row.id!==deletingId);S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions({reset:true});if(S.sessions.length)await selectSession(S.sessions[0].id)}
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const configuredWait=Number(S.config?.chat_upload_frontend_wait_ms);const handoffWait=Number.isFinite(configuredWait)?Math.max(0,Math.min(5000,configuredWait)):CHAT_UPLOAD_HANDOFF_WAIT_MS;const uploadWait=await waitForPendingUploads(handoffWait);if(uploadWait&&!uploadWait.ok&&(uploadWait.timeout||uploadWait.error)){showError(uploadWait.timeout?'上传仍在后台处理；任务已先提交，文件完成后会出现在工作区。':`上传继续在后台处理：${uploadWait.error.message||uploadWait.error}`)}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
-async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
+async function sendMessage(){showError('');const promptEl=E('prompt');const promptText=promptEl.value.trim();const sessionId=String(S.activeId||'').trim();if(!promptText||!sessionId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();_setSubmissionState(sessionId,'submitting');promptEl.value='';try{const configuredWait=Number(S.config?.chat_upload_frontend_wait_ms);const handoffWait=Number.isFinite(configuredWait)?Math.max(0,Math.min(5000,configuredWait)):CHAT_UPLOAD_HANDOFF_WAIT_MS;const uploadWait=await waitForPendingUploads(handoffWait);if(uploadWait&&!uploadWait.ok&&(uploadWait.timeout||uploadWait.error)){showError(uploadWait.timeout?'上传仍在后台处理；任务已先提交，文件完成后会出现在工作区。':`上传继续在后台处理：${uploadWait.error.message||uploadWait.error}`)}const out=await api('/api/sessions/'+sessionId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});_submissionStateFromAck(sessionId,out);S.lastDeltaTs=Date.now();if(String(S.activeId||'')===sessionId)scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.deferred_start&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){_setSubmissionState(sessionId,'failed',{error:String(err?.message||err||'')});if(String(S.activeId||'')===sessionId&&!promptEl.value.trim())promptEl.value=promptText;showError(err.message||String(err))}}
+async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();const sessionId=String(S.activeId||'');await api('/api/sessions/'+sessionId+'/interrupt',{method:'POST'});_setSubmissionState(sessionId,'complete');S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
 async function toggleUserMemoryMode(e){if(e)e.preventDefault();if(S.config?.user_memory_setting_locked){showError(t('memory_mode_locked'));return}const cycle=['weak','on','off'];const cur=currentUserMemoryMode();const next=cycle[(cycle.indexOf(cur)+1+cycle.length)%cycle.length];try{const out=await api('/api/user-memory/config',{method:'POST',body:JSON.stringify({mode:next})});S.config=S.config||{};S.config.user_memory_mode=String(out?.user_memory_mode||next);renderMemoryModeAction();showError('')}catch(err){showError(err.message||String(err))}}
@@ -5420,7 +5499,7 @@ function renderApplicationSkillCatalog(){const host=E('applicationSkillCatalog')
 async function saveApplication(){const payload={name:E('applicationName').value.trim(),icon:E('applicationIcon').value.trim(),description:E('applicationDescription').value.trim(),skills:APP_STORE.selectedSkillIds};if(!payload.name){E('applicationEditorError').textContent=appText('name_required');return}if(!payload.skills.length){E('applicationEditorError').textContent=appText('skill_required');return}const path=APP_STORE.editingId?'/api/apps/'+encodeURIComponent(APP_STORE.editingId):'/api/apps/personal';await api(path,{method:APP_STORE.editingId?'PATCH':'POST',body:JSON.stringify(payload)});closeApplicationEditor();await loadApplicationStore(true);showError(appText('saved'))}
 async function submitApplication(app){if(!confirm(appText('confirm_submit')))return;await api('/api/apps/'+encodeURIComponent(app.id)+'/submit',{method:'POST',body:'{}'});await loadApplicationStore(true);showError(appText('submitted'))}
 async function deleteApplication(app){if(!confirm(appText('confirm_delete')))return;await api('/api/apps/'+encodeURIComponent(app.id),{method:'DELETE'});await loadApplicationStore(true);showError(appText('deleted'))}
-async function launchApplication(app){const out=await api('/api/apps/'+encodeURIComponent(app.id)+'/launch',{method:'POST',body:'{}'});applyRuntimeConfigStats({session_creation_limit:out?.session_creation_limit});const sid=String(out?.id||'').trim();if(!sid)throw new Error('application launch returned no session');const row={id:sid,title:String(out.title||app.name||sid),running:false,updated_at:Date.now()/1000,message_count:0,ui_language:String(out.ui_language||S.config?.language||currentLang()),app_binding:out.app_binding||{}};S.sessions=[row,...S.sessions.filter(x=>String(x?.id||'')!==sid)];S.lastSessionsSig=sessionsSignature(S.sessions);switchApplicationSide('sessions');renderSessions();renderStats();await selectSession(sid)}
+async function launchApplication(app){const out=await api('/api/apps/'+encodeURIComponent(app.id)+'/launch',{method:'POST',body:'{}'});applyRuntimeConfigStats({session_creation_limit:out?.session_creation_limit});const sid=String(out?.id||'').trim();if(!sid)throw new Error('application launch returned no session');const row={id:sid,title:String(out.title||app.name||sid),running:false,updated_at:Date.now()/1000,message_count:0,ui_language:String(out.ui_language||S.config?.language||currentLang()),app_binding:out.app_binding||{}};S.sessionById.set(sid,row);S.sessions=[row,...S.sessions.filter(x=>String(x?.id||'')!==sid)];S.lastSessionsSig=sessionsSignature(S.sessions);switchApplicationSide('sessions');renderSessions();renderStats();await selectSession(sid)}
 function bindApplicationStore(){bindClick('sessionsSideTab',()=>switchApplicationSide('sessions'));bindClick('appsSideTab',()=>switchApplicationSide('apps'));bindClick('personalAppsTab',()=>switchApplicationScope('personal'));bindClick('sharedAppsTab',()=>switchApplicationScope('shared'));bindClick('newApplicationBtn',()=>openApplicationEditor());bindClick('refreshApplicationsBtn',()=>loadApplicationStore(true));bindClick('closeApplicationEditorBtn',closeApplicationEditor);bindClick('cancelApplicationEditorBtn',closeApplicationEditor);bindClick('saveApplicationBtn',()=>saveApplication().catch(err=>{E('applicationEditorError').textContent=err.message||String(err)}));const search=E('applicationSkillSearch');if(search)search.oninput=renderApplicationSkillCatalog;const modal=E('applicationEditor');if(modal)modal.addEventListener('click',ev=>{if(ev.target===modal)closeApplicationEditor()});applyApplicationI18n()}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
 async function refreshAll(forceProbe=false){
@@ -5450,12 +5529,35 @@ function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
 window.addEventListener('DOMContentLoaded',()=>bindClick('programBtn',openProgram));
 window.addEventListener('DOMContentLoaded',()=>{bindClick('refreshUserProcessesBtn',()=>refreshUserProcesses(true).catch(err=>showError(err.message)));USER_PROCESS_STATE.timer=setInterval(()=>{if(document.visibilityState!=='hidden')refreshUserProcesses(false).catch(()=>{})},5000)});
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
-window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
+function kernelNoticeDeviceId(){let value=localStorage.getItem('clouds_kernel_notice_device')||'';if(value.length<24){const bytes=new Uint8Array(18);crypto.getRandomValues(bytes);value='web_'+Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');localStorage.setItem('clouds_kernel_notice_device',value)}return value}
+async function acknowledgeKernelNotice(version){const deviceId=kernelNoticeDeviceId();await api('/api/kernel/update-notice/ack',{method:'POST',body:JSON.stringify({device_id:deviceId,version})});E('kernelUpdateModal').style.display='none'}
+async function checkKernelUpdateNotice(){try{const deviceId=kernelNoticeDeviceId(),out=await api('/api/kernel/update-notice?device_id='+encodeURIComponent(deviceId)),notice=out?.notice;if(!notice)return;E('kernelUpdateMeta').textContent=`Version ${notice.version} · score ${Number(notice.score||0).toFixed(1)} · ${notice.canary?'Canary':'Stable'}`;E('kernelUpdateChangelog').textContent=notice.changelog||'The liquid agent kernel has been upgraded.';E('kernelUpdateModal').dataset.version=notice.version;E('kernelUpdateModal').style.display='flex'}catch(_){}}
+window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});bindClick('kernelUpdateConfirm',()=>acknowledgeKernelNotice(E('kernelUpdateModal').dataset.version||''));bindClick('kernelUpdateClose',()=>acknowledgeKernelNotice(E('kernelUpdateModal').dataset.version||''));renderMemoryModeAction();setTimeout(checkKernelUpdateNotice,500)});
+window.addEventListener('DOMContentLoaded',()=>{const search=E('sessionSearch');if(search){search.value=S.sessionSearch;search.addEventListener('input',()=>scheduleSessionSearch(search.value))}});
 """
 
-# split-source: order=959 original-lines=89415-89454 hash=655a539a8a0eacf3
+# split-source: order=1064 original-lines=97434-97450 hash=1f328a483cfc505e
 
-APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
+APP_CSS += r"""
+:root{--web-scrollbar-size:8px;--web-scrollbar-thumb:rgba(98,116,142,.44);--web-scrollbar-thumb-hover:rgba(76,98,128,.7)}
+.session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
+html,body{scrollbar-gutter:stable}
+*{scrollbar-width:thin;scrollbar-color:transparent transparent!important}
+*:hover,*:focus,*:focus-within{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}
+*::-webkit-scrollbar{width:var(--web-scrollbar-size);height:var(--web-scrollbar-size)}
+*::-webkit-scrollbar-track,*::-webkit-scrollbar-corner{background:transparent!important}
+*::-webkit-scrollbar-button{display:none;width:0;height:0}
+*::-webkit-scrollbar-thumb{min-height:28px;border:2px solid transparent;border-radius:999px;background:transparent!important;background-clip:padding-box!important}
+*:hover::-webkit-scrollbar-thumb,*:focus::-webkit-scrollbar-thumb,*:focus-within::-webkit-scrollbar-thumb,*:active::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb)!important;background-clip:padding-box!important}
+*:hover::-webkit-scrollbar-thumb:hover,*:focus-within::-webkit-scrollbar-thumb:hover{background:var(--web-scrollbar-thumb-hover)!important;background-clip:padding-box!important}
+#chat,#sessionList,.chat-tabs,.preview-body,.preview-code-scroll,.msg-md .md-code,.msg-code-shell,.msg-diff-shell,#activity,#commands,#diffs,#fileExplorer,#catalog,.popup-menu,.application-list,.application-editor-body,.application-skill-catalog,.modal,.modal-body{scrollbar-gutter:stable}
+@media(hover:none),(pointer:coarse){*:active{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}*:active::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb)!important;background-clip:padding-box!important}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+"""
+
+# split-source: order=1065 original-lines=97451-97490 hash=3bb1241d6a6545d4
+
+APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number};
 type Msg={role:string;text:string;type?:string;data?:Record<string,unknown>;thinking?:string;agent_role?:string;[key:string]:unknown};
 type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
 type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;response_stream?:boolean;live_thinking?:string;live_response_text?:string;live_response_role?:string;live_response_label?:string;live_response_stream_id?:string;live_response_active?:boolean;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;multi_agent_context_hud_enabled?:boolean;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};

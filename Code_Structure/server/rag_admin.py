@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1066 original-lines=121779-121936 hash=854829282d494ae6
+# split-source: order=1179 original-lines=131738-131895 hash=854829282d494ae6
 
 
 class _RagAdminAuthMixin:
@@ -165,7 +165,7 @@ class _RagAdminAuthMixin:
             )
         return True
 
-# split-source: order=1068 original-lines=122051-122239 hash=c1b91099095057bf
+# split-source: order=1181 original-lines=132010-132210 hash=f94df43f580e59d4
 
 
 class RagAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
@@ -342,6 +342,18 @@ class RagAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/evidence-batches":
+            try:
+                out = self.app.rag_evidence_batches(self._user_id(), self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/rag/synthesize-evaluations":
+            try:
+                out = self.app.rag_synthesize_evaluations(self._user_id(), self._read_json())
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/rag/rebuild":
             try:
                 out = self.app.rag_rebuild()
@@ -356,7 +368,7 @@ class RagAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
-# split-source: order=1069 original-lines=122240-122438 hash=6e5644e269e55ae3
+# split-source: order=1182 original-lines=132211-132409 hash=6e5644e269e55ae3
 
 
 class CodeAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):

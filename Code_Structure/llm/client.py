@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=919 original-lines=24200-24222 hash=ec5cc2a0de1c5071
+# split-source: order=1024 original-lines=25323-25345 hash=ec5cc2a0de1c5071
 
 
 class OllamaError(RuntimeError):
@@ -30,7 +30,7 @@ class OllamaError(RuntimeError):
         self.retryable = retryable
         self.transient = transient
 
-# split-source: order=920 original-lines=24223-26538 hash=ea6456c19eb701d3
+# split-source: order=1025 original-lines=25346-27848 hash=a2b922e1238d414b
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
@@ -863,6 +863,8 @@ class OllamaClient:
             ):
                 continue
             out.append(row)
+        if is_openai_like_provider(provider):
+            out = self._sanitize_openai_tool_history(out)
         media_rows = [m for m in (media_inputs or []) if isinstance(m, dict)]
         if not media_rows:
             return out
@@ -921,7 +923,11 @@ class OllamaClient:
             thinking_parts.append(thinking_inline)
         # Match the streaming path's 4-key coverage (some providers use
         # `thinking`/`thought` on the message object, not just reasoning*).
-        seen_thinking = set()
+        seen_thinking = {
+            str(item).strip()
+            for item in thinking_parts
+            if str(item).strip()
+        }
         for key in ("reasoning_content", "reasoning", "thinking", "thought"):
             extra_text = str(msg.get(key) or "").strip()
             if extra_text and extra_text not in seen_thinking:
@@ -1537,11 +1543,101 @@ class OllamaClient:
                 out.append(msg)
         return out
 
+    @staticmethod
+    def _is_ambiguous_invalid_parameter_error(exc: Exception) -> bool:
+        if int(getattr(exc, "status", 0) or 0) != 400:
+            return False
+        details = f"{exc} {getattr(exc, 'body', '')}".lower().replace("_", "")
+        return (
+            "invalidparameter" in details
+            or "parameter specified in the request is not valid" in details
+            or ('"param":""' in details and "badrequest" in details)
+        )
+
+    @staticmethod
+    def _minimal_openai_compat_payload(payload: dict, reasoning_strip: list[str] | None = None) -> dict:
+        optional = {
+            "temperature",
+            "max_tokens",
+            "max_completion_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+            "stop",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+            "logprobs",
+            "top_logprobs",
+        }
+        optional.update(str(key) for key in (reasoning_strip or []) if str(key))
+        return {key: value for key, value in payload.items() if key not in optional}
+
+    @staticmethod
+    def _sanitize_openai_tool_history(messages: list[dict]) -> list[dict]:
+        """Repair incomplete OpenAI tool-call blocks before sending them.
+
+        Strict compatible endpoints reject an assistant ``tool_calls`` message
+        unless every retained call is followed immediately by a matching tool
+        result. Runtime gates can intentionally skip part of a multi-call batch,
+        and older persisted sessions may therefore contain incomplete blocks.
+        Keep complete pairs, remove dangling calls, and discard orphan results.
+        """
+        rows = [dict(row) for row in (messages or []) if isinstance(row, dict)]
+        cleaned: list[dict] = []
+        index = 0
+        while index < len(rows):
+            row = rows[index]
+            role = str(row.get("role", "") or "").strip().lower()
+            raw_calls = row.get("tool_calls")
+            if role == "assistant" and isinstance(raw_calls, list) and raw_calls:
+                calls: list[dict] = []
+                seen_call_ids: set[str] = set()
+                for raw_call in raw_calls:
+                    if not isinstance(raw_call, dict):
+                        continue
+                    call_id = str(raw_call.get("id", "") or "").strip()
+                    if not call_id or call_id in seen_call_ids:
+                        continue
+                    seen_call_ids.add(call_id)
+                    calls.append(dict(raw_call))
+
+                result_index = index + 1
+                results_by_id: dict[str, dict] = {}
+                while result_index < len(rows):
+                    result = rows[result_index]
+                    if str(result.get("role", "") or "").strip().lower() != "tool":
+                        break
+                    tool_call_id = str(result.get("tool_call_id", "") or "").strip()
+                    if tool_call_id and tool_call_id not in results_by_id:
+                        results_by_id[tool_call_id] = result
+                    result_index += 1
+
+                matched_calls = [call for call in calls if str(call.get("id", "") or "") in results_by_id]
+                assistant_row = dict(row)
+                if matched_calls:
+                    assistant_row["tool_calls"] = matched_calls
+                    cleaned.append(assistant_row)
+                    for call in matched_calls:
+                        cleaned.append(results_by_id[str(call.get("id", "") or "")])
+                else:
+                    assistant_row.pop("tool_calls", None)
+                    if str(assistant_row.get("content", "") or "").strip():
+                        cleaned.append(assistant_row)
+                index = result_index
+                continue
+            if role != "tool":
+                cleaned.append(row)
+            index += 1
+        return cleaned
+
     def _chat_openai_compat(
         self,
         req_messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
@@ -1562,6 +1658,12 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+        forced_tool_name = str(tool_choice or "").strip()
+        if tools and forced_tool_name:
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": forced_tool_name},
+            }
         reasoning = reasoning or {}
         reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
         reasoning_strip = list(reasoning.get("strip_keys", []) or []) if isinstance(reasoning, dict) else []
@@ -1581,6 +1683,22 @@ class OllamaClient:
             except OllamaError as exc:
                 err_text = str(exc).lower()
                 status_400 = int(getattr(exc, "status", 0) or 0) == 400
+                if self._is_ambiguous_invalid_parameter_error(exc):
+                    minimal_payload = self._minimal_openai_compat_payload(payload, reasoning_strip)
+                    try:
+                        lines = self._iter_response_lines_url_with_retries(
+                            endpoint,
+                            minimal_payload,
+                            headers=self._render_headers(),
+                            max_attempts=http_retry_attempts,
+                            cancel_check=cancel_check,
+                            on_retry=on_http_retry,
+                        )
+                        return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+                    except OllamaError as retry_exc:
+                        exc = retry_exc
+                        err_text = str(retry_exc).lower()
+                        status_400 = int(getattr(retry_exc, "status", 0) or 0) == 400
                 # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
                 # Collapse tool messages into user messages and retry the stream.
                 if status_400 and (
@@ -1593,6 +1711,22 @@ class OllamaClient:
                     lines = self._iter_response_lines_url_with_retries(
                         endpoint,
                         fallback_payload,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                    return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+                # Tool choice is an optional compatibility optimization.  A
+                # number of otherwise OpenAI-compatible local gateways accept
+                # tools but reject this field; retry without it rather than
+                # turning a capability mismatch into a failed agent round.
+                if status_400 and "tool_choice" in payload:
+                    stripped = dict(payload)
+                    stripped.pop("tool_choice", None)
+                    lines = self._iter_response_lines_url_with_retries(
+                        endpoint,
+                        stripped,
                         headers=self._render_headers(),
                         max_attempts=http_retry_attempts,
                         cancel_check=cancel_check,
@@ -1627,9 +1761,25 @@ class OllamaClient:
         except OllamaError as exc:
             err_text = str(exc).lower()
             status_400 = int(getattr(exc, "status", 0) or 0) == 400
+            raw = None
+            if self._is_ambiguous_invalid_parameter_error(exc):
+                minimal_payload = self._minimal_openai_compat_payload(payload, reasoning_strip)
+                try:
+                    raw = self._post_json_url_with_retries(
+                        endpoint,
+                        minimal_payload,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                except OllamaError as retry_exc:
+                    exc = retry_exc
+                    err_text = str(retry_exc).lower()
+                    status_400 = int(getattr(retry_exc, "status", 0) or 0) == 400
             # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
             # Retry once with tool messages collapsed into user messages.
-            if status_400 and (
+            if raw is None and status_400 and (
                 "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
             ):
                 fallback_msgs = self._collapse_tool_role_messages(req_messages)
@@ -1644,7 +1794,19 @@ class OllamaClient:
                     cancel_check=cancel_check,
                     on_retry=on_http_retry,
                 )
-            elif status_400 and reasoning_strip and any(k in payload for k in reasoning_strip):
+            elif raw is None and status_400 and "tool_choice" in payload:
+                stripped = dict(payload)
+                stripped.pop("tool_choice", None)
+                stripped["stream"] = False
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    stripped,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+            elif raw is None and status_400 and reasoning_strip and any(k in payload for k in reasoning_strip):
                 # Endpoint does not understand the reasoning field; drop and retry.
                 stripped = {k: v for k, v in payload.items() if k not in reasoning_strip}
                 stripped["stream"] = False
@@ -1656,7 +1818,7 @@ class OllamaClient:
                     cancel_check=cancel_check,
                     on_retry=on_http_retry,
                 )
-            else:
+            elif raw is None:
                 raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -1752,6 +1914,7 @@ class OllamaClient:
         req_messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
@@ -1830,6 +1993,9 @@ class OllamaClient:
             payload["system"] = "\n\n".join(system_parts)
         if tools:
             payload["tools"] = self._convert_tools_to_anthropic(tools)
+            forced_tool_name = str(tool_choice or "").strip()
+            if forced_tool_name:
+                payload["tool_choice"] = {"type": "tool", "name": forced_tool_name}
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -1844,11 +2010,23 @@ class OllamaClient:
                 raise
             except Exception as exc:
                 raise OllamaError(f"anthropic stream response failed: {exc}", url=endpoint) from exc
-        raw = self._post_json_url(endpoint, payload, headers=headers)
+        try:
+            raw = self._post_json_url(endpoint, payload, headers=headers)
+        except OllamaError as exc:
+            # Anthropic-compatible proxies do not all implement the optional
+            # tool_choice field.  Keep the native tool schema and retry once
+            # without the optimization before surfacing a provider error.
+            if int(getattr(exc, "status", 0) or 0) == 400 and "tool_choice" in payload:
+                fallback_payload = dict(payload)
+                fallback_payload.pop("tool_choice", None)
+                raw = self._post_json_url(endpoint, fallback_payload, headers=headers)
+            else:
+                raise
         # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
         # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
         if isinstance(raw.get("choices"), list) and tools:
             payload["tools"] = tools  # original OpenAI-format tools
+            payload.pop("tool_choice", None)
             raw = self._post_json_url(endpoint, payload, headers=headers)
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -1881,7 +2059,7 @@ class OllamaClient:
                         "arguments": json_dumps(block.get("input", {})),
                     },
                 })
-        return "\n".join(text_parts), tool_calls, "\n".join(thinking_parts)
+        return "\n".join(text_parts), self._normalize_tool_calls(tool_calls), "\n".join(thinking_parts)
 
     def _anthropic_stream_result_from_lines(self, lines, *, on_content_delta=None) -> dict:
         text_parts: list[str] = []
@@ -2121,6 +2299,7 @@ class OllamaClient:
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         system: str | None = None,
         max_tokens: int = 2000,
         temperature: float = 0.2,
@@ -2173,6 +2352,7 @@ class OllamaClient:
             return self._chat_openai_compat(
                 req_messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -2187,6 +2367,7 @@ class OllamaClient:
             return self._chat_anthropic(
                 req_messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -2259,8 +2440,12 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
-        if think:
-            native_payload["think"] = True
+        # Ollama reasoning models (for example qwen3/deepseek-r1) may enable
+        # thinking by default when the field is omitted.  Send the explicit
+        # boolean for models that advertise the native switch so a bounded
+        # no-thinking compatibility turn can actually produce a tool call.
+        if model_reasoning_style(provider, self.model) == "ollama":
+            native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools
         raw = self._post_json("/api/chat", native_payload)
@@ -2296,6 +2481,7 @@ class OllamaClient:
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         system: str | None = None,
         max_tokens: int = 2000,
         temperature: float = 0.2,
@@ -2319,6 +2505,7 @@ class OllamaClient:
             response = self._chat_impl(
                 messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 system=system,
                 max_tokens=max_tokens,
                 temperature=temperature,

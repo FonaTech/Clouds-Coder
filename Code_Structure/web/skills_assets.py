@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=960 original-lines=89455-89610 hash=d6b2f4627cd4c34c
+# split-source: order=1066 original-lines=97491-97646 hash=d6b2f4627cd4c34c
 
 SKILLS_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -163,7 +163,7 @@ SKILLS_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=961 original-lines=89611-89707 hash=22d432d0f0a0df36
+# split-source: order=1067 original-lines=97647-97746 hash=f638f2c553f584a8
 
 SKILLS_EXTRA_CSS = """
 .skills-main{display:grid;grid-template-columns:minmax(280px,330px) minmax(560px,1fr) minmax(390px,500px);gap:12px;height:78vh;min-height:680px;max-height:78vh;align-items:stretch}
@@ -244,13 +244,16 @@ SKILLS_EXTRA_CSS = """
 .skill-item .name{font-weight:700;font-size:.82rem}
 .skill-item .desc{font-size:.76rem;color:#516175;white-space:pre-wrap}
 .skill-item .path{font-size:.72rem;color:#708097}
-.skills-app .block-scroll::-webkit-scrollbar,.skills-app .flow-wrap::-webkit-scrollbar,.flow-node .c::-webkit-scrollbar{width:10px;height:10px}
-.skills-app .block-scroll::-webkit-scrollbar-thumb,.skills-app .flow-wrap::-webkit-scrollbar-thumb,.flow-node .c::-webkit-scrollbar-thumb{background:#c7d4e6;border-radius:999px}
-.skills-app .block-scroll::-webkit-scrollbar-track,.skills-app .flow-wrap::-webkit-scrollbar-track,.flow-node .c::-webkit-scrollbar-track{background:#edf2f9}
-.skills-panel-left::-webkit-scrollbar,.skills-panel-center::-webkit-scrollbar,.skills-panel-right::-webkit-scrollbar{width:10px;height:10px}
-.skills-panel-left::-webkit-scrollbar-thumb,.skills-panel-center::-webkit-scrollbar-thumb,.skills-panel-right::-webkit-scrollbar-thumb{background:#c7d4e6;border-radius:999px}
-.skills-panel-left::-webkit-scrollbar-track,.skills-panel-center::-webkit-scrollbar-track,.skills-panel-right::-webkit-scrollbar-track{background:#edf2f9}
-.skills-panel-center{scrollbar-color:#c7d4e6 #edf2f9;scrollbar-width:thin}
+.skills-app .block-scroll::-webkit-scrollbar,.skills-app .flow-wrap::-webkit-scrollbar,.flow-node .c::-webkit-scrollbar{width:8px;height:8px}
+.skills-app .block-scroll::-webkit-scrollbar-thumb,.skills-app .flow-wrap::-webkit-scrollbar-thumb,.flow-node .c::-webkit-scrollbar-thumb{background:transparent;border:2px solid transparent;background-clip:padding-box;border-radius:999px}
+.skills-app .block-scroll:hover::-webkit-scrollbar-thumb,.skills-app .flow-wrap:hover::-webkit-scrollbar-thumb,.flow-node .c:hover::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb);background-clip:padding-box}
+.skills-app .block-scroll::-webkit-scrollbar-track,.skills-app .flow-wrap::-webkit-scrollbar-track,.flow-node .c::-webkit-scrollbar-track{background:transparent}
+.skills-panel-left::-webkit-scrollbar,.skills-panel-center::-webkit-scrollbar,.skills-panel-right::-webkit-scrollbar{width:8px;height:8px}
+.skills-panel-left::-webkit-scrollbar-thumb,.skills-panel-center::-webkit-scrollbar-thumb,.skills-panel-right::-webkit-scrollbar-thumb{background:transparent;border:2px solid transparent;background-clip:padding-box;border-radius:999px}
+.skills-panel-left:hover::-webkit-scrollbar-thumb,.skills-panel-center:hover::-webkit-scrollbar-thumb,.skills-panel-right:hover::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb);background-clip:padding-box}
+.skills-panel-left::-webkit-scrollbar-track,.skills-panel-center::-webkit-scrollbar-track,.skills-panel-right::-webkit-scrollbar-track{background:transparent}
+.skills-panel-center{scrollbar-color:transparent transparent;scrollbar-width:thin}
+.skills-panel-center:hover{scrollbar-color:var(--web-scrollbar-thumb) transparent}
 @media (max-width:1180px){
   .skills-main{grid-template-columns:1fr;height:auto;max-height:none;min-height:0}
   .flow-wrap{height:320px;min-height:320px;flex:none}
@@ -262,7 +265,7 @@ SKILLS_EXTRA_CSS = """
 }
 """
 
-# split-source: order=962 original-lines=89708-89853 hash=b9236cd0942f4735
+# split-source: order=1068 original-lines=97747-97892 hash=b9236cd0942f4735
 
 SKILLS_APP_JS = """const S={config:null,rules:null,skillScan:{skills_count:0,skills:[],tree:{type:'dir',name:'skills',path:'',children:[]},warnings:[]},flow:{nodes:[],edges:[]},flowZoom:1,selectedNodeId:null,drag:null,linkDrag:null,pan:null,skillMap:{},activeSkillFile:'',uploadReports:[]};
 const ADMIN_TOKEN_KEY='clouds_coder_admin_token';

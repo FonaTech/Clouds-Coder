@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=847 original-lines=15168-15201 hash=494ce756bc5b35d8
+# split-source: order=952 original-lines=16195-16228 hash=494ce756bc5b35d8
 
 
 def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object]:
@@ -41,7 +41,7 @@ def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object
             break
     return rows
 
-# split-source: order=848 original-lines=15202-15207 hash=4bfe2fe5ea6ce1a8
+# split-source: order=953 original-lines=16229-16234 hash=4bfe2fe5ea6ce1a8
 
 
 def _ask_user_option_value(option: object) -> str:
@@ -49,7 +49,7 @@ def _ask_user_option_value(option: object) -> str:
         return trim(str(option.get("value", option.get("id", option.get("label", ""))) or "").strip(), 400)
     return trim(str(option or "").strip(), 400)
 
-# split-source: order=921 original-lines=26539-26552 hash=f19c222e839c27ec
+# split-source: order=1026 original-lines=27849-27862 hash=f19c222e839c27ec
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -65,10 +65,19 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
-# split-source: order=922 original-lines=26553-27079 hash=06fb072ba785b90b
+# split-source: order=1027 original-lines=27863-28410 hash=4b2f915df6112fcb
 
 TOOLS = [
-    tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
+    tool_def(
+        "bash",
+        (
+            "Run a shell command. Use shell-native readers/search pipelines when they are the most natural option; "
+            "successful output that can be verified against local source files is automatically merged into the same "
+            "source-addressable long-content memory used by read_file."
+        ),
+        {"command": {"type": "string"}},
+        ["command"],
+    ),
     tool_def(
         "read_file",
         (
@@ -77,17 +86,20 @@ TOOLS = [
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
-            "and mode='full' when complete content is explicitly needed. Successful reads are remembered in "
-            "the tool-memory registry; use that evidence instead of repeating identical broad reads."
+            "and mode='full' when complete content is explicitly needed. Use mode='structure' or mode='segment' "
+            "to resume a long-file reading pass from compact understanding cards. Reader choice is not mandatory: "
+            "read_file and source-aligned shell readers update the same long-content memory. Successful reads are "
+            "remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
             "mode": {
                 "type": "string",
-                "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
-                "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"],
+                "description": "Reading strategy. Use structure/overview to inspect a long source memory, segment with target/query to read one remembered section, symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
             },
             "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
+            "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure', for example 's0001'."},
             "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
             "line": {"type": "integer", "description": "1-based center line for mode='window'."},
             "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
@@ -95,6 +107,7 @@ TOOLS = [
             "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
             "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
             "offset": {"type": "integer", "description": "0-based character offset for mode='full'; legacy 0-based line/entry offset for mode='window' or mode='directory'. Prefer mode='window' with line/context for line-oriented reads."},
+            "fresh": {"type": "boolean", "description": "Force exact source reread even when long-content memory already covers the requested range; use for freshness/verification."},
         },
         ["path"],
     ),
@@ -105,6 +118,7 @@ TOOLS = [
         (
             "Update current todos. update_mode='status_update' is merge-only: omitted unfinished rows are preserved, "
             "so a partial progress payload can never shorten the task tree. In approved plan mode, use it for status-only progress. "
+            "Before changing todos, inspect the canonical rows supplied in the current context and decide whether each objective should be reused/updated, added as a genuinely independent item, or removed as obsolete. "
             "When new current-step tool evidence or reviewer findings prove the open subplan is no longer suitable, "
             "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
             "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
@@ -141,12 +155,17 @@ TOOLS = [
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
             "revision_evidence": {},
             "evidence": {},
+            "plan_updates": {
+                "type": "array",
+                "items": {},
+                "description": "Optional plan-step edits identified by step_id/id/key or plan_step_index. Single-step edits are applied directly; multi-step or structural edits receive an independent semantic/context review.",
+            },
         },
         [],
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Inspect existing canonical rows first and choose reuse/update, independent add, or evidence-backed removal. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -170,6 +189,7 @@ TOOLS = [
             "revision_reason": {"type": "string"},
             "revision_evidence": {},
             "evidence": {},
+            "plan_updates": {"type": "array", "items": {}},
         },
         [],
     ),
@@ -209,6 +229,7 @@ TOOLS = [
             "evidence": {},
             "revision_reason": {"type": "string"},
             "revision_evidence": {"type": "array", "items": {"type": "string"}},
+            "plan_updates": {"type": "array", "items": {}},
         },
         [],
     ),
@@ -248,8 +269,8 @@ TOOLS = [
             "metadata": {"type": "boolean"},
         },
     ),
-    tool_def("load_skill", "Load a skill by name.", {"name": {"type": "string"}}, ["name"]),
-    tool_def("unload_skill", "Unload a currently active or pinned skill. Hard-bound skills cannot be unloaded.", {"name": {"type": "string"}}, ["name"]),
+    tool_def("load_skill", "Independently load any relevant canonical skill for the current step; initial selection is not an allowlist.", {"name": {"type": "string"}, "purpose": {"type": "string"}, "keep_for_step": {"type": "boolean"}}, ["name"]),
+    tool_def("unload_skill", "Unload an irrelevant active skill, preserving its cache. Pinned/hard-bound skills cannot be unloaded.", {"name": {"type": "string"}, "purpose": {"type": "string"}}, ["name"]),
     tool_def("list_skill_providers", "List discovered skill providers.", {}),
     tool_def("list_skill_protocols", "List supported skill backend protocols.", {}),
     tool_def(
@@ -594,14 +615,14 @@ TOOLS = [
     ),
 ]
 
-# split-source: order=923 original-lines=27080-27081 hash=3ee29b226eaf3576
+# split-source: order=1028 original-lines=28411-28412 hash=3ee29b226eaf3576
 
 TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
 
-# split-source: order=924 original-lines=27082-27082 hash=08ea091c248842a3
+# split-source: order=1029 original-lines=28413-28413 hash=08ea091c248842a3
 TOOL_SPEC_BY_NAME: dict[str, dict] = {}
 
-# split-source: order=925 original-lines=27083-27092 hash=5b49546953f9369c
+# split-source: order=1030 original-lines=28414-28423 hash=5b49546953f9369c
 for _tool in TOOLS:
     try:
         _fn = _tool.get("function", {})
@@ -613,17 +634,17 @@ for _tool in TOOLS:
     except Exception:
         continue
 
-# split-source: order=926 original-lines=27093-27094 hash=bfed07d2aedc6126
+# split-source: order=1031 original-lines=28424-28425 hash=bfed07d2aedc6126
 
 TOOL_NAME_FUZZY_MAP: dict[str, str] = {}
 
-# split-source: order=927 original-lines=27095-27098 hash=61dd6436d3455b98
+# split-source: order=1032 original-lines=28426-28429 hash=61dd6436d3455b98
 for _name in TOOL_SPEC_BY_NAME.keys():
     _key = re.sub(r"[^a-z0-9]+", "", str(_name or "").lower())
     if _key and _key not in TOOL_NAME_FUZZY_MAP:
         TOOL_NAME_FUZZY_MAP[_key] = str(_name)
 
-# split-source: order=928 original-lines=27099-27116 hash=8c7992dc17a67107
+# split-source: order=1033 original-lines=28430-28447 hash=8c7992dc17a67107
 
 for _alias, _target in {
     "writefile": "write_file",
@@ -643,7 +664,7 @@ for _alias, _target in {
 }.items():
     TOOL_NAME_FUZZY_MAP[_alias] = _target
 
-# split-source: order=929 original-lines=27117-27133 hash=a168e414b363725e
+# split-source: order=1034 original-lines=28448-28464 hash=a168e414b363725e
 
 
 def is_todo_resume_tool_name(raw: object) -> bool:
@@ -662,7 +683,7 @@ def is_todo_resume_tool_name(raw: object) -> bool:
         "resumetodos",
     }
 
-# split-source: order=930 original-lines=27134-27152 hash=b3e6ffc2768f20fa
+# split-source: order=1035 original-lines=28465-28483 hash=b3e6ffc2768f20fa
 
 
 def canonicalize_tool_name(raw: object) -> str:
@@ -683,7 +704,7 @@ def canonicalize_tool_name(raw: object) -> str:
         return lowered
     return mapped or name
 
-# split-source: order=931 original-lines=27153-27168 hash=b445806005f59898
+# split-source: order=1036 original-lines=28484-28499 hash=b445806005f59898
 
 
 def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
@@ -701,7 +722,7 @@ def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enable
         out.append(tool)
     return out
 
-# split-source: order=932 original-lines=27169-27179 hash=9ed4253b5af25719
+# split-source: order=1037 original-lines=28500-28510 hash=9ed4253b5af25719
 
 
 # Fix F: orchestration / worktree / teammate-management tools a sync-mode developer
@@ -714,7 +735,7 @@ DEVELOPER_TOOL_DROP: set[str] = {
     "shutdown_request", "plan_approval", "scan_skills", "write_skill",
 }
 
-# split-source: order=933 original-lines=27180-27243 hash=c3efb64c9011ad20
+# split-source: order=1038 original-lines=28511-28574 hash=c3efb64c9011ad20
 
 AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
     "explorer": {

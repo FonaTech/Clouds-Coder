@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1004 original-lines=96098-96114 hash=bc81238fa4cef592
+# split-source: order=1117 original-lines=104696-104712 hash=bc81238fa4cef592
 
 
 def _code_module_name(rel_path: str, language: str = "") -> str:
@@ -24,7 +24,7 @@ def _code_module_name(rel_path: str, language: str = "") -> str:
         parts = parts[:-1] + [stem]
     return ".".join(part for part in parts if part)
 
-# split-source: order=1005 original-lines=96115-96124 hash=4f22991749d8d80d
+# split-source: order=1118 original-lines=104713-104722 hash=4f22991749d8d80d
 
 
 def _code_choose_community(rel_path: str, language: str, labels: list[str] | None = None) -> str:
@@ -36,7 +36,7 @@ def _code_choose_community(rel_path: str, language: str, labels: list[str] | Non
         return f"test:{top}"
     return f"{str(language or 'code').strip() or 'code'}:{top}"
 
-# split-source: order=1006 original-lines=96125-96139 hash=497286dfec9f9fc5
+# split-source: order=1119 original-lines=104723-104737 hash=497286dfec9f9fc5
 
 
 def _code_query_terms(text: str, limit: int = 48) -> set[str]:
@@ -53,7 +53,7 @@ def _code_query_terms(text: str, limit: int = 48) -> set[str]:
             break
     return set(out)
 
-# split-source: order=1015 original-lines=97203-98879 hash=94f856d7b4188da2
+# split-source: order=1128 original-lines=105868-107562 hash=97877150ec596b87
 
 
 class TFGraphIDFIndex:
@@ -443,6 +443,12 @@ class TFGraphIDFIndex:
                 "category": category,
                 "language": language,
                 "summary": str(doc.get("summary", "") or ""),
+                "understanding_outline": [
+                    trim(str(x), 180)
+                    for x in (doc.get("understanding_outline", []) or [])[:64]
+                    if str(x).strip()
+                ],
+                "understanding_version": int(doc.get("understanding_version", 0) or 0),
                 "entities": entities[:32],
                 "community": community,
                 "source_rel_path": source_rel_path,
@@ -487,6 +493,15 @@ class TFGraphIDFIndex:
                 "seq": int(chunk.get("seq", 0) or 0),
                 "text": text,
                 "anchor": str(chunk.get("anchor", "") or ""),
+                "segment_id": str(chunk.get("segment_id", "") or ""),
+                "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                "section_path": [
+                    trim(str(x), 180)
+                    for x in (chunk.get("section_path", []) or [])[:12]
+                    if str(x).strip()
+                ],
+                "section_depth": int(chunk.get("section_depth", 0) or 0),
+                "is_code_block": bool(chunk.get("is_code_block", False)),
                 "entities": entities[:24],
                 # Persist the defining symbol so query-time symbol-exact boosting can match
                 # an identifier query to the chunk that defines it (code recall lever).
@@ -997,6 +1012,9 @@ class TFGraphIDFIndex:
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "")),
+                    "segment_id": str(chunk.get("segment_id", "") or ""),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": list(chunk.get("section_path", []) or [])[:12],
                     "symbol": str(chunk.get("symbol", "")),
                     "text": _rag_focused_excerpt(
                         str(chunk.get("text", "")),
@@ -1732,7 +1750,7 @@ class TFGraphIDFIndex:
             "communities": dict(self.community_counts),
         }
 
-# split-source: order=1024 original-lines=102087-102572 hash=8cc63c73bb7cd857
+# split-source: order=1137 original-lines=110847-111335 hash=a9656c2b2bfdf2c1
 
 
 class CodeGraphIndex(TFGraphIDFIndex):
@@ -1874,7 +1892,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     "imports": imports[:64],
                     "exports": exports[:64],
                     "labels": labels[:24],
-                    "symbols": symbols[:200],
+                    "symbols": symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX],
                     "line_count": int(src.get("line_count", src.get("metadata", {}).get("line_count", 0)) or 0)
                     if isinstance(src.get("metadata", {}), dict)
                     else int(src.get("line_count", 0) or 0),
@@ -2081,6 +2099,9 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "") or chunk.get("symbol", "") or ""),
+                    "segment_id": str(chunk.get("segment_id", "") or ""),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": list(chunk.get("section_path", []) or [])[:12],
                     "text": trim(str(chunk.get("text", "")), 1800),
                     "entities": list(chunk.get("entities", []) or [])[:12],
                     "symbol": str(chunk.get("symbol", "") or ""),
