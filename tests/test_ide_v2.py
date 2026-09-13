@@ -42,8 +42,7 @@ class RuntimeWorkdirTests(unittest.TestCase):
                 mock.patch.object(cc, "SCRIPT_DIR", script_root),
                 mock.patch.dict(
                     os.environ,
-                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(
-                        Path(temp) / "runtime")},
+                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(Path(temp) / "runtime")},
                 ),
             ):
                 self.assertEqual(cc._resolve_default_agent_workdir(), script_root)
@@ -61,12 +60,10 @@ class RuntimeWorkdirTests(unittest.TestCase):
                     mock.patch.object(cc, "SCRIPT_DIR", script_root),
                     mock.patch.dict(
                         os.environ,
-                        {"AGENT_WORKDIR": str(explicit), "CLOUDS_CODER_HOME": str(
-                            root / "runtime")},
+                        {"AGENT_WORKDIR": str(explicit), "CLOUDS_CODER_HOME": str(root / "runtime")},
                     ),
                 ):
-                    self.assertEqual(
-                        cc._resolve_default_agent_workdir(), explicit.resolve())
+                    self.assertEqual(cc._resolve_default_agent_workdir(), explicit.resolve())
                     self.assertEqual(cc._runtime_storage_mode(), "explicit-workdir")
 
     def test_direct_runtime_does_not_import_from_stable_workspace(self):
@@ -75,7 +72,7 @@ class RuntimeWorkdirTests(unittest.TestCase):
             script_root = root / "source"
             local_codes = script_root / "Codes"
             local_crypto = cc.CryptoBox(local_codes)
-            local_state = local_codes / "user_local" / "sessions" / "sess_local" / "state.json"  # noqa: E501
+            local_state = local_codes / "user_local" / "sessions" / "sess_local" / "state.json"
             local_crypto.write_json(local_state, {"title": "local history"})
             source_state = local_state.read_bytes()
             with (
@@ -117,27 +114,22 @@ class RuntimeWorkdirTests(unittest.TestCase):
             workspace = root / "stable" / "workspace"
             session_dir = legacy_codes / "user_local" / "sessions" / "sess_legacy"
             legacy_crypto = cc.CryptoBox(legacy_codes)
-            legacy_crypto.write_json(
-                session_dir / "state.json", {"title": "legacy", "messages": [{"role": "user", "content": "kept"}]})  # noqa: E501
-            legacy_crypto.write_json(session_dir / "meta.json",
-                                     {"title": "legacy", "message_count": 1})
+            legacy_crypto.write_json(session_dir / "state.json", {"title": "legacy", "messages": [{"role": "user", "content": "kept"}]})
+            legacy_crypto.write_json(session_dir / "meta.json", {"title": "legacy", "message_count": 1})
             source_state = (session_dir / "state.json").read_bytes()
 
             with mock.patch.object(cc, "SCRIPT_DIR", installed_root):
                 result = cc._migrate_legacy_runtime_roots(workspace)
 
             target_codes = workspace / "Codes"
-            target_state = target_codes / "user_local" / "sessions" / "sess_legacy" / "state.json"  # noqa: E501
+            target_state = target_codes / "user_local" / "sessions" / "sess_legacy" / "state.json"
             self.assertIn("site-packages:Codes", result["copied"])
             self.assertEqual(result["imported_sessions"], 1)
-            self.assertEqual((legacy_codes / ".encryption_key").read_bytes(),
-                             (target_codes / ".encryption_key").read_bytes())
+            self.assertEqual((legacy_codes / ".encryption_key").read_bytes(), (target_codes / ".encryption_key").read_bytes())
             self.assertEqual((session_dir / "state.json").read_bytes(), source_state)
-            self.assertEqual(cc.CryptoBox(target_codes).read_json(
-                target_state, {}).get("title"), "legacy")
+            self.assertEqual(cc.CryptoBox(target_codes).read_json(target_state, {}).get("title"), "legacy")
 
-    def test_installed_runtime_merges_different_keys_without_overwriting_new_history(
-            self):
+    def test_installed_runtime_merges_different_keys_without_overwriting_new_history(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             installed_root = root / "lib" / "python3.13" / "site-packages"
@@ -148,14 +140,10 @@ class RuntimeWorkdirTests(unittest.TestCase):
             target_crypto = cc.CryptoBox(target_codes)
             legacy_user = legacy_codes / "user_local" / "sessions"
             target_user = target_codes / "user_local" / "sessions"
-            legacy_crypto.write_json(legacy_user / "sess_old" /
-                                     "state.json", {"title": "old history"})
-            legacy_crypto.write_json(legacy_user / "sess_same" /
-                                     "state.json", {"title": "legacy collision"})
-            target_crypto.write_json(target_user / "sess_new" /
-                                     "state.json", {"title": "new history"})
-            target_crypto.write_json(target_user / "sess_same" /
-                                     "state.json", {"title": "current collision"})
+            legacy_crypto.write_json(legacy_user / "sess_old" / "state.json", {"title": "old history"})
+            legacy_crypto.write_json(legacy_user / "sess_same" / "state.json", {"title": "legacy collision"})
+            target_crypto.write_json(target_user / "sess_new" / "state.json", {"title": "new history"})
+            target_crypto.write_json(target_user / "sess_same" / "state.json", {"title": "current collision"})
             source_state = (legacy_user / "sess_old" / "state.json").read_bytes()
 
             with mock.patch.object(cc, "SCRIPT_DIR", installed_root):
@@ -164,24 +152,10 @@ class RuntimeWorkdirTests(unittest.TestCase):
             imported = target_user / "sess_old" / "state.json"
             self.assertEqual(result["imported_sessions"], 1)
             self.assertEqual(result["skipped_sessions"], 1)
-            self.assertEqual(target_crypto.read_json(
-                imported, {}).get("title"), "old history")
-            self.assertEqual(
-                target_crypto.read_json(
-                    target_user /
-                    "sess_new" /
-                    "state.json",
-                    {}).get("title"),
-                "new history")
-            self.assertEqual(
-                target_crypto.read_json(
-                    target_user /
-                    "sess_same" /
-                    "state.json",
-                    {}).get("title"),
-                "current collision")
-            self.assertEqual((legacy_user / "sess_old" /
-                             "state.json").read_bytes(), source_state)
+            self.assertEqual(target_crypto.read_json(imported, {}).get("title"), "old history")
+            self.assertEqual(target_crypto.read_json(target_user / "sess_new" / "state.json", {}).get("title"), "new history")
+            self.assertEqual(target_crypto.read_json(target_user / "sess_same" / "state.json", {}).get("title"), "current collision")
+            self.assertEqual((legacy_user / "sess_old" / "state.json").read_bytes(), source_state)
 
 
 class OfflineJSAssetTests(unittest.TestCase):
@@ -310,6 +284,17 @@ class OfflineJSAssetTests(unittest.TestCase):
         self.assertIn(
             '"chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS)',
             inspect.getsource(cc.Handler.do_GET),
+        )
+
+    def test_web_and_ide_creation_preserve_title_provenance(self):
+        self.assertIn("JSON.stringify({title,user_named:userNamed})", cc.APP_JS)
+        self.assertIn("title_origin:String(out?.title_origin", cc.APP_JS)
+        ide_source = inspect.getsource(cc.AppContext.ide_create_session)
+        self.assertIn('title_origin = "manual" if requested_title else "default"', ide_source)
+        self.assertIn('"IDE Workspace"', ide_source)
+        self.assertIn(
+            "self.ide_create_session(user_id, None",
+            inspect.getsource(cc.AppContext.ide_agent_task),
         )
 
     def test_session_manager_does_not_probe_ollama_during_construction(self):
@@ -557,7 +542,7 @@ class IDESandboxBackendTests(unittest.TestCase):
             mock.patch.object(cc.Path, "resolve", lambda value: value),
         ):
             rewritten = session._rewrite_shell_virtual_paths(
-                "type /skills/demo/SKILL.md & type /js_lib/marked.min.js & dir /workspace",  # noqa: E501
+                "type /skills/demo/SKILL.md & type /js_lib/marked.min.js & dir /workspace",
                 windows_workspace,
             )
         self.assertIn('"C:/Clouds Coder/skills"/demo/SKILL.md', rewritten)
@@ -602,7 +587,7 @@ class IDESandboxBackendTests(unittest.TestCase):
         app._ide_emit_workspace_change = mock.Mock()
         completed = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
         host_file = self.files / "nested" / "input.txt"
-        with mock.patch.object(cc, "run_subprocess_text", return_value=completed) as run:  # noqa: E501
+        with mock.patch.object(cc, "run_subprocess_text", return_value=completed) as run:
             result = app.ide_run_command(
                 "user-a",
                 "sess-a",
@@ -643,7 +628,7 @@ class IDESandboxBackendTests(unittest.TestCase):
                 session.files_root,
             )
             js_error = session._guard_shell_write_scope(
-                "python -c \"from pathlib import Path; Path('/js_lib/x.js').write_text('x')\"",  # noqa: E501
+                "python -c \"from pathlib import Path; Path('/js_lib/x.js').write_text('x')\"",
                 session.files_root,
             )
         self.assertIn("write blocked", skill_error)
@@ -792,19 +777,15 @@ class IDEAuthStoreTests(unittest.TestCase):
     def test_local_session_isolated_by_caller_identity(self):
         first_id = cc.user_id_from_ip("192.168.1.21")
         second_id = cc.user_id_from_ip("192.168.1.22")
-        first = self.store.local_session(
-            legacy_user_id=first_id, client_ip="192.168.1.21")
-        second = self.store.local_session(
-            legacy_user_id=second_id, client_ip="192.168.1.22")
+        first = self.store.local_session(legacy_user_id=first_id, client_ip="192.168.1.21")
+        second = self.store.local_session(legacy_user_id=second_id, client_ip="192.168.1.22")
 
         self.assertNotEqual(first["account"]["user_id"], second["account"]["user_id"])
         self.assertNotEqual(first["account"]["username"], second["account"]["username"])
         self.assertEqual(first["account"]["role"], "user")
         self.assertEqual(second["account"]["role"], "user")
-        self.assertIsNotNone(self.store.verify_session(
-            first["access_token"], "192.168.1.21"))
-        self.assertIsNone(self.store.verify_session(
-            first["access_token"], "192.168.1.22"))
+        self.assertIsNotNone(self.store.verify_session(first["access_token"], "192.168.1.21"))
+        self.assertIsNone(self.store.verify_session(first["access_token"], "192.168.1.22"))
 
         same_identity = self.store.local_session(
             legacy_user_id=first_id,
@@ -827,8 +808,7 @@ class IDEAuthStoreTests(unittest.TestCase):
                     token_digest TEXT PRIMARY KEY, username_key TEXT NOT NULL,
                     auth_version INTEGER NOT NULL, csrf_token TEXT NOT NULL,
                     created_at REAL NOT NULL, expires_at REAL NOT NULL,
-                    revoked_at REAL NOT NULL DEFAULT 0,
-                    last_ip TEXT NOT NULL DEFAULT '',
+                    revoked_at REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
                     device_digest TEXT NOT NULL DEFAULT ''
                 )"""
             )
@@ -836,16 +816,14 @@ class IDEAuthStoreTests(unittest.TestCase):
                 """INSERT INTO ide_sessions
                    (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
                     revoked_at,last_ip,device_digest)
-                   SELECT token_digest,username_key,auth_version,csrf_token,
-                          created_at,expires_at,
+                   SELECT token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
                           revoked_at,last_ip,device_digest FROM ide_sessions_current"""
             )
             conn.execute("DROP TABLE ide_sessions_current")
         upgraded = cc.IDEAuthStore(self.store.path)
         self.assertIsNone(upgraded.verify_session(local["access_token"], "127.0.0.1"))
         with sqlite3.connect(str(self.store.path)) as conn:
-            columns = {row[1]
-                       for row in conn.execute("PRAGMA table_info(ide_sessions)")}
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(ide_sessions)")}
             active = conn.execute(
                 "SELECT COUNT(*) FROM ide_sessions WHERE revoked_at=0"
             ).fetchone()[0]
@@ -1891,6 +1869,18 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertFalse((self.root / "escaped").exists())
 
     def test_chunked_upload_is_idempotent_atomic_and_normalizes_windows_paths(self):
+        self.assertEqual(
+            cc.normalize_upload_rel_path("/C:/Users/demo/Drop/file.txt"),
+            "Users/demo/Drop/file.txt",
+        )
+        self.assertEqual(
+            cc.normalize_upload_rel_path(r"C:\Users\demo\Drop\file.txt"),
+            "Users/demo/Drop/file.txt",
+        )
+        self.assertEqual(
+            cc.normalize_upload_rel_path(r"\\server\share\Drop\file.txt"),
+            "Drop/file.txt",
+        )
         target = self.files / "imports" / "样例" / "子目录" / "数据.txt"
         target.parent.mkdir(parents=True)
         target.write_bytes(b"old-content")
@@ -1950,7 +1940,7 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         upload_id = "up_00112233445566778899aabbccddeeff"
         chunk_size = 512 * 1024
         for offset in range(0, len(raw), chunk_size):
-            chunk = raw[offset: offset + chunk_size]
+            chunk = raw[offset : offset + chunk_size]
             complete = offset + len(chunk) == len(raw)
             out = self.app.ide_upload_chunk(
                 "account-a",
@@ -2173,8 +2163,7 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertIn("shared skill", allowed_shared_read.stdout)
         self.assertIn("shared library", allowed_shared_read.stdout)
         self.assertNotEqual(blocked_shared_write.returncode, 0)
-        self.assertEqual(
-            (shared_skills / "SKILL.md").read_text(encoding="utf-8"), "shared skill")
+        self.assertEqual((shared_skills / "SKILL.md").read_text(encoding="utf-8"), "shared skill")
         self.assertFalse(Path("/private/tmp/clouds-coder-sandbox-test").exists())
 
     def test_remote_process_environment_uses_workspace_private_temp(self):
@@ -2212,18 +2201,16 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         session.skills = cc.SkillStore(self.root / "skills")
         session.js_lib_root = self.root / "js_lib"
         (self.root / "skills" / "private").mkdir(parents=True)
-        (self.root / "skills" / "private" / "SKILL.md").write_text("skill", encoding="utf-8")  # noqa: E501
+        (self.root / "skills" / "private" / "SKILL.md").write_text("skill", encoding="utf-8")
         (self.root / "js_lib" / "monaco" / "min" / "vs").mkdir(parents=True)
-        (self.root / "js_lib" / "monaco" / "min" / "vs" /
-         "loader.js").write_text("loader", encoding="utf-8")
+        (self.root / "js_lib" / "monaco" / "min" / "vs" / "loader.js").write_text("loader", encoding="utf-8")
 
         for path, expected in (
             ("/skills/private/SKILL.md", "skill"),
             ("/js_lib/monaco/min/vs/loader.js", "loader"),
         ):
             with self.subTest(path=path):
-                self.assertEqual(
-                    session._remote_agent_file_scope_error(path, "read"), "")
+                self.assertEqual(session._remote_agent_file_scope_error(path, "read"), "")
                 result = session._run_read(path)
                 self.assertIn(expected, result)
 
@@ -2274,11 +2261,17 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         session = cc.SessionState.__new__(cc.SessionState)
         session.ide_remote_sandbox_required = True
         session.skill_mode = "dynamic"
-        session.skills = types.SimpleNamespace(list_names=lambda: ["shared-skill"])
+        session.skills = types.SimpleNamespace(
+            skills={},
+            list_metadata=lambda: [{"id": "local:shared-skill", "canonical_id": "local:shared-skill", "name": "shared-skill"}],
+        )
+        session.blackboard = {"loaded_skills": {}}
+        session._ensure_blackboard = lambda: session.blackboard
+        session._active_skill_step_id = lambda board=None: "remote-step"
         session._ensure_skills_ready = lambda force=False: None
-        session.query_code_library_callback = lambda _session, args: f"code:{args['query']}"  # noqa: E501
-        session.query_knowledge_library_callback = lambda _session, args: f"knowledge:{args['query']}"  # noqa: E501
-        session.rag_remember_callback = lambda _session, args: f"remembered:{args['text']}"  # noqa: E501
+        session.query_code_library_callback = lambda _session, args: f"code:{args['query']}"
+        session.query_knowledge_library_callback = lambda _session, args: f"knowledge:{args['query']}"
+        session.rag_remember_callback = lambda _session, args: f"remembered:{args['text']}"
         session._emit = lambda *_args, **_kwargs: None
 
         class ReadyMcp:
@@ -2292,17 +2285,15 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
 
         session.mcp = ReadyMcp()
         self.assertEqual(
-            session._dispatch_tool_inner("list_skills", {}, "developer"),
-            "shared-skill",
+            json.loads(session._dispatch_tool_inner("list_skills", {}, "developer"))["skills"][0]["canonical_id"],
+            "local:shared-skill",
         )
         self.assertEqual(
-            session._dispatch_tool_inner("query_code_library", {
-                                         "query": "api"}, "developer"),
+            session._dispatch_tool_inner("query_code_library", {"query": "api"}, "developer"),
             "code:api",
         )
         self.assertEqual(
-            session._dispatch_tool_inner("query_knowledge_library", {
-                                         "query": "paper"}, "developer"),
+            session._dispatch_tool_inner("query_knowledge_library", {"query": "paper"}, "developer"),
             "knowledge:paper",
         )
         self.assertEqual(
@@ -2340,21 +2331,17 @@ class IDEHTTPAuthTests(unittest.TestCase):
 
                 @staticmethod
                 def list_shared():
-                    return [{"id": "shared-app", "name": "Shared App", "status": "published"}]  # noqa: E501
+                    return [{"id": "shared-app", "name": "Shared App", "status": "published"}]
 
                 @staticmethod
                 def skill_catalog():
-                    return [{"id": "shared-skill",
-                             "name": "Shared Skill", "description": "Test"}]
+                    return [{"id": "shared-skill", "name": "Shared Skill", "description": "Test"}]
 
                 def list_personal(applications_self, user_id):
-                    return [
-                        dict(row) for row in applications_self.rows.get(
-                            user_id, {}).values()]
+                    return [dict(row) for row in applications_self.rows.get(user_id, {}).values()]
 
                 def save_personal(applications_self, user_id, payload, app_id=""):
-                    applications_self.owner.application_calls.append(
-                        ("save", user_id, app_id))
+                    applications_self.owner.application_calls.append(("save", user_id, app_id))
                     rows = applications_self.rows.setdefault(user_id, {})
                     if app_id and app_id not in rows:
                         raise KeyError(app_id)
@@ -2379,8 +2366,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
                     return dict(row)
 
                 def submit(applications_self, user_id, app_id):
-                    applications_self.owner.application_calls.append(
-                        ("submit", user_id, app_id))
+                    applications_self.owner.application_calls.append(("submit", user_id, app_id))
                     row = applications_self.rows.get(user_id, {}).get(app_id)
                     if row is None:
                         raise KeyError(app_id)
@@ -2389,7 +2375,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
                         key,
                         {
                             **row,
-                            "id": f"submission-{len(applications_self.submissions) + 1}",  # noqa: E501
+                            "id": f"submission-{len(applications_self.submissions) + 1}",
                             "scope": "shared",
                             "status": "pending",
                             "source_app_id": app_id,
@@ -2398,11 +2384,8 @@ class IDEHTTPAuthTests(unittest.TestCase):
                     )
 
                 def delete_personal(applications_self, user_id, app_id):
-                    applications_self.owner.application_calls.append(
-                        ("delete", user_id, app_id))
-                    return applications_self.rows.get(
-                        user_id, {}).pop(
-                        app_id, None) is not None
+                    applications_self.owner.application_calls.append(("delete", user_id, app_id))
+                    return applications_self.rows.get(user_id, {}).pop(app_id, None) is not None
 
             self.applications = Applications(self)
 
@@ -2457,11 +2440,11 @@ class IDEHTTPAuthTests(unittest.TestCase):
         def ide_applications_payload(self, user_id, *, client_ip, collaboration=False):
             return {
                 "ok": True,
-                "personal": [] if collaboration else self.applications.list_personal(user_id),  # noqa: E501
+                "personal": [] if collaboration else self.applications.list_personal(user_id),
                 "shared": self.applications.list_shared(),
                 "legacy_personal": [],
                 "web_sessions": [],
-                "skill_catalog": [] if collaboration else self.applications.skill_catalog(),  # noqa: E501
+                "skill_catalog": [] if collaboration else self.applications.skill_catalog(),
                 "collaboration": collaboration,
             }
 
@@ -2483,11 +2466,12 @@ class IDEHTTPAuthTests(unittest.TestCase):
 
         def shared_resource_manifest(self, user_id, *, collaboration=False):
             return {
-                "skills": {
-                    "enabled": True, "count": 1, "read_only": True, "admin_write": True}, "js_libraries": {  # noqa: E501
-                    "enabled": True, "count": 2, "read_only": True}, "mcp": {
-                    "enabled": True, "ready": 1, "total": 1, "tool_count": 1}, "api_paths": {  # noqa: E501
-                    "resources": "/api/ide/v2/resources"}, "services": {}, }
+                "skills": {"enabled": True, "count": 1, "read_only": True, "admin_write": True},
+                "js_libraries": {"enabled": True, "count": 2, "read_only": True},
+                "mcp": {"enabled": True, "ready": 1, "total": 1, "tool_count": 1},
+                "api_paths": {"resources": "/api/ide/v2/resources"},
+                "services": {},
+            }
 
         @staticmethod
         def skills_catalog():
@@ -2601,8 +2585,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
         self.assertEqual(saved["state"]["active_view"], "search")
         self.assertEqual(self.app.saved[0], setup["account"]["user_id"])
 
-    def test_application_authoring_routes_use_authenticated_account_and_pending_review(
-            self):
+    def test_application_authoring_routes_use_authenticated_account_and_pending_review(self):
         origin = f"http://127.0.0.1:{self.port}"
         status, headers, setup = self.request(
             "POST",
@@ -2621,8 +2604,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
         status, _, created = self.request(
             "POST",
             "/api/ide/v2/applications",
-            {"name": "IDE App", "description": "draft",
-                "icon": "A", "skills": ["shared-skill"]},
+            {"name": "IDE App", "description": "draft", "icon": "A", "skills": ["shared-skill"]},
             owner_headers,
         )
         self.assertEqual(status, 201)
@@ -2637,8 +2619,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual([row["id"] for row in catalog["personal"]], [app_id])
-        self.assertEqual([row["id"]
-                         for row in catalog["skill_catalog"]], ["shared-skill"])
+        self.assertEqual([row["id"] for row in catalog["skill_catalog"]], ["shared-skill"])
 
         status, _, updated = self.request(
             "PATCH",
@@ -2671,8 +2652,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
         status, _, edited = self.request(
             "PATCH",
             f"/api/ide/v2/applications/{app_id}",
-            {"name": "IDE App v3", "description": "new revision",
-                "skills": ["shared-skill"]},
+            {"name": "IDE App v3", "description": "new revision", "skills": ["shared-skill"]},
             owner_headers,
         )
         self.assertEqual(status, 200)
@@ -2815,8 +2795,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
         cookie = headers["Set-Cookie"].split(";", 1)[0]
         read_headers = {"Cookie": cookie}
 
-        status, _, resources = self.request(
-            "GET", "/api/ide/v2/resources", headers=read_headers)
+        status, _, resources = self.request("GET", "/api/ide/v2/resources", headers=read_headers)
         self.assertEqual(status, 200)
         self.assertTrue(resources["skills"]["can_write"])
         self.assertEqual(resources["js_libraries"]["count"], 2)
@@ -2882,8 +2861,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
 
             cookie_a, auth_a = login("192.168.1.21")
             _cookie_b, auth_b = login("192.168.1.22")
-            self.assertNotEqual(auth_a["account"]["user_id"],
-                                auth_b["account"]["user_id"])
+            self.assertNotEqual(auth_a["account"]["user_id"], auth_b["account"]["user_id"])
             self.assertEqual(auth_a["account"]["role"], "user")
             self.assertEqual(auth_b["account"]["role"], "user")
 
@@ -2978,10 +2956,8 @@ class IDEHTTPAuthTests(unittest.TestCase):
 
 class IDEWorkbenchSourceTests(unittest.TestCase):
     def test_automatic_auth_is_identity_bound_and_csrf_can_resync(self):
-        self.assertIn("legacy_user_id=user_id_from_ip(client_ip)",
-                      inspect.getsource(cc.AppContext.local_ide_login))
-        self.assertIn("session_kind=\"local_auto\"",
-                      inspect.getsource(cc.IDEAuthStore.local_session))
+        self.assertIn("legacy_user_id=user_id_from_ip(client_ip)", inspect.getsource(cc.AppContext.local_ide_login))
+        self.assertIn("session_kind=\"local_auto\"", inspect.getsource(cc.IDEAuthStore.local_session))
         self.assertIn("if(res.status===403&&data.code==='csrf_required'", cc.IDE_JS)
         self.assertIn("async function refreshCsrfToken()", cc.IDE_JS)
         self.assertIn("await refreshCsrfToken();", cc.IDE_JS)
@@ -3051,7 +3027,7 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
 
     def test_hidden_panel_state_survives_panel_tab_restoration(self):
         source = cc.IDE_JS
-        restore_start = source.index("async function restoreWorkbenchState()")
+        restore_start = source.index("async function restoreWorkbenchState(")
         restore_end = source.index("async function runSearch()", restore_start)
         restore = source[restore_start:restore_end]
 
@@ -3358,6 +3334,42 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
             "if(S.agentPollBusy){S.agentPollRequested=true;return}", cc.IDE_JS
         )
 
+    def test_workbench_restore_selects_session_before_live_agent_updates(self):
+        start = cc.IDE_JS.index("async function startWorkbench()")
+        end = cc.IDE_JS.index(
+            "window.addEventListener('pagehide'", start
+        )
+        source = cc.IDE_JS[start:end]
+
+        select = source.index("workbenchSessionFromState(savedWorkbench.state||{})")
+        reset = source.index("resetAgentSessionUI(S.activeSession)")
+        connect = source.index("connectAgentEvents()")
+        poll = source.index("scheduleAgentPoll(40)")
+        self.assertLess(select, reset)
+        self.assertLess(reset, connect)
+        self.assertLess(connect, poll)
+        self.assertIn(
+            "expectedSession:bootSession,expectedSeq:bootSessionSeq", source
+        )
+
+    def test_delayed_workbench_restore_cannot_replace_a_user_session_switch(self):
+        start = cc.IDE_JS.index("async function restoreWorkbenchState(")
+        end = cc.IDE_JS.index("async function runSearch()", start)
+        source = cc.IDE_JS[start:end]
+
+        self.assertIn("expectedSession=String(opt.expectedSession||'')", source)
+        self.assertIn("S.sessionSwitchSeq!==expectedSeq", source)
+        self.assertIn("await switchSession(restoredSession,false)", source)
+        self.assertNotIn("S.activeSession=restoredSession", source)
+        self.assertIn("sessionRequestCurrent(session,seq)", source)
+
+        switch_start = cc.IDE_JS.rindex(
+            "async function switchSession(sessionId,isNew=false,opt={})"
+        )
+        switch_end = cc.IDE_JS.index("async function newFile()", switch_start)
+        switch_source = cc.IDE_JS[switch_start:switch_end]
+        self.assertIn("await saveWorkbenchState()", switch_source)
+
     def test_text_markdown_image_and_excel_preview_paths_are_wired(self):
         self.assertEqual(cc.preview_kind_for_path("notes.txt"), "markdown")
         self.assertEqual(cc.preview_kind_for_path("report.mdx"), "markdown")
@@ -3374,6 +3386,13 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
             ".artifact-stage img{display:block;width:100%;height:100%", cc.IDE_CSS
         )
         self.assertIn(".artifact-preview-error", cc.IDE_CSS)
+
+    def test_html_preview_token_cache_is_declared_in_ide_bundle(self):
+        declaration = "const PREVIEW_TOKENS=new Map();"
+        self.assertIn(declaration, cc.IDE_JS)
+        self.assertLess(cc.IDE_JS.index(declaration), cc.IDE_JS.index("async function previewToken(file)"))
+        self.assertIn("PREVIEW_TOKENS.get(key)", cc.IDE_JS)
+        self.assertIn("/preview-token?root_id=", cc.IDE_JS)
 
     def test_program_agent_todo_model_attachment_and_diff_controls_are_wired(self):
         self.assertIn('id="agentTodoPanel"', cc.IDE_INDEX_HTML)
@@ -3397,6 +3416,10 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertNotIn("input.disabled=true", cc.IDE_JS)
         self.assertIn("input.value=''", cc.IDE_JS)
         self.assertIn("input.value=input.value.trim()?", cc.IDE_JS)
+        self.assertIn("starting=!!state.scheduler_starting", cc.IDE_JS)
+        self.assertIn("S.agentSubmissionStatus='submitting'", cc.IDE_JS)
+        self.assertIn("S.agentSubmissionStatus='starting'", cc.IDE_JS)
+        self.assertNotIn("if(!busy&&!awaiting&&S.agentSubmitting)S.agentSubmitting=false", cc.IDE_JS)
         self.assertIn(".agent-stop-button", cc.IDE_CSS)
         self.assertIn(".agent-drop-hint", cc.IDE_CSS)
 
@@ -3574,6 +3597,28 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
             cc.IDE_JS,
         )
 
+    def test_sse_burst_is_coalesced_before_agent_state_render(self):
+        node = cc.shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable for the frontend scheduler check")
+        start = cc.IDE_JS.index("function scheduleAgentEventFrame()")
+        end = cc.IDE_JS.index("\nfunction handleAgentEvent", start)
+        scheduler = cc.IDE_JS[start:end]
+        script = (
+            "const S={agentEventRaf:0,agentFileRefresh:new Set()};"
+            "const document={hidden:false};let pending=null,timers=[],polls=[];"
+            "function setTimeout(fn,delay){pending=fn;timers.push(delay);return 1}"
+            "function scheduleWorkspaceRefresh(){}"
+            "function scheduleAgentPoll(delay){polls.push(delay)}\n"
+            + scheduler
+            + "\nfor(let i=0;i<100;i++)scheduleAgentEventFrame();"
+            "pending();process.stdout.write(JSON.stringify({timers,polls}));"
+        )
+        completed = cc.subprocess.run(
+            [node, "-e", script], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(json.loads(completed.stdout), {"timers": [120], "polls": [40]})
+
 
 class IDEAutoTitleTests(unittest.TestCase):
     @staticmethod
@@ -3588,8 +3633,16 @@ class IDEAutoTitleTests(unittest.TestCase):
         )
         session.last_auto_title_source = ""
         session.last_auto_title_ts = 0.0
+        session.auto_title_revision = 0
+        session.auto_title_last_goal_digest = ""
+        session.auto_title_refine_pending = False
+        session.auto_title_refine_generation = 0
+        session.auto_title_refine_attempt_digest = ""
+        session.auto_title_refine_attempt_ts = 0.0
+        session.auto_title_refine_lock = threading.RLock()
         session.cancel_requested = False
         session.lock = threading.RLock()
+        session.root = Path(tempfile.gettempdir())
         session.ui_language = "zh-CN"
         session.messages = [
             {
@@ -3613,10 +3666,18 @@ class IDEAutoTitleTests(unittest.TestCase):
                 return {"content": model_title}
 
         session.ollama = FakeModel()
+        session._build_auto_title_client = lambda: session.ollama
         session._inject_runtime_environment_context = lambda text="": text
         session._persist = mock.Mock()
+        session._schedule_persist_delayed = mock.Mock()
         session._emit = mock.Mock()
         return session, prompts
+
+    def wait_for_auto_title(self, session):
+        deadline = time.time() + 2.0
+        while session.auto_title_refine_pending and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(session.auto_title_refine_pending)
 
     def test_program_ide_task_envelope_is_removed_before_title_generation(self):
         session, prompts = self.make_session()
@@ -3625,16 +3686,68 @@ class IDEAutoTitleTests(unittest.TestCase):
             "制作一个宝可梦精灵球的图片，用matplot设计制作显示",
         )
         self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
         self.assertEqual(session.title, "宝可梦精灵球绘制")
         self.assertEqual(session.title_origin, "auto")
         self.assertEqual(session.last_auto_title_source, "model")
-        self.assertIn("制作一个宝可梦精灵球", prompts[0])
-        self.assertNotIn("Workspace root:", prompts[0])
+        self.assertEqual(len(prompts), 1)
+
+    def test_auto_title_is_not_a_visible_or_interruptible_startup_phase(self):
+        worker_source = inspect.getsource(cc.SessionState._agent_worker)
+        submit_source = inspect.getsource(cc.SessionState.submit_user_message)
+        self.assertNotIn('_startup_phase("auto-title")', worker_source)
+        self.assertNotIn('progress_label="startup session title"', worker_source)
+        self.assertIn('_maybe_auto_rename_session_title("run-start")', worker_source)
+        self.assertIn('_maybe_auto_rename_session_title("message-accepted")', submit_source)
+
+    def test_manual_rename_wins_over_inflight_model_title(self):
+        session, _ = self.make_session()
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_chat(*_args, **_kwargs):
+            started.set()
+            release.wait(1.0)
+            finished.set()
+            return {"content": "模型生成标题"}
+
+        session._build_auto_title_client = lambda: types.SimpleNamespace(chat=blocked_chat)
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.assertTrue(started.wait(1.0))
+        with session.lock:
+            session.title = "用户命名"
+            session.title_origin = "manual"
+            session.auto_title_refine_generation += 1
+            session.auto_title_refine_pending = False
+        release.set()
+        self.assertTrue(finished.wait(1.0))
+        time.sleep(0.02)
+        self.assertEqual(session.title, "用户命名")
+        session._emit.assert_not_called()
+
+    def test_disabled_or_failed_title_model_uses_local_fallback(self):
+        session, prompts = self.make_session()
+        with mock.patch.object(cc, "AUTO_TITLE_MODEL_REFINE", False):
+            self.assertTrue(session._maybe_auto_rename_session_title("test"))
+            self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
+        self.assertEqual(session.last_auto_title_source, "fallback")
+        self.assertEqual(prompts, [])
+
+    def test_generic_greeting_does_not_hide_later_concrete_title_goal(self):
+        session, _ = self.make_session()
+        session.messages.insert(0, {"role": "user", "content": "hello"})
+        self.assertEqual(
+            session._best_session_title_goal_text(),
+            "制作一个宝可梦精灵球的图片，用matplot设计制作显示",
+        )
 
     def test_generic_model_title_falls_back_to_concrete_user_task(self):
         session, _ = self.make_session(model_title="IDE编程请求处理")
         self.assertTrue(session._maybe_auto_rename_session_title("test"))
-        self.assertEqual(session.title, "制作一个宝可梦精灵球的图片")
+        self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
         self.assertEqual(session.last_auto_title_source, "fallback")
         self.assertFalse(session._is_low_quality_auto_title(session.title))
 
@@ -3643,9 +3756,76 @@ class IDEAutoTitleTests(unittest.TestCase):
         session.app_binding = {"app_id": "app_image", "name": "Image Studio"}
         session.title_origin = "application"
         self.assertTrue(session._maybe_auto_rename_session_title("application-start"))
+        self.wait_for_auto_title(session)
         self.assertEqual(session.title, "Image Studio-宝可梦精灵球绘制")
         self.assertEqual(session.title_origin, "auto")
         self.assertEqual(session.last_auto_title_source, "model")
+
+    def test_model_title_application_prefix_is_normalized_before_truncation(self):
+        session, _ = self.make_session()
+        app_name = "Long Image Creation Application"
+        session.app_binding = {"app_id": "app_image", "name": app_name}
+        self.assertEqual(
+            session._normalize_auto_title(f"{app_name} ： 修复IDE气泡实时刷新"),
+            "修复IDE气泡实时刷新",
+        )
+        for separator in ("-", " — ", ":", "："):
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    session._application_title_suffix(f"{app_name}{separator}修复气泡"),
+                    "修复气泡",
+                )
+        self.assertEqual(
+            session._application_title(session._normalize_auto_title(f"{app_name} — 修复IDE气泡实时刷新")),
+            f"{app_name}-修复IDE气泡实时刷新",
+        )
+
+    def test_partial_title_profile_inherits_active_provider_connection(self):
+        session, _ = self.make_session()
+        del session._build_auto_title_client
+        session.model_profiles = {"active": {"model": "title-model"}}
+        session.active_profile_id = "active"
+        session.ollama = types.SimpleNamespace(
+            base_url="https://models.example/v1",
+            model="main-model",
+            provider="openai_compat",
+            endpoint="https://models.example/v1/chat/completions",
+            api_key="secret",
+            headers={"X-Tenant": "demo"},
+            payload_template="",
+        )
+        session.telemetry_callback = None
+        client = session._build_auto_title_client()
+        self.assertEqual(client.model, "title-model")
+        self.assertEqual(client.provider, "openai_compat")
+        self.assertEqual(client.endpoint, "https://models.example/v1/chat/completions")
+        self.assertEqual(client.api_key, "secret")
+        self.assertEqual(client.headers, {"X-Tenant": "demo"})
+
+    def test_model_refine_keeps_one_application_prefix(self):
+        session, _ = self.make_session(title="Image Studio-IDE编程请求处理")
+        session.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        session.title_origin = "auto"
+        session.auto_title_refine_lock = threading.RLock()
+        session.auto_title_refine_generation = 3
+        session.auto_title_refine_pending = True
+        session.auto_title_last_goal_digest = "goal-digest"
+        session.auto_title_revision = 1
+        session.root = Path(tempfile.mkdtemp(prefix="clouds-title-test-"))
+        self.addCleanup(cc.shutil.rmtree, session.root, True)
+        session._build_auto_title_client = lambda: types.SimpleNamespace(
+            chat=lambda *_args, **_kwargs: {"content": "Image Studio：IDE气泡实时刷新"}
+        )
+        session._auto_title_model_refine_worker(
+            "修复IDE气泡实时刷新",
+            "goal-digest",
+            "宝可梦精灵球绘制",
+            "test",
+            3,
+        )
+        self.assertEqual(session.title, "Image Studio-IDE气泡实时刷新")
+        self.assertEqual(session.last_auto_title_source, "model")
+        self.assertFalse(session.auto_title_refine_pending)
 
     def test_legacy_application_title_and_placeholder_suffix_are_replaceable(self):
         exact, _ = self.make_session(title="Image Studio")
@@ -3658,8 +3838,8 @@ class IDEAutoTitleTests(unittest.TestCase):
         placeholder, _ = self.make_session(title="Image Studio-IDE编程请求处理")
         placeholder.app_binding = {"app_id": "app_image", "name": "Image Studio"}
         placeholder.title_origin = "auto"
-        self.assertTrue(
-            placeholder._maybe_auto_rename_session_title("application-repair"))
+        self.assertTrue(placeholder._maybe_auto_rename_session_title("application-repair"))
+        self.wait_for_auto_title(placeholder)
         self.assertEqual(placeholder.title, "Image Studio-宝可梦精灵球绘制")
 
     def test_manual_application_session_title_is_never_overwritten(self):
@@ -3681,17 +3861,20 @@ class IDEAutoTitleTests(unittest.TestCase):
             "制作一个宝可梦精灵球的图片，用matplot设计制作显示",
         )
         self.assertTrue(session._maybe_auto_rename_session_title("test"))
-        self.assertEqual(session.title, "制作一个宝可梦精灵球的图片")
+        self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
         self.assertEqual(session.last_auto_title_source, "fallback")
 
     def test_legacy_default_and_bad_auto_titles_are_replaceable(self):
         session, _ = self.make_session(title="IDE编程会话 / IDE编程会话")
         self.assertEqual(session.title_origin, "default")
         self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
 
         bad, _ = self.make_session(title="编程任务进行中")
         self.assertEqual(bad.title_origin, "auto")
         self.assertTrue(bad._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(bad)
         self.assertEqual(bad.title, "宝可梦精灵球绘制")
 
     def test_windows_localized_program_titles_are_replaceable_defaults(self):
@@ -3705,12 +3888,14 @@ class IDEAutoTitleTests(unittest.TestCase):
                 session, _ = self.make_session(title=title)
                 self.assertEqual(session.title_origin, "default")
                 self.assertTrue(session._maybe_auto_rename_session_title("test"))
+                self.wait_for_auto_title(session)
                 self.assertEqual(session.title, "宝可梦精灵球绘制")
 
     def test_shared_workspace_is_replaceable_and_legacy_sessions_are_migrated(self):
         session, _ = self.make_session(title="Shared workspace")
         self.assertEqual(session.title_origin, "default")
         self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
         self.assertEqual(session.title, "宝可梦精灵球绘制")
 
         legacy, _ = self.make_session(title="Shared workspace")
@@ -3758,9 +3943,187 @@ class IDEAutoTitleTests(unittest.TestCase):
         self.assertEqual(session.title, "我的太阳系模型")
         self.assertEqual(session.title_origin, "manual")
         self.assertEqual(session.last_auto_title_source, "")
+        self.assertEqual(session.auto_title_revision, 1)
+        self.assertEqual(session.auto_title_refine_generation, 1)
+        self.assertFalse(session.auto_title_refine_pending)
+
+
+class EventHubCursorTests(unittest.TestCase):
+    def test_publish_preserves_restored_session_sequence(self):
+        hub = cc.EventHub()
+        subscriber = hub.subscribe()
+        restored_event = {"type": "message", "seq": 417, "data": {"role": "user"}}
+        hub.publish(restored_event)
+        self.assertEqual(subscriber.get_nowait()["seq"], 417)
+        next_local_event = {"type": "status", "data": {}}
+        hub.publish(next_local_event)
+        self.assertEqual(subscriber.get_nowait()["seq"], 418)
+
+    def test_session_event_commits_message_before_publish(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.id = "sess_live"
+        session.lock = threading.RLock()
+        session.running = False
+        session.event_seq = 416
+        session.messages = [{"role": "user", "content": "new message", "ts": cc.now_ts()}]
+        session.scheduler_visible_inputs = []
+        session.operations = []
+        session.activity = []
+        session._maybe_persist_after_event = mock.Mock()
+        session._publish_collaboration_event_heartbeat = mock.Mock()
+
+        class ObservingHub:
+            def publish(self, event):
+                self.event = event
+                self.operation_seq = session.operations[-1]["seq"]
+                self.message_seq = session.messages[-1]["seq"]
+
+        session.events = ObservingHub()
+        event = session._emit("message", {"role": "user", "text": "new message"})
+        self.assertEqual(event["seq"], 417)
+        self.assertEqual(session.events.operation_seq, 417)
+        self.assertEqual(session.events.message_seq, 417)
 
 
 class IDEAgentStateTests(unittest.TestCase):
+    def test_runtime_controls_have_separate_origin_and_ui_projection(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        self.assertTrue(
+            session._is_ui_hidden_runtime_message(
+                {"role": "user", "content": "<intent-fusion type='continuation'>internal context</intent-fusion>"}
+            )
+        )
+        self.assertTrue(
+            session._is_ui_hidden_runtime_message(
+                {"role": "user", "content": "<compact-resume>archived context</compact-resume>"}
+            )
+        )
+        recalled = {"role": "user", "content": "<auto-context-recall>internal context</auto-context-recall>"}
+        self.assertTrue(session._is_runtime_internal_message(recalled))
+        projected = session._runtime_message_ui_projection(recalled)
+        self.assertEqual(projected["role"], "system")
+        self.assertEqual(projected["type"], "runtime_hint")
+        self.assertEqual(projected["data"]["control_tag"], "auto-context-recall")
+        self.assertTrue(
+            session._is_ui_hidden_runtime_message(
+                {"role": "user", "content": "<auto-continue>retry tool</auto-continue>"}
+            )
+        )
+        self.assertFalse(
+            session._is_runtime_internal_message(
+                {"role": "user", "content": "APPROACH / USER / DEVELOPER are ordinary words here"}
+            )
+        )
+
+    def test_ide_agent_state_drops_hidden_and_empty_rows_and_stabilizes_operations(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        session = cc.SessionState.__new__(cc.SessionState)
+
+        def snapshot_safe(**_kwargs):
+            return {
+                "running": False,
+                "event_seq": 3,
+                "message_count": 4,
+                "conversation_feed": [
+                    {
+                        "id": "hidden",
+                        "role": "user",
+                        "type": "message",
+                        "text": "<intent-fusion>internal</intent-fusion>",
+                        "ts": 1,
+                    },
+                    {"id": "empty", "role": "assistant", "type": "message", "text": "", "ts": 2},
+                    {
+                        "id": "natural",
+                        "role": "user",
+                        "type": "message",
+                        "text": "APPROACH is part of my request",
+                        "ts": 3,
+                    },
+                    {
+                        "id": "runtime-recall",
+                        "role": "system",
+                        "type": "runtime_hint",
+                        "text": "Archived context evidence was recalled for the active work.",
+                        "data": {
+                            "control_tag": "auto-context-recall",
+                            "origin": "runtime",
+                            "query": "engine invariant",
+                            "returned": 2,
+                            "default_collapsed": True,
+                        },
+                        "ts": 3.5,
+                    },
+                ],
+                "operations": [
+                    {"type": "status", "ts": 4, "data": {"summary": "stable status"}},
+                ],
+            }
+
+        session.snapshot_safe = snapshot_safe
+        session.lock = threading.Lock()
+        app._ide_session = lambda _user_id, _session_id: session
+        state = app.ide_agent_state("user-a", "session-a")
+        self.assertEqual([row["id"] for row in state["feed"]], ["natural", "runtime-recall"])
+        runtime = state["feed"][-1]
+        self.assertEqual(runtime["role"], "system")
+        self.assertEqual(runtime["type"], "runtime_hint")
+        self.assertEqual(runtime["data"]["query"], "engine invariant")
+        self.assertTrue(runtime["data"]["default_collapsed"])
+        self.assertEqual(len(state["operations"]), 1)
+        self.assertTrue(state["operations"][0]["id"].startswith("operation:"))
+
+    def test_frontend_row_identity_prefers_stable_id_or_sequence(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        key_start = source.index("function _chatVirtRowKey")
+        key_end = source.index("function _chatVirtFormatElapsed", key_start)
+        key_source = source[key_start:key_end]
+        self.assertIn("if(id)return`id:${id}`", key_source)
+        self.assertIn("if(seq>0)return`seq:${seq}`", key_source)
+        self.assertNotIn(":${idx}", key_source)
+
+    def test_web_and_ide_render_runtime_hint_from_structured_metadata(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        web_start = source.index("function _chatVirtRuntimeHintFromMessage")
+        web_end = source.index("function _chatVirtBuildMessageNode", web_start)
+        web_source = source[web_start:web_end]
+        self.assertIn("m?.type||'').toLowerCase()==='runtime_hint'", web_source)
+        self.assertIn("data.control_tag", web_source)
+        self.assertIn("data.details||m?.text", web_source)
+        self.assertIn("msg-runtime-details", source)
+
+        ide_start = source.index("function renderAgentRuntimeHint")
+        ide_end = source.index("function renderCompactCard", ide_start)
+        ide_source = source[ide_start:ide_end]
+        self.assertIn("data.control_tag", ide_source)
+        self.assertIn("data.default_collapsed===false", ide_source)
+        render_start = source.index("function renderAgentState(state)")
+        render_end = source.index("async function pollAgent", render_start)
+        self.assertIn("if(type==='runtime_hint'){renderAgentRuntimeHint(row);continue}", source[render_start:render_end])
+
+    def test_runtime_projection_uses_metadata_before_legacy_envelope(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        message = session._runtime_control_message(
+            "opaque provider-compatible evidence without an XML tag",
+            control_tag="auto-context-recall",
+            ui_data={"query": "semantic locator", "returned": 3},
+        )
+        projection = session._runtime_message_ui_projection(message)
+        self.assertEqual(projection["role"], "system")
+        self.assertEqual(projection["type"], "runtime_hint")
+        self.assertEqual(projection["data"]["query"], "semantic locator")
+        self.assertEqual(projection["data"]["returned"], 3)
+        self.assertEqual(message["content"], "opaque provider-compatible evidence without an XML tag")
+
+    def test_web_snapshot_refresh_discards_response_after_session_switch(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        refresh_start = source.index("async function refreshSnapshot(opt={})")
+        refresh_end = source.index("function scheduleSnapshot", refresh_start)
+        refresh_source = source[refresh_start:refresh_end]
+        self.assertIn("const requestedSessionId=String(S.activeId||'')", refresh_source)
+        self.assertIn("const nextSnapshot=await api('/api/sessions/'+requestedSessionId+q)", refresh_source)
+        self.assertIn("if(String(S.activeId||'')!==requestedSessionId)return", refresh_source)
+
     def test_collaboration_run_with_open_todos_is_blocked_not_completed(self):
         todos = cc.TodoManager("zh-CN")
         todos.update(
@@ -3785,8 +4148,7 @@ class IDEAgentStateTests(unittest.TestCase):
         self.assertIn("Outstanding Todos: 2 of 3", summary)
 
     def test_collaboration_tool_event_refreshes_agent_heartbeat_details(self):
-        coordinator = types.SimpleNamespace(
-            heartbeat=mock.Mock(return_value={"ok": True}))
+        coordinator = types.SimpleNamespace(heartbeat=mock.Mock(return_value={"ok": True}))
         session = cc.SessionState.__new__(cc.SessionState)
         session.id = "sess_live"
         session.running = True
@@ -3796,8 +4158,9 @@ class IDEAgentStateTests(unittest.TestCase):
         session.collaboration_agent_current_file = ""
 
         session._publish_collaboration_event_heartbeat(
-            "tool_start", {
-                "name": "edit_file", "path": "js/live.js", "summary": "tool start: edit_file"}, )  # noqa: E501
+            "tool_start",
+            {"name": "edit_file", "path": "js/live.js", "summary": "tool start: edit_file"},
+        )
 
         call = coordinator.heartbeat.call_args
         self.assertEqual(call.args[0], "sess_live")
@@ -4647,8 +5010,7 @@ class SubprocessTextSafetyTests(unittest.TestCase):
     def test_decode_subprocess_bytes_never_raises_for_mixed_output(self):
         raw = "Windows 中文输出".encode() + b"\xad"
         with (
-            mock.patch.object(cc, "_windows_subprocess_encodings",
-                              return_value=["cp936"]),
+            mock.patch.object(cc, "_windows_subprocess_encodings", return_value=["cp936"]),
             mock.patch.object(cc.locale, "getpreferredencoding", return_value="gbk"),
         ):
             text, diagnostics = cc.decode_subprocess_bytes(raw)
@@ -4661,7 +5023,7 @@ class SubprocessTextSafetyTests(unittest.TestCase):
             [
                 cc.sys.executable,
                 "-c",
-                "import os,sys; os.write(1, '中文'.encode()); os.write(2, b'bad\\xad'); sys.exit(7)",  # noqa: E501
+                "import os,sys; os.write(1, '中文'.encode()); os.write(2, b'bad\\xad'); sys.exit(7)",
             ],
             capture_output=True,
         )
@@ -4672,8 +5034,7 @@ class SubprocessTextSafetyTests(unittest.TestCase):
 
         with self.assertRaises(cc.subprocess.TimeoutExpired) as raised:
             cc.run_subprocess_text(
-                [cc.sys.executable, "-c",
-                    "import os,time; os.write(1,b'partial\\xad'); time.sleep(2)"],
+                [cc.sys.executable, "-c", "import os,time; os.write(1,b'partial\\xad'); time.sleep(2)"],
                 capture_output=True,
                 timeout=0.05,
             )
@@ -4683,8 +5044,9 @@ class SubprocessTextSafetyTests(unittest.TestCase):
     def test_captured_subprocesses_do_not_use_implicit_text_decoding(self):
         source = Path(cc.__file__).read_text(encoding="utf-8")
         pattern = re.compile(
-            r"subprocess\.run\([\s\S]{0,600}?(?:capture_output=True|stdout=subprocess\.PIPE)"  # noqa: E501
-            r"[\s\S]{0,300}?(?:text=True|universal_newlines=True)")
+            r"subprocess\.run\([\s\S]{0,600}?(?:capture_output=True|stdout=subprocess\.PIPE)"
+            r"[\s\S]{0,300}?(?:text=True|universal_newlines=True)"
+        )
         self.assertIsNone(pattern.search(source))
 
 
@@ -4734,20 +5096,14 @@ class HardApplicationSnapshotIntegrityTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_fallback_allows_workspace_and_restores_snapshot_tampering(self):
-        self.assertEqual(self.session._hard_snapshot_integrity_callback(
-            "before", "echo ok > normal.txt"), "")
-        (self.files / "normal.txt").write_text("workspace is writable", encoding="utf-8")  # noqa: E501
+        self.assertEqual(self.session._hard_snapshot_integrity_callback("before", "echo ok > normal.txt"), "")
+        (self.files / "normal.txt").write_text("workspace is writable", encoding="utf-8")
         os.chmod(self.resource, 0o600)
         self.resource.write_text("tampered", encoding="utf-8")
-        error = self.session._hard_snapshot_integrity_callback(
-            "after", "python mutate.py")
+        error = self.session._hard_snapshot_integrity_callback("after", "python mutate.py")
         self.assertIn("restored", error)
         self.assertEqual(self.resource.read_text(encoding="utf-8"), "approved skill\n")
-        self.assertEqual(
-            (self.files /
-             "normal.txt").read_text(
-                encoding="utf-8"),
-            "workspace is writable")
+        self.assertEqual((self.files / "normal.txt").read_text(encoding="utf-8"), "workspace is writable")
 
     def test_explicit_snapshot_mutation_is_rejected_before_execution(self):
         error = self.session._hard_snapshot_integrity_callback(
@@ -4756,7 +5112,7 @@ class HardApplicationSnapshotIntegrityTests(unittest.TestCase):
         self.assertIn("read-only", error)
         scripted = self.session._hard_snapshot_integrity_callback(
             "before",
-            "python -c \"from pathlib import Path; Path('.application_skills/01/SKILL.md').unlink()\"",  # noqa: E501
+            "python -c \"from pathlib import Path; Path('.application_skills/01/SKILL.md').unlink()\"",
         )
         self.assertIn("read-only", scripted)
 
@@ -4775,8 +5131,7 @@ class HardApplicationSnapshotIntegrityTests(unittest.TestCase):
             mock.patch.object(cc.shutil, "which", return_value="/usr/bin/bwrap"),
         ):
             prefix = self.session._workspace_sandbox_shell_prefix(self.files)
-        overlay = ["--ro-bind", str(self.snapshot.resolve()),
-                   "/workspace/.application_skills"]
+        overlay = ["--ro-bind", str(self.snapshot.resolve()), "/workspace/.application_skills"]
         self.assertIn(" ".join(overlay), " ".join(prefix))
 
 
@@ -4800,8 +5155,7 @@ class IDEApplicationBridgeTests(unittest.TestCase):
 
             class FakeApplications:
                 resolve_launch = staticmethod(lambda _user_id, _app_id: dict(app_row))
-                _resources_digest = staticmethod(
-                    cc.ApplicationRegistry._resources_digest)
+                _resources_digest = staticmethod(cc.ApplicationRegistry._resources_digest)
                 _verify_v2_runtime_contract_manifest = staticmethod(lambda *_args: None)
 
             def fake_session(title):
@@ -4836,8 +5190,9 @@ class IDEApplicationBridgeTests(unittest.TestCase):
             app.telemetry = types.SimpleNamespace(record=lambda *_args, **_kwargs: None)
             sessions = []
 
-            def create(_user_id, title, client_ip=""):
+            def create(_user_id, title, client_ip="", *, title_origin=None):
                 session = fake_session(title)
+                session.title_origin = title_origin or session.title_origin
                 sessions.append(session)
                 return session, {"remaining": 10}
 
@@ -4873,12 +5228,11 @@ class IDEApplicationBridgeTests(unittest.TestCase):
 
                 @staticmethod
                 def load(ref):
-                    return "---\nname: Demo\ndescription: Demo workflow\n---\nAlways return a checked result.\n" if ref == "demo" else ""  # noqa: E501
+                    return "---\nname: Demo\ndescription: Demo workflow\n---\nAlways return a checked result.\n" if ref == "demo" else ""
 
                 @staticmethod
                 def list_metadata():
-                    return [{"qualified_name": "demo", "name": "Demo",
-                             "description": "Demo workflow"}]
+                    return [{"qualified_name": "demo", "name": "Demo", "description": "Demo workflow"}]
 
                 @staticmethod
                 def _skill_runtime_contract(_meta):
@@ -4952,11 +5306,9 @@ class IDEApplicationBridgeTests(unittest.TestCase):
         source_user = cc.user_id_from_ip(cc._normalize_ip("10.0.0.8"))
         app.applications = types.SimpleNamespace(
             list_shared=lambda: [{"id": "shared"}],
-            list_personal=lambda uid: [{"id": "target"}] if uid == "ide_account" else (
-                [{"id": "legacy"}] if uid == source_user else [{"id": "wrong"}]),
+            list_personal=lambda uid: [{"id": "target"}] if uid == "ide_account" else ([{"id": "legacy"}] if uid == source_user else [{"id": "wrong"}]),
         )
-        app.manager_for_user = lambda uid: types.SimpleNamespace(
-            list=lambda **_kwargs: {"sessions": []})
+        app.manager_for_user = lambda uid: types.SimpleNamespace(list=lambda **_kwargs: {"sessions": []})
         payload = app.ide_applications_payload("ide_account", client_ip="10.0.0.8")
         self.assertEqual([row["id"] for row in payload["personal"]], ["target"])
         self.assertEqual([row["id"] for row in payload["legacy_personal"]], ["legacy"])
@@ -4970,19 +5322,10 @@ class IDEApplicationBridgeTests(unittest.TestCase):
             source_user = cc.user_id_from_ip(cc._normalize_ip("10.0.0.9"))
             source_root = root / "source-session"
             (source_root / "files").mkdir(parents=True)
-            (source_root / "files" / "work.txt").write_text("preserved", encoding="utf-8")  # noqa: E501
-            source_binding = {"app_id": "app_source",
-                              "name": "App", "scope": "personal"}
-            crypto.write_json(source_root / "state.json",
-                              {"id": "sess_source",
-                               "title": "Imported",
-                               "app_binding": source_binding,
-                               "bound_skill_ids": ["demo"],
-                                  "bound_skill_capsule": "{}"})
-            crypto.write_json(source_root / "meta.json",
-                              {"id": "sess_source",
-                               "title": "Imported",
-                               "message_count": 3})
+            (source_root / "files" / "work.txt").write_text("preserved", encoding="utf-8")
+            source_binding = {"app_id": "app_source", "name": "App", "scope": "personal"}
+            crypto.write_json(source_root / "state.json", {"id": "sess_source", "title": "Imported", "app_binding": source_binding, "bound_skill_ids": ["demo"], "bound_skill_capsule": "{}"})
+            crypto.write_json(source_root / "meta.json", {"id": "sess_source", "title": "Imported", "message_count": 3})
 
             class SourceSession:
                 id = "sess_source"
@@ -5038,34 +5381,22 @@ class IDEApplicationBridgeTests(unittest.TestCase):
                 resolve_launch=lambda *_args: {},
                 remove_imported_copy=lambda *_args: True,
             )
-            app.manager_for_user = lambda uid: source_manager if uid == source_user else target_manager  # noqa: E501
+            app.manager_for_user = lambda uid: source_manager if uid == source_user else target_manager
             app._ide_legacy_session_running = lambda *_args: False
             app._rollback_session_quota_reservation = lambda _uid: None
 
             def create_target(_uid, title, client_ip=""):
-                target = types.SimpleNamespace(
-                    id="sess_target",
-                    title=title,
-                    root=target_manager.root /
-                    "sess_target")
+                target = types.SimpleNamespace(id="sess_target", title=title, root=target_manager.root / "sess_target")
                 target.root.mkdir(parents=True)
                 return target, {"remaining": 4}
 
             app.create_session_for_user = create_target
-            result = app.ide_import_application_session(
-                "ide_account", "sess_source", client_ip="10.0.0.9")
-            copied_state = crypto.read_json(
-                target_manager.root / result["id"] / "state.json", {})
+            result = app.ide_import_application_session("ide_account", "sess_source", client_ip="10.0.0.9")
+            copied_state = crypto.read_json(target_manager.root / result["id"] / "state.json", {})
             source_state = crypto.read_json(source_root / "state.json", {})
             self.assertEqual(copied_state["id"], "sess_target")
             self.assertEqual(copied_state["app_binding"]["app_id"], "app_imported")
-            self.assertEqual(
-                (target_manager.root /
-                 result["id"] /
-                    "files" /
-                    "work.txt").read_text(
-                    encoding="utf-8"),
-                "preserved")
+            self.assertEqual((target_manager.root / result["id"] / "files" / "work.txt").read_text(encoding="utf-8"), "preserved")
             self.assertEqual(source_state["id"], "sess_source")
             self.assertEqual(source_state["app_binding"]["app_id"], "app_source")
 
@@ -5077,9 +5408,7 @@ class IDEApplicationBridgeTests(unittest.TestCase):
             cc.IDE_INDEX_HTML,
             r"<strong>Personal</strong><button id=\"newIdeApplicationBtn\"",
         )
-        self.assertIn(
-            'class="application-create-glyph" aria-hidden="true">+</span>',
-            cc.IDE_INDEX_HTML)
+        self.assertIn('class="application-create-glyph" aria-hidden="true">+</span>', cc.IDE_INDEX_HTML)
         self.assertIn(".application-create-button", cc.IDE_CSS)
         self.assertIn("background:transparent!important", cc.IDE_CSS)
         self.assertNotIn(".application-empty-create", cc.IDE_CSS)
@@ -5096,6 +5425,26 @@ class IDEApplicationBridgeTests(unittest.TestCase):
         self.assertIn('function deleteIdeApplication(', cc.IDE_JS)
         self.assertIn('Submit for Shared Review', cc.IDE_JS)
         self.assertIn('switchSession(out.id,true)', cc.IDE_JS)
+
+    def test_ide_assets_bound_long_running_views_and_theme_scrollbars(self):
+        for marker in (
+            "PANEL_LOG_MAX_CHARS",
+            "appendPanelText",
+            "AGENT_MESSAGES_DOM_LIMIT",
+            "trimAgentMessages",
+            "agentTimelineSignature",
+            "agentProgressSignature",
+            "finishAgentMessagesRender",
+            "timelineChanged",
+        ):
+            self.assertIn(marker, cc.IDE_JS)
+        self.assertIn("scrollbar-width:thin", cc.IDE_CSS)
+        self.assertIn("::-webkit-scrollbar-thumb", cc.IDE_CSS)
+        self.assertIn("scrollbar-gutter:stable", cc.IDE_CSS)
+        self.assertIn("--ide-scrollbar-thumb", cc.IDE_CSS)
+        self.assertIn("@media(hover:none),(pointer:coarse)", cc.IDE_CSS)
+        self.assertIn("--web-scrollbar-thumb", cc.APP_CSS)
+        self.assertIn("#chat,#sessionList", cc.APP_CSS)
 
 
 if __name__ == "__main__":

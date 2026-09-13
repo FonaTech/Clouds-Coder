@@ -18,16 +18,19 @@ class FakeOllama:
     def chat(self, messages, **kwargs):
         self.calls.append({"messages": messages, "kwargs": kwargs})
         response = (
-            self.responses.pop(0) if self.responses else {
+            self.responses.pop(0)
+            if self.responses
+            else {
                 "decision": "reject",
                 "confidence": "high",
-                "reason": "The proposal has not demonstrated complete requirement coverage.",  # noqa: E501
+                "reason": "The proposal has not demonstrated complete requirement coverage.",
                 "removed_objectives": [],
                 "replacement_mapping": [],
                 "requirement_coverage": [],
                 "completion_risk": "high",
                 "evidence": [],
-            })
+            }
+        )
         if isinstance(response, str):
             return {"content": response}
         return {"content": json.dumps(response, ensure_ascii=False)}
@@ -46,8 +49,9 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         session.runtime_plan_mode_needed = False
         session.runtime_reclassify_required = False
         session.runtime_authoritative_goal = (
-            "Build all ten ordered stages of the offline city game, including terrain, roads, "  # noqa: E501
-            "zoning, buildings, utilities, traffic, management, save/load, and final acceptance.")  # noqa: E501
+            "Build all ten ordered stages of the offline city game, including terrain, roads, "
+            "zoning, buildings, utilities, traffic, management, save/load, and final acceptance."
+        )
         session.run_generation = 1
         session.messages = []
         session.blackboard = {
@@ -411,9 +415,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
 
         self.assertEqual(len(repaired), 2)
         self.assertEqual(len({row["subtask_id"] for row in repaired}), 2)
-        dynamic = next(
-            row for row in repaired if "动态 BufferGeometry" in row["content"]
-        )
+        dynamic = next(row for row in repaired if "动态 BufferGeometry" in row["content"])
         self.assertEqual(dynamic["status"], "completed")
         self.assertNotIn("external_subtask_id", dynamic)
 
@@ -451,9 +453,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         self.assertEqual(len(persisted), 2)
         self.assertEqual(len({row["subtask_id"] for row in persisted}), 2)
         self.assertEqual(session.todo.snapshot(), persisted)
-        dynamic = next(
-            row for row in persisted if "动态 BufferGeometry" in row["content"]
-        )
+        dynamic = next(row for row in persisted if "动态 BufferGeometry" in row["content"])
         self.assertEqual(dynamic["status"], "completed")
 
     def test_stale_todo_transaction_cannot_overwrite_a_newer_tree(self):
@@ -489,10 +489,8 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         rejection = {
             "decision": "reject",
             "confidence": "high",
-            "reason": "Stages three and four still carry uncovered acceptance requirements.",  # noqa: E501
-            "removed_objectives": [
-                "阶段3",
-                "阶段4"],
+            "reason": "Stages three and four still carry uncovered acceptance requirements.",
+            "removed_objectives": ["阶段3", "阶段4"],
             "replacement_mapping": [],
             "requirement_coverage": ["Stages one and two remain covered"],
             "completion_risk": "high",
@@ -505,7 +503,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": self.stages(2),
                 "update_mode": "revise_open",
-                "revision_reason": "Use a shorter execution tree after the latest implementation findings.",  # noqa: E501
+                "revision_reason": "Use a shorter execution tree after the latest implementation findings.",
                 "revision_evidence": [
                     "Only stages one and two have observable results"
                 ],
@@ -529,17 +527,17 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         approval = {
             "decision": "approve",
             "confidence": "medium",
-            "reason": "The merged objective explicitly retains every implementation and acceptance obligation.",  # noqa: E501
+            "reason": "The merged objective explicitly retains every implementation and acceptance obligation.",
             "removed_objectives": ["stage two", "stage three", "stage four"],
             "replacement_mapping": [
                 {
                     "removed": "stages two through four",
                     "replacement": "combined implementation and acceptance objective",
-                    "reason": "The replacement preserves all three scopes and their checks.",  # noqa: E501
+                    "reason": "The replacement preserves all three scopes and their checks.",
                 }
             ],
             "requirement_coverage": [
-                "rendering, terrain, and roads -> combined implementation and acceptance objective"  # noqa: E501
+                "rendering, terrain, and roads -> combined implementation and acceptance objective"
             ],
             "completion_risk": "medium",
             "evidence": ["The replacement text carries the full obligations"],
@@ -563,7 +561,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": proposal,
                 "update_mode": "revise_open",
-                "revision_reason": "Current module boundaries require one integrated implementation transaction.",  # noqa: E501
+                "revision_reason": "Current module boundaries require one integrated implementation transaction.",
                 "revision_evidence": [
                     "The modules now share one verified integration boundary"
                 ],
@@ -588,7 +586,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": self.stages(1),
                 "update_mode": "revise_open",
-                "revision_reason": "Replace the remaining objectives based on a new execution shape.",  # noqa: E501
+                "revision_reason": "Replace the remaining objectives based on a new execution shape.",
             },
             role="developer",
         )
@@ -638,7 +636,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         response = {
             "approved": True,
             "confidence": "low",
-            "reason": "The expanded current subtask preserves the parent step and its acceptance obligation.",  # noqa: E501
+            "reason": "The expanded current subtask preserves the parent step and its acceptance obligation.",
             "unsupported_changes": [],
         }
         session, step = self.plan_session("single", [response])
@@ -692,6 +690,152 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         self.assertEqual(
             session.blackboard["plan_todo_revisions"][-1]["status"], "accepted"
         )
+
+    def test_single_plan_step_edit_reuses_canonical_step_identity(self):
+        session, step = self.plan_session("single")
+        result = session._dispatch_todo_update(
+            {
+                "plan_updates": [
+                    {
+                        "step_id": step["id"],
+                        "content": "实现完整城市系统并记录跨模块约束",
+                    }
+                ]
+            },
+            role="developer",
+        )
+
+        self.assertIn("single_step_update", result)
+        current = next(
+            row for row in session.blackboard["project_todos"]
+            if row.get("id") == step["id"]
+        )
+        self.assertEqual(current["content"], "实现完整城市系统并记录跨模块约束")
+        self.assertEqual(current["key"], step["key"])
+        self.assertEqual(current["status"], "in_progress")
+        self.assertEqual(session.blackboard["plan_step_revisions"][-1]["mode"], "single_step_update")
+
+    def test_unscoped_todo_is_model_classified_before_becoming_a_new_child(self):
+        classification = {
+            "intent": "parent_update",
+            "confidence": "high",
+            "reason": "The incoming wording is a progress-based refinement of the active step.",
+            "parent_content": "实现完整城市系统并记录跨模块约束",
+        }
+        session, step = self.plan_session("single", [classification])
+        result = session._dispatch_todo_update(
+            {
+                "todos": [
+                    {
+                        "content": "实现完整城市系统并记录跨模块约束",
+                        "status": "in_progress",
+                    }
+                ]
+            },
+            role="developer",
+        )
+
+        self.assertNotIn("preserve_current_subplan", result)
+        current = next(
+            row for row in session.blackboard["project_todos"]
+            if row.get("id") == step["id"]
+        )
+        self.assertEqual(current["content"], "实现完整城市系统并记录跨模块约束")
+        worker_rows = [
+            row for row in session.todo.snapshot()
+            if row.get("parent_step_id") == step["id"]
+        ]
+        self.assertFalse(
+            any("实现完整城市系统并记录跨模块约束" in row.get("content", "") for row in worker_rows if not session._is_plan_step_acceptance_subtask(row.get("content", "")))
+        )
+
+    def test_multi_step_plan_edit_is_reviewed_and_rejected_without_mutation(self):
+        rejection = {
+            "decision": "reject",
+            "confidence": "high",
+            "reason": "The proposed edits drop the required acceptance obligations.",
+            "completion_risk": "high",
+            "requirement_coverage": [],
+            "evidence": ["No progress evidence supports removing the checks."],
+        }
+        session = self.bare_session("single", [rejection])
+        rows = []
+        for index, title in enumerate(("研究文献", "编写 HTML", "验证链接")):
+            rows.append(
+                {
+                    "id": f"pt:{index:03d}",
+                    "key": f"bb:proj:pt:{index:03d}",
+                    "content": title,
+                    "full_content": title,
+                    "status": "in_progress" if index == 0 else "pending",
+                    "category": "plan_step",
+                    "plan_step_index": index,
+                }
+            )
+        session.blackboard.update({
+            "project_todos": rows,
+            "plan": {"phase": "executing"},
+        })
+
+        result = session._apply_plan_step_updates(
+            [
+                {"step_id": "pt:000", "content": "研究并整理全部文献"},
+                {"step_id": "pt:001", "content": "为每篇文章编写 HTML 与交互"},
+            ],
+            board=session.blackboard,
+            reason="New evidence suggests a broader sequence.",
+            evidence=["review:missing acceptance evidence"],
+        )
+
+        self.assertIn("plan_update_rejected", result)
+        self.assertEqual(
+            [row["content"] for row in session.blackboard["project_todos"] if row.get("category") == "plan_step"],
+            ["研究文献", "编写 HTML", "验证链接"],
+        )
+        self.assertEqual(session.blackboard["plan_step_revisions"][-1]["status"], "rejected")
+
+    def test_plan_step_deletion_requires_review_and_preserves_completed_rows(self):
+        approval = {
+            "decision": "approve",
+            "confidence": "medium",
+            "reason": "The open step is obsolete and the remaining plan still covers the goal.",
+            "completion_risk": "low",
+            "requirement_coverage": ["The remaining steps cover the requested deliverable."],
+            "evidence": ["review:obsolete open step"],
+        }
+        session = self.bare_session("single", [approval])
+        rows = [
+            {
+                "id": "pt:000", "key": "bb:proj:pt:000", "content": "已完成准备",
+                "full_content": "已完成准备", "status": "completed", "category": "plan_step",
+                "plan_step_index": 0, "completed_at": 10.0, "evidence": "files inspected",
+            },
+            {
+                "id": "pt:001", "key": "bb:proj:pt:001", "content": "过时步骤",
+                "full_content": "过时步骤", "status": "pending", "category": "plan_step",
+                "plan_step_index": 1,
+            },
+            {
+                "id": "pt:002", "key": "bb:proj:pt:002", "content": "最终验证",
+                "full_content": "最终验证", "status": "pending", "category": "plan_step",
+                "plan_step_index": 2,
+            },
+        ]
+        session.blackboard.update({"project_todos": rows, "plan": {"phase": "executing"}})
+
+        result = session._apply_plan_step_updates(
+            [{"step_id": "pt:001", "action": "delete"}],
+            board=session.blackboard,
+            reason="Review found this open step obsolete.",
+            evidence=["review:obsolete open step"],
+        )
+
+        self.assertIn("semantic_review", result)
+        remaining = [row for row in session.blackboard["project_todos"] if row.get("category") == "plan_step"]
+        self.assertEqual([row["id"] for row in remaining], ["pt:000", "pt:002"])
+        self.assertEqual([row["plan_step_index"] for row in remaining], [0, 1])
+        self.assertEqual(remaining[0]["status"], "completed")
+        self.assertEqual(remaining[0]["evidence"], "files inspected")
 
 
 if __name__ == "__main__":
