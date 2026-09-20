@@ -5,81 +5,81 @@
 
 from __future__ import annotations
 
-# split-source: order=175 original-lines=4283-4283 hash=0de182d69186f310
+# split-source: order=175 original-lines=4285-4285 hash=0de182d69186f310
 RAG_LIBRARY_DIRNAME = "RAG_Library"
 
-# split-source: order=176 original-lines=4284-4284 hash=1c1e1de533d243c7
+# split-source: order=176 original-lines=4286-4286 hash=1c1e1de533d243c7
 RAG_ADMIN_PORT_OFFSET = 2
 
-# split-source: order=177 original-lines=4285-4285 hash=c0f0809a695fc9d1
+# split-source: order=177 original-lines=4287-4287 hash=c0f0809a695fc9d1
 CODE_LIBRARY_DIRNAME = "Code_Library"
 
-# split-source: order=183 original-lines=4294-4294 hash=15ac97b37116e7af
+# split-source: order=183 original-lines=4296-4296 hash=15ac97b37116e7af
 WEB_SEARCH_INDEX_DIRNAME = "Web_Search_Index"
 
-# split-source: order=185 original-lines=4296-4296 hash=a03862a542a37ae6
+# split-source: order=185 original-lines=4298-4298 hash=a03862a542a37ae6
 USER_MEMORY_DIRNAME = ".clouds_coder"
 
-# split-source: order=186 original-lines=4297-4297 hash=f9d6faf310172e3d
+# split-source: order=186 original-lines=4299-4299 hash=f9d6faf310172e3d
 USER_MEMORY_DB_FILENAME = "user_memory.sqlite"
 
-# split-source: order=187 original-lines=4298-4298 hash=febd58a2c34ffb3d
+# split-source: order=187 original-lines=4300-4300 hash=febd58a2c34ffb3d
 USER_MEMORY_PROFILE_FILENAME = "user_profile.json"
 
-# split-source: order=188 original-lines=4299-4299 hash=8f0b97463a93304a
+# split-source: order=188 original-lines=4301-4301 hash=8f0b97463a93304a
 USER_MEMORY_MODE_CHOICES = {"off", "weak", "on"}
 
-# split-source: order=190 original-lines=4301-4301 hash=72466feef8186fb8
+# split-source: order=190 original-lines=4303-4303 hash=72466feef8186fb8
 USER_MEMORY_WEAK_CAPSULE_CHARS = 1200
 
-# split-source: order=191 original-lines=4302-4302 hash=5512298c89436343
+# split-source: order=191 original-lines=4304-4304 hash=5512298c89436343
 USER_MEMORY_ON_CAPSULE_CHARS = 2200
 
-# split-source: order=192 original-lines=4303-4306 hash=acd37ce36c51b613
+# split-source: order=192 original-lines=4305-4308 hash=acd37ce36c51b613
 # Uniform per-injection budget for the prompt capsule, applied regardless of mode
 # so per-turn token cost is the SAME whether memory is weak or on (mode governs how
 # much is stored/queried + capsule richness at build time, not hot-path weight).
 USER_MEMORY_CAPSULE_INJECT_CHARS = 600
 
-# split-source: order=193 original-lines=4307-4307 hash=c5722113df436b0f
+# split-source: order=193 original-lines=4309-4309 hash=c5722113df436b0f
 USER_MEMORY_MAX_SUMMARY_CHARS = 1200
 
-# split-source: order=194 original-lines=4308-4308 hash=b23bc08397e51a50
+# split-source: order=194 original-lines=4310-4310 hash=b23bc08397e51a50
 USER_MEMORY_QUERY_LIMIT = 8
 
-# split-source: order=195 original-lines=4309-4309 hash=42789d8e57098529
+# split-source: order=195 original-lines=4311-4311 hash=42789d8e57098529
 USER_MEMORY_DECAY_HALFLIFE_DAYS = 45.0
 
-# split-source: order=196 original-lines=4310-4310 hash=25a72ca204adb0bf
+# split-source: order=196 original-lines=4312-4312 hash=25a72ca204adb0bf
 USER_MEMORY_PROFILE_SCHEMA_VERSION = 1
 
-# split-source: order=216 original-lines=4332-4332 hash=05e40a7a15c29087
+# split-source: order=216 original-lines=4334-4334 hash=05e40a7a15c29087
 WEB_SEARCH_CONTEXT_REGISTRY_MAX = 80
 
-# split-source: order=217 original-lines=4333-4333 hash=e7001f0ab1908461
+# split-source: order=217 original-lines=4335-4335 hash=e7001f0ab1908461
 WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS = 4
 
-# split-source: order=218 original-lines=4334-4334 hash=46c79dbe876edf7d
+# split-source: order=218 original-lines=4336-4336 hash=46c79dbe876edf7d
 WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS = 3_200
 
-# split-source: order=219 original-lines=4335-4335 hash=19a8758020b0287f
+# split-source: order=219 original-lines=4337-4337 hash=19a8758020b0287f
 WEB_SEARCH_CONTEXT_NODE_MAX = 18
 
-# split-source: order=220 original-lines=4336-4336 hash=aa4f67667523a908
+# split-source: order=220 original-lines=4338-4338 hash=aa4f67667523a908
 WEB_SEARCH_CONTEXT_URL_MAX = 12
 
-# split-source: order=221 original-lines=4337-4337 hash=aaf2fa5cd0810b8f
+# split-source: order=221 original-lines=4339-4339 hash=aaf2fa5cd0810b8f
 RAG_CHUNK_CHARS = 1200
 
-# split-source: order=222 original-lines=4338-4338 hash=309ddd6d99043a56
+# split-source: order=222 original-lines=4340-4340 hash=309ddd6d99043a56
 RAG_CHUNK_OVERLAP = 180
 
-# split-source: order=223 original-lines=4339-4341 hash=cbc0bc1b1ec764d8
+# split-source: order=223 original-lines=4341-4343 hash=cbc0bc1b1ec764d8
 # Per-document chunk ceiling. Books need far more than a typical doc, so this is generous;
 # it is the hard upper bound that keeps a single pathological file from exhausting memory.
 RAG_MAX_CHUNKS_PER_DOC = 20000
 
-# split-source: order=224 original-lines=4342-4352 hash=f9665580fd1c5daf
+# split-source: order=224 original-lines=4344-4354 hash=f9665580fd1c5daf
 # Max characters retained from ONE source document before chunking. Sized for book-length
 # inputs (~12M chars ≈ several thousand pages) while staying bounded so ingest memory/time
 # can't run away. At RAG_CHUNK_CHARS/overlap this yields well under RAG_MAX_CHUNKS_PER_DOC,
@@ -92,28 +92,28 @@ RAG_MAX_DOCUMENT_CHARS = max(
     ),
 )
 
-# split-source: order=229 original-lines=4366-4366 hash=9f810d660d111af5
+# split-source: order=229 original-lines=4368-4368 hash=9f810d660d111af5
 RAG_MAX_QUERY_RESULTS = 64
 
-# split-source: order=230 original-lines=4367-4367 hash=85b3ffab92dc6826
+# split-source: order=230 original-lines=4369-4369 hash=85b3ffab92dc6826
 RAG_HIGH_RECALL_POOL_MULTIPLIER = 4
 
-# split-source: order=231 original-lines=4368-4368 hash=e6f0dbdcee02aefa
+# split-source: order=231 original-lines=4370-4370 hash=e6f0dbdcee02aefa
 RAG_HIGH_RECALL_MIN_POOL = 64
 
-# split-source: order=232 original-lines=4369-4369 hash=25da11c02b0cf298
+# split-source: order=232 original-lines=4371-4371 hash=25da11c02b0cf298
 RAG_RETRIEVAL_MAX_PER_DOC = 5
 
-# split-source: order=233 original-lines=4370-4373 hash=6841816deefd0ee6
+# split-source: order=233 original-lines=4372-4375 hash=6841816deefd0ee6
 # BM25 lexical ranking (Okapi). k1 controls term-frequency saturation; b controls
 # length normalization (0 = none, 1 = full). These replace the older TF-IDF cosine
 # scoring which over-penalized long chunks and saturated term frequency poorly.
 RAG_BM25_K1 = 1.5
 
-# split-source: order=234 original-lines=4374-4374 hash=2d171a12f2a2b0df
+# split-source: order=234 original-lines=4376-4376 hash=2d171a12f2a2b0df
 RAG_BM25_B = 0.6
 
-# split-source: order=235 original-lines=4375-4381 hash=8e22666a18931d46
+# split-source: order=235 original-lines=4377-4383 hash=8e22666a18931d46
 # BM25 saturation constant for mapping a raw BM25 sum into [0,1] via raw/(raw+sat). This
 # is POOL-INDEPENDENT (unlike min-max), so a uniformly-weak result set stays low instead
 # of being forced to 1.0 — preserving the absolute-relevance signal the no-evidence and
@@ -122,131 +122,131 @@ RAG_BM25_B = 0.6
 # while a near-zero match stays below it.
 RAG_BM25_SATURATION = 4.0
 
-# split-source: order=236 original-lines=4382-4385 hash=7f661449fcaa2f49
+# split-source: order=236 original-lines=4384-4387 hash=7f661449fcaa2f49
 # Exact-symbol / exact-identifier match boost added on top of normalized BM25 when a
 # query term equals a chunk's defining symbol or a document filename stem. Scaled by
 # symbol rarity (rarer symbol → closer to the full boost) so common names don't dominate.
 RAG_SYMBOL_EXACT_BOOST = 0.5
 
-# split-source: order=237 original-lines=4386-4389 hash=330961715af48b17
+# split-source: order=237 original-lines=4388-4391 hash=330961715af48b17
 # Index snapshot format tag. Bumping this invalidates older on-disk snapshots that lack
 # BM25 fields (raw-tf postings + chunk_lengths), forcing a one-time rebuild from the
 # persisted documents/chunks (the real source of truth) instead of scoring incorrectly.
 RAG_INDEX_SNAPSHOT_FORMAT = "bm25-v2-structured-memory"
 
-# split-source: order=238 original-lines=4390-4390 hash=5d991f69eabf4d86
+# split-source: order=238 original-lines=4392-4392 hash=5d991f69eabf4d86
 RAG_GRAPH_MAX_NODES = 2000
 
-# split-source: order=239 original-lines=4391-4391 hash=d12a174d6fd9e3d1
+# split-source: order=239 original-lines=4393-4393 hash=d12a174d6fd9e3d1
 RAG_TASK_HISTORY_LIMIT = 400
 
-# split-source: order=240 original-lines=4392-4392 hash=dee63d928b5da55d
+# split-source: order=240 original-lines=4394-4394 hash=dee63d928b5da55d
 RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
 
-# split-source: order=241 original-lines=4393-4393 hash=0bd03a6d3e7f0f2e
+# split-source: order=241 original-lines=4395-4395 hash=0bd03a6d3e7f0f2e
 RAG_MAX_IMPORT_FILES = 20_000
 
-# split-source: order=242 original-lines=4394-4394 hash=0210661dff3213bd
+# split-source: order=242 original-lines=4396-4396 hash=0210661dff3213bd
 RAG_MAX_IMPORT_BATCH_ITEMS = 500
 
-# split-source: order=243 original-lines=4395-4395 hash=1280f2f93657c8ec
+# split-source: order=243 original-lines=4397-4397 hash=1280f2f93657c8ec
 RAG_MAX_IMPORT_BATCH_BYTES = 48 * 1024 * 1024
 
-# split-source: order=244 original-lines=4396-4396 hash=9b16447b85b735a1
+# split-source: order=244 original-lines=4398-4398 hash=9b16447b85b735a1
 RAG_PDF_IMAGE_LIMIT = 8
 
-# split-source: order=245 original-lines=4397-4397 hash=da5178fecc5cbb0b
+# split-source: order=245 original-lines=4399-4399 hash=da5178fecc5cbb0b
 RAG_QUERY_CONTEXT_CHARS = 1600
 
-# split-source: order=246 original-lines=4398-4398 hash=ad9a742e3b013a67
+# split-source: order=246 original-lines=4400-4400 hash=ad9a742e3b013a67
 RAG_MAX_GLOBAL_COMMUNITIES = 3
 
-# split-source: order=247 original-lines=4399-4399 hash=4bbc8f3a1ecc50a5
+# split-source: order=247 original-lines=4401-4401 hash=4bbc8f3a1ecc50a5
 RAG_MAX_COMMUNITY_MAP_SUPPORT = 4
 
-# split-source: order=248 original-lines=4400-4400 hash=549e954ad7f48ea0
+# split-source: order=248 original-lines=4402-4402 hash=549e954ad7f48ea0
 RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT = False
 
-# split-source: order=249 original-lines=4401-4401 hash=2bc7d7e718aba97c
+# split-source: order=249 original-lines=4403-4403 hash=2bc7d7e718aba97c
 RAG_DYNAMIC_NOISE_MIN_DOC_FREQ = 6
 
-# split-source: order=250 original-lines=4402-4402 hash=733eefaf02668c28
+# split-source: order=250 original-lines=4404-4404 hash=733eefaf02668c28
 RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ = 2
 
-# split-source: order=251 original-lines=4403-4403 hash=e6e6f84055bb3023
+# split-source: order=251 original-lines=4405-4405 hash=e6e6f84055bb3023
 RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO = 0.18
 
-# split-source: order=252 original-lines=4404-4404 hash=1f390b7adea12881
+# split-source: order=252 original-lines=4406-4406 hash=1f390b7adea12881
 RAG_DYNAMIC_NOISE_HARD_DOC_RATIO = 0.42
 
-# split-source: order=253 original-lines=4405-4405 hash=ffb33a9079f79edb
+# split-source: order=253 original-lines=4407-4407 hash=ffb33a9079f79edb
 RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO = 0.46
 
-# split-source: order=254 original-lines=4406-4406 hash=c1f3ed654aa13e2e
+# split-source: order=254 original-lines=4408-4408 hash=c1f3ed654aa13e2e
 RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO = 0.80
 
-# split-source: order=255 original-lines=4407-4407 hash=610fab1edd200089
+# split-source: order=255 original-lines=4409-4409 hash=610fab1edd200089
 RAG_MIN_SYNTHESIS_SCORE = 0.12       # chunks below this score are filtered before LLM synthesis
 
-# split-source: order=256 original-lines=4408-4408 hash=92ad3654a044311c
+# split-source: order=256 original-lines=4410-4410 hash=92ad3654a044311c
 RAG_NO_EVIDENCE_THRESHOLD = 0.18     # if best chunk score < this, skip LLM entirely and return no-evidence message
 
-# split-source: order=257 original-lines=4409-4409 hash=b41ef5fe5a88a655
+# split-source: order=257 original-lines=4411-4411 hash=b41ef5fe5a88a655
 RAG_WEAK_MATCH_SCORE_CAP = 0.095     # fuzzy fallback candidates stay visible but cannot trigger grounded synthesis
 
-# split-source: order=258 original-lines=4410-4410 hash=5c1d29556c1d9c54
+# split-source: order=258 original-lines=4412-4412 hash=5c1d29556c1d9c54
 RAG_SYNTHESIS_MAX_PER_DOC = 2        # max chunks from the same document in synthesis evidence
 
-# split-source: order=259 original-lines=4411-4411 hash=d9cf5b5fb75012f3
+# split-source: order=259 original-lines=4413-4413 hash=d9cf5b5fb75012f3
 RAG_WORKFLOW_ACCEPT_SCORE = 0.72
 
-# split-source: order=260 original-lines=4412-4412 hash=be24078cca77958b
+# split-source: order=260 original-lines=4414-4414 hash=be24078cca77958b
 RAG_NO_EVIDENCE_MESSAGE = "知识库中暂无足够证据回答此问题。请尝试扩展查询范围或导入相关文档。"
 
-# split-source: order=261 original-lines=4413-4417 hash=9a8108a254df24cc
+# split-source: order=261 original-lines=4415-4419 hash=9a8108a254df24cc
 RAG_CONTEXT_BUDGETS = {
     "tight": {"top_k": 6, "pool": 24, "chars": 3600, "evidence": 4},
     "standard": {"top_k": 10, "pool": 48, "chars": 7200, "evidence": 6},
     "deep": {"top_k": 16, "pool": 64, "chars": 12000, "evidence": 9},
 }
 
-# split-source: order=262 original-lines=4418-4418 hash=47e19cb979054ec1
+# split-source: order=262 original-lines=4420-4420 hash=47e19cb979054ec1
 RAG_WEAK_EVIDENCE_MESSAGE = "知识库命中了相关材料，但证据强度不足以可靠回答。以下仅返回可核查的候选证据。"
 
-# split-source: order=263 original-lines=4419-4419 hash=aeacd5ed42d26293
+# split-source: order=263 original-lines=4421-4421 hash=aeacd5ed42d26293
 RAG_EVIDENCE_SCHEMA_VERSION = 1
 
-# split-source: order=264 original-lines=4420-4423 hash=51af3e6d5ed6ed17
+# split-source: order=264 original-lines=4422-4425 hash=51af3e6d5ed6ed17
 RAG_EVIDENCE_BATCH_CHARS = max(
     2400,
     min(120_000, int(str(os.getenv("AGENT_RAG_EVIDENCE_BATCH_CHARS", "24000") or "24000"))),
 )
 
-# split-source: order=265 original-lines=4424-4427 hash=2eb793e0b835469f
+# split-source: order=265 original-lines=4426-4429 hash=2eb793e0b835469f
 RAG_EVALUATION_SUMMARY_CHARS = max(
     2400,
     min(120_000, int(str(os.getenv("AGENT_RAG_EVALUATION_SUMMARY_CHARS", "24000") or "24000"))),
 )
 
-# split-source: order=266 original-lines=4428-4428 hash=25f028f81020ec5c
+# split-source: order=266 original-lines=4430-4430 hash=25f028f81020ec5c
 RAG_DENSE_DEFAULT_ENABLED = str(os.getenv("AGENT_RAG_DENSE_DEFAULT", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
 
-# split-source: order=267 original-lines=4429-4429 hash=1376830a693ad1b8
+# split-source: order=267 original-lines=4431-4431 hash=1376830a693ad1b8
 RAG_EMBEDDING_MODE_VALUES = {"off", "sparse", "tfidf", "dense", "hybrid"}
 
-# split-source: order=268 original-lines=4430-4433 hash=35a7b18dbc7431ea
+# split-source: order=268 original-lines=4432-4435 hash=35a7b18dbc7431ea
 RAG_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_RAG_IMPORT_WORKERS", "2") or "2"))),
 )
 
-# split-source: order=270 original-lines=4438-4441 hash=58a3791de9558c47
+# split-source: order=270 original-lines=4440-4443 hash=58a3791de9558c47
 RAG_PARSE_TIMEOUT_SECONDS = max(
     15,
     min(240, int(str(os.getenv("AGENT_RAG_PARSE_TIMEOUT", "75") or "75"))),
 )
 
-# split-source: order=1093 original-lines=100074-104707 hash=3cf5127aba1f993e
+# split-source: order=1093 original-lines=100076-104709 hash=3cf5127aba1f993e
 
 RAG_TERM_GROUPS = (
     # ── Batch 1 / 10 : 检索 · 研究 · CS基础 · 编程语言 ──────────────────────
@@ -4882,7 +4882,7 @@ RAG_TERM_GROUPS = (
     # ── Batch LLL end — 4000 groups reached ────────────────────────────────
 )
 
-# split-source: order=1094 original-lines=104708-104729 hash=16c96d4b2d9ea8e8
+# split-source: order=1094 original-lines=104710-104731 hash=16c96d4b2d9ea8e8
 RAG_RESEARCH_HINTS = (
     "abstract",
     "introduction",
@@ -4906,7 +4906,7 @@ RAG_RESEARCH_HINTS = (
     "论文",
 )
 
-# split-source: order=1095 original-lines=104730-104740 hash=636311fb17640a4e
+# split-source: order=1095 original-lines=104732-104742 hash=636311fb17640a4e
 RAG_CODE_HINTS = (
     "def ",
     "class ",
@@ -4919,7 +4919,7 @@ RAG_CODE_HINTS = (
     "public class",
 )
 
-# split-source: order=1096 original-lines=104741-104756 hash=4605c77eed589f3f
+# split-source: order=1096 original-lines=104743-104758 hash=4605c77eed589f3f
 RAG_SHORT_TOKEN_ALLOWLIST = {
     "2d",
     "3d",
@@ -4937,7 +4937,7 @@ RAG_SHORT_TOKEN_ALLOWLIST = {
     "vr",
 }
 
-# split-source: order=1097 original-lines=104757-104829 hash=527026fadb463036
+# split-source: order=1097 original-lines=104759-104831 hash=527026fadb463036
 RAG_EN_STOPWORDS = {
     "a",
     "an",
@@ -5012,7 +5012,7 @@ RAG_EN_STOPWORDS = {
     "yours",
 }
 
-# split-source: order=1098 original-lines=104830-104866 hash=7523a7a144f1f7c8
+# split-source: order=1098 original-lines=104832-104868 hash=7523a7a144f1f7c8
 RAG_ZH_STOPWORDS = {
     "一个",
     "一种",
@@ -5051,7 +5051,7 @@ RAG_ZH_STOPWORDS = {
     "可以",
 }
 
-# split-source: order=1099 original-lines=104867-104945 hash=fffc05a6e73ad1f0
+# split-source: order=1099 original-lines=104869-104947 hash=fffc05a6e73ad1f0
 RAG_GENERIC_ENTITY_TERMS_EN = {
     "acknowledgment",
     "acknowledgments",
@@ -5132,7 +5132,7 @@ RAG_GENERIC_ENTITY_TERMS_EN = {
     "theorems",
 }
 
-# split-source: order=1100 original-lines=104946-104988 hash=cd605de6a86d441a
+# split-source: order=1100 original-lines=104948-104990 hash=cd605de6a86d441a
 RAG_GENERIC_ENTITY_TERMS_ZH = {
     "图",
     "图谱",
@@ -5177,7 +5177,7 @@ RAG_GENERIC_ENTITY_TERMS_ZH = {
     "表格",
 }
 
-# split-source: order=1101 original-lines=104989-105007 hash=e90fa9ad0c5a4f61
+# split-source: order=1101 original-lines=104991-105009 hash=e90fa9ad0c5a4f61
 RAG_STRUCTURAL_ENTITY_PATTERNS = (
     re.compile(
         r"^(?:fig(?:ure)?s?|table|tables|sec(?:tion)?s?|chapter|chapters|appendix|appendices|"
@@ -5198,7 +5198,7 @@ RAG_STRUCTURAL_ENTITY_PATTERNS = (
     ),
 )
 
-# split-source: order=1133 original-lines=105965-105974 hash=bca531e8850a5266
+# split-source: order=1133 original-lines=105967-105976 hash=bca531e8850a5266
 
 
 
@@ -5210,7 +5210,7 @@ CODE_LIBRARY_IGNORED_DIRS = {
     "__pycache__", ".venv", "venv", "env", ".tox",
 }
 
-# split-source: order=1134 original-lines=105975-106031 hash=bc72eba2e2dbde18
+# split-source: order=1134 original-lines=105977-106033 hash=bc72eba2e2dbde18
 CODE_LIBRARY_LANGUAGE_BY_EXT = {
     ".py": "python",
     ".pyi": "python",
@@ -5269,7 +5269,7 @@ CODE_LIBRARY_LANGUAGE_BY_EXT = {
     ".md": "markdown",
 }
 
-# split-source: order=1135 original-lines=106032-106038 hash=9de27595b7cb2425
+# split-source: order=1135 original-lines=106034-106040 hash=9de27595b7cb2425
 CODE_LIBRARY_SPECIAL_FILENAMES = {
     "dockerfile": "docker",
     "makefile": "make",

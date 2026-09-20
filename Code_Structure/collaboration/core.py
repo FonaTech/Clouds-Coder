@@ -5,19 +5,19 @@
 
 from __future__ import annotations
 
-# split-source: order=93 original-lines=530-533 hash=60317e63d1c028ef
+# split-source: order=93 original-lines=532-535 hash=60317e63d1c028ef
 
 
 def _now() -> float:
     return time.time()
 
-# split-source: order=94 original-lines=534-537 hash=1929f0af1ffc0b2d
+# split-source: order=94 original-lines=536-539 hash=1929f0af1ffc0b2d
 
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
-# split-source: order=95 original-lines=538-544 hash=4d410ba2e075a890
+# split-source: order=95 original-lines=540-546 hash=4d410ba2e075a890
 
 
 def _load_json(value: Any, fallback: Any) -> Any:
@@ -26,13 +26,13 @@ def _load_json(value: Any, fallback: Any) -> Any:
     except Exception:
         return fallback
 
-# split-source: order=96 original-lines=545-548 hash=ee6e3653cf3898c4
+# split-source: order=96 original-lines=547-550 hash=ee6e3653cf3898c4
 
 
 def _b64_token(prefix: str, size: int = 32) -> str:
     return prefix + base64.urlsafe_b64encode(os.urandom(size)).decode("ascii").rstrip("=")
 
-# split-source: order=97 original-lines=549-557 hash=54ad7c4545192550
+# split-source: order=97 original-lines=551-559 hash=54ad7c4545192550
 
 
 def _branch_label(index: int) -> str:
@@ -43,19 +43,19 @@ def _branch_label(index: int) -> str:
         label = chr(65 + remainder) + label
     return label
 
-# split-source: order=98 original-lines=558-561 hash=2b8af246a2e07ed0
+# split-source: order=98 original-lines=560-563 hash=2b8af246a2e07ed0
 
 
 def _digest(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
-# split-source: order=99 original-lines=562-565 hash=5c84a9c0388fcce5
+# split-source: order=99 original-lines=564-567 hash=5c84a9c0388fcce5
 
 
 def _password_hash(password: str, salt: bytes, iterations: int = COLLAB_PASSWORD_ITERATIONS) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations), dklen=32)
 
-# split-source: order=100 original-lines=566-575 hash=0525df69846b9be1
+# split-source: order=100 original-lines=568-577 hash=0525df69846b9be1
 
 
 def _normalize_ip(value: object) -> str:
@@ -67,7 +67,7 @@ def _normalize_ip(value: object) -> str:
     except Exception:
         return raw[:96] or "unknown"
 
-# split-source: order=101 original-lines=576-582 hash=329b30d8a2be6900
+# split-source: order=101 original-lines=578-584 hash=329b30d8a2be6900
 
 
 def _normalize_name(value: object, *, field: str, minimum: int = 1, maximum: int = 80) -> tuple[str, str]:
@@ -76,7 +76,7 @@ def _normalize_name(value: object, *, field: str, minimum: int = 1, maximum: int
         raise CollaborationError("invalid_" + field, f"{field} must be {minimum}-{maximum} visible characters", 400)
     return text, text.casefold()
 
-# split-source: order=102 original-lines=583-594 hash=092b9f914018d781
+# split-source: order=102 original-lines=585-596 hash=092b9f914018d781
 
 
 _COLLAB_PUBLIC_SECRET_PATTERNS = (
@@ -90,7 +90,7 @@ _COLLAB_PUBLIC_SECRET_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9+/=_-]{40,}(?![A-Za-z0-9])"),
 )
 
-# split-source: order=103 original-lines=595-625 hash=2d23dac2c6735cfc
+# split-source: order=103 original-lines=597-627 hash=2d23dac2c6735cfc
 
 
 def _collaboration_public_text(value: object, maximum: int = 500) -> str:
@@ -123,7 +123,7 @@ def _collaboration_public_text(value: object, maximum: int = 500) -> str:
     limit = max(1, int(maximum or 1))
     return text if len(text) <= limit else text[: max(1, limit - 3)].rstrip() + "..."
 
-# split-source: order=104 original-lines=626-650 hash=ad6d495fc71aed76
+# split-source: order=104 original-lines=628-652 hash=ad6d495fc71aed76
 
 
 def _collaboration_task_objective(value: object, maximum: int = 4000) -> str:
@@ -150,7 +150,7 @@ def _collaboration_task_objective(value: object, maximum: int = 4000) -> str:
             raw = "\n".join(lines[payload_index:]).strip()
     return _collaboration_public_text(raw, maximum)
 
-# split-source: order=105 original-lines=651-658 hash=51b883f33dda370a
+# split-source: order=105 original-lines=653-660 hash=51b883f33dda370a
 
 
 def _collaboration_task_title(value: object) -> str:
@@ -160,7 +160,7 @@ def _collaboration_task_title(value: object) -> str:
     first = re.split(r"(?<=[.!?。！？])\s+", safe, maxsplit=1)[0].strip()
     return _collaboration_public_text(first or safe, 160) or "Shared Agent task"
 
-# split-source: order=106 original-lines=659-665 hash=6eb8f9562e1f2200
+# split-source: order=106 original-lines=661-667 hash=6eb8f9562e1f2200
 
 
 def _collaboration_task_key(value: object) -> str:
@@ -169,7 +169,7 @@ def _collaboration_task_key(value: object) -> str:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
 
-# split-source: order=107 original-lines=666-684 hash=08744832f0f0ecd9
+# split-source: order=107 original-lines=668-686 hash=08744832f0f0ecd9
 
 
 def _collaboration_plan_steps(value: object) -> list[str]:
@@ -190,7 +190,7 @@ def _collaboration_plan_steps(value: object) -> list[str]:
             break
     return rows
 
-# split-source: order=108 original-lines=685-692 hash=bd214df5d5a036c1
+# split-source: order=108 original-lines=687-694 hash=bd214df5d5a036c1
 
 
 class CollaborationError(Exception):
@@ -200,7 +200,7 @@ class CollaborationError(Exception):
         self.status = int(status or 400)
         self.details = dict(details or {})
 
-# split-source: order=109 original-lines=693-703 hash=fe2f6acbc02ca7ca
+# split-source: order=109 original-lines=695-705 hash=fe2f6acbc02ca7ca
 
 
 @dataclass(frozen=True)
@@ -213,7 +213,7 @@ class CollaborationPrincipal:
     nickname: str
     expires_at: float
 
-# split-source: order=110 original-lines=704-737 hash=2740907bbb62a91d
+# split-source: order=110 original-lines=706-739 hash=2740907bbb62a91d
 
 
 def _normalize_operation(components: object) -> list[dict]:
@@ -249,13 +249,13 @@ def _normalize_operation(components: object) -> list[dict]:
             out.append(normalized)
     return out
 
-# split-source: order=111 original-lines=738-741 hash=ff8931b270bdbeb2
+# split-source: order=111 original-lines=740-743 hash=ff8931b270bdbeb2
 
 
 def operation_input_length(components: object) -> int:
     return sum(int(c.get("retain", 0)) + int(c.get("delete", 0)) for c in _normalize_operation(components))
 
-# split-source: order=112 original-lines=742-764 hash=fb2948399a8203a2
+# split-source: order=112 original-lines=744-766 hash=fb2948399a8203a2
 
 
 def apply_text_operation(text: str, components: object) -> str:
@@ -280,7 +280,7 @@ def apply_text_operation(text: str, components: object) -> str:
         raise CollaborationError("invalid_operation", "operation does not consume the whole document", 409)
     return "".join(output)
 
-# split-source: order=113 original-lines=765-841 hash=2f8e90d05f10f763
+# split-source: order=113 original-lines=767-843 hash=2f8e90d05f10f763
 
 
 def transform_text_operation(incoming: object, applied: object) -> list[dict]:
@@ -359,7 +359,7 @@ def transform_text_operation(incoming: object, applied: object) -> list[dict]:
             out = [{"retain": post_length}]
     return out
 
-# split-source: order=114 original-lines=842-3557 hash=df104ac8f441e453
+# split-source: order=114 original-lines=844-3559 hash=df104ac8f441e453
 
 
 class CollaborationStore:
@@ -3077,7 +3077,7 @@ class CollaborationStore:
             rows = conn.execute("SELECT * FROM audit_events" + where + " ORDER BY audit_id DESC LIMIT ? OFFSET ?", (*params, take, skip)).fetchall()
         return {"events": [{**dict(row), "details": _load_json(row["details_json"], {})} for row in rows], "total": total, "limit": take, "offset": skip, "chain": self.verify_audit_chain()}
 
-# split-source: order=115 original-lines=3558-3771 hash=a9249a04c1992b57
+# split-source: order=115 original-lines=3560-3773 hash=a9249a04c1992b57
 
 
 class CollaborationWriteCoordinator:

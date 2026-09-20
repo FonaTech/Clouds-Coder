@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1161 original-lines=113080-113312 hash=95e14dc259996fcc
+# split-source: order=1161 original-lines=113082-113314 hash=95e14dc259996fcc
 
 RAG_ADMIN_INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -240,7 +240,7 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=1162 original-lines=113313-113416 hash=dc08c3ef867f7c4e
+# split-source: order=1162 original-lines=113315-113418 hash=dc08c3ef867f7c4e
 
 RAG_ADMIN_CSS = """
 :root{
@@ -346,7 +346,7 @@ textarea{resize:vertical;min-height:120px}
 }
 """
 
-# split-source: order=1163 original-lines=113417-115637 hash=c6a477b4e27f05ec
+# split-source: order=1163 original-lines=113419-115639 hash=c6a477b4e27f05ec
 
 RAG_ADMIN_JS = """
 const S={config:null,library:null,tasks:null,graph:null,filesystem:null,query:null};
@@ -2569,7 +2569,7 @@ window.addEventListener('DOMContentLoaded',async()=>{
 });
 """
 
-# split-source: order=1164 original-lines=115638-115650 hash=a629a6953651964d
+# split-source: order=1164 original-lines=115640-115652 hash=a629a6953651964d
 
 CODE_ADMIN_INDEX_HTML = (
     RAG_ADMIN_INDEX_HTML
@@ -2584,7 +2584,7 @@ CODE_ADMIN_INDEX_HTML = (
     )
 )
 
-# split-source: order=1165 original-lines=115651-115681 hash=2392d18fa3cd2280
+# split-source: order=1165 original-lines=115653-115683 hash=2392d18fa3cd2280
 CODE_ADMIN_CSS = (
     RAG_ADMIN_CSS
     + """
@@ -2617,7 +2617,7 @@ html,body{background:radial-gradient(circle at top left,#fff8fc 0,#ffeef5 42%,#f
 """
 )
 
-# split-source: order=1166 original-lines=115682-115686 hash=25e2546e58f05805
+# split-source: order=1166 original-lines=115684-115688 hash=25e2546e58f05805
 CODE_ADMIN_JS = (
     RAG_ADMIN_JS
     .replace("/api/rag/", "/api/code/")

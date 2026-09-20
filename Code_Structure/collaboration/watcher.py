@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1208 original-lines=136516-136590 hash=b6deac3b65a75205
+# split-source: order=1208 original-lines=136518-136592 hash=b6deac3b65a75205
 
 
 def collaboration_file_watcher_loop(
@@ -82,7 +82,7 @@ def collaboration_file_watcher_loop(
                     except Exception as diagnostic_error:
                         log(f"[collaboration] storage diagnostics unavailable: {type(diagnostic_error).__name__}")
 
-# split-source: order=1209 original-lines=136591-136608 hash=a921e94f45e639bd
+# split-source: order=1209 original-lines=136593-136610 hash=a921e94f45e639bd
 
 
 def collaboration_watcher_health(app) -> dict:

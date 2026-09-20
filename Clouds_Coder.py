@@ -508,7 +508,9 @@ def _ensure_liquid_kernel_sqlite_lifecycle(registry_class) -> None:
 
 # A standalone main-file update can leave an older local liquid_kernel package.
 # Adapt that package in memory as well as shipping the fixed embedded archive.
-from liquid_kernel.control import LiquidKernelRegistry as _LiquidKernelRegistry  # noqa: E402
+from liquid_kernel.control import (  # noqa: E402
+    LiquidKernelRegistry as _LiquidKernelRegistry,
+)
 
 _ensure_liquid_kernel_sqlite_lifecycle(_LiquidKernelRegistry)
 

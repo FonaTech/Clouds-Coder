@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=978 original-lines=17208-17262 hash=8f3e8f16ab9530cf
+# split-source: order=978 original-lines=17210-17264 hash=8f3e8f16ab9530cf
 
 class EventHub:
     _MAXSIZE = 512

@@ -234,14 +234,16 @@ from liquid_kernel import (  # noqa: E402
     LiquidKernelError,
 )
 
-# split-source: order=78 original-lines=507-511 hash=752512784d9d5e2f
+# split-source: order=78 original-lines=507-513 hash=8cddaf6a4630eba5
 
 
 # A standalone main-file update can leave an older local liquid_kernel package.
 # Adapt that package in memory as well as shipping the fixed embedded archive.
-from liquid_kernel.control import LiquidKernelRegistry as _LiquidKernelRegistry  # noqa: E402
+from liquid_kernel.control import (  # noqa: E402
+    LiquidKernelRegistry as _LiquidKernelRegistry,
+)
 
-# split-source: order=119 original-lines=3893-3902 hash=42ec21eda00bbe87
+# split-source: order=119 original-lines=3895-3904 hash=42ec21eda00bbe87
 # END EMBEDDED COLLABORATION WEB ASSETS
 
 try:
@@ -253,14 +255,14 @@ except ImportError:
     _pty = None
     _termios = None
 
-# split-source: order=120 original-lines=3903-3907 hash=2bd8ec70b5d6db71
+# split-source: order=120 original-lines=3905-3909 hash=2bd8ec70b5d6db71
 
 try:
     import certifi as _certifi
 except Exception:
     _certifi = None
 
-# split-source: order=121 original-lines=3908-3911 hash=cba211345467525c
+# split-source: order=121 original-lines=3910-3913 hash=cba211345467525c
 try:
     import yaml as _yaml
 except Exception:
