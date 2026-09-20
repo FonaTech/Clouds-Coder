@@ -5,21 +5,14 @@ import unittest
 from pathlib import Path
 
 import Clouds_Coder as cc
-from liquid_kernel import (
-    LiquidKernelControlPlane,
-    LiquidKernelError,
-    default_evolution_config,
-)
+from liquid_kernel import LiquidKernelControlPlane, LiquidKernelError, default_evolution_config
 
 
 def wait_for_run(plane: LiquidKernelControlPlane, run_id: str, timeout: float = 8.0) -> dict:
     deadline = time.monotonic() + timeout
-    active = {"queued", "collecting", "assessing", "proposal_ready", "validating_patch", "benchmarking"}
+    active = {"queued", "collecting", "assessing", "generating", "proposal_ready", "validating_patch", "benchmarking", "judging"}
     detail = plane.registry.run_detail(run_id)
-    while (
-        (detail["status"] in active or bool(getattr(plane, "active_run_id", "")))
-        and time.monotonic() < deadline
-    ):
+    while (detail["status"] in active or plane.active_run_id == run_id) and time.monotonic() < deadline:
         time.sleep(0.02)
         detail = plane.registry.run_detail(run_id)
     return detail
@@ -255,7 +248,7 @@ class LiquidKernelEvolutionTests(unittest.TestCase):
             approved = plane.approve(run["run_id"])
             self.assertEqual(approved["state"]["canary"]["percent"], 5)
 
-    def test_one_generator_failure_does_not_discard_a_later_candidate(self):
+    def test_generator_failure_fails_run_without_deployment(self):
         calls = 0
 
         def flaky_model(system: str, prompt: str, profile: str, max_tokens: int) -> dict:
@@ -269,9 +262,10 @@ class LiquidKernelEvolutionTests(unittest.TestCase):
             plane = LiquidKernelControlPlane(Path(temp), model_callback=flaky_model, judge_callback=improving_judge)
             plane.apply_startup_config("Thinking", "off")
             detail = wait_for_run(plane, plane.trigger("manual")["run_id"])
-            self.assertEqual(detail["status"], "awaiting_approval")
-            self.assertEqual(detail["result"]["candidate_index"], 2)
-            self.assertEqual(detail["result"]["evaluations"][0]["code"], "provider_bad_request")
+            self.assertEqual(detail["status"], "failed")
+            self.assertEqual(detail["result"]["code"], "provider_bad_request")
+            self.assertIsNone(plane.registry.active_state()["canary"])
+            self.assertEqual(calls, 1)
 
     def test_all_candidates_share_the_same_bounded_designed_case_set(self):
         calls = 0
