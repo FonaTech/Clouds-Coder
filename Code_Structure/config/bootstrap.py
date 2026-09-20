@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=71 original-lines=78-330 hash=788d2c4d65c5de3d
+# split-source: order=73 original-lines=114-366 hash=788d2c4d65c5de3d
 
 _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
     "UEsDBBQAAAAIAJFAK13NzUY/oAAAAHYBAAALAAAAX19pbml0X18ucHl1jrsKwkAQRfv9iiWVgvgHVppCjEZ8NSLDYjZhYHZHh10Lv96QR2OSKe+5dzilsNPL"
@@ -260,7 +260,7 @@ _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
     "BE8AAFJFQURNRS5tZFBLBQYAAAAAAwADAKgAAADvVgAAAAA="
 )
 
-# split-source: order=72 original-lines=331-376 hash=e4001db78593c290
+# split-source: order=74 original-lines=367-412 hash=e4001db78593c290
 
 
 def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> dict:
@@ -308,14 +308,14 @@ def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> 
         "required_files": list(required),
     }
 
-# split-source: order=913 original-lines=14047-14051 hash=5cd9aacc032a0f5b
+# split-source: order=915 original-lines=14082-14086 hash=5cd9aacc032a0f5b
 
 
 def _liquid_kernel_history_present(runtime_root: Path) -> bool:
     root = Path(runtime_root)
     return root.is_dir() and any((root / name).exists() for name in ("registry.sqlite", "active.json", "artifacts"))
 
-# split-source: order=914 original-lines=14052-14081 hash=af942e21e79e26a3
+# split-source: order=916 original-lines=14087-14116 hash=af942e21e79e26a3
 
 
 def prepare_liquid_kernel_runtime(runtime_root: Path, startup_policy: object = "inherit") -> dict:
@@ -347,7 +347,7 @@ def prepare_liquid_kernel_runtime(runtime_root: Path, startup_policy: object = "
         pass
     return status
 
-# split-source: order=915 original-lines=14082-14095 hash=bc332d47a0e9051a
+# split-source: order=917 original-lines=14117-14130 hash=bc332d47a0e9051a
 
 
 def _persist_liquid_kernel_bootstrap(runtime_root: Path, status: dict) -> dict:

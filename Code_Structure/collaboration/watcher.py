@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1186 original-lines=134755-134827 hash=c33d45b5cc87ccd6
+# split-source: order=1188 original-lines=134791-134863 hash=c33d45b5cc87ccd6
 
 
 # 第九层：进程入口与服务启动。
@@ -80,7 +80,7 @@ def collaboration_file_watcher_loop(
                     f"{trim(str(exc), 240)}; failures={failures}; retry_in={retry_delay:.1f}s"
                 )
 
-# split-source: order=1187 original-lines=134828-134845 hash=a921e94f45e639bd
+# split-source: order=1189 original-lines=134864-134881 hash=a921e94f45e639bd
 
 
 def collaboration_watcher_health(app) -> dict:

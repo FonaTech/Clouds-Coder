@@ -209,6 +209,7 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     ],
     "utils/compress.py": ["compress_text_blob", "decompress_text_blob"],
     "utils/crypto.py": ["CryptoBox"],
+    "utils/sqlite.py": ["_ClosingSQLiteConnection", "_connect_sqlite"],
     "utils/misc.py": [
         "now_ts", "make_id", "sanitize_profile_id", "user_id_from_ip", "_meta_string_list",
         "_module_exists", "is_benign_socket_error", "_socket_error_code",

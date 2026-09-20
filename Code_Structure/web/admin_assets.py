@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1069 original-lines=97893-98193 hash=7c88529883c0ec46
+# split-source: order=1071 original-lines=97932-98232 hash=7c88529883c0ec46
 
 ADMIN_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -308,7 +308,7 @@ ADMIN_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=1070 original-lines=98194-98330 hash=a2460b3a00298ccb
+# split-source: order=1072 original-lines=98233-98369 hash=a2460b3a00298ccb
 
 ADMIN_CSS = """
 :root{--bg:#f3f6fb;--surface:#fff;--surface2:#f7f9fc;--text:#172033;--muted:#667085;--line:#dce3ee;--brand:#2563eb;--brand2:#0f9f8f;--danger:#b42318;--warn:#b54708;--shadow:0 18px 44px rgba(27,39,71,.09)}
@@ -447,7 +447,7 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 @media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head,.collab-detail-head,.collab-service-bar{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid,.process-toolbar,.evolution-form-grid{grid-template-columns:1fr}.evolution-span{grid-column:auto}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}.collab-filter-row,.collab-member-filter{grid-template-columns:1fr}.collab-service-actions{justify-content:flex-start}.collab-service-actions>*{flex:1 1 180px;text-align:center}}
 """
 
-# split-source: order=1071 original-lines=98331-98706 hash=4bd75922f60a79ef
+# split-source: order=1073 original-lines=98370-98745 hash=4bd75922f60a79ef
 
 ADMIN_JS = r"""
 const ADMIN_LANGUAGE_CODES=['zh-CN','zh-TW','ja','en'];

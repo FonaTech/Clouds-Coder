@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1162 original-lines=115476-115485 hash=9c0c3a1fff932193
+# split-source: order=1164 original-lines=115513-115522 hash=9c0c3a1fff932193
 
 
 class SkillsStudioError(Exception):
@@ -17,7 +17,7 @@ class SkillsStudioError(Exception):
         self.status = int(status or 400)
         self.details = dict(details or {})
 
-# split-source: order=1163 original-lines=115486-115501 hash=d2fe3603f0912f53
+# split-source: order=1165 original-lines=115523-115538 hash=d2fe3603f0912f53
 
 
 def _studio_slug(value: object, fallback: str = "skill") -> str:
@@ -35,13 +35,13 @@ def _studio_slug(value: object, fallback: str = "skill") -> str:
         )
     return text
 
-# split-source: order=1164 original-lines=115502-115505 hash=0128d9491e800215
+# split-source: order=1166 original-lines=115539-115542 hash=0128d9491e800215
 
 
 def _studio_hash(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8", errors="ignore")).hexdigest()
 
-# split-source: order=1165 original-lines=115506-115515 hash=9448eda197483a51
+# split-source: order=1167 original-lines=115543-115552 hash=9448eda197483a51
 
 
 def _studio_cookie_value(headers, name: str) -> str:
@@ -53,7 +53,7 @@ def _studio_cookie_value(headers, name: str) -> str:
     except Exception:
         return ""
 
-# split-source: order=1166 original-lines=115516-117374 hash=3cd5b26888a127df
+# split-source: order=1168 original-lines=115553-117410 hash=e2c475d79831c3ea
 
 
 class SkillsStudioStore:
@@ -95,11 +95,10 @@ class SkillsStudioStore:
         self._job_cancel: set[str] = set()
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.path), timeout=8.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=8000")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=8.0,
+            pragmas=("PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=8000"),
+        )
 
     def _init_db(self):
         with self.lock, self._connect() as db:

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=922 original-lines=15126-15246 hash=6db42547dfc7c5cd
+# split-source: order=924 original-lines=15165-15285 hash=6db42547dfc7c5cd
 
 
 def _admin_config_schema() -> list[dict]:
@@ -128,13 +128,13 @@ def _admin_config_schema() -> list[dict]:
         row("rag_file_name", "runtime", "Use filenames as RAG entities", "boolean", False, true_flag="--RAG_File_Name=on", false_flag="--RAG_File_Name=off"),
     ]
 
-# split-source: order=923 original-lines=15247-15250 hash=40890890ea051821
+# split-source: order=925 original-lines=15286-15289 hash=40890890ea051821
 
 
 def _admin_factory_config() -> dict:
     return {row["key"]: row.get("factory_default") for row in _admin_config_schema()}
 
-# split-source: order=924 original-lines=15251-15406 hash=e4ee3c750cce4f1e
+# split-source: order=926 original-lines=15290-15445 hash=e4ee3c750cce4f1e
 
 
 def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
@@ -292,7 +292,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
     out["_effective_ports"] = effective_ports
     return out, errors
 
-# split-source: order=925 original-lines=15407-15443 hash=80095834e40509e0
+# split-source: order=927 original-lines=15446-15482 hash=80095834e40509e0
 
 
 def _admin_config_to_argv(config: dict) -> list[str]:
@@ -331,7 +331,7 @@ def _admin_config_to_argv(config: dict) -> list[str]:
                 argv.extend([flag, value_text])
     return argv
 
-# split-source: order=926 original-lines=15444-15459 hash=12dc636b75f461e9
+# split-source: order=928 original-lines=15483-15498 hash=12dc636b75f461e9
 
 
 def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot_id: str) -> str:
@@ -349,7 +349,7 @@ def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot
     )
     return f"http://{host}:{port}/api/health?{query}"
 
-# split-source: order=927 original-lines=15460-15546 hash=0c9904b7a02980a4
+# split-source: order=929 original-lines=15499-15585 hash=0c9904b7a02980a4
 
 
 def _admin_supervised_restart(
@@ -437,7 +437,7 @@ def _admin_supervised_restart(
     )
     return False
 
-# split-source: order=928 original-lines=15547-15568 hash=1bc6ac699682e60b
+# split-source: order=930 original-lines=15586-15607 hash=1bc6ac699682e60b
 
 def _admin_argparse_defaults(config: dict) -> dict:
     """Map canonical Admin config keys to argparse destinations."""
@@ -461,7 +461,7 @@ def _admin_argparse_defaults(config: dict) -> dict:
         out.pop(key, None)
     return out
 
-# split-source: order=929 original-lines=15569-15589 hash=77b9b0b9223e21aa
+# split-source: order=931 original-lines=15608-15628 hash=77b9b0b9223e21aa
 
 def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
     values = _admin_factory_config()

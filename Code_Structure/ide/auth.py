@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=918 original-lines=14381-14388 hash=7405d447cbf41aba
+# split-source: order=920 original-lines=14418-14425 hash=7405d447cbf41aba
 
 
 class IDEAuthError(Exception):
@@ -15,7 +15,7 @@ class IDEAuthError(Exception):
         self.status = int(status or 400)
         self.retry_after = max(0, int(retry_after or 0))
 
-# split-source: order=919 original-lines=14389-15110 hash=ff607e4a4f8751ea
+# split-source: order=921 original-lines=14426-15149 hash=1a1c531f4009ac86
 
 
 class IDEAuthStore:
@@ -43,12 +43,14 @@ class IDEAuthStore:
             not self.path.parent.is_dir() or not self.path.is_file()
         ):
             raise sqlite3.OperationalError("IDE authentication storage is unavailable")
-        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=10.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=10000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+            ),
+        )
 
     def storage_health(self) -> dict:
         try:

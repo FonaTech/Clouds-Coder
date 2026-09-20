@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1081 original-lines=103641-103675 hash=c2633677113d7d7b
+# split-source: order=1083 original-lines=103680-103714 hash=c2633677113d7d7b
 
 
 # ============================================================================
@@ -42,7 +42,7 @@ class EvidenceRecord:
     def to_dict(self) -> dict:
         return asdict(self)
 
-# split-source: order=1082 original-lines=103676-103682 hash=46f6fd237ad775dd
+# split-source: order=1084 original-lines=103715-103721 hash=46f6fd237ad775dd
 
 
 def _rag_float(value: object, default: float = 0.0) -> float:
@@ -51,7 +51,7 @@ def _rag_float(value: object, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
-# split-source: order=1083 original-lines=103683-103699 hash=ea43f876f146604f
+# split-source: order=1085 original-lines=103722-103738 hash=ea43f876f146604f
 
 
 def _rag_evidence_source_type(row: dict) -> str:
@@ -70,7 +70,7 @@ def _rag_evidence_source_type(row: dict) -> str:
         return "raw_chunk"
     return "legacy"
 
-# split-source: order=1084 original-lines=103700-103755 hash=762cc7217b6aa9b3
+# split-source: order=1086 original-lines=103739-103794 hash=762cc7217b6aa9b3
 
 
 def _rag_normalize_evidence_record(row: object, *, source_document: dict | None = None) -> dict:
@@ -128,7 +128,7 @@ def _rag_normalize_evidence_record(row: object, *, source_document: dict | None 
     })
     return normalized
 
-# split-source: order=1085 original-lines=103756-103798 hash=5682c8736506a8b0
+# split-source: order=1087 original-lines=103795-103837 hash=5682c8736506a8b0
 
 
 def _rag_validate_evidence_record(row: dict, query: str = "") -> dict:
@@ -173,7 +173,7 @@ def _rag_validate_evidence_record(row: dict, query: str = "") -> dict:
     record["validation"] = validation
     return record
 
-# split-source: order=1086 original-lines=103799-103816 hash=7b6192e61e1eb394
+# split-source: order=1088 original-lines=103838-103855 hash=7b6192e61e1eb394
 
 
 def _rag_evidence_batches(rows: list[dict], *, max_chars: int = RAG_EVIDENCE_BATCH_CHARS) -> list[list[dict]]:
@@ -193,7 +193,7 @@ def _rag_evidence_batches(rows: list[dict], *, max_chars: int = RAG_EVIDENCE_BAT
         batches.append(current)
     return batches
 
-# split-source: order=1087 original-lines=103817-103822 hash=adced9dcb9234d72
+# split-source: order=1089 original-lines=103856-103861 hash=adced9dcb9234d72
 
 
 def _rag_safe_name(name: str, fallback: str = "document") -> str:
@@ -201,7 +201,7 @@ def _rag_safe_name(name: str, fallback: str = "document") -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
     return safe or fallback
 
-# split-source: order=1088 original-lines=103823-103839 hash=8256f8af0f0c3e33
+# split-source: order=1090 original-lines=103862-103878 hash=8256f8af0f0c3e33
 
 
 def _rag_detect_language(text: str) -> str:
@@ -220,7 +220,7 @@ def _rag_detect_language(text: str) -> str:
         return "en"
     return "unknown"
 
-# split-source: order=1089 original-lines=103840-103854 hash=ae335b203709f25e
+# split-source: order=1091 original-lines=103879-103893 hash=ae335b203709f25e
 
 
 def _rag_cjk_ngrams(seq: str, *, min_n: int = 2, max_n: int = 4, limit: int = 120) -> list[str]:
@@ -237,7 +237,7 @@ def _rag_cjk_ngrams(seq: str, *, min_n: int = 2, max_n: int = 4, limit: int = 12
                 break
     return out
 
-# split-source: order=1090 original-lines=103855-103876 hash=a509f4e26bf3379b
+# split-source: order=1092 original-lines=103894-103915 hash=a509f4e26bf3379b
 
 
 def _rag_is_noise_token(token: object) -> bool:
@@ -261,7 +261,7 @@ def _rag_is_noise_token(token: object) -> bool:
         return True
     return False
 
-# split-source: order=1091 original-lines=103877-103891 hash=49c94bd89926670a
+# split-source: order=1093 original-lines=103916-103930 hash=49c94bd89926670a
 
 
 def _rag_entity_allowed(token: object) -> bool:
@@ -278,7 +278,7 @@ def _rag_entity_allowed(token: object) -> bool:
         return False
     return True
 
-# split-source: order=1092 original-lines=103892-103908 hash=8f77ad80b84a7ae2
+# split-source: order=1094 original-lines=103931-103947 hash=8f77ad80b84a7ae2
 
 
 def _rag_filter_entities(values: list[object], limit: int = 32) -> list[str]:
@@ -297,7 +297,7 @@ def _rag_filter_entities(values: list[object], limit: int = 32) -> list[str]:
             break
     return out
 
-# split-source: order=1093 original-lines=103909-103944 hash=d4f514f469978213
+# split-source: order=1095 original-lines=103948-103983 hash=d4f514f469978213
 
 
 def _rag_filename_entity_aliases(filename: object, source_rel_path: object = "", limit: int = 24) -> list[str]:
@@ -335,7 +335,7 @@ def _rag_filename_entity_aliases(filename: object, source_rel_path: object = "",
         pieces.extend(split_tokens)
     return _rag_filter_entities(pieces, limit=limit)
 
-# split-source: order=1094 original-lines=103945-103977 hash=2b67aafb5ee5a63a
+# split-source: order=1096 original-lines=103984-104016 hash=2b67aafb5ee5a63a
 
 
 def _rag_apply_filename_entity_policy(
@@ -370,7 +370,7 @@ def _rag_apply_filename_entity_policy(
         return merged[:limit]
     return filtered[:limit]
 
-# split-source: order=1095 original-lines=103978-104017 hash=10463c89f0201e79
+# split-source: order=1097 original-lines=104017-104056 hash=10463c89f0201e79
 
 
 def _rag_choose_community(category: object, language: object, entities: list[object], raw_community: object = "") -> str:
@@ -412,7 +412,7 @@ def _rag_choose_community(category: object, language: object, entities: list[obj
         return f"{cat}:{first}"
     return f"{cat}:{lang}"
 
-# split-source: order=1099 original-lines=104086-104139 hash=5f2e46a51c494145
+# split-source: order=1101 original-lines=104125-104178 hash=5f2e46a51c494145
 
 
 def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
@@ -468,7 +468,7 @@ def _rag_tokenize(text: str, max_terms: int = 4000) -> list[str]:
             return out
     return out
 
-# split-source: order=1100 original-lines=104140-104163 hash=a906665e32db82b6
+# split-source: order=1102 original-lines=104179-104202 hash=a906665e32db82b6
 
 
 def _rag_expand_tokens(tokens: list[str]) -> list[str]:
@@ -494,7 +494,7 @@ def _rag_expand_tokens(tokens: list[str]) -> list[str]:
                 out.append(part)
     return out
 
-# split-source: order=1101 original-lines=104164-104182 hash=704c7d12a398a746
+# split-source: order=1103 original-lines=104203-104221 hash=704c7d12a398a746
 
 
 def _rag_extract_entities(text: str, limit: int = 32) -> list[str]:
@@ -515,7 +515,7 @@ def _rag_extract_entities(text: str, limit: int = 32) -> list[str]:
             counter[token] += freq
     return _rag_filter_entities([name for name, _ in counter.most_common(limit * 3)], limit=limit)
 
-# split-source: order=1102 original-lines=104183-104219 hash=e0a07466be3508a1
+# split-source: order=1104 original-lines=104222-104258 hash=e0a07466be3508a1
 
 
 def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
@@ -554,7 +554,7 @@ def _rag_classify_document(filename: str, kind: str, text: str) -> dict:
         labels.append("office")
     return {"category": category, "labels": sorted({str(x) for x in labels if str(x).strip()})}
 
-# split-source: order=1110 original-lines=104472-104510 hash=d9d71b5674446a4d
+# split-source: order=1112 original-lines=104511-104549 hash=d9d71b5674446a4d
 
 
 def _rag_structure_outline(text: str, *, max_items: int = 64, max_chars: int = 3600) -> list[str]:
@@ -595,7 +595,7 @@ def _rag_structure_outline(text: str, *, max_items: int = 64, max_chars: int = 3
             rows.append(item)
     return [trim(x, 180) for x in rows if x][: max(1, int(max_items or 64))]
 
-# split-source: order=1111 original-lines=104511-104597 hash=146d8a047e11c0e8
+# split-source: order=1113 original-lines=104550-104636 hash=146d8a047e11c0e8
 
 
 def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
@@ -684,7 +684,7 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
         _flush(current_text, current_heading, current_depth)
     return chunks[:RAG_MAX_CHUNKS_PER_DOC]
 
-# split-source: order=1115 original-lines=104672-104690 hash=72f6c82513a4c799
+# split-source: order=1117 original-lines=104711-104729 hash=72f6c82513a4c799
 
 
 def _code_language_from_name(name: str, text: str = "") -> str:
@@ -705,14 +705,14 @@ def _code_language_from_name(name: str, text: str = "") -> str:
             return "shell"
     return "text"
 
-# split-source: order=1116 original-lines=104691-104695 hash=28e4542ecc7f6d38
+# split-source: order=1118 original-lines=104730-104734 hash=28e4542ecc7f6d38
 
 
 def _code_is_test_path(rel_path: str) -> bool:
     low = str(rel_path or "").strip().lower()
     return any(token in low for token in ("/tests/", "/test/", "_test.", ".spec.", ".test.", "/__tests__/"))
 
-# split-source: order=1120 original-lines=104738-104752 hash=66418ff2b69e755d
+# split-source: order=1122 original-lines=104777-104791 hash=66418ff2b69e755d
 
 
 class _CallCollector(ast.NodeVisitor):
@@ -729,21 +729,21 @@ class _CallCollector(ast.NodeVisitor):
             self.calls.append(func.id)
         self.generic_visit(node)
 
-# split-source: order=1121 original-lines=104753-104755 hash=a19cb208aec4ce1c
+# split-source: order=1123 original-lines=104792-104794 hash=a19cb208aec4ce1c
 
 
 _ALGO_COMPLEXITY_RE = re.compile(r"O\s*\(\s*(?:n|log|1|n\^2|n²|n\s*\*)", re.IGNORECASE)
 
-# split-source: order=1122 original-lines=104756-104756 hash=4a246044d3169bfe
+# split-source: order=1124 original-lines=104795-104795 hash=4a246044d3169bfe
 _ALGO_STEP_RE = re.compile(r"#\s*(?:step|phase|algorithm|算法|步骤)\s*\d*[:：\s]", re.IGNORECASE)
 
-# split-source: order=1123 original-lines=104757-104757 hash=11a327683a15c351
+# split-source: order=1125 original-lines=104796-104796 hash=11a327683a15c351
 _ALGO_MATH_VARS = frozenset(["alpha", "beta", "gamma", "epsilon", "theta", "delta", "lambda", "mu", "sigma", "omega"])
 
-# split-source: order=1124 original-lines=104758-104758 hash=247850f225a77823
+# split-source: order=1126 original-lines=104797-104797 hash=247850f225a77823
 _ALGO_DOC_KEYWORDS = frozenset(["algorithm", "complexity", "iterate", "convergence", "converge", "算法", "复杂度", "迭代"])
 
-# split-source: order=1125 original-lines=104759-104784 hash=f4c89ff5d85d4942
+# split-source: order=1127 original-lines=104798-104823 hash=f4c89ff5d85d4942
 
 
 def _detect_algo_chunk(text: str) -> bool:
@@ -771,7 +771,7 @@ def _detect_algo_chunk(text: str) -> bool:
         score += 1
     return score >= 2
 
-# split-source: order=1126 original-lines=104785-105351 hash=1b8a52529802fdad
+# split-source: order=1128 original-lines=104824-105390 hash=1b8a52529802fdad
 
 
 class CodeContentParser:
@@ -1340,7 +1340,7 @@ class CodeContentParser:
             "chunks": chunks[:CODE_MAX_CHUNKS_PER_DOC],
         }
 
-# split-source: order=1127 original-lines=105352-105867 hash=45693a92274f4b77
+# split-source: order=1129 original-lines=105391-105906 hash=45693a92274f4b77
 
 
 class RAGContentParser:

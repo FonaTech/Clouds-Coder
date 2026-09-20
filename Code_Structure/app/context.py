@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1173 original-lines=117384-128100 hash=27c44b14c80da282
+# split-source: order=1175 original-lines=117420-128136 hash=27c44b14c80da282
 
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.

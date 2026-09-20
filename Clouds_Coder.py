@@ -72,6 +72,41 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Finish the transaction and release the connection on context exit."""
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, exc_traceback)
+        finally:
+            self.close()
+
+
+def _connect_sqlite(
+    database: str,
+    *,
+    timeout: float,
+    isolation_level: str | None = "",
+    row_factory=sqlite3.Row,
+    pragmas: tuple[str, ...] = (),
+) -> sqlite3.Connection:
+    # sqlite3.Connection's own context manager does not close the connection.
+    # Polling/request handlers must not rely on cyclic GC to release DB/WAL FDs.
+    conn = sqlite3.connect(
+        database, timeout=timeout, isolation_level=isolation_level,
+        factory=_ClosingSQLiteConnection,
+    )
+    try:
+        conn.row_factory = row_factory
+        for statement in pragmas:
+            conn.execute(statement)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
 except Exception:
@@ -743,13 +778,15 @@ class CollaborationStore:
             not self.db_path.parent.is_dir() or not self.db_path.is_file()
         ):
             raise sqlite3.OperationalError("collaboration database storage is unavailable")
-        conn = sqlite3.connect(str(self.db_path), timeout=15.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=15000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        return _connect_sqlite(
+            str(self.db_path), timeout=15.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=15000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+                "PRAGMA foreign_keys=ON",
+            ),
+        )
 
     def storage_health(self) -> dict:
         try:
@@ -4508,7 +4545,7 @@ LLM_HTTP_RETRY_404_ON_VLLM = (
 LLM_HTTP_RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_AGENT_ROUNDS = 200
 MIN_AGENT_ROUNDS = 8
-MAX_AGENT_ROUNDS_CAP = 400
+MAX_AGENT_ROUNDS_CAP = 8_000
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 BASH_READ_LOOP_THRESHOLD = 10
 READ_FILE_LOOP_THRESHOLD = 6
@@ -4660,7 +4697,7 @@ STALL_PLAN_SYNTHESIS_MAX_TOKENS = 3000
 STALL_ESCALATION_CONTEXT_MAX_CHARS = 3000
 MAX_RUN_SECONDS = 3000
 MIN_RUN_TIMEOUT_SECONDS = 600
-MAX_RUN_TIMEOUT_SECONDS = 86_400
+MAX_RUN_TIMEOUT_SECONDS = 864_000
 MIN_TIMEOUT_SECONDS = 600
 MAX_TIMEOUT_SECONDS = 86_400
 DEFAULT_TIMEOUT_SECONDS = max(
@@ -9727,9 +9764,7 @@ class AgentWebSearchEngine:
             pass
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=15)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return _connect_sqlite(str(self.db_path), timeout=15)
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -14123,12 +14158,14 @@ class AdminAuthStore:
             not self.path.parent.is_dir() or not self.path.is_file()
         ):
             raise sqlite3.OperationalError("administrator authentication storage is unavailable")
-        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=10.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=10000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+            ),
+        )
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -14413,12 +14450,14 @@ class IDEAuthStore:
             not self.path.parent.is_dir() or not self.path.is_file()
         ):
             raise sqlite3.OperationalError("IDE authentication storage is unavailable")
-        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=10.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=10000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+            ),
+        )
 
     def storage_health(self) -> dict:
         try:
@@ -108807,9 +108846,7 @@ class UserMemoryStore:
             self._write_profile_locked(self._empty_profile())
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.db_path), timeout=15)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return _connect_sqlite(str(self.db_path), timeout=15)
 
     def _init_db(self):
         with self.lock:
@@ -115554,11 +115591,10 @@ class SkillsStudioStore:
         self._job_cancel: set[str] = set()
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.path), timeout=8.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=8000")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=8.0,
+            pragmas=("PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=8000"),
+        )
 
     def _init_db(self):
         with self.lock, self._connect() as db:
@@ -128173,10 +128209,10 @@ class TelemetryStore:
         return raw
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.path), timeout=8.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=8000")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=8.0, row_factory=None,
+            pragmas=("PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=8000"),
+        )
 
     def _init_db(self):
         with self.lock, self._connect() as conn:

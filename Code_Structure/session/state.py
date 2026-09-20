@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1059 original-lines=29104-89565 hash=218f63fcf8d386bc
+# split-source: order=1061 original-lines=29143-89604 hash=218f63fcf8d386bc
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.

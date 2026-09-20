@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=851 original-lines=12129-12132 hash=1763dd2a03d63357
+# split-source: order=853 original-lines=12165-12168 hash=1763dd2a03d63357
 
 
 class CircuitBreakerTriggered(RuntimeError):

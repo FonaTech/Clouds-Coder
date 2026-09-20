@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1175 original-lines=128141-128516 hash=dad83c8a109695ff
+# split-source: order=1177 original-lines=128177-128552 hash=b8af8e0b329e26c0
 
 
 class TelemetryStore:
@@ -41,10 +41,10 @@ class TelemetryStore:
         return raw
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.path), timeout=8.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=8000")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=8.0, row_factory=None,
+            pragmas=("PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=8000"),
+        )
 
     def _init_db(self):
         with self.lock, self._connect() as conn:
@@ -383,7 +383,7 @@ class TelemetryStore:
             "generated_at": current,
         }
 
-# split-source: order=1176 original-lines=128517-129326 hash=6620df1b5b9667dc
+# split-source: order=1178 original-lines=128553-129362 hash=6620df1b5b9667dc
 
 
 class ApplicationRegistry:

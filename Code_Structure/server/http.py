@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=688 original-lines=6314-6325 hash=6073888fd5937940
+# split-source: order=690 original-lines=6352-6363 hash=6073888fd5937940
 
 
 def admin_language_payload(manager: object) -> dict:
@@ -19,12 +19,12 @@ def admin_language_payload(manager: object) -> dict:
         "supported_languages": supported_ui_languages_payload(),
     }
 
-# split-source: order=801 original-lines=8914-8916 hash=ad30cdd414ee4b37
+# split-source: order=803 original-lines=8952-8954 hash=ad30cdd414ee4b37
 
 
 _UI_TRUNCATION_MARKER = "\n…(truncated for UI)"
 
-# split-source: order=802 original-lines=8917-8925 hash=aba447d2c530d053
+# split-source: order=804 original-lines=8955-8963 hash=aba447d2c530d053
 
 
 def _ui_trim_text(value: object, limit: int) -> tuple[str, bool]:
@@ -35,7 +35,7 @@ def _ui_trim_text(value: object, limit: int) -> tuple[str, bool]:
     keep = max(1, limit - len(_UI_TRUNCATION_MARKER))
     return text[:keep] + _UI_TRUNCATION_MARKER, True
 
-# split-source: order=803 original-lines=8926-8986 hash=7ab38ccadacd41cf
+# split-source: order=805 original-lines=8964-9024 hash=7ab38ccadacd41cf
 
 
 def _bounded_ui_value(
@@ -98,7 +98,7 @@ def _bounded_ui_value(
         return out_list, truncated
     return _ui_trim_text(value, text_limit)
 
-# split-source: order=804 original-lines=8987-9038 hash=9ea54ca7928bbed7
+# split-source: order=806 original-lines=9025-9076 hash=9ea54ca7928bbed7
 
 
 def _bounded_ui_row(
@@ -152,7 +152,7 @@ def _bounded_ui_row(
         projected["ui_truncated"] = True
     return projected
 
-# split-source: order=805 original-lines=9039-9087 hash=6a2ea4d9d7a02580
+# split-source: order=807 original-lines=9077-9125 hash=6a2ea4d9d7a02580
 
 
 def _bounded_ui_rows(
@@ -203,7 +203,7 @@ def _bounded_ui_rows(
         selected.reverse()
     return selected, len(selected) < len(source)
 
-# split-source: order=806 original-lines=9088-9132 hash=3b11e1a68491cd75
+# split-source: order=808 original-lines=9126-9170 hash=3b11e1a68491cd75
 
 
 def _enforce_ui_payload_budget(payload: dict, byte_budget: int) -> dict:
@@ -250,7 +250,7 @@ def _enforce_ui_payload_budget(payload: dict, byte_budget: int) -> dict:
                 payload[f"{key}_truncated"] = True
     return payload
 
-# split-source: order=807 original-lines=9133-9188 hash=02abec25163d8472
+# split-source: order=809 original-lines=9171-9226 hash=02abec25163d8472
 
 
 def _apply_lite_snapshot_bounds(payload: dict) -> dict:
@@ -308,7 +308,7 @@ def _apply_lite_snapshot_bounds(payload: dict) -> dict:
     payload["ui_payload_limit_bytes"] = int(LITE_SNAPSHOT_MAX_BYTES)
     return _enforce_ui_payload_budget(payload, LITE_SNAPSHOT_MAX_BYTES)
 
-# split-source: order=1174 original-lines=128101-128140 hash=72f9d812840a61ba
+# split-source: order=1176 original-lines=128137-128176 hash=72f9d812840a61ba
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -350,7 +350,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
-# split-source: order=1177 original-lines=129327-131094 hash=2b1b6922ad7fec45
+# split-source: order=1179 original-lines=129363-131130 hash=2b1b6922ad7fec45
 
 
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
@@ -2120,7 +2120,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             sess.events.unsubscribe(sub)
 
-# split-source: order=1180 original-lines=131896-132009 hash=79a78cd04af97eeb
+# split-source: order=1182 original-lines=131932-132045 hash=79a78cd04af97eeb
 
 
 class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
@@ -2236,7 +2236,7 @@ class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
         if not self._handle_admin_auth_post(path):
             return self._send_json({"error": "not found"}, 404)
 
-# split-source: order=1184 original-lines=134066-134536 hash=e5c3c84a1d0a44ec
+# split-source: order=1186 original-lines=134102-134572 hash=e5c3c84a1d0a44ec
 
 class CollaborationHandler(IdeHandler):
     server_version = "CloudsCoderCollaboration/1.0"

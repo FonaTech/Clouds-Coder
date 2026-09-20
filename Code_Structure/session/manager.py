@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=723 original-lines=7474-7479 hash=86ab07aacf89e33f
+# split-source: order=725 original-lines=7512-7517 hash=86ab07aacf89e33f
 
 
 class SessionCreationLimitExceeded(RuntimeError):
@@ -13,7 +13,7 @@ class SessionCreationLimitExceeded(RuntimeError):
         self.status = dict(status or {})
         super().__init__(str(self.status.get("message", "daily session limit reached")))
 
-# split-source: order=1060 original-lines=89566-91908 hash=dfc9e4509cd94f45
+# split-source: order=1062 original-lines=89605-91947 hash=dfc9e4509cd94f45
 
 class SessionManager:
     def __init__(

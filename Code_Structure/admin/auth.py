@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=902 original-lines=13540-13572 hash=28ee420b5a6d9364
+# split-source: order=904 original-lines=13575-13607 hash=28ee420b5a6d9364
 
 def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
     peer = handler.client_address[0] if getattr(handler, "client_address", None) else "0.0.0.0"
@@ -40,7 +40,7 @@ def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
         current = candidate
     return current
 
-# split-source: order=916 original-lines=14096-14103 hash=d6f677beb0fa793e
+# split-source: order=918 original-lines=14131-14138 hash=d6f677beb0fa793e
 
 
 class AdminAuthError(Exception):
@@ -50,7 +50,7 @@ class AdminAuthError(Exception):
         self.status = int(status or 400)
         self.retry_after = max(0, int(retry_after or 0))
 
-# split-source: order=917 original-lines=14104-14380 hash=927375521985540f
+# split-source: order=919 original-lines=14139-14417 hash=f6c0d26d6fab6758
 
 
 class AdminAuthStore:
@@ -73,12 +73,14 @@ class AdminAuthStore:
             not self.path.parent.is_dir() or not self.path.is_file()
         ):
             raise sqlite3.OperationalError("administrator authentication storage is unavailable")
-        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=10.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=10000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+            ),
+        )
 
     def _initialize(self) -> None:
         with self._connect() as conn:
