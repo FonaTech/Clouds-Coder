@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=690 original-lines=6398-6422 hash=1ba352169adb7a74
+# split-source: order=690 original-lines=6397-6421 hash=1ba352169adb7a74
 
 
 def normalize_ui_language(raw: str | None) -> str:
@@ -32,7 +32,7 @@ def normalize_ui_language(raw: str | None) -> str:
         return mapped
     return DEFAULT_UI_LANGUAGE
 
-# split-source: order=691 original-lines=6423-6442 hash=8cce3c29aa7f9a70
+# split-source: order=691 original-lines=6422-6441 hash=8cce3c29aa7f9a70
 
 
 def normalize_ui_style(raw: str | None) -> str:
@@ -54,13 +54,13 @@ def normalize_ui_style(raw: str | None) -> str:
         return mapped
     return DEFAULT_UI_STYLE
 
-# split-source: order=692 original-lines=6443-6446 hash=8122501e60c7063a
+# split-source: order=692 original-lines=6442-6445 hash=8122501e60c7063a
 
 
 def supported_ui_languages_payload() -> list[dict]:
     return [dict(x) for x in SUPPORTED_UI_LANGUAGES]
 
-# split-source: order=694 original-lines=6459-6468 hash=67b7a36374a83ec8
+# split-source: order=694 original-lines=6458-6467 hash=67b7a36374a83ec8
 
 
 def agent_language_preference_payload(language: str | None) -> dict:
@@ -72,7 +72,7 @@ def agent_language_preference_payload(language: str | None) -> dict:
         row["public_progress_mode"] = "off"
     return row
 
-# split-source: order=695 original-lines=6469-6490 hash=f2169616eec4cc2d
+# split-source: order=695 original-lines=6468-6489 hash=f2169616eec4cc2d
 
 
 def normalize_execution_mode(raw: str | None, default: str = EXECUTION_MODE_SYNC) -> str:
@@ -96,7 +96,7 @@ def normalize_execution_mode(raw: str | None, default: str = EXECUTION_MODE_SYNC
         return fallback
     return EXECUTION_MODE_SYNC
 
-# split-source: order=696 original-lines=6491-6521 hash=1a7837dacd04848d
+# split-source: order=696 original-lines=6490-6520 hash=1a7837dacd04848d
 
 
 def model_language_instruction(lang: str) -> str:
@@ -129,7 +129,7 @@ def model_language_instruction(lang: str) -> str:
         "Do not translate code, file paths, commands, API/tool names, or JSON keys."
     )
 
-# split-source: order=702 original-lines=6999-7011 hash=3282989af9f87290
+# split-source: order=702 original-lines=6998-7010 hash=3282989af9f87290
 
 
 def backend_i18n_text(language: str, key: str, **kwargs) -> str:
@@ -144,7 +144,7 @@ def backend_i18n_text(language: str, key: str, **kwargs) -> str:
             return template
     return template
 
-# split-source: order=703 original-lines=7012-7018 hash=44c5dc8d85b13d9e
+# split-source: order=703 original-lines=7011-7017 hash=44c5dc8d85b13d9e
 
 
 def backend_role_label(role: str, language: str) -> str:
@@ -153,7 +153,7 @@ def backend_role_label(role: str, language: str) -> str:
         return backend_i18n_text(language, f"role_{role_key}")
     return backend_i18n_text(language, "role_agent")
 
-# split-source: order=704 original-lines=7019-7060 hash=efdfecfa720e25dc
+# split-source: order=704 original-lines=7018-7059 hash=efdfecfa720e25dc
 
 
 def _detect_os_shell_instruction() -> str:
@@ -197,7 +197,7 @@ def _detect_os_shell_instruction() -> str:
         "If you must use absolute paths, always quote them with double quotes."
     )
 
-# split-source: order=705 original-lines=7061-7069 hash=af013e3c4e2107c4
+# split-source: order=705 original-lines=7060-7068 hash=af013e3c4e2107c4
 
 def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
     txt = str(raw or "").strip()
@@ -208,7 +208,7 @@ def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
         return p.resolve()
     return ((base_dir or WORKDIR).resolve() / p).resolve()
 
-# split-source: order=706 original-lines=7070-7079 hash=12ef97467ee9db28
+# split-source: order=706 original-lines=7069-7078 hash=12ef97467ee9db28
 
 
 def resolve_optional_file_path(raw: str, base_dir: Path | None = None) -> Path:
@@ -220,7 +220,7 @@ def resolve_optional_file_path(raw: str, base_dir: Path | None = None) -> Path:
         return p.resolve()
     return ((base_dir or WORKDIR).resolve() / p).resolve()
 
-# split-source: order=707 original-lines=7080-7089 hash=0eda8ecf40330dc2
+# split-source: order=707 original-lines=7079-7088 hash=0eda8ecf40330dc2
 
 
 def resolve_skills_root_path(raw: str, base_dir: Path | None = None) -> Path:
@@ -232,7 +232,7 @@ def resolve_skills_root_path(raw: str, base_dir: Path | None = None) -> Path:
         return p.resolve()
     return ((base_dir or WORKDIR).resolve() / p).resolve()
 
-# split-source: order=708 original-lines=7090-7103 hash=f260e0a0c0f804f7
+# split-source: order=708 original-lines=7089-7102 hash=f260e0a0c0f804f7
 
 
 def _count_skill_markdown_files(root: Path, limit: int = 2048) -> int:
@@ -248,7 +248,7 @@ def _count_skill_markdown_files(root: Path, limit: int = 2048) -> int:
         return 0
     return total
 
-# split-source: order=709 original-lines=7104-7140 hash=a51220e541abfcba
+# split-source: order=709 original-lines=7103-7139 hash=a51220e541abfcba
 
 
 def select_preferred_skills_root(
@@ -287,7 +287,7 @@ def select_preferred_skills_root(
 
     return ensure_embedded_skills(workdir), "embedded-default"
 
-# split-source: order=710 original-lines=7141-7157 hash=a90f45ee4fbfde32
+# split-source: order=710 original-lines=7140-7156 hash=a90f45ee4fbfde32
 
 
 def load_web_ui_config_file(path: Path) -> dict:
@@ -306,7 +306,7 @@ def load_web_ui_config_file(path: Path) -> dict:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
-# split-source: order=711 original-lines=7158-7174 hash=7af2da604142cd96
+# split-source: order=711 original-lines=7157-7173 hash=7af2da604142cd96
 
 
 def extract_show_upload_list_setting(raw: object) -> bool | None:
@@ -325,7 +325,7 @@ def extract_show_upload_list_setting(raw: object) -> bool | None:
                 return _to_bool_like(section.get(key), default=False)
     return None
 
-# split-source: order=712 original-lines=7175-7191 hash=b8eb5cc95c75642d
+# split-source: order=712 original-lines=7174-7190 hash=b8eb5cc95c75642d
 
 
 def extract_ui_style_setting(raw: object) -> str | None:
@@ -344,7 +344,7 @@ def extract_ui_style_setting(raw: object) -> str | None:
                 return normalize_ui_style(str(section.get(key) or ""))
     return None
 
-# split-source: order=713 original-lines=7192-7213 hash=1700307c7f4f43a3
+# split-source: order=713 original-lines=7191-7212 hash=1700307c7f4f43a3
 
 
 def extract_js_lib_download_setting(raw: object) -> bool | None:
@@ -368,7 +368,7 @@ def extract_js_lib_download_setting(raw: object) -> bool | None:
                 return _to_bool_like(section.get(key), default=True)
     return None
 
-# split-source: order=714 original-lines=7214-7259 hash=bcbbb7bee1d1820d
+# split-source: order=714 original-lines=7213-7258 hash=bcbbb7bee1d1820d
 
 
 def extract_daily_session_limit_setting(raw: object) -> int | None:
@@ -416,7 +416,7 @@ def extract_daily_session_limit_setting(raw: object) -> int | None:
                 return _parse_non_negative_int(section.get(key))
     return None
 
-# split-source: order=715 original-lines=7260-7308 hash=8870893baf59b79f
+# split-source: order=715 original-lines=7259-7307 hash=8870893baf59b79f
 
 
 def extract_shell_command_timeout_setting(raw: object) -> int | None:
@@ -467,7 +467,7 @@ def extract_shell_command_timeout_setting(raw: object) -> int | None:
                 return _parse_timeout(section.get(key))
     return None
 
-# split-source: order=716 original-lines=7309-7326 hash=7266e28c036f18ee
+# split-source: order=716 original-lines=7308-7325 hash=7266e28c036f18ee
 
 
 def normalize_shell_timeout_mode(value: object, default: str = DEFAULT_SHELL_TIMEOUT_MODE) -> str:
@@ -487,7 +487,7 @@ def normalize_shell_timeout_mode(value: object, default: str = DEFAULT_SHELL_TIM
     text = aliases.get(text, text)
     return text if text in SHELL_TIMEOUT_MODES else fallback
 
-# split-source: order=717 original-lines=7327-7339 hash=9328794d105bdf46
+# split-source: order=717 original-lines=7326-7338 hash=9328794d105bdf46
 
 
 def extract_shell_timeout_mode_setting(raw: object) -> str | None:
@@ -502,7 +502,7 @@ def extract_shell_timeout_mode_setting(raw: object) -> str | None:
                 return normalize_shell_timeout_mode(container.get(key))
     return None
 
-# split-source: order=718 original-lines=7340-7367 hash=142ff4da1e2a0e7f
+# split-source: order=718 original-lines=7339-7366 hash=142ff4da1e2a0e7f
 
 
 def extract_shell_async_handoff_setting(raw: object) -> int | None:
@@ -532,7 +532,7 @@ def extract_shell_async_handoff_setting(raw: object) -> int | None:
                 return None
     return None
 
-# split-source: order=719 original-lines=7368-7402 hash=1c6c0fe1eb5e7c93
+# split-source: order=719 original-lines=7367-7401 hash=1c6c0fe1eb5e7c93
 
 
 def extract_context_token_limit_setting(raw: object) -> int | None:
@@ -569,7 +569,7 @@ def extract_context_token_limit_setting(raw: object) -> int | None:
                 return _parse_limit(section.get(key))
     return None
 
-# split-source: order=720 original-lines=7403-7424 hash=f5016fe44e36c4f6
+# split-source: order=720 original-lines=7402-7423 hash=f5016fe44e36c4f6
 
 
 def normalize_auto_task_level_ceiling(value: object, default: int = DEFAULT_AUTO_TASK_LEVEL_CEILING) -> int:
@@ -593,7 +593,7 @@ def normalize_auto_task_level_ceiling(value: object, default: int = DEFAULT_AUTO
         return int(raw)
     return 0
 
-# split-source: order=721 original-lines=7425-7460 hash=eb92ef4ff195cacb
+# split-source: order=721 original-lines=7424-7459 hash=eb92ef4ff195cacb
 
 
 def normalize_l2_todo_policy(value: object, default: str = DEFAULT_L2_TODO_POLICY) -> str:
@@ -631,7 +631,7 @@ def normalize_l2_todo_policy(value: object, default: str = DEFAULT_L2_TODO_POLIC
     fallback = str(default or DEFAULT_L2_TODO_POLICY).strip().lower().replace("_", "-")
     return aliases.get(fallback, DEFAULT_L2_TODO_POLICY)
 
-# split-source: order=722 original-lines=7461-7503 hash=a419cc8181e68fb5
+# split-source: order=722 original-lines=7460-7502 hash=a419cc8181e68fb5
 
 
 def extract_l2_todo_policy_setting(raw: object) -> str | None:
@@ -676,7 +676,7 @@ def extract_l2_todo_policy_setting(raw: object) -> str | None:
                 return "force" if _to_bool_like(section.get(key), default=True) else "off"
     return None
 
-# split-source: order=723 original-lines=7504-7533 hash=d80bbdccf183f77c
+# split-source: order=723 original-lines=7503-7532 hash=d80bbdccf183f77c
 
 
 def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
@@ -708,7 +708,7 @@ def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
                 return normalize_auto_task_level_ceiling(section.get(key))
     return None
 
-# split-source: order=724 original-lines=7534-7554 hash=f5f947766e92c002
+# split-source: order=724 original-lines=7533-7553 hash=f5f947766e92c002
 
 
 def normalize_read_context_policy(value: object, default: str = DEFAULT_READ_CONTEXT_POLICY) -> str:
@@ -731,13 +731,13 @@ def normalize_read_context_policy(value: object, default: str = DEFAULT_READ_CON
         return raw
     return normalize_read_context_policy(default, "auto") if str(default or "").strip().lower() != raw else "auto"
 
-# split-source: order=725 original-lines=7555-7558 hash=146cba5e58468542
+# split-source: order=725 original-lines=7554-7557 hash=146cba5e58468542
 
 
 def normalize_tool_memory_policy(value: object, default: str = DEFAULT_TOOL_MEMORY_POLICY) -> str:
     return normalize_read_context_policy(value, default)
 
-# split-source: order=726 original-lines=7559-7582 hash=0dfb00d55cadcb2a
+# split-source: order=726 original-lines=7558-7581 hash=0dfb00d55cadcb2a
 
 
 def extract_read_context_policy_setting(raw: object) -> str | None:
@@ -763,7 +763,7 @@ def extract_read_context_policy_setting(raw: object) -> str | None:
                 return normalize_read_context_policy(section.get(key))
     return None
 
-# split-source: order=727 original-lines=7583-7606 hash=6c7a96d8cb2de88d
+# split-source: order=727 original-lines=7582-7605 hash=6c7a96d8cb2de88d
 
 
 def extract_tool_memory_policy_setting(raw: object) -> str | None:
@@ -789,7 +789,7 @@ def extract_tool_memory_policy_setting(raw: object) -> str | None:
                 return normalize_tool_memory_policy(section.get(key))
     return extract_read_context_policy_setting(raw)
 
-# split-source: order=729 original-lines=7613-7623 hash=4b6ffdf2995c7b37
+# split-source: order=729 original-lines=7612-7622 hash=4b6ffdf2995c7b37
 
 
 def default_multimodal_capabilities() -> dict[str, bool]:
@@ -802,7 +802,7 @@ def default_multimodal_capabilities() -> dict[str, bool]:
         "output_video": False,
     }
 
-# split-source: order=730 original-lines=7624-7636 hash=2e6d6aae947d1ddf
+# split-source: order=730 original-lines=7623-7635 hash=2e6d6aae947d1ddf
 
 
 def _to_bool_like(raw: object, default: bool = False) -> bool:
@@ -817,7 +817,7 @@ def _to_bool_like(raw: object, default: bool = False) -> bool:
         return False
     return default
 
-# split-source: order=731 original-lines=7637-7649 hash=e5330bd50c006691
+# split-source: order=731 original-lines=7636-7648 hash=e5330bd50c006691
 
 
 def extract_web_search_enabled_setting(raw: object) -> bool | None:
@@ -832,7 +832,7 @@ def extract_web_search_enabled_setting(raw: object) -> bool | None:
             return _to_bool_like(section.get(key), default=DEFAULT_WEB_SEARCH_ENABLED)
     return None
 
-# split-source: order=732 original-lines=7650-7676 hash=b623041feef4cdf6
+# split-source: order=732 original-lines=7649-7675 hash=b623041feef4cdf6
 
 
 def _single_no_plan_todo_setting_sections(raw: dict) -> list[dict]:
@@ -861,7 +861,7 @@ def _single_no_plan_todo_setting_sections(raw: dict) -> list[dict]:
                     sections.append(child)
     return sections
 
-# split-source: order=733 original-lines=7677-7702 hash=f918d26a261d4824
+# split-source: order=733 original-lines=7676-7701 hash=f918d26a261d4824
 
 
 def _single_no_plan_todo_setting_present(raw: object) -> bool:
@@ -889,7 +889,7 @@ def _single_no_plan_todo_setting_present(raw: object) -> bool:
         for key in (*enabled_keys, *prompt_keys)
     )
 
-# split-source: order=734 original-lines=7703-7749 hash=ca48429712a5b828
+# split-source: order=734 original-lines=7702-7748 hash=ca48429712a5b828
 
 
 def extract_single_no_plan_todo_settings(raw: object) -> tuple[bool, str]:
@@ -938,7 +938,7 @@ def extract_single_no_plan_todo_settings(raw: object) -> tuple[bool, str]:
         return True, prompt or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
     return False, ""
 
-# split-source: order=735 original-lines=7750-7780 hash=d98799beafdaf215
+# split-source: order=735 original-lines=7749-7779 hash=d98799beafdaf215
 
 
 def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY_MODE) -> str:
@@ -971,13 +971,13 @@ def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY
     fallback = str(default or DEFAULT_USER_MEMORY_MODE).strip().lower()
     return fallback if fallback in USER_MEMORY_MODE_CHOICES else DEFAULT_USER_MEMORY_MODE
 
-# split-source: order=736 original-lines=7781-7784 hash=81fb3d5ca2ad8058
+# split-source: order=736 original-lines=7780-7783 hash=81fb3d5ca2ad8058
 
 
 def user_memory_enabled_from_mode(mode: object) -> bool:
     return normalize_user_memory_mode(mode) != "off"
 
-# split-source: order=737 original-lines=7785-7824 hash=b0e9dd3a612c2123
+# split-source: order=737 original-lines=7784-7823 hash=b0e9dd3a612c2123
 
 
 def extract_user_memory_mode_setting(raw: object) -> str | None:
@@ -1019,7 +1019,7 @@ def extract_user_memory_mode_setting(raw: object) -> str | None:
                 return "weak" if _to_bool_like(section.get(key), default=True) else "off"
     return None
 
-# split-source: order=738 original-lines=7825-7840 hash=c8140018cfb82faf
+# split-source: order=738 original-lines=7824-7839 hash=c8140018cfb82faf
 
 
 def set_web_search_enabled_on_runtime(target: object, enabled: bool, *, persist: bool = False) -> None:
@@ -1037,7 +1037,7 @@ def set_web_search_enabled_on_runtime(target: object, enabled: bool, *, persist:
     except Exception:
         pass
 
-# split-source: order=739 original-lines=7841-7887 hash=3f0b7008aa45192b
+# split-source: order=739 original-lines=7840-7886 hash=3f0b7008aa45192b
 
 
 def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, bool]:
@@ -1086,7 +1086,7 @@ def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, 
             caps["input_image"] = True
     return caps
 
-# split-source: order=740 original-lines=7888-7927 hash=3f6d2a3e97a5dd48
+# split-source: order=740 original-lines=7887-7926 hash=3f6d2a3e97a5dd48
 
 
 def parse_capability_overrides(raw: object) -> dict[str, bool]:
@@ -1128,7 +1128,7 @@ def parse_capability_overrides(raw: object) -> dict[str, bool]:
             out[mapped] = _to_bool_like(value, default=False)
     return out
 
-# split-source: order=741 original-lines=7928-7937 hash=3a4562a324845c0c
+# split-source: order=741 original-lines=7927-7936 hash=3a4562a324845c0c
 
 
 def merge_multimodal_capabilities(base: dict[str, bool], override: dict[str, bool]) -> dict[str, bool]:
@@ -1140,7 +1140,7 @@ def merge_multimodal_capabilities(base: dict[str, bool], override: dict[str, boo
             out[key] = bool(value)
     return out
 
-# split-source: order=742 original-lines=7938-7954 hash=d205fcbaf2f104d3
+# split-source: order=742 original-lines=7937-7953 hash=d205fcbaf2f104d3
 
 
 def parse_media_endpoints(raw: object) -> dict[str, str]:
@@ -1159,7 +1159,7 @@ def parse_media_endpoints(raw: object) -> dict[str, str]:
             out[media_type] = v
     return out
 
-# split-source: order=758 original-lines=8132-8157 hash=380fc2b2a9209690
+# split-source: order=758 original-lines=8131-8156 hash=380fc2b2a9209690
 
 def extract_runtime_region_hint_setting(raw: object) -> str:
     if not isinstance(raw, dict):
@@ -1187,7 +1187,7 @@ def extract_runtime_region_hint_setting(raw: object) -> str:
                 return trim(value, 160)
     return ""
 
-# split-source: order=759 original-lines=8158-8175 hash=be32b3fed30e7bce
+# split-source: order=759 original-lines=8157-8174 hash=be32b3fed30e7bce
 
 def extract_runtime_timezone_hint_setting(raw: object) -> str:
     if not isinstance(raw, dict):
@@ -1207,7 +1207,7 @@ def extract_runtime_timezone_hint_setting(raw: object) -> str:
                 return trim(value, 120)
     return ""
 
-# split-source: order=760 original-lines=8176-8225 hash=06d71d8bf464e298
+# split-source: order=760 original-lines=8175-8224 hash=06d71d8bf464e298
 
 def runtime_environment_context_snapshot(
     *,
@@ -1259,7 +1259,7 @@ def runtime_environment_context_snapshot(
         "workspace": str(files_root or "").strip(),
     }
 
-# split-source: order=761 original-lines=8226-8255 hash=d901fe071f1104e4
+# split-source: order=761 original-lines=8225-8254 hash=d901fe071f1104e4
 
 def runtime_environment_context_block(snapshot: dict) -> str:
     snap = snapshot if isinstance(snapshot, dict) else {}
@@ -1291,7 +1291,7 @@ def runtime_environment_context_block(snapshot: dict) -> str:
         "Do not infer the current year from model memory. If a market or jurisdiction calendar matters and is not in this block, verify it with tools and state any uncertainty."
     )
 
-# split-source: order=797 original-lines=8730-8740 hash=2dc5eec7887c2b9d
+# split-source: order=797 original-lines=8729-8739 hash=2dc5eec7887c2b9d
 
 def load_offline_js_lib_index(js_root: Path) -> dict:
     fp = (js_root / OFFLINE_JS_LIB_INDEX_FILE).resolve()
@@ -1304,7 +1304,7 @@ def load_offline_js_lib_index(js_root: Path) -> dict:
     except Exception:
         return {}
 
-# split-source: order=852 original-lines=12249-12270 hash=8f663dd5fe60a2cc
+# split-source: order=852 original-lines=12248-12269 hash=8f663dd5fe60a2cc
 
 def extract_ollama_model_capabilities(payload: object) -> dict:
     """Translate Ollama ``/api/show`` metadata to provider-neutral hints."""
@@ -1328,7 +1328,7 @@ def extract_ollama_model_capabilities(payload: object) -> dict:
         caps["tools"] = True
     return caps
 
-# split-source: order=861 original-lines=12393-12404 hash=bf4350913a845978
+# split-source: order=861 original-lines=12392-12403 hash=bf4350913a845978
 
 def resolve_ollama_model(base_url: str, preferred: str) -> str:
     models = list_ollama_models(base_url)
@@ -1342,13 +1342,13 @@ def resolve_ollama_model(base_url: str, preferred: str) -> str:
             return m
     return models[0]
 
-# split-source: order=862 original-lines=12405-12408 hash=fd13dc6907d09805
+# split-source: order=862 original-lines=12404-12407 hash=fd13dc6907d09805
 
 def infer_thinking_model(model: str) -> bool:
     # Thinking control is disabled globally: do not infer or force it by model name.
     return False
 
-# split-source: order=873 original-lines=12618-12627 hash=9f92f7c16525f0e2
+# split-source: order=873 original-lines=12617-12626 hash=9f92f7c16525f0e2
 
 def extract_base_url(endpoint_or_base: str) -> str:
     s = (endpoint_or_base or "").strip()
@@ -1360,7 +1360,7 @@ def extract_base_url(endpoint_or_base: str) -> str:
             return s[: -len(suffix)] or s
     return s
 
-# split-source: order=875 original-lines=12639-12656 hash=512eb439750bd9a8
+# split-source: order=875 original-lines=12638-12655 hash=512eb439750bd9a8
 
 def infer_user_complexity_value(text: str) -> str:
     low = strip_thinking_content(str(text or "")).strip().lower()
@@ -1380,7 +1380,7 @@ def infer_user_complexity_value(text: str) -> str:
             return "complex"
     return ""
 
-# split-source: order=876 original-lines=12657-12686 hash=ba5fc5d15d62db7c
+# split-source: order=876 original-lines=12656-12685 hash=ba5fc5d15d62db7c
 
 def normalize_task_complexity(raw: object, default: str = "simple") -> str:
     value = str(raw or "").strip().lower()
@@ -1412,17 +1412,17 @@ def normalize_task_complexity(raw: object, default: str = "simple") -> str:
         return ""
     return fallback if fallback in TASK_COMPLEXITY_LEVELS else "simple"
 
-# split-source: order=877 original-lines=12687-12689 hash=13a04b142c411b7a
+# split-source: order=877 original-lines=12686-12688 hash=13a04b142c411b7a
 
 def task_complexity_rank(raw: object, default: str = "simple") -> int:
     return int(TASK_COMPLEXITY_RANKS.get(normalize_task_complexity(raw, default=default), 1))
 
-# split-source: order=878 original-lines=12690-12692 hash=f2cfc12da1138ba7
+# split-source: order=878 original-lines=12689-12691 hash=f2cfc12da1138ba7
 
 def task_complexity_at_least(raw: object, threshold: str) -> bool:
     return task_complexity_rank(raw) >= task_complexity_rank(threshold)
 
-# split-source: order=879 original-lines=12693-12703 hash=95ddd61442a13767
+# split-source: order=879 original-lines=12692-12702 hash=95ddd61442a13767
 
 def max_task_complexity(*values: object, default: str = "simple") -> str:
     best = normalize_task_complexity(default, default=default)
@@ -1435,7 +1435,7 @@ def max_task_complexity(*values: object, default: str = "simple") -> str:
             best_rank = cur_rank
     return best
 
-# split-source: order=880 original-lines=12704-12720 hash=155ddbecefe13b19
+# split-source: order=880 original-lines=12703-12719 hash=155ddbecefe13b19
 
 def normalize_openai_compat_provider_name(raw: str) -> str:
     value = str(raw or "").strip().lower().replace("-", "_")
@@ -1454,7 +1454,7 @@ def normalize_openai_compat_provider_name(raw: str) -> str:
     }
     return aliases.get(value, value or "openai_compat")
 
-# split-source: order=900 original-lines=12848-12899 hash=f819d83005bfa3ae
+# split-source: order=900 original-lines=12847-12898 hash=f819d83005bfa3ae
 
 
 def resolve_reasoning_payload(
@@ -1508,7 +1508,7 @@ def resolve_reasoning_payload(
         return {"think": True}
     return {}
 
-# split-source: order=904 original-lines=12968-13002 hash=62d57a511ae77d05
+# split-source: order=904 original-lines=12967-13001 hash=62d57a511ae77d05
 
 def extract_openai_compat_model_ids(payload: object) -> list[str]:
     out: list[str] = []
@@ -1545,7 +1545,7 @@ def extract_openai_compat_model_ids(payload: object) -> list[str]:
     _walk(payload, 0)
     return out
 
-# split-source: order=905 original-lines=13003-13082 hash=39722d42d270d76c
+# split-source: order=905 original-lines=13002-13081 hash=39722d42d270d76c
 
 
 def extract_openai_compat_model_records(payload: object) -> list[dict]:
@@ -1627,7 +1627,7 @@ def extract_openai_compat_model_records(payload: object) -> list[dict]:
     walk(payload)
     return records
 
-# split-source: order=911 original-lines=13235-13278 hash=04a3e2b3c671defc
+# split-source: order=911 original-lines=13234-13277 hash=04a3e2b3c671defc
 
 
 def merge_probed_models_into_profile(
@@ -1673,7 +1673,7 @@ def merge_probed_models_into_profile(
         profile["model_settings"] = settings
     return changed
 
-# split-source: order=912 original-lines=13279-13336 hash=c692ebaf3390e810
+# split-source: order=912 original-lines=13278-13335 hash=c692ebaf3390e810
 
 
 def probe_and_merge_model_profiles(
@@ -1733,7 +1733,7 @@ def probe_and_merge_model_profiles(
         ) or changed
     return changed
 
-# split-source: order=913 original-lines=13337-13362 hash=6b1d6e07b394ec70
+# split-source: order=913 original-lines=13336-13361 hash=6b1d6e07b394ec70
 
 
 def normalize_model_runtime_settings(raw: object) -> dict:
@@ -1761,7 +1761,7 @@ def normalize_model_runtime_settings(raw: object) -> dict:
             out[key] = normalize_timeout_seconds(value, minimum=MIN_TIMEOUT_SECONDS, maximum=MAX_TIMEOUT_SECONDS, fallback=DEFAULT_REQUEST_TIMEOUT)
     return out
 
-# split-source: order=914 original-lines=13363-13378 hash=7a37a34172d713be
+# split-source: order=914 original-lines=13362-13377 hash=7a37a34172d713be
 
 
 def apply_model_runtime_settings(profile: dict, model: str, settings: object = None) -> dict:
@@ -1779,7 +1779,7 @@ def apply_model_runtime_settings(profile: dict, model: str, settings: object = N
     row["selection"] = f"{row.get('id', '')}::{row.get('model', '')}"
     return row
 
-# split-source: order=915 original-lines=13379-13389 hash=6ccad9fce2141bc2
+# split-source: order=915 original-lines=13378-13388 hash=6ccad9fce2141bc2
 
 
 def model_runtime_settings_for(profile: dict, model: str = "") -> dict:
@@ -1792,7 +1792,7 @@ def model_runtime_settings_for(profile: dict, model: str = "") -> dict:
         out.update(normalize_model_runtime_settings(per_model.get(target, {})))
     return out
 
-# split-source: order=916 original-lines=13390-13402 hash=1b887aa820a3a005
+# split-source: order=916 original-lines=13389-13401 hash=1b887aa820a3a005
 
 
 def apply_model_option_runtime_fields(option: dict, profile: dict, model: str = "") -> dict:
@@ -1807,7 +1807,7 @@ def apply_model_option_runtime_fields(option: dict, profile: dict, model: str = 
         option.setdefault("title", str(profile.get("title", profile.get("label", "")) or ""))
     return option
 
-# split-source: order=919 original-lines=13435-13470 hash=6145f26539ee9055
+# split-source: order=919 original-lines=13434-13469 hash=6145f26539ee9055
 
 def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeout: int = 20) -> tuple[dict, str]:
     raw = str(source or "").strip()
@@ -1845,7 +1845,7 @@ def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeou
         )
     return config, source_desc
 
-# split-source: order=920 original-lines=13471-14331 hash=355b52fdbbafcae2
+# split-source: order=920 original-lines=13470-14330 hash=355b52fdbbafcae2
 
 def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_ollama_model: str) -> dict:
     model_caps_map = config.get("model_capabilities", {})
@@ -2708,7 +2708,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             profile["model_settings"] = current
     return {"profiles": profiles, "default_profile_id": default_profile_id}
 
-# split-source: order=921 original-lines=14332-14421 hash=c5f9c22e6c982021
+# split-source: order=921 original-lines=14331-14420 hash=c5f9c22e6c982021
 
 def looks_like_llm_config(config: dict) -> bool:
     if not isinstance(config, dict) or not config:
@@ -2800,7 +2800,7 @@ def looks_like_llm_config(config: dict) -> bool:
     }
     return bool(keys & markers)
 
-# split-source: order=925 original-lines=14617-14845 hash=c72333b87d914997
+# split-source: order=925 original-lines=14616-14844 hash=c72333b87d914997
 
 def parse_front_matter(text: str) -> tuple[dict, str]:
     text = text or ""
@@ -3031,14 +3031,14 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
     meta = _parse_simple_yaml_block(raw_meta)
     return _normalize_front_matter_value(meta), body
 
-# split-source: order=933 original-lines=14932-14936 hash=3121d4770c4e99e8
+# split-source: order=933 original-lines=14931-14935 hash=3121d4770c4e99e8
 
 
 def normalize_liquid_kernel_startup_policy(value: object, default: str = "inherit") -> str:
     normalized = str(value or "").strip().lower()
     return normalized if normalized in LIQUID_KERNEL_STARTUP_POLICIES else str(default or "inherit")
 
-# split-source: order=960 original-lines=16783-16817 hash=33063117770270a8
+# split-source: order=960 original-lines=16782-16816 hash=33063117770270a8
 
 
 def normalize_upload_rel_path(path_text: str) -> str:

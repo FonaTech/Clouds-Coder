@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=73 original-lines=124-435 hash=eaf13947588ab3b5
+# split-source: order=73 original-lines=123-434 hash=eaf13947588ab3b5
 
 _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
     "UEsDBBQAAAAIAAAAIVzNzUY/oAAAAHYBAAALAAAAX19pbml0X18ucHl1jrsKwkAQRfv9iiWVgvgHVppCjEZ8NSLDYjZhYHZHh10Lv96QR2OSKe+5dzilsNPL"
@@ -319,7 +319,7 @@ _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
     "ZRDaDAAAmBwAAAkAAAAAAAAAAAAAAIABjV4AAFJFQURNRS5tZFBLBQYAAAAABAAEAN8AAACOawAAAAA="
 )
 
-# split-source: order=74 original-lines=436-482 hash=521b7ee87110fe55
+# split-source: order=74 original-lines=435-481 hash=521b7ee87110fe55
 
 
 def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> dict:
@@ -368,7 +368,7 @@ def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> 
             "required_files": list(required), "model_capability_version": 2,
             "backup_root": str(backup) if backup else ""}
 
-# split-source: order=77 original-lines=491-506 hash=861baa5a704fc2e7
+# split-source: order=77 original-lines=490-505 hash=861baa5a704fc2e7
 
 
 def _ensure_liquid_kernel_sqlite_lifecycle(registry_class) -> None:
@@ -386,14 +386,14 @@ def _ensure_liquid_kernel_sqlite_lifecycle(registry_class) -> None:
     registry_class._connect = managed_connect
     registry_class.SQLITE_CONNECTIONS_CLOSE_ON_EXIT = True
 
-# split-source: order=934 original-lines=14937-14941 hash=5cd9aacc032a0f5b
+# split-source: order=934 original-lines=14936-14940 hash=5cd9aacc032a0f5b
 
 
 def _liquid_kernel_history_present(runtime_root: Path) -> bool:
     root = Path(runtime_root)
     return root.is_dir() and any((root / name).exists() for name in ("registry.sqlite", "active.json", "artifacts"))
 
-# split-source: order=935 original-lines=14942-14971 hash=af942e21e79e26a3
+# split-source: order=935 original-lines=14941-14970 hash=af942e21e79e26a3
 
 
 def prepare_liquid_kernel_runtime(runtime_root: Path, startup_policy: object = "inherit") -> dict:
@@ -425,7 +425,7 @@ def prepare_liquid_kernel_runtime(runtime_root: Path, startup_policy: object = "
         pass
     return status
 
-# split-source: order=936 original-lines=14972-14985 hash=bc332d47a0e9051a
+# split-source: order=936 original-lines=14971-14984 hash=bc332d47a0e9051a
 
 
 def _persist_liquid_kernel_bootstrap(runtime_root: Path, status: dict) -> dict:

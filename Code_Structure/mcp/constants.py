@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-# split-source: order=179 original-lines=4289-4289 hash=d2766984060631d7
+# split-source: order=179 original-lines=4288-4288 hash=d2766984060631d7
 MCP_SERVICE_PORT_OFFSET = 4
 
-# split-source: order=1025 original-lines=24835-24864 hash=637b2ed2c7e80e0c
+# split-source: order=1025 original-lines=24834-24863 hash=637b2ed2c7e80e0c
 
 
 # ----------------------------------------------------------------------------
@@ -40,20 +40,20 @@ MCP_SERVICE_PORT_OFFSET = 4
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 
-# split-source: order=1026 original-lines=24865-24865 hash=8952944d0fe9c8fd
+# split-source: order=1026 original-lines=24864-24864 hash=8952944d0fe9c8fd
 MCP_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
-# split-source: order=1027 original-lines=24866-24866 hash=d98dc1d8bc8c35e0
+# split-source: order=1027 original-lines=24865-24865 hash=d98dc1d8bc8c35e0
 MCP_TOOL_PREFIX = "mcp__"
 
-# split-source: order=1028 original-lines=24867-24867 hash=f05e95f5608e9db3
+# split-source: order=1028 original-lines=24866-24866 hash=f05e95f5608e9db3
 _MCP_DEFAULT_HANDSHAKE_TIMEOUT = 20.0
 
-# split-source: order=1029 original-lines=24868-24868 hash=2cfd699f97d758a8
+# split-source: order=1029 original-lines=24867-24867 hash=2cfd699f97d758a8
 _MCP_DEFAULT_CALL_TIMEOUT = 60.0
 
-# split-source: order=1030 original-lines=24869-24869 hash=97320939011d5517
+# split-source: order=1030 original-lines=24868-24868 hash=97320939011d5517
 _MCP_MAX_RESULT_CHARS = 24000
 
-# split-source: order=1031 original-lines=24870-24870 hash=d3f40a4f9ffb843b
+# split-source: order=1031 original-lines=24869-24869 hash=d3f40a4f9ffb843b
 _MCP_TRUST_STORE_VERSION = 1

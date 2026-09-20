@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=979 original-lines=17265-17625 hash=c27ca69f2081e0f9
+# split-source: order=979 original-lines=17264-17624 hash=c27ca69f2081e0f9
 
 class TodoManager:
     def __init__(self, language: str = DEFAULT_UI_LANGUAGE):

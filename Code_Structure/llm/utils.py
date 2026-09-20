@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=851 original-lines=12234-12248 hash=b6bc62480e297d33
+# split-source: order=851 original-lines=12233-12247 hash=b6bc62480e297d33
 
 def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, list[str], str]:
     url = f"{str(base_url or '').rstrip('/')}/api/tags"
@@ -22,7 +22,7 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     except Exception as exc:
         return False, [], str(exc)
 
-# split-source: order=853 original-lines=12271-12304 hash=57be9b471851f92b
+# split-source: order=853 original-lines=12270-12303 hash=57be9b471851f92b
 
 
 def probe_ollama_model_records(
@@ -58,21 +58,21 @@ def probe_ollama_model_records(
             continue
     return records
 
-# split-source: order=854 original-lines=12305-12309 hash=a4f53fc70863cd38
+# split-source: order=854 original-lines=12304-12308 hash=a4f53fc70863cd38
 
 
 def list_ollama_models(base_url: str, timeout: int = 4) -> list[str]:
     ok, tags, _ = probe_ollama_environment(base_url, timeout=timeout)
     return tags if ok else []
 
-# split-source: order=855 original-lines=12310-12311 hash=5336afa576b84f38
+# split-source: order=855 original-lines=12309-12310 hash=5336afa576b84f38
 
 _OLLAMA_TAG_CACHE_LOCK = threading.Lock()
 
-# split-source: order=856 original-lines=12312-12312 hash=0e9c32a2e7390246
+# split-source: order=856 original-lines=12311-12311 hash=0e9c32a2e7390246
 _OLLAMA_TAG_CACHE: dict[str, dict] = {}
 
-# split-source: order=859 original-lines=12321-12346 hash=91d4292d35ee6bfb
+# split-source: order=859 original-lines=12320-12345 hash=91d4292d35ee6bfb
 
 def _fetch_ollama_models_cached(key: str, base_url: str, cached_tags: list[str]) -> None:
     """Fetch Ollama tags and publish one cache snapshot.
@@ -100,7 +100,7 @@ def _fetch_ollama_models_cached(key: str, base_url: str, cached_tags: list[str])
                 else:
                     _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
 
-# split-source: order=860 original-lines=12347-12392 hash=0a5b233c8dd8fde4
+# split-source: order=860 original-lines=12346-12391 hash=0a5b233c8dd8fde4
 
 
 def list_ollama_models_cached(
@@ -148,7 +148,7 @@ def list_ollama_models_cached(
         tags = row.get("tags", []) if isinstance(row, dict) else []
     return list(tags) if isinstance(tags, list) else list(cached_tags)
 
-# split-source: order=863 original-lines=12409-12453 hash=869060a204c81ba4
+# split-source: order=863 original-lines=12408-12452 hash=869060a204c81ba4
 
 def split_thinking_content(text: str) -> tuple[str, str]:
     if not text:
@@ -195,12 +195,12 @@ def split_thinking_content(text: str) -> tuple[str, str]:
     thinking = "\n\n".join(part for part in thinking_parts if part).strip()
     return body, trim(thinking, 24_000) if thinking else ""
 
-# split-source: order=864 original-lines=12454-12456 hash=84300145b305a8f9
+# split-source: order=864 original-lines=12453-12455 hash=84300145b305a8f9
 
 def strip_thinking_content(text: str) -> str:
     return split_thinking_content(text)[0]
 
-# split-source: order=865 original-lines=12457-12482 hash=dcb58a8b1e81d434
+# split-source: order=865 original-lines=12456-12481 hash=dcb58a8b1e81d434
 
 def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tuple[bool, str]:
     if not model:
@@ -228,7 +228,7 @@ def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tu
     except Exception as exc:
         return False, str(exc)
 
-# split-source: order=866 original-lines=12483-12497 hash=0e6bd9e34bd84ee7
+# split-source: order=866 original-lines=12482-12496 hash=0e6bd9e34bd84ee7
 
 def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     url = f"{str(base_url or '').rstrip('/')}/api/ps"
@@ -245,7 +245,7 @@ def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     except Exception:
         return []
 
-# split-source: order=867 original-lines=12498-12529 hash=e1a3cc4af04a7227
+# split-source: order=867 original-lines=12497-12528 hash=e1a3cc4af04a7227
 
 def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[bool, str]:
     target = str(model or "").strip()
@@ -279,7 +279,7 @@ def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[boo
     except Exception as exc:
         return False, trim(str(exc), 180)
 
-# split-source: order=868 original-lines=12530-12548 hash=593b4b2efdfdfc26
+# split-source: order=868 original-lines=12529-12547 hash=593b4b2efdfdfc26
 
 def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
     cli = shutil.which("ollama")
@@ -300,7 +300,7 @@ def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"pull failed for '{model}': {exc}"
 
-# split-source: order=869 original-lines=12549-12568 hash=5e190838582bfe71
+# split-source: order=869 original-lines=12548-12567 hash=5e190838582bfe71
 
 def ordered_model_candidates(base_url: str, preferred: str, exclude: set[str] | None = None) -> list[str]:
     blocked = set(exclude or set())
@@ -322,7 +322,7 @@ def ordered_model_candidates(base_url: str, preferred: str, exclude: set[str] | 
         dedup.append(item)
     return dedup
 
-# split-source: order=870 original-lines=12569-12586 hash=94d20ab520ec1fcb
+# split-source: order=870 original-lines=12568-12585 hash=94d20ab520ec1fcb
 
 def pick_working_ollama_model(
     base_url: str,
@@ -342,7 +342,7 @@ def pick_working_ollama_model(
             errors.append(f"{candidate}: {err}")
     return None, "; ".join(errors)
 
-# split-source: order=874 original-lines=12628-12638 hash=5cd2e8ebe2b3c672
+# split-source: order=874 original-lines=12627-12637 hash=5cd2e8ebe2b3c672
 
 def complete_chat_endpoint(endpoint_or_base: str) -> str:
     s = (endpoint_or_base or "").strip()
@@ -355,17 +355,17 @@ def complete_chat_endpoint(endpoint_or_base: str) -> str:
         return s.rstrip("/") + "/chat/completions"
     return s.rstrip("/") + "/v1/chat/completions"
 
-# split-source: order=883 original-lines=12733-12735 hash=35e7f0d901bff49a
+# split-source: order=883 original-lines=12732-12734 hash=35e7f0d901bff49a
 
 def is_openai_compat_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_COMPAT_PROVIDER_NAMES
 
-# split-source: order=884 original-lines=12736-12738 hash=13cd547ebeda1f0d
+# split-source: order=884 original-lines=12735-12737 hash=13cd547ebeda1f0d
 
 def is_openai_like_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_LIKE_PROVIDER_NAMES
 
-# split-source: order=898 original-lines=12793-12804 hash=18bd1763e9c788d2
+# split-source: order=898 original-lines=12792-12803 hash=18bd1763e9c788d2
 
 
 def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_OFF) -> str:
@@ -379,7 +379,7 @@ def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_
         hi = lo
     return EFFORT_LEVELS[min(max(EFFORT_ORDER[e], lo), hi)]
 
-# split-source: order=899 original-lines=12805-12847 hash=da8e3c5f5941b610
+# split-source: order=899 original-lines=12804-12846 hash=da8e3c5f5941b610
 
 
 def model_reasoning_style(
@@ -424,7 +424,7 @@ def model_reasoning_style(
         return "none"
     return "none"
 
-# split-source: order=901 original-lines=12900-12918 hash=295e33cfad729bd0
+# split-source: order=901 original-lines=12899-12917 hash=295e33cfad729bd0
 
 def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, str]:
     raw_provider = str(provider or "").strip().lower().replace("-", "_")
@@ -445,7 +445,7 @@ def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, s
         headers.setdefault("X-Title", "Clouds Coder")
     return headers
 
-# split-source: order=902 original-lines=12919-12952 hash=1abf019732b65984
+# split-source: order=902 original-lines=12918-12951 hash=1abf019732b65984
 
 def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> list[str]:
     base = extract_base_url(endpoint_or_base).rstrip("/")
@@ -481,7 +481,7 @@ def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> 
         out.append(url)
     return out
 
-# split-source: order=903 original-lines=12953-12967 hash=c9c6503140863a55
+# split-source: order=903 original-lines=12952-12966 hash=c9c6503140863a55
 
 
 def anthropic_model_list_url(endpoint_or_base: str) -> str:
@@ -498,15 +498,15 @@ def anthropic_model_list_url(endpoint_or_base: str) -> str:
         return base + "/models"
     return base + "/v1/models"
 
-# split-source: order=906 original-lines=13083-13085 hash=f510f7fa62bb9c96
+# split-source: order=906 original-lines=13082-13084 hash=f510f7fa62bb9c96
 
 
 _PROVIDER_MODEL_CACHE_LOCK = threading.Lock()
 
-# split-source: order=907 original-lines=13086-13086 hash=fd12c2e776ffc328
+# split-source: order=907 original-lines=13085-13085 hash=fd12c2e776ffc328
 _PROVIDER_MODEL_CACHE: dict[str, dict] = {}
 
-# split-source: order=908 original-lines=13087-13160 hash=bd11795609769247
+# split-source: order=908 original-lines=13086-13159 hash=bd11795609769247
 
 
 def _fetch_provider_models_cached(
@@ -582,7 +582,7 @@ def _fetch_provider_models_cached(
                 "models": records or previous.get("models", cached_models),
             }
 
-# split-source: order=909 original-lines=13161-13228 hash=c7683721fb27e656
+# split-source: order=909 original-lines=13160-13227 hash=c7683721fb27e656
 
 
 def probe_provider_models(
@@ -652,7 +652,7 @@ def probe_provider_models(
         models = row.get("models", []) if isinstance(row, dict) else []
     return [dict(x) for x in models if isinstance(x, dict)]
 
-# split-source: order=917 original-lines=13403-13416 hash=267da5b275a37edb
+# split-source: order=917 original-lines=13402-13415 hash=267da5b275a37edb
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -668,7 +668,7 @@ def _is_http_url(text: str) -> bool:
     except Exception:
         return False
 
-# split-source: order=918 original-lines=13417-13434 hash=cf2e2cc8977a7264
+# split-source: order=918 original-lines=13416-13433 hash=cf2e2cc8977a7264
 
 def _resolve_local_path(raw: str, base_dir: Path) -> Path:
     src = str(raw or "").strip()

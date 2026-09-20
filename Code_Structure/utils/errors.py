@@ -5,13 +5,13 @@
 
 from __future__ import annotations
 
-# split-source: order=857 original-lines=12313-12316 hash=7837bc958e112591
+# split-source: order=857 original-lines=12312-12315 hash=7837bc958e112591
 
 
 class EmptyActionError(RuntimeError):
     """Raised when assistant returns only thinking but no actionable output."""
 
-# split-source: order=1020 original-lines=23564-23569 hash=577f6c7ce048cc8a
+# split-source: order=1020 original-lines=23563-23568 hash=577f6c7ce048cc8a
 
 class ProcessManagerError(Exception):
     def __init__(self, message: str, *, status: int = 400, code: str = "process_error"):

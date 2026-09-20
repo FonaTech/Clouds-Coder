@@ -5,57 +5,57 @@
 
 from __future__ import annotations
 
-# split-source: order=75 original-lines=483-484 hash=f6066de408fdcc76
+# split-source: order=75 original-lines=482-483 hash=f6066de408fdcc76
 
 LIQUID_KERNEL_PACKAGE_STATUS = _ensure_embedded_liquid_kernel_package()
 
-# split-source: order=79 original-lines=514-515 hash=1dade94812514ba7
+# split-source: order=79 original-lines=513-514 hash=1dade94812514ba7
 
 _ensure_liquid_kernel_sqlite_lifecycle(_LiquidKernelRegistry)
 
-# split-source: order=80 original-lines=516-519 hash=ee5dc1c0a7aac01a
+# split-source: order=80 original-lines=515-518 hash=ee5dc1c0a7aac01a
 
 
 # BEGIN EMBEDDED COLLABORATION BACKEND
 COLLAB_DB_FILENAME = "collaboration.sqlite"
 
-# split-source: order=81 original-lines=520-520 hash=c56c7cb111836469
+# split-source: order=81 original-lines=519-519 hash=c56c7cb111836469
 COLLAB_SESSION_TTL_SECONDS = 24 * 60 * 60
 
-# split-source: order=82 original-lines=521-521 hash=8832150c0059657b
+# split-source: order=82 original-lines=520-520 hash=8832150c0059657b
 COLLAB_PRESENCE_TTL_SECONDS = 10 * 60
 
-# split-source: order=83 original-lines=522-522 hash=de8ed94ab7864cc9
+# split-source: order=83 original-lines=521-521 hash=de8ed94ab7864cc9
 COLLAB_PASSWORD_ITERATIONS = 600_000
 
-# split-source: order=84 original-lines=523-523 hash=36b49430566c8d18
+# split-source: order=84 original-lines=522-522 hash=36b49430566c8d18
 COLLAB_MAX_AVATAR_BYTES = 2 * 1024 * 1024
 
-# split-source: order=85 original-lines=524-524 hash=00e70de6f00e2d5b
+# split-source: order=85 original-lines=523-523 hash=00e70de6f00e2d5b
 COLLAB_MAX_TEXT_BYTES = 2 * 1024 * 1024
 
-# split-source: order=86 original-lines=525-525 hash=01ff3e0cd1c8937d
+# split-source: order=86 original-lines=524-524 hash=01ff3e0cd1c8937d
 COLLAB_DELETE_RETENTION_DAYS = 30
 
-# split-source: order=87 original-lines=526-526 hash=64b98b9081f195c3
+# split-source: order=87 original-lines=525-525 hash=64b98b9081f195c3
 COLLAB_EVENT_RETENTION = 100_000
 
-# split-source: order=88 original-lines=527-527 hash=b074247e70bde3e4
+# split-source: order=88 original-lines=526-526 hash=b074247e70bde3e4
 COLLAB_AGENT_STALE_SECONDS = 15 * 60
 
-# split-source: order=89 original-lines=528-528 hash=1a5f7f9ad8a9f1ed
+# split-source: order=89 original-lines=527-527 hash=1a5f7f9ad8a9f1ed
 COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS = 5
 
-# split-source: order=90 original-lines=529-529 hash=023a10a71eb84937
+# split-source: order=90 original-lines=528-528 hash=023a10a71eb84937
 COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS = 0.75
 
-# split-source: order=91 original-lines=530-530 hash=f5c7be3867936c6b
+# split-source: order=91 original-lines=529-529 hash=f5c7be3867936c6b
 COLLAB_EXTERNAL_WRITE_CONFIRMATIONS = 2
 
-# split-source: order=92 original-lines=531-531 hash=a696c4cb0610567f
+# split-source: order=92 original-lines=530-530 hash=a696c4cb0610567f
 COLLAB_SCHEMA_VERSION = 3
 
-# split-source: order=116 original-lines=3774-3845 hash=2e2668bbaef4489c
+# split-source: order=116 original-lines=3773-3844 hash=2e2668bbaef4489c
 # END EMBEDDED COLLABORATION BACKEND
 
 # BEGIN EMBEDDED COLLABORATION WEB ASSETS
@@ -129,7 +129,7 @@ COLLAB_INDEX_HTML = r"""<!doctype html>
 </body>
 </html>"""
 
-# split-source: order=117 original-lines=3846-3853 hash=d2c47b37eaa3f9d1
+# split-source: order=117 original-lines=3845-3852 hash=d2c47b37eaa3f9d1
 
 
 COLLAB_CSS = r"""
@@ -139,7 +139,7 @@ COLLAB_CSS = r"""
 .remote-cursor{border-left:2px solid #f778ba}.remote-cursor-1{border-left-color:#d2a8ff}.remote-cursor-2{border-left-color:#ffa657}.remote-cursor-3{border-left-color:#79c0ff}.remote-cursor-4{border-left-color:#7ee787}.mobile-agent-toggle{display:none}@media(max-width:980px){.editor-view.active{grid-template-columns:190px minmax(300px,1fr)}.mobile-agent-toggle{display:block}.agent-pane{display:none;position:fixed;right:0;top:84px;bottom:0;width:min(340px,90vw);z-index:20;box-shadow:-14px 0 32px rgba(0,0,0,.3)}.agent-pane.open{display:flex}.field-grid{grid-template-columns:1fr}}@media(max-width:640px){.editor-view.active{grid-template-columns:132px minmax(260px,1fr)}.topbar{gap:7px}.project-title{max-width:43vw}.tabs{padding-left:0}.tab{padding:0 10px}.lobby-panel{padding:20px}.data-view{padding:14px}.editor-toolbar #revisionState{display:none}}
 """
 
-# split-source: order=118 original-lines=3854-3894 hash=2b5738a3354ee2ee
+# split-source: order=118 original-lines=3853-3893 hash=2b5738a3354ee2ee
 
 
 COLLAB_JS = r"""
@@ -182,31 +182,31 @@ function formatSize(n){const x=Number(n||0);return x<1024?`${x} B`:x<1048576?`${
 window.addEventListener('DOMContentLoaded',bootstrap);
 """
 
-# split-source: order=124 original-lines=3916-3916 hash=03128a27cd7f6781
+# split-source: order=124 original-lines=3915-3915 hash=03128a27cd7f6781
 APP_VERSION = "0.1.1"
 
-# split-source: order=133 original-lines=3925-3925 hash=374dd0959ba27624
+# split-source: order=133 original-lines=3924-3924 hash=374dd0959ba27624
 IDE_AUTH_FILENAME = "ide_auth.sqlite"
 
-# split-source: order=134 original-lines=3926-3926 hash=0b4c17aeb10f1f74
+# split-source: order=134 original-lines=3925-3925 hash=0b4c17aeb10f1f74
 IDE_AUTH_SESSION_TTL_SECONDS = 24 * 60 * 60
 
-# split-source: order=135 original-lines=3927-3927 hash=5aaa76336d790f72
+# split-source: order=135 original-lines=3926-3926 hash=5aaa76336d790f72
 IDE_AUTH_MAX_ACTIVE_SESSIONS = 12
 
-# split-source: order=136 original-lines=3928-3928 hash=98f6060068fa0002
+# split-source: order=136 original-lines=3927-3927 hash=98f6060068fa0002
 IDE_DEVICE_SECRET_MIN_BYTES = 32
 
-# split-source: order=137 original-lines=3929-3929 hash=a404d9ae80b9befe
+# split-source: order=137 original-lines=3928-3928 hash=a404d9ae80b9befe
 IDE_DEVICE_LABEL_MAX_CHARS = 120
 
-# split-source: order=138 original-lines=3930-3930 hash=c617e0b20384cebb
+# split-source: order=138 original-lines=3929-3929 hash=c617e0b20384cebb
 IDE_DEVICE_PAIRING_TTL_SECONDS = 15 * 60
 
-# split-source: order=139 original-lines=3931-3931 hash=aa5a9ec9aa119f83
+# split-source: order=139 original-lines=3930-3930 hash=aa5a9ec9aa119f83
 IDE_WORKBENCH_STATE_FILENAME = "ide_workbench.json"
 
-# split-source: order=140 original-lines=3932-3969 hash=b803f271aab0220a
+# split-source: order=140 original-lines=3931-3968 hash=b803f271aab0220a
 IDE_PROMPT_ENHANCEMENT_BUDGETS = {
     "low": {
         "max_tokens": 1800,
@@ -246,132 +246,132 @@ IDE_PROMPT_ENHANCEMENT_BUDGETS = {
     },
 }
 
-# split-source: order=141 original-lines=3970-3970 hash=1545eb3da1b940f9
+# split-source: order=141 original-lines=3969-3969 hash=1545eb3da1b940f9
 IDE_EXTENSIONS_DIRNAME = "ide_extensions"
 
-# split-source: order=163 original-lines=4273-4273 hash=a997d472618f8d52
+# split-source: order=163 original-lines=4272-4272 hash=a997d472618f8d52
 LONG_OUTPUT_MODEL_PAGE_CHARS = 12_000
 
-# split-source: order=164 original-lines=4274-4274 hash=8c2491abb6e0cc7e
+# split-source: order=164 original-lines=4273-4273 hash=8c2491abb6e0cc7e
 LONG_OUTPUT_UI_PAGE_CHARS = 2_400
 
-# split-source: order=165 original-lines=4275-4275 hash=544872ccd2e85e14
+# split-source: order=165 original-lines=4274-4274 hash=544872ccd2e85e14
 LONG_OUTPUT_UI_PREVIEW_MAX_PAGES = 4
 
-# split-source: order=166 original-lines=4276-4276 hash=534ab4c23d27943f
+# split-source: order=166 original-lines=4275-4275 hash=534ab4c23d27943f
 LONG_OUTPUT_LISTING_OFFLOAD_CHARS = 6_000
 
-# split-source: order=167 original-lines=4277-4277 hash=915131cba81fe455
+# split-source: order=167 original-lines=4276-4276 hash=915131cba81fe455
 LONG_OUTPUT_READ_PAGE_LINES = 240
 
-# split-source: order=168 original-lines=4278-4278 hash=5ba10b04660cf554
+# split-source: order=168 original-lines=4277-4277 hash=5ba10b04660cf554
 LONG_OUTPUT_READ_PAGE_MAX_CHARS = 16_000
 
-# split-source: order=169 original-lines=4279-4279 hash=0f137f7221565dbc
+# split-source: order=169 original-lines=4278-4278 hash=0f137f7221565dbc
 LONG_OUTPUT_TEMP_MAX_FILES = 160
 
-# split-source: order=170 original-lines=4280-4280 hash=6f730f958cee9bf9
+# split-source: order=170 original-lines=4279-4279 hash=6f730f958cee9bf9
 READ_FILE_DEFAULT_MAX_CHARS = 50_000
 
-# split-source: order=171 original-lines=4281-4281 hash=5f1d47ca5e792fcf
+# split-source: order=171 original-lines=4280-4280 hash=5f1d47ca5e792fcf
 READ_FILE_HARD_MAX_CHARS = 120_000
 
-# split-source: order=172 original-lines=4282-4282 hash=458d55e17e7f2069
+# split-source: order=172 original-lines=4281-4281 hash=458d55e17e7f2069
 READ_FILE_OVERVIEW_HEAD_LINES = 80
 
-# split-source: order=173 original-lines=4283-4283 hash=50730e30641f4d18
+# split-source: order=173 original-lines=4282-4282 hash=50730e30641f4d18
 READ_FILE_SEARCH_MAX_MATCHES = 24
 
-# split-source: order=178 original-lines=4288-4288 hash=8b7e1cb77524d088
+# split-source: order=178 original-lines=4287-4287 hash=8b7e1cb77524d088
 CODE_ADMIN_PORT_OFFSET = 3
 
-# split-source: order=180 original-lines=4290-4293 hash=4f1953580ab11aba
+# split-source: order=180 original-lines=4289-4292 hash=4f1953580ab11aba
 # IDE follows the agent port like every other service (skills+1/rag+2/code+3/mcp+4),
 # at +5, instead of squatting on a fixed port that would collide with mcp-service at the
 # default --port. IDE_DEFAULT_PORT is kept only as a pre-config fallback constant.
 IDE_PORT_OFFSET = 5
 
-# split-source: order=181 original-lines=4294-4294 hash=5d58f0c9149c60a8
+# split-source: order=181 original-lines=4293-4293 hash=5d58f0c9149c60a8
 IDE_DEFAULT_PORT = 8084
 
-# split-source: order=182 original-lines=4295-4295 hash=d82339baad5a90c5
+# split-source: order=182 original-lines=4294-4294 hash=d82339baad5a90c5
 COLLAB_PORT_OFFSET = 7
 
-# split-source: order=184 original-lines=4297-4297 hash=5d2ec5bed6df683b
+# split-source: order=184 original-lines=4296-4296 hash=5d2ec5bed6df683b
 DEFAULT_WEB_SEARCH_ENABLED = True
 
-# split-source: order=189 original-lines=4302-4302 hash=b42636ef8fc02ea6
+# split-source: order=189 original-lines=4301-4301 hash=b42636ef8fc02ea6
 DEFAULT_USER_MEMORY_MODE = "weak"
 
-# split-source: order=197 original-lines=4313-4313 hash=cb0ecd939b7207f4
+# split-source: order=197 original-lines=4312-4312 hash=cb0ecd939b7207f4
 AGENT_WEB_SEARCH_USER_AGENT = "CloudsCoderAgentWebSearch/1.0 (+bounded autonomous agent research)"
 
-# split-source: order=198 original-lines=4314-4314 hash=48f97c2fe1dea0f5
+# split-source: order=198 original-lines=4313-4313 hash=48f97c2fe1dea0f5
 AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS = 8
 
-# split-source: order=199 original-lines=4315-4315 hash=04cbb6f9caed1662
+# split-source: order=199 original-lines=4314-4314 hash=04cbb6f9caed1662
 AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES = 12
 
-# split-source: order=200 original-lines=4316-4316 hash=08da7aca32d704a4
+# split-source: order=200 original-lines=4315-4315 hash=08da7aca32d704a4
 AGENT_WEB_SEARCH_HARD_MAX_PAGES = 60
 
-# split-source: order=201 original-lines=4317-4317 hash=6d9b4580a7f0aca5
+# split-source: order=201 original-lines=4316-4316 hash=6d9b4580a7f0aca5
 AGENT_WEB_SEARCH_DEFAULT_DEPTH = 1
 
-# split-source: order=202 original-lines=4318-4318 hash=8cd74128bb1256e5
+# split-source: order=202 original-lines=4317-4317 hash=8cd74128bb1256e5
 AGENT_WEB_SEARCH_HARD_DEPTH = 2
 
-# split-source: order=203 original-lines=4319-4319 hash=490574a43d92b115
+# split-source: order=203 original-lines=4318-4318 hash=490574a43d92b115
 AGENT_WEB_SEARCH_FETCH_TIMEOUT = 12.0
 
-# split-source: order=204 original-lines=4320-4320 hash=0e696a345340d3e2
+# split-source: order=204 original-lines=4319-4319 hash=0e696a345340d3e2
 AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT = 76.0
 
-# split-source: order=205 original-lines=4321-4321 hash=2c9401545c0b495b
+# split-source: order=205 original-lines=4320-4320 hash=2c9401545c0b495b
 AGENT_WEB_SEARCH_MAX_PAGE_BYTES = 1_200_000
 
-# split-source: order=206 original-lines=4322-4322 hash=ca9c9e400a625eed
+# split-source: order=206 original-lines=4321-4321 hash=ca9c9e400a625eed
 AGENT_WEB_SEARCH_MAX_TEXT_CHARS = 80_000
 
-# split-source: order=207 original-lines=4323-4325 hash=3f86128c62290c9e
+# split-source: order=207 original-lines=4322-4324 hash=3f86128c62290c9e
 AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED = str(
     os.getenv("AGENT_WEB_SEARCH_PUBLIC_DISCOVERY", "true") or "true"
 ).strip().lower() not in {"0", "false", "no", "off"}
 
-# split-source: order=208 original-lines=4326-4326 hash=4f7bd9752dc1f741
+# split-source: order=208 original-lines=4325-4325 hash=4f7bd9752dc1f741
 AGENT_WEB_SEARCH_PUBLIC_FEED_URL = "https://www.bing.com/search?format=rss&q={query}"
 
-# split-source: order=209 original-lines=4327-4327 hash=03e9d05405290318
+# split-source: order=209 original-lines=4326-4326 hash=03e9d05405290318
 AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES = 600_000
 
-# split-source: order=210 original-lines=4328-4328 hash=b0b8c24a0933d4f9
+# split-source: order=210 original-lines=4327-4327 hash=b0b8c24a0933d4f9
 AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES = 300
 
-# split-source: order=211 original-lines=4329-4329 hash=fb9eeff9e5ae0dfc
+# split-source: order=211 original-lines=4328-4328 hash=fb9eeff9e5ae0dfc
 AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES = 4_000
 
-# split-source: order=212 original-lines=4330-4330 hash=6af26e24dfda231b
+# split-source: order=212 original-lines=4329-4329 hash=6af26e24dfda231b
 AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER = 3
 
-# split-source: order=213 original-lines=4331-4331 hash=2821e54095c94d31
+# split-source: order=213 original-lines=4330-4330 hash=2821e54095c94d31
 AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS = 24
 
-# split-source: order=214 original-lines=4332-4332 hash=169bb0e5c20e8fda
+# split-source: order=214 original-lines=4331-4331 hash=169bb0e5c20e8fda
 AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING = 0.85
 
-# split-source: order=215 original-lines=4333-4333 hash=cd815eb666bcee9e
+# split-source: order=215 original-lines=4332-4332 hash=cd815eb666bcee9e
 AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX = 1.5
 
-# split-source: order=225 original-lines=4355-4355 hash=6d9c418366a43fc9
+# split-source: order=225 original-lines=4354-4354 hash=6d9c418366a43fc9
 CODE_CHUNK_CHARS = 1800
 
-# split-source: order=226 original-lines=4356-4356 hash=a3d5d3f00ca60280
+# split-source: order=226 original-lines=4355-4355 hash=a3d5d3f00ca60280
 CODE_CHUNK_OVERLAP = 120
 
-# split-source: order=227 original-lines=4357-4357 hash=5fb1eb141b1d74ed
+# split-source: order=227 original-lines=4356-4356 hash=5fb1eb141b1d74ed
 CODE_MAX_CHUNKS_PER_DOC = 260
 
-# split-source: order=228 original-lines=4358-4367 hash=251d7376dd4bb0f9
+# split-source: order=228 original-lines=4357-4366 hash=251d7376dd4bb0f9
 # Code parsing keeps prompt/RAG chunks bounded separately from the structural
 # source index.  The latter is allowed to inspect substantially larger files
 # so symbol lookup remains complete for generated or monolithic codebases.
@@ -383,85 +383,85 @@ CODE_SOURCE_ANALYSIS_MAX_CHARS = max(
     ),
 )
 
-# split-source: order=269 original-lines=4436-4439 hash=3b4caf8923937cc0
+# split-source: order=269 original-lines=4435-4438 hash=3b4caf8923937cc0
 CODE_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_CODE_IMPORT_WORKERS", str(RAG_IMPORT_WORKER_COUNT)) or str(RAG_IMPORT_WORKER_COUNT)))),
 )
 
-# split-source: order=271 original-lines=4444-4447 hash=d7f2530a10690848
+# split-source: order=271 original-lines=4443-4446 hash=d7f2530a10690848
 CODE_PARSE_TIMEOUT_SECONDS = max(
     10,
     min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
 )
 
-# split-source: order=272 original-lines=4448-4448 hash=38461f46593b5137
+# split-source: order=272 original-lines=4447-4447 hash=38461f46593b5137
 DEFAULT_CONTEXT_TOKEN_LIMIT = 200_000
 
-# split-source: order=273 original-lines=4449-4449 hash=ef2e26c29b28b031
+# split-source: order=273 original-lines=4448-4448 hash=ef2e26c29b28b031
 TOKEN_THRESHOLD = 1_000_000
 
-# split-source: order=274 original-lines=4450-4453 hash=c013e04d841477da
+# split-source: order=274 original-lines=4449-4452 hash=c013e04d841477da
 CONTEXT_AUTO_COMPACT_RESERVE_RATIO = max(
     0.01,
     min(0.20, float(str(os.getenv("AGENT_CONTEXT_RESERVE_RATIO", "0.05") or "0.05"))),
 )
 
-# split-source: order=275 original-lines=4454-4457 hash=05d2e021f1dc5f13
+# split-source: order=275 original-lines=4453-4456 hash=05d2e021f1dc5f13
 CONTEXT_ESTIMATE_SAFETY_MULTIPLIER = max(
     1.0,
     min(1.8, float(str(os.getenv("AGENT_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER", "1.18") or "1.18"))),
 )
 
-# split-source: order=276 original-lines=4458-4461 hash=77d61ff3bf4f06da
+# split-source: order=276 original-lines=4457-4460 hash=77d61ff3bf4f06da
 CONTEXT_USAGE_CALIBRATION_MAX = max(
     CONTEXT_ESTIMATE_SAFETY_MULTIPLIER,
     min(2.5, float(str(os.getenv("AGENT_CONTEXT_USAGE_CALIBRATION_MAX", "2.20") or "2.20"))),
 )
 
-# split-source: order=277 original-lines=4462-4465 hash=259b43e78198df07
+# split-source: order=277 original-lines=4461-4464 hash=259b43e78198df07
 CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
     60,
     min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
 )
 
-# split-source: order=278 original-lines=4466-4469 hash=1fff81f82b548117
+# split-source: order=278 original-lines=4465-4468 hash=1fff81f82b548117
 LARGE_FILE_AUTO_PAGE_BYTES = max(
     32 * 1024,
     int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
 )
 
-# split-source: order=279 original-lines=4470-4473 hash=408454e15a6e2540
+# split-source: order=279 original-lines=4469-4472 hash=408454e15a6e2540
 LARGE_FILE_AUTO_PAGE_LINES = max(
     1000,
     int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
 )
 
-# split-source: order=280 original-lines=4474-4477 hash=e8075bf3af10bf51
+# split-source: order=280 original-lines=4473-4476 hash=e8075bf3af10bf51
 LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
     1200,
     int(str(os.getenv("AGENT_LARGE_SOURCE_UPLOAD_EXCERPT_CHARS", "3200") or "3200")),
 )
 
-# split-source: order=281 original-lines=4478-4481 hash=098812c34988096a
+# split-source: order=281 original-lines=4477-4480 hash=098812c34988096a
 CHAT_UPLOAD_PARSE_QUEUE_MAX = max(
     2,
     min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_QUEUE_MAX", "12") or "12"))),
 )
 
-# split-source: order=282 original-lines=4482-4485 hash=95d56f16eebe147a
+# split-source: order=282 original-lines=4481-4484 hash=95d56f16eebe147a
 CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS = max(
     5,
     min(180, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_TIMEOUT", "45") or "45"))),
 )
 
-# split-source: order=283 original-lines=4486-4489 hash=27076b5c61066281
+# split-source: order=283 original-lines=4485-4488 hash=27076b5c61066281
 CHAT_UPLOAD_INLINE_TEXT_BYTES = max(
     16 * 1024,
     min(512 * 1024, int(str(os.getenv("AGENT_CHAT_UPLOAD_INLINE_TEXT_BYTES", "131072") or "131072"))),
 )
 
-# split-source: order=284 original-lines=4490-4496 hash=dcff8e90c538f8fd
+# split-source: order=284 original-lines=4489-4495 hash=dcff8e90c538f8fd
 CHAT_UPLOAD_PARSE_MAX_BYTES = max(
     256 * 1024,
     min(
@@ -470,7 +470,7 @@ CHAT_UPLOAD_PARSE_MAX_BYTES = max(
     ),
 )
 
-# split-source: order=285 original-lines=4497-4503 hash=0bb9a7b183a0333f
+# split-source: order=285 original-lines=4496-4502 hash=0bb9a7b183a0333f
 CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES = max(
     64 * 1024,
     min(
@@ -479,91 +479,91 @@ CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES = max(
     ),
 )
 
-# split-source: order=286 original-lines=4504-4507 hash=bc70a02d8eb365d6
+# split-source: order=286 original-lines=4503-4506 hash=bc70a02d8eb365d6
 CHAT_UPLOAD_TEXT_CONTEXT_CHARS = max(
     1200,
     min(12_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_TEXT_CONTEXT_CHARS", "3200") or "3200"))),
 )
 
-# split-source: order=287 original-lines=4508-4511 hash=e45fad91a055c809
+# split-source: order=287 original-lines=4507-4510 hash=e45fad91a055c809
 CHAT_UPLOAD_PROMPT_MAX_FILES = max(
     2,
     min(12, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_FILES", "6") or "6"))),
 )
 
-# split-source: order=288 original-lines=4512-4515 hash=f14bba4ce211c5f2
+# split-source: order=288 original-lines=4511-4514 hash=f14bba4ce211c5f2
 CHAT_UPLOAD_PROMPT_MAX_CHARS = max(
     2400,
     min(16_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_CHARS", "6000") or "6000"))),
 )
 
-# split-source: order=289 original-lines=4516-4519 hash=31dca3d77d7f4e96
+# split-source: order=289 original-lines=4515-4518 hash=31dca3d77d7f4e96
 CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
     240,
     min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
 )
 
-# split-source: order=290 original-lines=4520-4523 hash=cab80bd9623e4f2b
+# split-source: order=290 original-lines=4519-4522 hash=cab80bd9623e4f2b
 CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
     0,
     min(5_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "250") or "250"))),
 )
 
-# split-source: order=291 original-lines=4524-4527 hash=c1850ba4c94e4833
+# split-source: order=291 original-lines=4523-4526 hash=c1850ba4c94e4833
 CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
     str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 
-# split-source: order=292 original-lines=4528-4531 hash=c62a654ce3cb2808
+# split-source: order=292 original-lines=4527-4530 hash=c62a654ce3cb2808
 CHAT_UPLOAD_INGEST_QUEUE_MAX = max(
     2,
     min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_INGEST_QUEUE_MAX", "8") or "8"))),
 )
 
-# split-source: order=293 original-lines=4532-4535 hash=4cda7027fbfb62f9
+# split-source: order=293 original-lines=4531-4534 hash=4cda7027fbfb62f9
 SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS = max(
     0.05,
     min(2.0, float(str(os.getenv("AGENT_SESSION_SUBMIT_LOCK_TIMEOUT", "0.08") or "0.08"))),
 )
 
-# split-source: order=294 original-lines=4536-4539 hash=638d813154db7b08
+# split-source: order=294 original-lines=4535-4538 hash=638d813154db7b08
 SESSION_DEFERRED_START_QUEUE_MAX = max(
     4,
     min(80, int(str(os.getenv("AGENT_SESSION_DEFERRED_START_QUEUE_MAX", "24") or "24"))),
 )
 
-# split-source: order=295 original-lines=4540-4540 hash=c7cb84eaad8a11f6
+# split-source: order=295 original-lines=4539-4539 hash=c7cb84eaad8a11f6
 SESSION_SUBMISSION_DEDUPE_MAX = 32
 
-# split-source: order=296 original-lines=4541-4541 hash=73851971d2d87af3
+# split-source: order=296 original-lines=4540-4540 hash=73851971d2d87af3
 SESSION_SUBMISSION_DEDUPE_SECONDS = 0.75
 
-# split-source: order=297 original-lines=4542-4542 hash=85b1f9cd3e16f9a3
+# split-source: order=297 original-lines=4541-4541 hash=85b1f9cd3e16f9a3
 SCHEDULER_SUBMISSION_DEDUPE_MAX = 256
 
-# split-source: order=298 original-lines=4543-4545 hash=552abe14f0d650fb
+# split-source: order=298 original-lines=4542-4544 hash=552abe14f0d650fb
 FAST_START_LOCAL_CLASSIFICATION = str(
     os.getenv("AGENT_FAST_START_LOCAL_CLASSIFICATION", "true") or "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
-# split-source: order=299 original-lines=4546-4548 hash=0cdee1b632665aee
+# split-source: order=299 original-lines=4545-4547 hash=0cdee1b632665aee
 FAST_START_LOCAL_TITLE = str(
     os.getenv("AGENT_FAST_START_LOCAL_TITLE", "true") or "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
-# split-source: order=300 original-lines=4549-4551 hash=c29fa289df7f7bfe
+# split-source: order=300 original-lines=4548-4550 hash=c29fa289df7f7bfe
 AUTO_TITLE_MODEL_REFINE = str(
     os.getenv("AGENT_AUTO_TITLE_MODEL_REFINE", "true") or "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
-# split-source: order=301 original-lines=4552-4555 hash=1feec3140eb86669
+# split-source: order=301 original-lines=4551-4554 hash=1feec3140eb86669
 AUTO_TITLE_MODEL_TIMEOUT_SECONDS = max(
     2.0,
     min(15.0, float(str(os.getenv("AGENT_AUTO_TITLE_MODEL_TIMEOUT", "12") or "12"))),
 )
 
-# split-source: order=302 original-lines=4556-4562 hash=bdfe721649955dcf
+# split-source: order=302 original-lines=4555-4561 hash=bdfe721649955dcf
 AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS = max(
     15.0,
     min(
@@ -572,195 +572,195 @@ AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS = max(
     ),
 )
 
-# split-source: order=303 original-lines=4563-4565 hash=2af4129c0cfe2c8b
+# split-source: order=303 original-lines=4562-4564 hash=2af4129c0cfe2c8b
 FAST_START_DEFER_CAPABILITY_PROBE = str(
     os.getenv("AGENT_FAST_START_DEFER_CAPABILITY_PROBE", "true") or "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
-# split-source: order=304 original-lines=4566-4566 hash=b4c2dff3ac711444
+# split-source: order=304 original-lines=4565-4565 hash=b4c2dff3ac711444
 SESSION_RUNTIME_MESSAGE_WINDOW = 400
 
-# split-source: order=305 original-lines=4567-4567 hash=ac9d024fe939a4a5
+# split-source: order=305 original-lines=4566-4566 hash=ac9d024fe939a4a5
 SESSION_RUNTIME_ACTIVITY_WINDOW = 300
 
-# split-source: order=306 original-lines=4568-4568 hash=caf892958d9de110
+# split-source: order=306 original-lines=4567-4567 hash=caf892958d9de110
 SESSION_RUNTIME_OPERATION_WINDOW = 500
 
-# split-source: order=307 original-lines=4569-4569 hash=518abd9435cad61e
+# split-source: order=307 original-lines=4568-4568 hash=518abd9435cad61e
 SESSION_RUNTIME_UPLOAD_WINDOW = 80
 
-# split-source: order=308 original-lines=4570-4573 hash=84495b3758240480
+# split-source: order=308 original-lines=4569-4572 hash=84495b3758240480
 LITE_SNAPSHOT_MAX_BYTES = max(
     256 * 1024,
     min(1024 * 1024, int(str(os.getenv("AGENT_LITE_SNAPSHOT_MAX_BYTES", str(512 * 1024)) or str(512 * 1024)))),
 )
 
-# split-source: order=309 original-lines=4574-4574 hash=df8858f679e1c7ee
+# split-source: order=309 original-lines=4573-4573 hash=df8858f679e1c7ee
 LITE_SNAPSHOT_MESSAGES_BYTES = 48 * 1024
 
-# split-source: order=310 original-lines=4575-4575 hash=30d74054d259e25c
+# split-source: order=310 original-lines=4574-4574 hash=30d74054d259e25c
 LITE_SNAPSHOT_FEED_BYTES = 160 * 1024
 
-# split-source: order=311 original-lines=4576-4576 hash=c9187c2dd8407f3a
+# split-source: order=311 original-lines=4575-4575 hash=c9187c2dd8407f3a
 LITE_SNAPSHOT_OPERATIONS_BYTES = 48 * 1024
 
-# split-source: order=312 original-lines=4577-4580 hash=1dfcc3955160d361
+# split-source: order=312 original-lines=4576-4579 hash=1dfcc3955160d361
 IDE_AGENT_STATE_MAX_BYTES = max(
     192 * 1024,
     min(768 * 1024, int(str(os.getenv("AGENT_IDE_STATE_MAX_BYTES", str(384 * 1024)) or str(384 * 1024)))),
 )
 
-# split-source: order=313 original-lines=4581-4581 hash=18d386b79c0ae336
+# split-source: order=313 original-lines=4580-4580 hash=18d386b79c0ae336
 IDE_AGENT_FEED_BYTES = 176 * 1024
 
-# split-source: order=314 original-lines=4582-4582 hash=3cad95bcb225023d
+# split-source: order=314 original-lines=4581-4581 hash=3cad95bcb225023d
 IDE_AGENT_OPERATIONS_BYTES = 112 * 1024
 
-# split-source: order=315 original-lines=4583-4586 hash=f0f770fff8f1760d
+# split-source: order=315 original-lines=4582-4585 hash=f0f770fff8f1760d
 SESSION_WATCHDOG_INTERVAL_SECONDS = max(
     10,
     min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
 )
 
-# split-source: order=316 original-lines=4587-4590 hash=2f0af45aae578f5e
+# split-source: order=316 original-lines=4586-4589 hash=2f0af45aae578f5e
 SESSION_HEARTBEAT_STALE_SECONDS = max(
     60,
     min(7200, int(str(os.getenv("AGENT_SESSION_HEARTBEAT_STALE_SECONDS", "900") or "900"))),
 )
 
-# split-source: order=317 original-lines=4591-4594 hash=29714ac4f4b31c3e
+# split-source: order=317 original-lines=4590-4593 hash=29714ac4f4b31c3e
 SESSION_LIST_DEFAULT_LIMIT = max(
     50,
     min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "120") or "120"))),
 )
 
-# split-source: order=318 original-lines=4595-4598 hash=3fedde7256972fe2
+# split-source: order=318 original-lines=4594-4597 hash=3fedde7256972fe2
 SESSION_INDEX_SYNC_SNAPSHOT_MAX = max(
     16,
     min(2000, int(str(os.getenv("AGENT_SESSION_INDEX_SYNC_SNAPSHOT_MAX", "256") or "256"))),
 )
 
-# split-source: order=319 original-lines=4599-4602 hash=5b857cc8aef0b551
+# split-source: order=319 original-lines=4598-4601 hash=5b857cc8aef0b551
 SESSION_INDEX_JOURNAL_COMPACT_RECORDS = max(
     32,
     min(4096, int(str(os.getenv("AGENT_SESSION_INDEX_JOURNAL_COMPACT_RECORDS", "512") or "512"))),
 )
 
-# split-source: order=320 original-lines=4603-4606 hash=647decba1d7ddde3
+# split-source: order=320 original-lines=4602-4605 hash=647decba1d7ddde3
 SESSION_INDEX_JOURNAL_COMPACT_BYTES = max(
     64 * 1024,
     min(16 * 1024 * 1024, int(str(os.getenv("AGENT_SESSION_INDEX_JOURNAL_COMPACT_BYTES", str(1024 * 1024)) or str(1024 * 1024)))),
 )
 
-# split-source: order=321 original-lines=4607-4610 hash=6fe2a559713952ce
+# split-source: order=321 original-lines=4606-4609 hash=6fe2a559713952ce
 SESSION_CATALOG_RECENT_MAX = max(
     64,
     min(2048, int(str(os.getenv("AGENT_SESSION_CATALOG_RECENT_MAX", "384") or "384"))),
 )
 
-# split-source: order=322 original-lines=4611-4614 hash=eb199293806adbc6
+# split-source: order=322 original-lines=4610-4613 hash=eb199293806adbc6
 IDE_SESSION_LIST_DEFAULT_LIMIT = max(
     20,
     min(200, int(str(os.getenv("AGENT_IDE_SESSION_LIST_DEFAULT_LIMIT", "80") or "80"))),
 )
 
-# split-source: order=323 original-lines=4615-4615 hash=21e8078826b7ba9b
+# split-source: order=323 original-lines=4614-4614 hash=21e8078826b7ba9b
 IDLE_TIMEOUT = 60
 
-# split-source: order=324 original-lines=4616-4616 hash=1a34e5cff4506d8a
+# split-source: order=324 original-lines=4615-4615 hash=1a34e5cff4506d8a
 POLL_INTERVAL = 5
 
-# split-source: order=325 original-lines=4617-4617 hash=ecc63ca91f81dbaf
+# split-source: order=325 original-lines=4616-4616 hash=ecc63ca91f81dbaf
 SSE_HEARTBEAT_SECONDS = 15
 
-# split-source: order=326 original-lines=4618-4618 hash=a30d873cdb336db5
+# split-source: order=326 original-lines=4617-4617 hash=a30d873cdb336db5
 MODEL_CALL_PROGRESS_DELAY = 8.0
 
-# split-source: order=327 original-lines=4619-4619 hash=ee18cc3fa25431b0
+# split-source: order=327 original-lines=4618-4618 hash=ee18cc3fa25431b0
 MODEL_CALL_PROGRESS_INTERVAL = 12.0
 
-# split-source: order=328 original-lines=4620-4623 hash=fc51caddf4da1aba
+# split-source: order=328 original-lines=4619-4622 hash=fc51caddf4da1aba
 RUN_COMPLETION_SUMMARY_ENABLED = (
     str(os.getenv("AGENT_RUN_COMPLETION_SUMMARY", "false") or "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 
-# split-source: order=329 original-lines=4624-4627 hash=c24b4663de1ae03b
+# split-source: order=329 original-lines=4623-4626 hash=c24b4663de1ae03b
 LLM_HTTP_RETRY_MAX_ATTEMPTS = max(
     0,
     min(10, int(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_ATTEMPTS", "5") or "5"))),
 )
 
-# split-source: order=330 original-lines=4628-4631 hash=b687fffa93fa8803
+# split-source: order=330 original-lines=4627-4630 hash=b687fffa93fa8803
 LLM_HTTP_RETRY_DELAY_SECONDS = max(
     1.0,
     min(600.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_DELAY_SECONDS", "60") or "60"))),
 )
 
-# split-source: order=331 original-lines=4632-4635 hash=49cd4f3ffd00005a
+# split-source: order=331 original-lines=4631-4634 hash=49cd4f3ffd00005a
 LLM_HTTP_RETRY_MAX_SECONDS = max(
     LLM_HTTP_RETRY_DELAY_SECONDS,
     min(1800.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_SECONDS", "600") or "600"))),
 )
 
-# split-source: order=332 original-lines=4636-4639 hash=3788f6c3fe156cbd
+# split-source: order=332 original-lines=4635-4638 hash=3788f6c3fe156cbd
 LLM_HTTP_RETRY_404_ON_VLLM = (
     str(os.getenv("AGENT_LLM_HTTP_RETRY_404_ON_VLLM", "true") or "true").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 
-# split-source: order=333 original-lines=4640-4640 hash=f5bc75cb9e79f51e
+# split-source: order=333 original-lines=4639-4639 hash=f5bc75cb9e79f51e
 LLM_HTTP_RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
-# split-source: order=334 original-lines=4641-4641 hash=a1dfeb4d99dabe31
+# split-source: order=334 original-lines=4640-4640 hash=a1dfeb4d99dabe31
 MAX_AGENT_ROUNDS = 200
 
-# split-source: order=335 original-lines=4642-4642 hash=404af4c5baeb3ff0
+# split-source: order=335 original-lines=4641-4641 hash=404af4c5baeb3ff0
 MIN_AGENT_ROUNDS = 8
 
-# split-source: order=336 original-lines=4643-4643 hash=dfd65611d9d4d2e7
+# split-source: order=336 original-lines=4642-4642 hash=dfd65611d9d4d2e7
 MAX_AGENT_ROUNDS_CAP = 8_000
 
-# split-source: order=337 original-lines=4644-4644 hash=f26c1e0b40321513
+# split-source: order=337 original-lines=4643-4643 hash=f26c1e0b40321513
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 
-# split-source: order=338 original-lines=4645-4645 hash=43de54d0295b2c50
+# split-source: order=338 original-lines=4644-4644 hash=43de54d0295b2c50
 BASH_READ_LOOP_THRESHOLD = 10
 
-# split-source: order=339 original-lines=4646-4646 hash=ba920330b8bf4e94
+# split-source: order=339 original-lines=4645-4645 hash=ba920330b8bf4e94
 READ_FILE_LOOP_THRESHOLD = 6
 
-# split-source: order=340 original-lines=4647-4647 hash=f291a7324309ff27
+# split-source: order=340 original-lines=4646-4646 hash=f291a7324309ff27
 READ_FILE_LOOP_DISTINCT_SOFT_LIMIT = 5
 
-# split-source: order=341 original-lines=4648-4648 hash=2318ec75e6ee9dad
+# split-source: order=341 original-lines=4647-4647 hash=2318ec75e6ee9dad
 READ_FILE_COMPACT_PIN_DISTINCT = 8
 
-# split-source: order=342 original-lines=4649-4649 hash=5dd256960ee032f1
+# split-source: order=342 original-lines=4648-4648 hash=5dd256960ee032f1
 READ_FILE_COMPACT_PIN_MAX_CHARS = 12_000
 
-# split-source: order=343 original-lines=4650-4650 hash=15395f4ada0504ad
+# split-source: order=343 original-lines=4649-4649 hash=15395f4ada0504ad
 READ_CONTEXT_REGISTRY_MAX = 80
 
-# split-source: order=344 original-lines=4651-4651 hash=3003f5ea1ba7c71d
+# split-source: order=344 original-lines=4650-4650 hash=3003f5ea1ba7c71d
 READ_CONTEXT_PROMPT_MAX_ITEMS = 14
 
-# split-source: order=345 original-lines=4652-4652 hash=b8522d387d0a4bd4
+# split-source: order=345 original-lines=4651-4651 hash=b8522d387d0a4bd4
 READ_CONTEXT_PROMPT_MAX_CHARS = 5_000
 
-# split-source: order=346 original-lines=4653-4653 hash=e9fba2dd33cbb897
+# split-source: order=346 original-lines=4652-4652 hash=e9fba2dd33cbb897
 READ_CONTEXT_SUMMARY_MAX_CHARS = 520
 
-# split-source: order=347 original-lines=4654-4654 hash=c6d03b12abba5754
+# split-source: order=347 original-lines=4653-4653 hash=c6d03b12abba5754
 READ_CONTEXT_SHARED_MAX_ITEMS = 4
 
-# split-source: order=348 original-lines=4655-4655 hash=f8a73cef7b17a635
+# split-source: order=348 original-lines=4654-4654 hash=f8a73cef7b17a635
 READ_CONTEXT_POLICY_CHOICES = {"auto", "conservative", "balanced", "wide"}
 
-# split-source: order=349 original-lines=4656-4656 hash=b98c5d6d9f81664e
+# split-source: order=349 original-lines=4655-4655 hash=b98c5d6d9f81664e
 DEFAULT_READ_CONTEXT_POLICY = "auto"
 
-# split-source: order=350 original-lines=4657-4663 hash=1c91b7e1ff48c3c1
+# split-source: order=350 original-lines=4656-4662 hash=1c91b7e1ff48c3c1
 # Cached read evidence is searchable on demand. Keep the scan bounded so a
 # book-length buffer never blocks a model turn, while still making exact facts
 # recoverable after micro/full compaction.
@@ -769,16 +769,16 @@ READ_CONTEXT_CACHE_SEARCH_MAX_BYTES = max(
     min(64 * 1024 * 1024, int(str(os.getenv("AGENT_READ_CACHE_SEARCH_MAX_BYTES", str(16 * 1024 * 1024)) or str(16 * 1024 * 1024)))),
 )
 
-# split-source: order=351 original-lines=4664-4664 hash=457448f88a6f6e5a
+# split-source: order=351 original-lines=4663-4663 hash=457448f88a6f6e5a
 READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES = 8
 
-# split-source: order=352 original-lines=4665-4665 hash=026abae0aa7ac4ef
+# split-source: order=352 original-lines=4664-4664 hash=026abae0aa7ac4ef
 READ_CONTEXT_CACHE_SNIPPET_CHARS = 2_400
 
-# split-source: order=353 original-lines=4666-4666 hash=395b78de1f083740
+# split-source: order=353 original-lines=4665-4665 hash=395b78de1f083740
 READ_CONTEXT_CACHE_LINE_CONTEXT = 2
 
-# split-source: order=354 original-lines=4667-4673 hash=9f9777e2d3b09936
+# split-source: order=354 original-lines=4666-4672 hash=9f9777e2d3b09936
 # Source decode cache is process-local only (never persisted into prompts or
 # session state). It avoids rereading/decoding multi-megabyte sources for every
 # focused lookup while remaining bounded for IDE workspaces.
@@ -787,46 +787,46 @@ LONG_CONTENT_SOURCE_CACHE_MAX_BYTES = max(
     min(256 * 1024 * 1024, int(str(os.getenv("AGENT_LONG_CONTENT_SOURCE_CACHE_MAX_BYTES", str(64 * 1024 * 1024)) or str(64 * 1024 * 1024)))),
 )
 
-# split-source: order=355 original-lines=4674-4677 hash=e4fec3b1b9ed5eb2
+# split-source: order=355 original-lines=4673-4676 hash=e4fec3b1b9ed5eb2
 LONG_CONTENT_SOURCE_CACHE_MAX_FILES = max(
     1,
     min(16, int(str(os.getenv("AGENT_LONG_CONTENT_SOURCE_CACHE_MAX_FILES", "4") or "4"))),
 )
 
-# split-source: order=356 original-lines=4678-4681 hash=9250a70c40ab794a
+# split-source: order=356 original-lines=4677-4680 hash=9250a70c40ab794a
 LONG_CONTENT_SYMBOL_MEMORY_MAX = max(
     256,
     min(100_000, int(str(os.getenv("AGENT_LONG_CONTENT_SYMBOL_MEMORY_MAX", "20000") or "20000"))),
 )
 
-# split-source: order=357 original-lines=4682-4682 hash=31649ba71abc9e9f
+# split-source: order=357 original-lines=4681-4681 hash=31649ba71abc9e9f
 TOOL_MEMORY_REGISTRY_MAX = 120
 
-# split-source: order=358 original-lines=4683-4683 hash=6ef3d4b6a84c12d0
+# split-source: order=358 original-lines=4682-4682 hash=6ef3d4b6a84c12d0
 TOOL_MEMORY_PROMPT_MAX_ITEMS = 18
 
-# split-source: order=359 original-lines=4684-4684 hash=56eaa4f69ae1742d
+# split-source: order=359 original-lines=4683-4683 hash=56eaa4f69ae1742d
 TOOL_MEMORY_PROMPT_MAX_CHARS = 5_500
 
-# split-source: order=360 original-lines=4685-4685 hash=961ee07c161f8002
+# split-source: order=360 original-lines=4684-4684 hash=961ee07c161f8002
 TOOL_MEMORY_SUMMARY_MAX_CHARS = 620
 
-# split-source: order=361 original-lines=4686-4686 hash=79a8f04ee22720f5
+# split-source: order=361 original-lines=4685-4685 hash=79a8f04ee22720f5
 TOOL_MEMORY_SHARED_MAX_ITEMS = 5
 
-# split-source: order=362 original-lines=4687-4687 hash=a6527a720f218397
+# split-source: order=362 original-lines=4686-4686 hash=a6527a720f218397
 TOOL_MEMORY_COMPACT_PIN_DISTINCT = 10
 
-# split-source: order=363 original-lines=4688-4688 hash=785140d321ff1585
+# split-source: order=363 original-lines=4687-4687 hash=785140d321ff1585
 TOOL_MEMORY_COMPACT_PIN_MAX_CHARS = 10_000
 
-# split-source: order=364 original-lines=4689-4689 hash=2390055a2536f16f
+# split-source: order=364 original-lines=4688-4688 hash=2390055a2536f16f
 TOOL_MEMORY_POLICY_CHOICES = READ_CONTEXT_POLICY_CHOICES
 
-# split-source: order=365 original-lines=4690-4690 hash=76b8b510959d7cea
+# split-source: order=365 original-lines=4689-4689 hash=76b8b510959d7cea
 DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 
-# split-source: order=366 original-lines=4691-4703 hash=6ed5a74d79ef6594
+# split-source: order=366 original-lines=4690-4702 hash=6ed5a74d79ef6594
 # Unified long-content reading memory.  This is deliberately separate from the
 # conversation/tool registries: those retain evidence, while this index retains
 # the durable understanding of a long text/file/code source.  Cards are small
@@ -841,43 +841,43 @@ DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 # migration step.
 LONG_CONTENT_MEMORY_VERSION = 4
 
-# split-source: order=367 original-lines=4704-4707 hash=aab11e76d9d3039f
+# split-source: order=367 original-lines=4703-4706 hash=aab11e76d9d3039f
 LONG_CONTENT_MEMORY_MAX_ITEMS = max(
     8,
     min(160, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_ITEMS", "80") or "80"))),
 )
 
-# split-source: order=368 original-lines=4708-4711 hash=f58103eac073e318
+# split-source: order=368 original-lines=4707-4710 hash=f58103eac073e318
 LONG_CONTENT_MEMORY_MAX_SEGMENTS = max(
     8,
     min(16384, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_SEGMENTS", "4096") or "4096"))),
 )
 
-# split-source: order=369 original-lines=4712-4715 hash=8dda207dc05c593c
+# split-source: order=369 original-lines=4711-4714 hash=8dda207dc05c593c
 LONG_CONTENT_TEXT_SEGMENT_LINES = max(
     40,
     min(600, int(str(os.getenv("AGENT_LONG_CONTENT_TEXT_SEGMENT_LINES", "180") or "180"))),
 )
 
-# split-source: order=370 original-lines=4716-4719 hash=b8c2c10786d876a7
+# split-source: order=370 original-lines=4715-4718 hash=b8c2c10786d876a7
 LONG_CONTENT_CODE_SEGMENT_LINES = max(
     80,
     min(1200, int(str(os.getenv("AGENT_LONG_CONTENT_CODE_SEGMENT_LINES", "360") or "360"))),
 )
 
-# split-source: order=371 original-lines=4720-4723 hash=15be6caa114ca764
+# split-source: order=371 original-lines=4719-4722 hash=15be6caa114ca764
 LONG_CONTENT_CARD_CHARS = max(
     180,
     min(1800, int(str(os.getenv("AGENT_LONG_CONTENT_CARD_CHARS", "720") or "720"))),
 )
 
-# split-source: order=372 original-lines=4724-4727 hash=82148a33411034a8
+# split-source: order=372 original-lines=4723-4726 hash=82148a33411034a8
 LONG_CONTENT_STRUCTURE_MAX_CHARS = max(
     1800,
     min(12000, int(str(os.getenv("AGENT_LONG_CONTENT_STRUCTURE_MAX_CHARS", "6000") or "6000"))),
 )
 
-# split-source: order=373 original-lines=4728-4735 hash=760e5756eb9b7259
+# split-source: order=373 original-lines=4727-4734 hash=760e5756eb9b7259
 # Semantic enrichment is intentionally bounded and best-effort.  It runs at
 # most once per source version after a real focused read; structure/overview
 # reads remain local and immediate.  This keeps long-file navigation cheap
@@ -887,147 +887,147 @@ LONG_CONTENT_SEMANTIC_ENABLED = (
     in {"1", "true", "yes", "on"}
 )
 
-# split-source: order=374 original-lines=4736-4739 hash=f333d2ab347a2d39
+# split-source: order=374 original-lines=4735-4738 hash=f333d2ab347a2d39
 LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS = max(
     0.5,
     min(20.0, float(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS", "4") or "4"))),
 )
 
-# split-source: order=375 original-lines=4740-4743 hash=440494edd7eeb5df
+# split-source: order=375 original-lines=4739-4742 hash=440494edd7eeb5df
 LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS = max(
     2400,
     min(24000, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS", "12000") or "12000"))),
 )
 
-# split-source: order=376 original-lines=4744-4747 hash=b8c235a021555a02
+# split-source: order=376 original-lines=4743-4746 hash=b8c235a021555a02
 LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS = max(
     160,
     min(1200, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS", "520") or "520"))),
 )
 
-# split-source: order=377 original-lines=4748-4748 hash=7d1e2bf64049ce32
+# split-source: order=377 original-lines=4747-4747 hash=7d1e2bf64049ce32
 LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS = 8
 
-# split-source: order=378 original-lines=4749-4749 hash=97374bb5ee479f79
+# split-source: order=378 original-lines=4748-4748 hash=97374bb5ee479f79
 LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS = 8
 
-# split-source: order=379 original-lines=4750-4750 hash=5a56514c278b1899
+# split-source: order=379 original-lines=4749-4749 hash=5a56514c278b1899
 LONG_CONTENT_SEMANTIC_MAX_RELATIONS = 8
 
-# split-source: order=380 original-lines=4751-4751 hash=286172623c76b74b
+# split-source: order=380 original-lines=4750-4750 hash=286172623c76b74b
 LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES = 6
 
-# split-source: order=381 original-lines=4752-4752 hash=3c79a06f06ae8043
+# split-source: order=381 original-lines=4751-4751 hash=3c79a06f06ae8043
 LONG_CONTENT_SEMANTIC_MAX_EVIDENCE = 12
 
-# split-source: order=382 original-lines=4753-4753 hash=5cb9c86361421cc3
+# split-source: order=382 original-lines=4752-4752 hash=5cb9c86361421cc3
 LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS = 8
 
-# split-source: order=383 original-lines=4754-4754 hash=6fd952a8f6cae4cd
+# split-source: order=383 original-lines=4753-4753 hash=6fd952a8f6cae4cd
 LONG_CONTENT_SEMANTIC_MAX_COVERED = 12
 
-# split-source: order=384 original-lines=4755-4755 hash=5d172817d91fc62b
+# split-source: order=384 original-lines=4754-4754 hash=5d172817d91fc62b
 LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS = 10
 
-# split-source: order=385 original-lines=4756-4759 hash=74328bf20956b60a
+# split-source: order=385 original-lines=4755-4758 hash=74328bf20956b60a
 LONG_CONTENT_SEMANTIC_MAX_REFRESHES = max(
     3,
     min(24, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_REFRESHES", "12") or "12"))),
 )
 
-# split-source: order=386 original-lines=4760-4763 hash=a1474078911c9ff9
+# split-source: order=386 original-lines=4759-4762 hash=a1474078911c9ff9
 LONG_CONTENT_OBSERVATION_MAX = max(
     8,
     min(128, int(str(os.getenv("AGENT_LONG_CONTENT_OBSERVATION_MAX", "32") or "32"))),
 )
 
-# split-source: order=387 original-lines=4764-4764 hash=5aac9a689e173b84
+# split-source: order=387 original-lines=4763-4763 hash=5aac9a689e173b84
 LONG_CONTENT_OBSERVATION_MAX_RANGES = 64
 
-# split-source: order=388 original-lines=4765-4765 hash=7078578771167159
+# split-source: order=388 original-lines=4764-4764 hash=7078578771167159
 LONG_CONTENT_OBSERVATION_MAX_EXCERPTS = 8
 
-# split-source: order=389 original-lines=4766-4766 hash=5353840ac409b53c
+# split-source: order=389 original-lines=4765-4765 hash=5353840ac409b53c
 LONG_CONTENT_OBSERVATION_EXCERPT_CHARS = 900
 
-# split-source: order=390 original-lines=4767-4767 hash=e6ac0a24e82e8450
+# split-source: order=390 original-lines=4766-4766 hash=e6ac0a24e82e8450
 LONG_CONTENT_RELATED_SOURCE_MAX = 4
 
-# split-source: order=391 original-lines=4768-4768 hash=4a9c4e03140ec73f
+# split-source: order=391 original-lines=4767-4767 hash=4a9c4e03140ec73f
 SHELL_SOURCE_CANDIDATE_MAX = 24
 
-# split-source: order=392 original-lines=4769-4771 hash=bc48d657116c38d0
+# split-source: order=392 original-lines=4768-4770 hash=bc48d657116c38d0
 LONG_CONTENT_TEXT_EXTS = {
     ".txt", ".md", ".mdx", ".rst", ".org", ".adoc", ".tex", ".bib",
 }
 
-# split-source: order=393 original-lines=4772-4776 hash=59fc73b56275e4d9
+# split-source: order=393 original-lines=4771-4775 hash=59fc73b56275e4d9
 LONG_CONTENT_DATA_EXTS = {
     ".json", ".jsonl", ".jsonc", ".yaml", ".yml", ".toml", ".ini",
     ".cfg", ".conf", ".env", ".properties", ".csv", ".tsv", ".xml",
     ".xsd", ".xsl",
 }
 
-# split-source: order=394 original-lines=4777-4777 hash=96b4ed206fb6cfbd
+# split-source: order=394 original-lines=4776-4776 hash=96b4ed206fb6cfbd
 DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
 
-# split-source: order=395 original-lines=4778-4778 hash=5dd2d6b152df4a77
+# split-source: order=395 original-lines=4777-4777 hash=5dd2d6b152df4a77
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 
-# split-source: order=396 original-lines=4779-4781 hash=4d0f227de7535157
+# split-source: order=396 original-lines=4778-4780 hash=4d0f227de7535157
 # Normal debugging often needs several corrected tool attempts before any
 # observable state changes. Keep this separate from the fused fault/error caps.
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 10
 
-# split-source: order=397 original-lines=4782-4782 hash=ac753bf664ede6c7
+# split-source: order=397 original-lines=4781-4781 hash=ac753bf664ede6c7
 FUSED_FAULT_BREAK_THRESHOLD = 15
 
-# split-source: order=398 original-lines=4783-4783 hash=6e4792252b33bf60
+# split-source: order=398 original-lines=4782-4782 hash=6e4792252b33bf60
 STALL_SEVERITY_ESCALATION_THRESHOLD = 5
 
-# split-source: order=399 original-lines=4784-4784 hash=501dcba997fc15a6
+# split-source: order=399 original-lines=4783-4783 hash=501dcba997fc15a6
 STALL_SEVERITY_WEIGHT_BASH_READ_LOOP = 2
 
-# split-source: order=400 original-lines=4785-4785 hash=66e205b0f4cd29ff
+# split-source: order=400 original-lines=4784-4784 hash=66e205b0f4cd29ff
 STALL_SEVERITY_WEIGHT_REPEATED_TOOL = 3
 
-# split-source: order=401 original-lines=4786-4786 hash=7bad5632e14a7510
+# split-source: order=401 original-lines=4785-4785 hash=7bad5632e14a7510
 STALL_SEVERITY_WEIGHT_FAULT = 2
 
-# split-source: order=402 original-lines=4787-4787 hash=80af46bba23c9932
+# split-source: order=402 original-lines=4786-4786 hash=80af46bba23c9932
 STALL_SEVERITY_WEIGHT_RECOVERY_RETRY = 2
 
-# split-source: order=403 original-lines=4788-4788 hash=fa31813899fef561
+# split-source: order=403 original-lines=4787-4787 hash=fa31813899fef561
 STALL_SEVERITY_WEIGHT_WATCHDOG = 2
 
-# split-source: order=404 original-lines=4789-4789 hash=3bc653efe5386a7f
+# split-source: order=404 original-lines=4788-4788 hash=3bc653efe5386a7f
 STALL_SEVERITY_DECAY_ON_SUCCESS = 2
 
-# split-source: order=405 original-lines=4790-4790 hash=df0968fab8fcb27a
+# split-source: order=405 original-lines=4789-4789 hash=df0968fab8fcb27a
 STALL_ESCALATION_MIN_LEVEL = 2
 
-# split-source: order=406 original-lines=4791-4791 hash=e78e512be493c7ca
+# split-source: order=406 original-lines=4790-4790 hash=e78e512be493c7ca
 STALL_PLAN_SYNTHESIS_MAX_TOKENS = 3000
 
-# split-source: order=407 original-lines=4792-4792 hash=68fc0aa846eee84e
+# split-source: order=407 original-lines=4791-4791 hash=68fc0aa846eee84e
 STALL_ESCALATION_CONTEXT_MAX_CHARS = 3000
 
-# split-source: order=408 original-lines=4793-4793 hash=5fb0a99df98dca19
+# split-source: order=408 original-lines=4792-4792 hash=5fb0a99df98dca19
 MAX_RUN_SECONDS = 3000
 
-# split-source: order=409 original-lines=4794-4794 hash=ce790d7e327a4eae
+# split-source: order=409 original-lines=4793-4793 hash=ce790d7e327a4eae
 MIN_RUN_TIMEOUT_SECONDS = 600
 
-# split-source: order=410 original-lines=4795-4795 hash=9557368f9b6b2e89
+# split-source: order=410 original-lines=4794-4794 hash=9557368f9b6b2e89
 MAX_RUN_TIMEOUT_SECONDS = 864_000
 
-# split-source: order=411 original-lines=4796-4796 hash=9e0f737dcb072927
+# split-source: order=411 original-lines=4795-4795 hash=9e0f737dcb072927
 MIN_TIMEOUT_SECONDS = 600
 
-# split-source: order=412 original-lines=4797-4797 hash=001cc4628c24174c
+# split-source: order=412 original-lines=4796-4796 hash=001cc4628c24174c
 MAX_TIMEOUT_SECONDS = 86_400
 
-# split-source: order=413 original-lines=4798-4804 hash=a82f960fa474f532
+# split-source: order=413 original-lines=4797-4803 hash=a82f960fa474f532
 DEFAULT_TIMEOUT_SECONDS = max(
     MIN_TIMEOUT_SECONDS,
     min(
@@ -1036,10 +1036,10 @@ DEFAULT_TIMEOUT_SECONDS = max(
     ),
 )
 
-# split-source: order=414 original-lines=4805-4805 hash=e394d84014850541
+# split-source: order=414 original-lines=4804-4804 hash=e394d84014850541
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
 
-# split-source: order=415 original-lines=4806-4821 hash=b6c694afe08a4d60
+# split-source: order=415 original-lines=4805-4820 hash=b6c694afe08a4d60
 # Patterns that indicate the shell process is waiting for interactive confirmation.
 # Checked against the tail of combined stdout+stderr (lowercased bytes).
 _SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
@@ -1057,40 +1057,40 @@ _SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
     b"enter to continue",
 )
 
-# split-source: order=416 original-lines=4822-4822 hash=eda5090ff7c057bc
+# split-source: order=416 original-lines=4821-4821 hash=eda5090ff7c057bc
 MIN_SHELL_COMMAND_TIMEOUT_SECONDS = 10
 
-# split-source: order=417 original-lines=4823-4823 hash=f8a21676c2aada41
+# split-source: order=417 original-lines=4822-4822 hash=f8a21676c2aada41
 MAX_SHELL_COMMAND_TIMEOUT_SECONDS = 86_400
 
-# split-source: order=418 original-lines=4824-4824 hash=7936d48d534fff21
+# split-source: order=418 original-lines=4823-4823 hash=7936d48d534fff21
 SHELL_TIMEOUT_MODES = ("fixed", "auto", "async")
 
-# split-source: order=419 original-lines=4825-4828 hash=4e4b48f16677f0e5
+# split-source: order=419 original-lines=4824-4827 hash=4e4b48f16677f0e5
 _DEFAULT_SHELL_TIMEOUT_MODE_RAW = str(
     os.getenv("AGENT_SHELL_TIMEOUT_MODE", os.getenv("AGENT_BASH_TIMEOUT_MODE", "auto"))
     or "auto"
 ).strip().lower()
 
-# split-source: order=420 original-lines=4829-4833 hash=9a4146aac345203f
+# split-source: order=420 original-lines=4828-4832 hash=9a4146aac345203f
 DEFAULT_SHELL_TIMEOUT_MODE = (
     _DEFAULT_SHELL_TIMEOUT_MODE_RAW
     if _DEFAULT_SHELL_TIMEOUT_MODE_RAW in SHELL_TIMEOUT_MODES
     else "auto"
 )
 
-# split-source: order=421 original-lines=4834-4834 hash=280b05b2444f1545
+# split-source: order=421 original-lines=4833-4833 hash=280b05b2444f1545
 MIN_SHELL_ASYNC_HANDOFF_SECONDS = 10
 
-# split-source: order=422 original-lines=4835-4835 hash=cad01336d59f25e9
+# split-source: order=422 original-lines=4834-4834 hash=cad01336d59f25e9
 MAX_SHELL_ASYNC_HANDOFF_SECONDS = 86_400
 
-# split-source: order=423 original-lines=4836-4838 hash=47ed8d8a65266f46
+# split-source: order=423 original-lines=4835-4837 hash=47ed8d8a65266f46
 # Shell recovery guidance is event-driven. It is absent from normal prompts
 # and appears briefly after a failed or truncated shell result.
 SHELL_FAILURE_GUIDANCE_SECONDS = 900
 
-# split-source: order=424 original-lines=4839-4853 hash=cfd1f525cbdd6c02
+# split-source: order=424 original-lines=4838-4852 hash=cfd1f525cbdd6c02
 DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS = max(
     MIN_SHELL_ASYNC_HANDOFF_SECONDS,
     min(
@@ -1107,7 +1107,7 @@ DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS = max(
     ),
 )
 
-# split-source: order=425 original-lines=4854-4868 hash=872cc6e0309141ea
+# split-source: order=425 original-lines=4853-4867 hash=872cc6e0309141ea
 DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
     MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
     min(
@@ -1124,7 +1124,7 @@ DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
     ),
 )
 
-# split-source: order=426 original-lines=4869-4883 hash=3207ec68e115656f
+# split-source: order=426 original-lines=4868-4882 hash=3207ec68e115656f
 # Optional single-agent/no-plan bootstrap for lightweight (L1) sessions.  It is
 # deliberately disabled by default so existing L1 sessions keep their current
 # execution posture.  L2 uses the independent ``l2_todo_policy`` setting,
@@ -1141,55 +1141,55 @@ DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT = (
     "invent unrelated work or switch to plan mode."
 )
 
-# split-source: order=427 original-lines=4884-4884 hash=304627c8157a045e
+# split-source: order=427 original-lines=4883-4883 hash=304627c8157a045e
 SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS = 2
 
-# split-source: order=428 original-lines=4885-4885 hash=6589c7e3e6120908
+# split-source: order=428 original-lines=4884-4884 hash=6589c7e3e6120908
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
 
-# split-source: order=429 original-lines=4886-4886 hash=81f1cdc998a51ca8
+# split-source: order=429 original-lines=4885-4885 hash=81f1cdc998a51ca8
 AGENT_MAX_OUTPUT_TOKENS = 16384
 
-# split-source: order=430 original-lines=4887-4887 hash=43d24a40fc50177b
+# split-source: order=430 original-lines=4886-4886 hash=43d24a40fc50177b
 OLLAMA_THINKING_TOOL_BUFFER = 4096
 
-# split-source: order=431 original-lines=4888-4888 hash=6cbb417436244bf5
+# split-source: order=431 original-lines=4887-4887 hash=6cbb417436244bf5
 WATCHDOG_INTENT_NO_TOOL_THRESHOLD = 2
 
-# split-source: order=432 original-lines=4889-4889 hash=4dcd997cebfcb00d
+# split-source: order=432 original-lines=4888-4888 hash=4dcd997cebfcb00d
 WATCHDOG_REPEAT_NO_TOOL_THRESHOLD = 2
 
-# split-source: order=433 original-lines=4890-4890 hash=0c4cc160a4eecc90
+# split-source: order=433 original-lines=4889-4889 hash=0c4cc160a4eecc90
 WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE = 4
 
-# split-source: order=434 original-lines=4891-4891 hash=168b15b5d5192ecf
+# split-source: order=434 original-lines=4890-4890 hash=168b15b5d5192ecf
 WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE = 4
 
-# split-source: order=435 original-lines=4892-4892 hash=973603744a777214
+# split-source: order=435 original-lines=4891-4891 hash=973603744a777214
 WATCHDOG_STATE_STALL_THRESHOLD = 6
 
-# split-source: order=436 original-lines=4893-4893 hash=62020ffe53ec86ac
+# split-source: order=436 original-lines=4892-4892 hash=62020ffe53ec86ac
 WATCHDOG_CONTEXT_STALL_THRESHOLD = 2
 
-# split-source: order=437 original-lines=4894-4894 hash=a3c5037219c95cc5
+# split-source: order=437 original-lines=4893-4893 hash=a3c5037219c95cc5
 WATCHDOG_REPEAT_SIMILARITY_THRESHOLD = 0.85
 
-# split-source: order=438 original-lines=4895-4895 hash=bb6983fb5e4969db
+# split-source: order=438 original-lines=4894-4894 hash=bb6983fb5e4969db
 WATCHDOG_CONTEXT_NEAR_RATIO = 0.92
 
-# split-source: order=439 original-lines=4896-4896 hash=b2242f8e4c6b496d
+# split-source: order=439 original-lines=4895-4895 hash=b2242f8e4c6b496d
 WATCHDOG_MAX_DECOMPOSE_STEPS = 12
 
-# split-source: order=440 original-lines=4897-4897 hash=304c3e4c88ea8137
+# split-source: order=440 original-lines=4896-4896 hash=304c3e4c88ea8137
 WATCHDOG_STEP_MAX_ATTEMPTS = 2
 
-# split-source: order=441 original-lines=4898-4898 hash=349f50c558c90724
+# split-source: order=441 original-lines=4897-4897 hash=349f50c558c90724
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
 
-# split-source: order=442 original-lines=4899-4899 hash=d302097293b09c7b
+# split-source: order=442 original-lines=4898-4898 hash=d302097293b09c7b
 EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 5
 
-# split-source: order=443 original-lines=4900-4906 hash=c7576eb88a806b3f
+# split-source: order=443 original-lines=4899-4905 hash=c7576eb88a806b3f
 # A completed response that contains reasoning but neither public content nor a
 # tool call is not itself a model failure.  Some reasoning models need several
 # turns to cross the reasoning/final boundary, especially behind compatibility
@@ -1198,20 +1198,20 @@ EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 5
 # provider-aware recovery ladder instead of accumulating near-identical hints.
 EMPTY_ACTION_INTERVENTION_THRESHOLD = 20
 
-# split-source: order=444 original-lines=4907-4911 hash=f7681b13745c7194
+# split-source: order=444 original-lines=4906-4910 hash=f7681b13745c7194
 # Todo bootstrap still needs a tool call, but reasoning models may require a
 # several completed thinking turns before they emit it.  Keep this grace
 # window separate from the generic empty-action threshold and do not synthesize
 # a Todo during it.
 EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS = 10
 
-# split-source: order=445 original-lines=4912-4912 hash=a22dc4c1e36ce0e4
+# split-source: order=445 original-lines=4911-4911 hash=a22dc4c1e36ce0e4
 EMPTY_ACTION_RECOVERY_MAX_TOKENS = 1600
 
-# split-source: order=446 original-lines=4913-4913 hash=3fdbe7ffc78f5c1f
+# split-source: order=446 original-lines=4912-4912 hash=3fdbe7ffc78f5c1f
 THINKING_BUDGET_FORCE_RATIO = 0.85
 
-# split-source: order=447 original-lines=4914-4935 hash=64ddcb605937b8ec
+# split-source: order=447 original-lines=4913-4934 hash=64ddcb605937b8ec
 # --- Tool timeout configuration ---
 _TOOL_TIMEOUT_MAP = {
     "read_file": 30,
@@ -1235,10 +1235,10 @@ _TOOL_TIMEOUT_MAP = {
     "compress": 30,
 }
 
-# split-source: order=448 original-lines=4936-4936 hash=3badf74b8d23a332
+# split-source: order=448 original-lines=4935-4935 hash=3badf74b8d23a332
 _DEFAULT_TOOL_TIMEOUT = 90
 
-# split-source: order=449 original-lines=4937-4949 hash=7b78f97cc7d886b1
+# split-source: order=449 original-lines=4936-4948 hash=7b78f97cc7d886b1
 CONVERSATION_VISIBLE_TOOL_EVENTS = {
     "agent_web_search",
     "query_code_library",
@@ -1253,7 +1253,7 @@ CONVERSATION_VISIBLE_TOOL_EVENTS = {
     "list_skill_protocols",
 }
 
-# split-source: order=450 original-lines=4950-4968 hash=b898c65e3a6197d1
+# split-source: order=450 original-lines=4949-4967 hash=b898c65e3a6197d1
 PERSIST_ON_EVENT_TYPES = {
     "command",
     "file_patch",
@@ -1274,51 +1274,51 @@ PERSIST_ON_EVENT_TYPES = {
     "todo_focus",
 }
 
-# split-source: order=451 original-lines=4969-4969 hash=dab464f4a6681b57
+# split-source: order=451 original-lines=4968-4968 hash=dab464f4a6681b57
 PERSIST_EVENT_MIN_INTERVAL_SECONDS = 1.5
 
-# split-source: order=452 original-lines=4970-4970 hash=d145e7696f8b6e7c
+# split-source: order=452 original-lines=4969-4969 hash=d145e7696f8b6e7c
 TRUNCATION_CONTINUATION_MAX_PASSES = 3
 
-# split-source: order=453 original-lines=4971-4971 hash=aeea6cb9a5a7802c
+# split-source: order=453 original-lines=4970-4970 hash=aeea6cb9a5a7802c
 TRUNCATION_CONTINUATION_MAX_TOKENS = 1800
 
-# split-source: order=454 original-lines=4972-4972 hash=b362b9a430f230bd
+# split-source: order=454 original-lines=4971-4971 hash=b362b9a430f230bd
 TRUNCATION_CONTINUATION_TAIL_CHARS = 2800
 
-# split-source: order=455 original-lines=4973-4973 hash=5a8c5a582672e139
+# split-source: order=455 original-lines=4972-4972 hash=5a8c5a582672e139
 TRUNCATION_CONTINUATION_ECHO_CHARS = 12000
 
-# split-source: order=456 original-lines=4974-4974 hash=13f883e0c500f236
+# split-source: order=456 original-lines=4973-4973 hash=13f883e0c500f236
 TRUNCATION_OVERLAP_SCAN_CHARS = 420
 
-# split-source: order=457 original-lines=4975-4975 hash=eae89e10ef4369ba
+# split-source: order=457 original-lines=4974-4974 hash=eae89e10ef4369ba
 TRUNCATION_PAIR_SCAN_CHARS = 120_000
 
-# split-source: order=458 original-lines=4976-4976 hash=206735da9ca74d98
+# split-source: order=458 original-lines=4975-4975 hash=206735da9ca74d98
 TRUNCATION_LIVE_BUFFER_MAX_CHARS = 32000
 
-# split-source: order=459 original-lines=4977-4977 hash=a19e06f68a32154b
+# split-source: order=459 original-lines=4976-4976 hash=a19e06f68a32154b
 MIN_CONTEXT_TOKEN_LIMIT = 4_000
 
-# split-source: order=460 original-lines=4978-4979 hash=82a8ec62579dfe9b
+# split-source: order=460 original-lines=4977-4978 hash=82a8ec62579dfe9b
 # Tiered compression thresholds (fraction of ctx_left / limit)
 COMPACT_TIER1_PCT = 0.40   # >40% left: normal; 20-40%: tier 1 light
 
-# split-source: order=461 original-lines=4980-4980 hash=fe1728c0fb47f223
+# split-source: order=461 original-lines=4979-4979 hash=fe1728c0fb47f223
 COMPACT_TIER2_PCT = 0.20   # 10-20%: tier 2 medium
 
-# split-source: order=462 original-lines=4981-4981 hash=8c7720b52f128bc4
+# split-source: order=462 original-lines=4980-4980 hash=8c7720b52f128bc4
 COMPACT_TIER3_PCT = 0.10   # <10%: tier 3 heavy
 
-# split-source: order=463 original-lines=4982-4983 hash=3908beb20becfd3e
+# split-source: order=463 original-lines=4981-4982 hash=3908beb20becfd3e
 # Absolute minimums — prevent percentage instability at low ctx_left
 COMPACT_TIER1_ABS = 3000
 
-# split-source: order=464 original-lines=4984-4984 hash=fe0db1a0ee5e0db6
+# split-source: order=464 original-lines=4983-4983 hash=fe0db1a0ee5e0db6
 COMPACT_TIER2_ABS = 1500
 
-# split-source: order=465 original-lines=4985-4991 hash=ec17bd79d731f50e
+# split-source: order=465 original-lines=4984-4990 hash=ec17bd79d731f50e
 CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS = max(
     5.0,
     min(
@@ -1327,71 +1327,71 @@ CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS = max(
     ),
 )
 
-# split-source: order=466 original-lines=4992-4993 hash=5e1874fbf1922a2e
+# split-source: order=466 original-lines=4991-4992 hash=5e1874fbf1922a2e
 # File buffer
 FILE_BUFFER_CONTENT_THRESHOLD = 2000  # chars: content larger than this gets offloaded
 
-# split-source: order=467 original-lines=4994-4994 hash=7c12351ee7dca714
+# split-source: order=467 original-lines=4993-4993 hash=7c12351ee7dca714
 FILE_BUFFER_MAX_FILES = 500
 
-# split-source: order=468 original-lines=4995-4995 hash=315b97aa3c361b8a
+# split-source: order=468 original-lines=4994-4994 hash=315b97aa3c361b8a
 AUTHORITATIVE_USER_GOAL_OPEN = "<authoritative-current-user-request>"
 
-# split-source: order=469 original-lines=4996-4996 hash=971c4cb5f712d084
+# split-source: order=469 original-lines=4995-4995 hash=971c4cb5f712d084
 AUTHORITATIVE_USER_GOAL_CLOSE = "</authoritative-current-user-request>"
 
-# split-source: order=470 original-lines=4997-4998 hash=86fadc5f8add80ca
+# split-source: order=470 original-lines=4996-4997 hash=86fadc5f8add80ca
 # Agent context limits per tier (messages count)
 AGENT_MSG_LIMIT_TIER0 = 800
 
-# split-source: order=471 original-lines=4999-4999 hash=4c34cb82b15562b1
+# split-source: order=471 original-lines=4998-4998 hash=4c34cb82b15562b1
 AGENT_MSG_LIMIT_TIER1 = 400
 
-# split-source: order=472 original-lines=5000-5000 hash=b344554068b7e437
+# split-source: order=472 original-lines=4999-4999 hash=b344554068b7e437
 AGENT_MSG_LIMIT_TIER2 = 200
 
-# split-source: order=473 original-lines=5001-5001 hash=00bba42734ec94ac
+# split-source: order=473 original-lines=5000-5000 hash=00bba42734ec94ac
 AGENT_MSG_LIMIT_TIER3 = 80
 
-# split-source: order=474 original-lines=5002-5002 hash=d02e0d81ccfae1f5
+# split-source: order=474 original-lines=5001-5001 hash=d02e0d81ccfae1f5
 AGENT_CTX_LIMIT_TIER0 = 400
 
-# split-source: order=475 original-lines=5003-5003 hash=3a49a78abe275b32
+# split-source: order=475 original-lines=5002-5002 hash=3a49a78abe275b32
 AGENT_CTX_LIMIT_TIER1 = 200
 
-# split-source: order=476 original-lines=5004-5004 hash=55dd310bb3da8ec8
+# split-source: order=476 original-lines=5003-5003 hash=55dd310bb3da8ec8
 AGENT_CTX_LIMIT_TIER2 = 100
 
-# split-source: order=477 original-lines=5005-5005 hash=06c16c04e024bf56
+# split-source: order=477 original-lines=5004-5004 hash=06c16c04e024bf56
 AGENT_CTX_LIMIT_TIER3 = 40
 
-# split-source: order=478 original-lines=5006-5006 hash=7b07d8695b2e312e
+# split-source: order=478 original-lines=5005-5005 hash=7b07d8695b2e312e
 MANAGER_CTX_LIMIT_TIER0 = 400
 
-# split-source: order=479 original-lines=5007-5007 hash=c5c2437f8ad9faca
+# split-source: order=479 original-lines=5006-5006 hash=c5c2437f8ad9faca
 MANAGER_CTX_LIMIT_TIER1 = 200
 
-# split-source: order=480 original-lines=5008-5008 hash=fcab4bf761597d8a
+# split-source: order=480 original-lines=5007-5007 hash=fcab4bf761597d8a
 MANAGER_CTX_LIMIT_TIER2 = 100
 
-# split-source: order=481 original-lines=5009-5009 hash=ba60f8163108104e
+# split-source: order=481 original-lines=5008-5008 hash=ba60f8163108104e
 MANAGER_CTX_LIMIT_TIER3 = 40
 
-# split-source: order=482 original-lines=5010-5010 hash=8415954b9ca23ca7
+# split-source: order=482 original-lines=5009-5009 hash=8415954b9ca23ca7
 MAX_CONTEXT_ARCHIVE_SEGMENTS = 1200
 
-# split-source: order=483 original-lines=5011-5012 hash=b80324a903ed6017
+# split-source: order=483 original-lines=5010-5011 hash=b80324a903ed6017
 # Display-only retained user bubbles (frontend persistence; not LLM context).
 MAX_USER_BUBBLE_LOG = 600
 
-# split-source: order=484 original-lines=5013-5017 hash=49ecc62e2717c14d
+# split-source: order=484 original-lines=5012-5016 hash=49ecc62e2717c14d
 # Manager->worker instruction budget. The old 1200/1400 cap forced the manager to
 # paraphrase the full goal + current step + failure context + concrete action into
 # ~200 tokens, dropping error traces and constraints — a major cause of poor
 # multi-agent worker output. Widened so handoffs keep enough intent.
 MANAGER_INSTRUCTION_MAX_CHARS = 3000
 
-# split-source: order=485 original-lines=5018-5023 hash=6e4a1b666867914f
+# split-source: order=485 original-lines=5017-5022 hash=6e4a1b666867914f
 # Manager-routing momentum: when a worker made real progress last round and the
 # active plan step is still in_progress, the manager would just re-route to the
 # same worker — a wasted HIGH/full LLM call. Instead reuse the prior route for up
@@ -1399,56 +1399,56 @@ MANAGER_INSTRUCTION_MAX_CHARS = 3000
 # so the manager always regains control to re-plan / switch agents / finish.
 MANAGER_MOMENTUM_MAX_SKIPS = 3
 
-# split-source: order=486 original-lines=5024-5028 hash=0a4664c23e741dee
+# split-source: order=486 original-lines=5023-5027 hash=0a4664c23e741dee
 # How many times the explorer may be routed within the recent window on a
 # coding-type task before the anti-stall logic forces a switch to developer.
 # Was a hard-coded 2 (too aggressive — starved genuine research); raise so the
 # explorer can actually do its job. Tune down if exploration loops appear.
 MODEL_OUTPUT_RETRY_TIMES = 3
 
-# split-source: order=487 original-lines=5029-5029 hash=464727f244ad79e1
+# split-source: order=487 original-lines=5028-5028 hash=464727f244ad79e1
 ARBITER_TRIGGER_MIN_CONTENT_CHARS = 50
 
-# split-source: order=488 original-lines=5030-5030 hash=56a8b3fe8fe5417d
+# split-source: order=488 original-lines=5029-5029 hash=56a8b3fe8fe5417d
 ARBITER_VALID_PLANNING_STREAK_LIMIT = 4
 
-# split-source: order=489 original-lines=5031-5031 hash=75d9242b5cfeae50
+# split-source: order=489 original-lines=5030-5030 hash=75d9242b5cfeae50
 ARBITER_DEFAULT_TIMEOUT_SECONDS = 1.5
 
-# split-source: order=490 original-lines=5032-5032 hash=aeca2ffc3ad973e4
+# split-source: order=490 original-lines=5031-5031 hash=aeca2ffc3ad973e4
 ARBITER_DEFAULT_MAX_TOKENS = 64
 
-# split-source: order=491 original-lines=5033-5033 hash=321024700293cce7
+# split-source: order=491 original-lines=5032-5032 hash=321024700293cce7
 ARBITER_DEFAULT_TEMPERATURE = 0.0
 
-# split-source: order=492 original-lines=5034-5034 hash=1403699b26993ef1
+# split-source: order=492 original-lines=5033-5033 hash=1403699b26993ef1
 LIVE_INPUT_DELAY_WRITE_ROUNDS = 2
 
-# split-source: order=493 original-lines=5035-5035 hash=64b6c16b75158887
+# split-source: order=493 original-lines=5034-5034 hash=64b6c16b75158887
 LIVE_INPUT_DELAY_TOOL_ROUNDS = 1
 
-# split-source: order=494 original-lines=5036-5036 hash=10dcd5edc664444f
+# split-source: order=494 original-lines=5035-5035 hash=10dcd5edc664444f
 LIVE_INPUT_DELAY_NORMAL_ROUNDS = 0
 
-# split-source: order=495 original-lines=5037-5037 hash=b5619c6c7b833fce
+# split-source: order=495 original-lines=5036-5036 hash=b5619c6c7b833fce
 LIVE_INPUT_MAX_INJECTIONS = 3
 
-# split-source: order=496 original-lines=5038-5038 hash=b36d3ae9bd950bd2
+# split-source: order=496 original-lines=5037-5037 hash=b36d3ae9bd950bd2
 LIVE_INPUT_REINJECT_INTERVAL = 1
 
-# split-source: order=497 original-lines=5039-5039 hash=706384ac48596ed1
+# split-source: order=497 original-lines=5038-5038 hash=706384ac48596ed1
 LIVE_INPUT_WEIGHT_BASE_DELAYED = 0.35
 
-# split-source: order=498 original-lines=5040-5040 hash=433de4a3e5c97613
+# split-source: order=498 original-lines=5039-5039 hash=433de4a3e5c97613
 LIVE_INPUT_WEIGHT_BASE_NORMAL = 0.65
 
-# split-source: order=499 original-lines=5041-5041 hash=797c3add85932c2f
+# split-source: order=499 original-lines=5040-5040 hash=797c3add85932c2f
 LIVE_INPUT_WEIGHT_STEP_DELAYED = 0.30
 
-# split-source: order=500 original-lines=5042-5042 hash=5a2e0d6ac80c04ac
+# split-source: order=500 original-lines=5041-5041 hash=5a2e0d6ac80c04ac
 LIVE_INPUT_WEIGHT_STEP_NORMAL = 0.20
 
-# split-source: order=502 original-lines=5049-5055 hash=deb510a842140857
+# split-source: order=502 original-lines=5048-5054 hash=deb510a842140857
 BENIGN_SOCKET_DEBUG_LOG_ENABLED = str(os.getenv("AGENT_DEBUG_SOCKET_LOG", "") or "").strip().lower() in {
     "1",
     "true",
@@ -1457,16 +1457,16 @@ BENIGN_SOCKET_DEBUG_LOG_ENABLED = str(os.getenv("AGENT_DEBUG_SOCKET_LOG", "") or
     "debug",
 }
 
-# split-source: order=503 original-lines=5056-5056 hash=95f173277a2b3041
+# split-source: order=503 original-lines=5055-5055 hash=95f173277a2b3041
 BENIGN_SOCKET_LOG_INTERVAL_SECONDS = 30.0
 
-# split-source: order=504 original-lines=5057-5057 hash=16bd723272a6a04e
+# split-source: order=504 original-lines=5056-5056 hash=16bd723272a6a04e
 FINAL_SUMMARY_MIN_CHARS = 80
 
-# split-source: order=505 original-lines=5058-5058 hash=2349aee5b109dfa2
+# split-source: order=505 original-lines=5057-5057 hash=2349aee5b109dfa2
 FINAL_SUMMARY_STRICT_MIN_CHARS = 120
 
-# split-source: order=506 original-lines=5059-5079 hash=da20b4ff75613bea
+# split-source: order=506 original-lines=5058-5078 hash=da20b4ff75613bea
 RUNTIME_CONTROL_HINT_PREFIXES = (
     "<reminder>",
     "<todo-rescue>",
@@ -1489,7 +1489,7 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<single-no-plan-todo-bootstrap-retry>",
 )
 
-# split-source: order=507 original-lines=5080-5108 hash=df45be2b6cc0798c
+# split-source: order=507 original-lines=5079-5107 hash=df45be2b6cc0798c
 # These blocks are runtime plumbing rather than user-visible conversation.  Keep
 # user-facing structured controls such as live-user-adjustment and
 # plan-approved-handoff available to the UI; only blocks that can leak model
@@ -1520,7 +1520,7 @@ UI_HIDDEN_RUNTIME_CONTROL_PREFIXES = (
     "<finish-blocked>",
 )
 
-# split-source: order=508 original-lines=5109-5131 hash=4b2540cf9918d6ed
+# split-source: order=508 original-lines=5108-5130 hash=4b2540cf9918d6ed
 # Runtime controls are model-facing protocol messages.  A selected subset is
 # also useful to the user as an observable, structured event.  This list only
 # controls the UI projection of legacy rows that predate explicit metadata; it
@@ -1545,12 +1545,12 @@ UI_PROJECTED_RUNTIME_CONTROL_TAGS = frozenset(
     }
 )
 
-# split-source: order=509 original-lines=5132-5134 hash=1dae378275785526
+# split-source: order=509 original-lines=5131-5133 hash=1dae378275785526
 # Legacy persisted controls that are useful as UI events.  New runtime rows do
 # not depend on this set: they carry an explicit ``_ui_project`` decision.
 UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS = frozenset({"auto-context-recall"})
 
-# split-source: order=510 original-lines=5135-5149 hash=83a5bcb924ac3de8
+# split-source: order=510 original-lines=5134-5148 hash=83a5bcb924ac3de8
 RETRY_RUNTIME_HINT_PREFIXES = (
     "<todo-rescue>",
     "<tool-retry>",
@@ -1567,29 +1567,29 @@ RETRY_RUNTIME_HINT_PREFIXES = (
     "<continuation-briefing>",
 )
 
-# split-source: order=511 original-lines=5150-5150 hash=81f0463f9441f2a3
+# split-source: order=511 original-lines=5149-5149 hash=81f0463f9441f2a3
 EXECUTION_MODE_SINGLE = "single"
 
-# split-source: order=512 original-lines=5151-5151 hash=47ab04fefe7471d7
+# split-source: order=512 original-lines=5150-5150 hash=47ab04fefe7471d7
 EXECUTION_MODE_SEQUENTIAL = "sequential"
 
-# split-source: order=513 original-lines=5152-5152 hash=f4e504aefed6b301
+# split-source: order=513 original-lines=5151-5151 hash=f4e504aefed6b301
 EXECUTION_MODE_SYNC = "sync"
 
-# split-source: order=514 original-lines=5153-5157 hash=1b8183f51b9a4b20
+# split-source: order=514 original-lines=5152-5156 hash=1b8183f51b9a4b20
 EXECUTION_MODE_CHOICES = (
     EXECUTION_MODE_SINGLE,
     EXECUTION_MODE_SEQUENTIAL,
     EXECUTION_MODE_SYNC,
 )
 
-# split-source: order=515 original-lines=5158-5158 hash=cf12fa88884cec55
+# split-source: order=515 original-lines=5157-5157 hash=cf12fa88884cec55
 AGENT_ROLES = ("explorer", "developer", "reviewer")
 
-# split-source: order=516 original-lines=5159-5159 hash=09a14a28a40a39c0
+# split-source: order=516 original-lines=5158-5158 hash=09a14a28a40a39c0
 AGENT_BUBBLE_ROLES = AGENT_ROLES + ("manager", "planner")
 
-# split-source: order=517 original-lines=5160-5166 hash=5de25e5d5ff03185
+# split-source: order=517 original-lines=5159-5165 hash=5de25e5d5ff03185
 AGENT_ROLE_LABELS = {
     "explorer": "Explorer",
     "developer": "Developer",
@@ -1598,7 +1598,7 @@ AGENT_ROLE_LABELS = {
     "planner": "Planner",
 }
 
-# split-source: order=518 original-lines=5167-5173 hash=639a54aac430eb2d
+# split-source: order=518 original-lines=5166-5172 hash=639a54aac430eb2d
 AGENT_ROLE_BUBBLE_COLORS = {
     "explorer": "#ff5fa2",
     "developer": "#22b455",
@@ -1607,7 +1607,7 @@ AGENT_ROLE_BUBBLE_COLORS = {
     "planner": "#e8533f",
 }
 
-# split-source: order=519 original-lines=5174-5183 hash=e3c5d5905fbcfb2d
+# split-source: order=519 original-lines=5173-5182 hash=e3c5d5905fbcfb2d
 BLACKBOARD_STATUSES = (
     "INITIALIZING",
     "PLANNING",
@@ -1619,10 +1619,10 @@ BLACKBOARD_STATUSES = (
     "PAUSED",
 )
 
-# split-source: order=520 original-lines=5184-5184 hash=d09e2635d60b5bfb
+# split-source: order=520 original-lines=5183-5183 hash=d09e2635d60b5bfb
 TASK_COMPLEXITY_LEVELS = ("simple", "moderate", "complex", "expert")
 
-# split-source: order=521 original-lines=5185-5190 hash=21ce85ef1f9b4296
+# split-source: order=521 original-lines=5184-5189 hash=21ce85ef1f9b4296
 TASK_COMPLEXITY_RANKS = {
     "simple": 1,
     "moderate": 2,
@@ -1630,7 +1630,7 @@ TASK_COMPLEXITY_RANKS = {
     "expert": 4,
 }
 
-# split-source: order=522 original-lines=5191-5197 hash=ad6961dda434ec1e
+# split-source: order=522 original-lines=5190-5196 hash=ad6961dda434ec1e
 TASK_PROFILE_TYPES = (
     "simple_qa",
     "simple_code",
@@ -1639,26 +1639,26 @@ TASK_PROFILE_TYPES = (
     "general",
 )
 
-# split-source: order=523 original-lines=5198-5198 hash=cf80af3ffe4a0251
+# split-source: order=523 original-lines=5197-5197 hash=cf80af3ffe4a0251
 TASK_LEVEL_CHOICES = (1, 2, 3, 4, 5)
 
-# split-source: order=524 original-lines=5199-5199 hash=c41281b649e13f1a
+# split-source: order=524 original-lines=5198-5198 hash=c41281b649e13f1a
 TASK_SCALE_PREFERENCES = ("fast", "balanced", "thorough")
 
-# split-source: order=525 original-lines=5200-5200 hash=6cb1db74570d1828
+# split-source: order=525 original-lines=5199-5199 hash=6cb1db74570d1828
 SEMANTIC_CONFIDENCE_CHOICES = ("high", "medium", "low")
 
-# split-source: order=526 original-lines=5201-5205 hash=9b217b4393ecb501
+# split-source: order=526 original-lines=5200-5204 hash=9b217b4393ecb501
 # Level-2 Todo behavior is configurable at startup.  ``force`` preserves the
 # default safety contract, ``auto`` lets the semantic classifier decide for the
 # current request, and ``off`` is an explicit escape hatch for callers that do
 # not want Todo scaffolding at this tier.
 L2_TODO_POLICY_CHOICES = ("force", "auto", "off")
 
-# split-source: order=527 original-lines=5206-5206 hash=9739b1717a08be36
+# split-source: order=527 original-lines=5205-5205 hash=9739b1717a08be36
 DEFAULT_L2_TODO_POLICY = "force"
 
-# split-source: order=528 original-lines=5207-5260 hash=c28cf0cbf3c45a97
+# split-source: order=528 original-lines=5206-5259 hash=c28cf0cbf3c45a97
 TASK_LEVEL_POLICIES: dict[int, dict] = {
     1: {
         "name": "simple_direct_answer",
@@ -1714,85 +1714,85 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
     },
 }
 
-# split-source: order=529 original-lines=5261-5261 hash=09f2fafb2cb29f14
+# split-source: order=529 original-lines=5260-5260 hash=09f2fafb2cb29f14
 MANAGER_ROUTE_TARGETS = ("explorer", "developer", "reviewer", "finish")
 
-# split-source: order=530 original-lines=5262-5262 hash=1ff71e4b76361d2d
+# split-source: order=530 original-lines=5261-5261 hash=1ff71e4b76361d2d
 BLACKBOARD_MAX_LOG_ENTRIES = 240
 
-# split-source: order=531 original-lines=5263-5263 hash=8a65b1055243dcb4
+# split-source: order=531 original-lines=5262-5262 hash=8a65b1055243dcb4
 BLACKBOARD_MAX_TEXT = 8000
 
-# split-source: order=532 original-lines=5264-5264 hash=cc41debd5b485726
+# split-source: order=532 original-lines=5263-5263 hash=cc41debd5b485726
 BLACKBOARD_MEMORY_SHORT_MAX = 72
 
-# split-source: order=533 original-lines=5265-5265 hash=4767abb9fa90c1da
+# split-source: order=533 original-lines=5264-5264 hash=4767abb9fa90c1da
 BLACKBOARD_MEMORY_MID_MAX_STEPS = 48
 
-# split-source: order=534 original-lines=5266-5266 hash=1bc619a7d1231b11
+# split-source: order=534 original-lines=5265-5265 hash=1bc619a7d1231b11
 BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP = 20
 
-# split-source: order=535 original-lines=5267-5267 hash=db5aa3610914669f
+# split-source: order=535 original-lines=5266-5266 hash=db5aa3610914669f
 BLACKBOARD_MEMORY_LONG_MAX = 96
 
-# split-source: order=536 original-lines=5268-5268 hash=5d4e18baf68db4d8
+# split-source: order=536 original-lines=5267-5267 hash=5d4e18baf68db4d8
 BLACKBOARD_MEMORY_INDEX_MAX = 260
 
-# split-source: order=537 original-lines=5269-5269 hash=a7d5ae902370d370
+# split-source: order=537 original-lines=5268-5268 hash=a7d5ae902370d370
 SKILL_REFRESH_MIN_INTERVAL_SECONDS = 1.5
 
-# split-source: order=538 original-lines=5270-5273 hash=29df4b1cf8e0e0fe
+# split-source: order=538 original-lines=5269-5272 hash=29df4b1cf8e0e0fe
 SKILL_CATALOG_FULL_REFRESH_SECONDS = max(
     5.0,
     min(300.0, float(str(os.getenv("AGENT_SKILL_CATALOG_FULL_REFRESH_SECONDS", "30") or "30"))),
 )
 
-# split-source: order=539 original-lines=5274-5274 hash=01431f69a39c76d0
+# split-source: order=539 original-lines=5273-5273 hash=01431f69a39c76d0
 SKILL_PROMPT_MAX_ITEMS = 40
 
-# split-source: order=540 original-lines=5275-5275 hash=f7ba6381bd98323e
+# split-source: order=540 original-lines=5274-5274 hash=f7ba6381bd98323e
 SKILL_PROMPT_MAX_CHARS = 2600
 
-# split-source: order=541 original-lines=5276-5276 hash=44a866e208737d1e
+# split-source: order=541 original-lines=5275-5275 hash=44a866e208737d1e
 SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
 
-# split-source: order=542 original-lines=5277-5277 hash=b6ed00eb7f2d7d09
+# split-source: order=542 original-lines=5276-5276 hash=b6ed00eb7f2d7d09
 SKILL_RUNTIME_CACHE_MAX_BYTES = 2_000_000
 
-# split-source: order=543 original-lines=5278-5281 hash=ac39a2a50ecdfb88
+# split-source: order=543 original-lines=5277-5280 hash=ac39a2a50ecdfb88
 # Automatic loading is deliberately conservative: only a strong local match
 # (or an explicit, high-confidence semantic selection) is loaded implicitly.
 # Medium-confidence matches remain discoverable to the model via list_skills.
 SKILL_AUTOLOAD_SCORE_THRESHOLD = 8.0
 
-# split-source: order=544 original-lines=5282-5282 hash=f5f7739a4c77eaee
+# split-source: order=544 original-lines=5281-5281 hash=f5f7739a4c77eaee
 SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD = 0.72
 
-# split-source: order=545 original-lines=5283-5283 hash=8c5306aaa0b9ac9a
+# split-source: order=545 original-lines=5282-5282 hash=8c5306aaa0b9ac9a
 SKILL_RUNTIME_EVALUATION_TTL_SECONDS = max(1.0, float(os.getenv("AGENT_SKILL_EVALUATION_TTL_SECONDS", "600")))
 
-# split-source: order=546 original-lines=5284-5284 hash=89ca4d3e8449c63f
+# split-source: order=546 original-lines=5283-5283 hash=89ca4d3e8449c63f
 SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS = max(0.1, float(os.getenv("AGENT_SKILL_EVALUATION_TIMEOUT_SECONDS", "8")))
 
-# split-source: order=547 original-lines=5285-5285 hash=1554536fde151208
+# split-source: order=547 original-lines=5284-5284 hash=1554536fde151208
 SKILL_RUNTIME_UNLOAD_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, float(os.getenv("AGENT_SKILL_UNLOAD_CONFIDENCE", "0.80"))))
 
-# split-source: order=548 original-lines=5286-5286 hash=d292180a1205db82
+# split-source: order=548 original-lines=5285-5285 hash=d292180a1205db82
 SKILL_RUNTIME_KEY_TOOL_INTERVAL = 12
 
-# split-source: order=549 original-lines=5287-5287 hash=b53c94603b92a3c3
+# split-source: order=549 original-lines=5286-5286 hash=b53c94603b92a3c3
 SKILL_RUNTIME_EVENTS_MAX = 160
 
-# split-source: order=550 original-lines=5288-5288 hash=e88601dcb19367b5
+# split-source: order=550 original-lines=5287-5287 hash=e88601dcb19367b5
 SKILL_METADATA_CAPSULE_MAX_CHARS = 5200
 
-# split-source: order=551 original-lines=5289-5289 hash=b58c263fb2f3c792
+# split-source: order=551 original-lines=5288-5288 hash=b58c263fb2f3c792
 SKILL_DEPENDENCY_MAX_DEPTH = 8
 
-# split-source: order=552 original-lines=5290-5290 hash=4953acb4cdc06413
+# split-source: order=552 original-lines=5289-5289 hash=4953acb4cdc06413
 AUTO_SKILLS_ROOT_CANDIDATES = ("skills", "Skills")
 
-# split-source: order=553 original-lines=5291-5321 hash=752822efd33875ac
+# split-source: order=553 original-lines=5290-5320 hash=752822efd33875ac
 SKILL_DEFAULT_ATTACHMENT_GLOBS = (
     "references/**/*.md",
     "routes/**/*.md",
@@ -1825,41 +1825,41 @@ SKILL_DEFAULT_ATTACHMENT_GLOBS = (
     "LICENSE*",
 )
 
-# split-source: order=554 original-lines=5322-5322 hash=a990f15e73e3e278
+# split-source: order=554 original-lines=5321-5321 hash=a990f15e73e3e278
 SKILL_INLINE_ATTACHMENT_MAX_FILES = 6
 
-# split-source: order=555 original-lines=5323-5323 hash=da384e686762c1ec
+# split-source: order=555 original-lines=5322-5322 hash=da384e686762c1ec
 SKILL_INLINE_ATTACHMENT_MAX_CHARS = 24_000
 
-# split-source: order=556 original-lines=5324-5324 hash=d9e3e9b939ec89a0
+# split-source: order=556 original-lines=5323-5323 hash=d9e3e9b939ec89a0
 SKILL_RESOURCE_MANIFEST_MAX_ITEMS = 120
 
-# split-source: order=557 original-lines=5325-5325 hash=edf32a28a3e7b667
+# split-source: order=557 original-lines=5324-5324 hash=edf32a28a3e7b667
 SKILL_BODY_COMPACT_THRESHOLD_CHARS = 12_000
 
-# split-source: order=558 original-lines=5326-5326 hash=4b6d387e27e06be8
+# split-source: order=558 original-lines=5325-5325 hash=4b6d387e27e06be8
 SKILL_BODY_PREVIEW_CHARS = 4_000
 
-# split-source: order=559 original-lines=5327-5327 hash=2e4c84b8d68db0d0
+# split-source: order=559 original-lines=5326-5326 hash=2e4c84b8d68db0d0
 SKILLS_VIRTUAL_PREFIX = "/skills"
 
-# split-source: order=560 original-lines=5328-5328 hash=efd27c0f1e41da97
+# split-source: order=560 original-lines=5327-5327 hash=efd27c0f1e41da97
 SKILLS_EXTERNAL_MOUNT = "__external__"
 
-# split-source: order=561 original-lines=5329-5329 hash=b83328d12be05209
+# split-source: order=561 original-lines=5328-5328 hash=b83328d12be05209
 PLAN_MODE_ENABLED_LEVELS = {3, 4, 5}
 
-# split-source: order=562 original-lines=5330-5330 hash=8dff7c27280b2ea0
+# split-source: order=562 original-lines=5329-5329 hash=8dff7c27280b2ea0
 PLAN_MODE_FORCED_LEVELS: set[int] = set()
 
-# split-source: order=563 original-lines=5331-5331 hash=47e96e03e05e112f
+# split-source: order=563 original-lines=5330-5330 hash=47e96e03e05e112f
 PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
 
-# split-source: order=564 original-lines=5332-5333 hash=c6c5d068a132fa56
+# split-source: order=564 original-lines=5331-5332 hash=c6c5d068a132fa56
 # Task phase definitions for stage-aware delegation
 TASK_PHASES = ("research", "design", "implement", "test", "review", "deploy")
 
-# split-source: order=565 original-lines=5334-5341 hash=d6ec81ef240e795e
+# split-source: order=565 original-lines=5333-5340 hash=d6ec81ef240e795e
 TASK_PHASE_ROUTING = {
     "research": "explorer",
     "design": "developer",
@@ -1869,7 +1869,7 @@ TASK_PHASE_ROUTING = {
     "deploy": "developer",
 }
 
-# split-source: order=566 original-lines=5342-5348 hash=b807b0f79e98e9ee
+# split-source: order=566 original-lines=5341-5347 hash=b807b0f79e98e9ee
 # Complexity keywords for semantic detection
 COMPLEXITY_KEYWORDS = (
     "简单", "复杂", "难", "容易", "快速", "详细", "深入",
@@ -1878,54 +1878,54 @@ COMPLEXITY_KEYWORDS = (
     "thorough", "quick", "fast", "lightweight", "heavy",
 )
 
-# split-source: order=567 original-lines=5349-5353 hash=220d684aef14dca6
+# split-source: order=567 original-lines=5348-5352 hash=220d684aef14dca6
 USER_COMPLEXITY_SIMPLE_TOKENS = (
     "简单", "简易", "轻量", "低复杂度", "低难度", "快速", "低配",
     "low", "simple", "easy", "quick", "fast", "lightweight", "basic", "minimal",
     "l1", "l2",
 )
 
-# split-source: order=568 original-lines=5354-5358 hash=0ab4090c0bd441af
+# split-source: order=568 original-lines=5353-5357 hash=0ab4090c0bd441af
 USER_COMPLEXITY_MODERATE_TOKENS = (
     "中等复杂度", "中等难度", "适中", "平衡", "标准", "普通", "常规",
     "medium", "mid", "moderate", "balanced", "standard", "normal",
     "l3",
 )
 
-# split-source: order=569 original-lines=5359-5363 hash=e0ac5bacc7882dd1
+# split-source: order=569 original-lines=5358-5362 hash=e0ac5bacc7882dd1
 USER_COMPLEXITY_COMPLEX_TOKENS = (
     "复杂", "深入", "详细", "高复杂度", "高难度", "中高复杂度",
     "high", "complex", "hard", "difficult", "thorough", "detailed", "deep", "heavy",
     "l4",
 )
 
-# split-source: order=570 original-lines=5364-5368 hash=8fef30670baf9787
+# split-source: order=570 original-lines=5363-5367 hash=8fef30670baf9787
 USER_COMPLEXITY_EXPERT_TOKENS = (
     "专家级", "系統級", "系统级", "生产级", "企業級", "企业级", "高风险", "超高复杂度",
     "expert", "advanced", "system-level", "production-ready", "enterprise", "mission-critical",
     "l5",
 )
 
-# split-source: order=571 original-lines=5369-5372 hash=c075136d501b5338
+# split-source: order=571 original-lines=5368-5371 hash=c075136d501b5338
 # Planning research is a bounded evidence pass, not a second implementation
 # phase. Three productive rounds are enough to inspect local constraints and
 # hand concrete findings to synthesis; stalled/duplicate rounds stop earlier.
 PLAN_MODE_EXPLORER_MAX_ROUNDS = 4
 
-# split-source: order=572 original-lines=5373-5373 hash=2517e27e66b827a8
+# split-source: order=572 original-lines=5372-5372 hash=2517e27e66b827a8
 PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS = 3
 
-# split-source: order=573 original-lines=5374-5374 hash=c3524b9db7d5f865
+# split-source: order=573 original-lines=5373-5373 hash=c3524b9db7d5f865
 PLAN_MODE_EXPLORER_STALE_ROUNDS = 2
 
-# split-source: order=574 original-lines=5375-5375 hash=ccf340fe4d6f8b34
+# split-source: order=574 original-lines=5374-5374 hash=ccf340fe4d6f8b34
 PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 
-# split-source: order=575 original-lines=5376-5377 hash=28021267334ad9ee
+# split-source: order=575 original-lines=5375-5376 hash=28021267334ad9ee
 # Reviewer debug mode
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
 
-# split-source: order=576 original-lines=5378-5383 hash=d42ef8ab065e43bd
+# split-source: order=576 original-lines=5377-5382 hash=d42ef8ab065e43bd
 REVIEWER_DEBUG_TOOL_ALLOWLIST = {
     "bash", "read_file", "write_file", "edit_file",
     "stop_background_process",
@@ -1933,49 +1933,49 @@ REVIEWER_DEBUG_TOOL_ALLOWLIST = {
     "finish_task", "finish_current_task",
 }
 
-# split-source: order=577 original-lines=5384-5384 hash=81086e04747acc95
+# split-source: order=577 original-lines=5383-5383 hash=81086e04747acc95
 EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
 
-# split-source: order=578 original-lines=5385-5385 hash=9d7178fa44c84402
+# split-source: order=578 original-lines=5384-5384 hash=9d7178fa44c84402
 DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
 
-# split-source: order=579 original-lines=5386-5389 hash=ae16b6a66fe09d23
+# split-source: order=579 original-lines=5385-5388 hash=ae16b6a66fe09d23
 # Acceptance-gate repair loop: once a step fails the heuristic gate this many
 # times, escalate from a plain rework hint to the active diagnose→repair→re-verify
 # driver (semantic judge + reviewer-debug + root-cause repair directives).
 ACCEPTANCE_GATE_STALL_THRESHOLD = 10
 
-# split-source: order=580 original-lines=5390-5393 hash=ba75a871b8cd6e93
+# split-source: order=580 original-lines=5389-5392 hash=ba75a871b8cd6e93
 # Deadlock guards: repeated no-progress rounds and an absolute repair-round cap.
 # The absolute cap prevents cosmetic evidence changes from resetting the
 # no-progress signature forever while the same acceptance decision remains stuck.
 ACCEPTANCE_GATE_HARD_CEILING = 10  # consecutive no-progress rounds before escalating to the user
 
-# split-source: order=581 original-lines=5394-5394 hash=4d18bf71288da19c
+# split-source: order=581 original-lines=5393-5393 hash=4d18bf71288da19c
 ACCEPTANCE_GATE_TOTAL_ROUND_CEILING = 10
 
-# split-source: order=582 original-lines=5395-5395 hash=a3919e0ace6358f9
+# split-source: order=582 original-lines=5394-5394 hash=a3919e0ace6358f9
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 
-# split-source: order=583 original-lines=5396-5396 hash=4caef42f3feddae1
+# split-source: order=583 original-lines=5395-5395 hash=4caef42f3feddae1
 PLAN_MODE_MAX_OPTIONS = 3
 
-# split-source: order=584 original-lines=5397-5397 hash=655c38e3a3568269
+# split-source: order=584 original-lines=5396-5396 hash=655c38e3a3568269
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
 
-# split-source: order=585 original-lines=5398-5398 hash=3e14150d669f2159
+# split-source: order=585 original-lines=5397-5397 hash=3e14150d669f2159
 PLAN_BUBBLE_MAX_CHARS = 12_000
 
-# split-source: order=586 original-lines=5399-5399 hash=790aa5759c5de751
+# split-source: order=586 original-lines=5398-5398 hash=790aa5759c5de751
 PLAN_NOTICE_BODY_MAX_CHARS = 10_000
 
-# split-source: order=587 original-lines=5400-5400 hash=f31621b9c74ebc02
+# split-source: order=587 original-lines=5399-5399 hash=f31621b9c74ebc02
 PLAN_MESSAGE_EVENT_MAX_CHARS = 12_000
 
-# split-source: order=588 original-lines=5401-5401 hash=232a43c53229de24
+# split-source: order=588 original-lines=5400-5400 hash=232a43c53229de24
 PLAN_STEP_FULL_CONTENT_MAX_CHARS = 24_000
 
-# split-source: order=589 original-lines=5402-5409 hash=3725345fc4347a51
+# split-source: order=589 original-lines=5401-5408 hash=3725345fc4347a51
 PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "bash", "read_file", "context_recall", "task_get", "task_list",
     "check_background", "list_background_processes", "read_from_blackboard", "write_to_blackboard",
@@ -1985,25 +1985,25 @@ PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "rag_remember",
 }
 
-# split-source: order=590 original-lines=5410-5410 hash=31894e2fb777af15
+# split-source: order=590 original-lines=5409-5409 hash=31894e2fb777af15
 FAILURE_LEDGER_MAX_FIXES = 20
 
-# split-source: order=591 original-lines=5411-5411 hash=9c5a97d6c98bb447
+# split-source: order=591 original-lines=5410-5410 hash=9c5a97d6c98bb447
 FAILURE_LEDGER_MAX_COMPILE_ERRORS = 15
 
-# split-source: order=592 original-lines=5412-5412 hash=fcc70c42273cb020
+# split-source: order=592 original-lines=5411-5411 hash=fcc70c42273cb020
 FAILURE_LEDGER_MAX_DELEGATIONS = 10
 
-# split-source: order=593 original-lines=5413-5413 hash=645687fd2c3004f0
+# split-source: order=593 original-lines=5412-5412 hash=645687fd2c3004f0
 FAILURE_LEDGER_MAX_STALLS = 8
 
-# split-source: order=594 original-lines=5414-5414 hash=084849a2703a6ff5
+# split-source: order=594 original-lines=5413-5413 hash=084849a2703a6ff5
 FAILURE_LEDGER_MAX_TOOL_FPS = 30
 
-# split-source: order=595 original-lines=5415-5415 hash=27b6e640f3fa209c
+# split-source: order=595 original-lines=5414-5414 hash=27b6e640f3fa209c
 FAILURE_LEDGER_MAX_ERRORS = 25
 
-# split-source: order=596 original-lines=5416-5455 hash=76c254c6d4cf5739
+# split-source: order=596 original-lines=5415-5454 hash=76c254c6d4cf5739
 # Error category definitions: (name, {cmd_keywords, output_patterns, success_negatives, label})
 # Priority order matters — first match wins. test before runtime because pytest cmd contains 'python'.
 ERROR_CATEGORY_DEFS: list[tuple[str, dict]] = [
@@ -2045,16 +2045,16 @@ ERROR_CATEGORY_DEFS: list[tuple[str, dict]] = [
     }),
 ]
 
-# split-source: order=597 original-lines=5456-5456 hash=99072701637b946e
+# split-source: order=597 original-lines=5455-5455 hash=99072701637b946e
 CHECKPOINT_MAX_COUNT = 3
 
-# split-source: order=598 original-lines=5457-5457 hash=3b93d76b1a0091f2
+# split-source: order=598 original-lines=5456-5456 hash=3b93d76b1a0091f2
 CHECKPOINT_INTERVAL_ROUNDS = 6
 
-# split-source: order=599 original-lines=5458-5458 hash=0174f7244bd5c1e3
+# split-source: order=599 original-lines=5457-5457 hash=0174f7244bd5c1e3
 PERSISTED_ROUTES_MAX = 8
 
-# split-source: order=600 original-lines=5459-5498 hash=8936e895ba2d7fe8
+# split-source: order=600 original-lines=5458-5497 hash=8936e895ba2d7fe8
 HTML_FRONTEND_REQUEST_KEYWORDS = (
     "html",
     "web page",
@@ -2096,7 +2096,7 @@ HTML_FRONTEND_REQUEST_KEYWORDS = (
     "可視化",
 )
 
-# split-source: order=601 original-lines=5499-5521 hash=7ca137017e6dd7de
+# split-source: order=601 original-lines=5498-5520 hash=7ca137017e6dd7de
 DEEP_RESEARCH_REQUEST_KEYWORDS = (
     "deep research",
     "deep-research",
@@ -2121,7 +2121,7 @@ DEEP_RESEARCH_REQUEST_KEYWORDS = (
     "研究報告",
 )
 
-# split-source: order=602 original-lines=5522-5541 hash=cb2e500a49279d7a
+# split-source: order=602 original-lines=5521-5540 hash=cb2e500a49279d7a
 DEEP_RESEARCH_RETRIEVAL_KEYWORDS = (
     "search",
     "web search",
@@ -2143,7 +2143,7 @@ DEEP_RESEARCH_RETRIEVAL_KEYWORDS = (
     "參考文獻",
 )
 
-# split-source: order=603 original-lines=5542-5559 hash=fe2b69b23ffda282
+# split-source: order=603 original-lines=5541-5558 hash=fe2b69b23ffda282
 DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS = (
     "based on this text",
     "only this text",
@@ -2163,11 +2163,11 @@ DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS = (
     "無需檢索",
 )
 
-# split-source: order=604 original-lines=5560-5561 hash=2ad4cdd83195a323
+# split-source: order=604 original-lines=5559-5560 hash=2ad4cdd83195a323
 
 DANGEROUS_PATTERNS = ["rm -rf /", "sudo ", "shutdown", "reboot", "> /dev/"]
 
-# split-source: order=605 original-lines=5562-5568 hash=5e51c4347665cdca
+# split-source: order=605 original-lines=5561-5567 hash=5e51c4347665cdca
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -2176,7 +2176,7 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
-# split-source: order=606 original-lines=5569-5575 hash=95864fa1b2c02420
+# split-source: order=606 original-lines=5568-5574 hash=95864fa1b2c02420
 
 SUPPORTED_UI_LANGUAGES = [
     {"code": "zh-CN", "label": "简体中文"},
@@ -2185,18 +2185,18 @@ SUPPORTED_UI_LANGUAGES = [
     {"code": "en", "label": "English"},
 ]
 
-# split-source: order=607 original-lines=5576-5576 hash=6c4b45d9b447348b
+# split-source: order=607 original-lines=5575-5575 hash=6c4b45d9b447348b
 UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
 
-# split-source: order=608 original-lines=5577-5577 hash=77184d3d0b573722
+# split-source: order=608 original-lines=5576-5576 hash=77184d3d0b573722
 DEFAULT_UI_LANGUAGE = "zh-CN"
 
-# split-source: order=609 original-lines=5578-5580 hash=f61b1553d4fcd571
+# split-source: order=609 original-lines=5577-5579 hash=f61b1553d4fcd571
 # Temporarily disabled: structured tool cards already expose tool activity, while
 # synthesized progress prose can anchor the next model turn to stale Todo text.
 PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED = False
 
-# split-source: order=610 original-lines=5581-5622 hash=1504f7d9a728e357
+# split-source: order=610 original-lines=5580-5621 hash=1504f7d9a728e357
 AGENT_LANGUAGE_PREFERENCES = {
     "zh-CN": {
         "id": "zh-cn-concise-milestones",
@@ -2240,22 +2240,22 @@ AGENT_LANGUAGE_PREFERENCES = {
     },
 }
 
-# split-source: order=611 original-lines=5623-5623 hash=dc9ede9e7307d1af
+# split-source: order=611 original-lines=5622-5622 hash=dc9ede9e7307d1af
 UI_STYLE_CHOICES = ("trad", "neo")
 
-# split-source: order=612 original-lines=5624-5624 hash=dbd27ce417571ffc
+# split-source: order=612 original-lines=5623-5623 hash=dbd27ce417571ffc
 UI_STYLE_LABELS = {"trad": "Trad", "neo": "Neo"}
 
-# split-source: order=613 original-lines=5625-5625 hash=cb93c5950fa7210f
+# split-source: order=613 original-lines=5624-5624 hash=cb93c5950fa7210f
 DEFAULT_UI_STYLE = "neo"
 
-# split-source: order=614 original-lines=5626-5626 hash=b1030d04dc08f944
+# split-source: order=614 original-lines=5625-5625 hash=b1030d04dc08f944
 DEFAULT_WEB_UI_DIR = "./web_UI"
 
-# split-source: order=615 original-lines=5627-5627 hash=4a3fba045723e573
+# split-source: order=615 original-lines=5626-5626 hash=4a3fba045723e573
 DEFAULT_WEB_UI_CONFIG = "web_ui.config.json"
 
-# split-source: order=616 original-lines=5628-5635 hash=fb9aef9aca2379fb
+# split-source: order=616 original-lines=5627-5634 hash=fb9aef9aca2379fb
 WEB_UI_REQUIRED_FILES = (
     "index.html",
     "style.css",
@@ -2265,13 +2265,13 @@ WEB_UI_REQUIRED_FILES = (
     "skills-extra.css",
 )
 
-# split-source: order=617 original-lines=5636-5636 hash=e1a5612614dd0088
+# split-source: order=617 original-lines=5635-5635 hash=e1a5612614dd0088
 WEB_UI_OPTIONAL_FILES = ("app.ts",)
 
-# split-source: order=618 original-lines=5637-5637 hash=cf6ccd8ac620590e
+# split-source: order=618 original-lines=5636-5636 hash=cf6ccd8ac620590e
 WEB_UI_APPLICATION_CONTRACT_VERSION = "clouds-coder-app-store-v1"
 
-# split-source: order=619 original-lines=5638-5657 hash=a3b947a92b4eb2c3
+# split-source: order=619 original-lines=5637-5656 hash=a3b947a92b4eb2c3
 WEB_UI_APPLICATION_FEATURE_MARKERS = {
     "index.html": (
         WEB_UI_APPLICATION_CONTRACT_VERSION,
@@ -2293,7 +2293,7 @@ WEB_UI_APPLICATION_FEATURE_MARKERS = {
     ),
 }
 
-# split-source: order=620 original-lines=5658-5672 hash=dab39255895e6b68
+# split-source: order=620 original-lines=5657-5671 hash=dab39255895e6b68
 
 IMAGE_EXTS = {
     ".png",
@@ -2310,13 +2310,13 @@ IMAGE_EXTS = {
     ".heif",
 }
 
-# split-source: order=621 original-lines=5673-5673 hash=50f97bb2cb31f385
+# split-source: order=621 original-lines=5672-5672 hash=50f97bb2cb31f385
 IMAGE_FORMATS_NEED_CONVERSION = {".svg", ".heic", ".heif", ".tiff", ".tif", ".bmp", ".avif"}
 
-# split-source: order=622 original-lines=5674-5674 hash=0199bc7436bec2a9
+# split-source: order=622 original-lines=5673-5673 hash=0199bc7436bec2a9
 IMAGE_SAFE_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
-# split-source: order=623 original-lines=5675-5685 hash=d67da696eb22f8c0
+# split-source: order=623 original-lines=5674-5684 hash=d67da696eb22f8c0
 AUDIO_EXTS = {
     ".mp3",
     ".wav",
@@ -2329,7 +2329,7 @@ AUDIO_EXTS = {
     ".webm",
 }
 
-# split-source: order=624 original-lines=5686-5696 hash=490ac44f36c5e1a4
+# split-source: order=624 original-lines=5685-5695 hash=490ac44f36c5e1a4
 VIDEO_EXTS = {
     ".mp4",
     ".mov",
@@ -2342,37 +2342,37 @@ VIDEO_EXTS = {
     ".3gp",
 }
 
-# split-source: order=625 original-lines=5697-5697 hash=292b975e52f43a3a
+# split-source: order=625 original-lines=5696-5696 hash=292b975e52f43a3a
 CODE_PREVIEW_STAGE_MAX_BYTES = 8_000_000
 
-# split-source: order=626 original-lines=5698-5698 hash=074cfa8accb5b674
+# split-source: order=626 original-lines=5697-5697 hash=074cfa8accb5b674
 CODE_PREVIEW_STAGE_MAX_ROWS = 25_000
 
-# split-source: order=627 original-lines=5699-5699 hash=fa3aa35b382a2e68
+# split-source: order=627 original-lines=5698-5698 hash=fa3aa35b382a2e68
 CODE_PREVIEW_STAGE_MAX_PER_FILE = 120
 
-# split-source: order=628 original-lines=5700-5700 hash=8fdb6a62a5acf119
+# split-source: order=628 original-lines=5699-5699 hash=8fdb6a62a5acf119
 CODE_PREVIEW_STAGE_MAX_TOTAL = 1200
 
-# split-source: order=629 original-lines=5701-5701 hash=88c38ed6f5c90f64
+# split-source: order=629 original-lines=5700-5700 hash=88c38ed6f5c90f64
 CODE_PREVIEW_DIFF_CONTEXT_LINES = 4
 
-# split-source: order=630 original-lines=5702-5702 hash=11a25a1863472126
+# split-source: order=630 original-lines=5701-5701 hash=11a25a1863472126
 CODE_PREVIEW_DIFF_MERGE_GAP = 10
 
-# split-source: order=631 original-lines=5703-5703 hash=a7169db36c59569e
+# split-source: order=631 original-lines=5702-5702 hash=a7169db36c59569e
 PREVIEW_DOWNLOAD_MAX_FILES = 500
 
-# split-source: order=632 original-lines=5704-5704 hash=d982e61e9945f820
+# split-source: order=632 original-lines=5703-5703 hash=d982e61e9945f820
 PREVIEW_DOWNLOAD_MAX_BYTES = 80_000_000
 
-# split-source: order=633 original-lines=5705-5705 hash=e1dafc3de8604e1a
+# split-source: order=633 original-lines=5704-5704 hash=e1dafc3de8604e1a
 FILES_TREE_DEFAULT_MAX_NODES = 420
 
-# split-source: order=634 original-lines=5706-5706 hash=240c54367061637b
+# split-source: order=634 original-lines=5705-5705 hash=240c54367061637b
 FILES_TREE_DEFAULT_MAX_DEPTH = 5
 
-# split-source: order=635 original-lines=5707-5715 hash=24ed387fdafed007
+# split-source: order=635 original-lines=5706-5714 hash=24ed387fdafed007
 FILES_TREE_SKIP_DIRS = {
     ".git", ".hg", ".svn", ".idea", ".vscode", ".vs",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
@@ -2383,105 +2383,105 @@ FILES_TREE_SKIP_DIRS = {
     "dist", "build", "target", "coverage", "out", "bin", "obj",
 }
 
-# split-source: order=636 original-lines=5716-5718 hash=db0ff16d8c3fe7f4
+# split-source: order=636 original-lines=5715-5717 hash=db0ff16d8c3fe7f4
 FILES_TREE_SKIP_REL_DIRS = {
     ".clouds_coder/long_output",
 }
 
-# split-source: order=637 original-lines=5719-5719 hash=0700ed49990e5f14
+# split-source: order=637 original-lines=5718-5718 hash=0700ed49990e5f14
 IDE_FILE_MAX_BYTES = 12 * 1024 * 1024
 
-# split-source: order=638 original-lines=5720-5720 hash=feb3a86ec351163b
+# split-source: order=638 original-lines=5719-5719 hash=feb3a86ec351163b
 IDE_UPLOAD_MAX_BYTES = 32 * 1024 * 1024
 
-# split-source: order=639 original-lines=5721-5721 hash=35098ebc5b9c1a6a
+# split-source: order=639 original-lines=5720-5720 hash=35098ebc5b9c1a6a
 IDE_UPLOAD_TOTAL_MAX_BYTES = 220 * 1024 * 1024
 
-# split-source: order=640 original-lines=5722-5722 hash=b0e6f665c4ca5b4f
+# split-source: order=640 original-lines=5721-5721 hash=b0e6f665c4ca5b4f
 IDE_UPLOAD_MAX_ITEMS = 1200
 
-# split-source: order=641 original-lines=5723-5723 hash=167cd0b104b6d2bf
+# split-source: order=641 original-lines=5722-5722 hash=167cd0b104b6d2bf
 IDE_UPLOAD_CHUNK_MAX_BYTES = 768 * 1024
 
-# split-source: order=642 original-lines=5724-5724 hash=b51f1fa8d4eff024
+# split-source: order=642 original-lines=5723-5723 hash=b51f1fa8d4eff024
 IDE_UPLOAD_STREAM_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
-# split-source: order=643 original-lines=5725-5725 hash=57b6079d828d62a1
+# split-source: order=643 original-lines=5724-5724 hash=57b6079d828d62a1
 IDE_TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024
 
-# split-source: order=644 original-lines=5726-5726 hash=186a5492c9d405bc
+# split-source: order=644 original-lines=5725-5725 hash=186a5492c9d405bc
 IDE_MARKDOWN_PREVIEW_MAX_LINES = 4000
 
-# split-source: order=645 original-lines=5727-5727 hash=2a2bf9e6ad207b04
+# split-source: order=645 original-lines=5726-5726 hash=2a2bf9e6ad207b04
 IDE_IMAGE_PREVIEW_MAX_EDGE = 4096
 
-# split-source: order=646 original-lines=5728-5728 hash=15bc6662a2934101
+# split-source: order=646 original-lines=5727-5727 hash=15bc6662a2934101
 IDE_IMAGE_PREVIEW_MAX_PIXELS = 24_000_000
 
-# split-source: order=647 original-lines=5729-5729 hash=494e4f64c5d7f123
+# split-source: order=647 original-lines=5728-5728 hash=494e4f64c5d7f123
 IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS = 180_000_000
 
-# split-source: order=648 original-lines=5730-5730 hash=4601fe8fb92c28f2
+# split-source: order=648 original-lines=5729-5729 hash=4601fe8fb92c28f2
 IDE_VECTOR_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
 
-# split-source: order=649 original-lines=5731-5731 hash=51496ca73db8c1c8
+# split-source: order=649 original-lines=5730-5730 hash=51496ca73db8c1c8
 IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 
-# split-source: order=650 original-lines=5732-5732 hash=927ce2ce0bf37764
+# split-source: order=650 original-lines=5731-5731 hash=927ce2ce0bf37764
 IDE_TABLE_PREVIEW_CELL_MAX_CHARS = 2000
 
-# split-source: order=651 original-lines=5733-5733 hash=9d884ddf5da82c31
+# split-source: order=651 original-lines=5732-5732 hash=9d884ddf5da82c31
 IDE_TABLE_PREVIEW_TOTAL_CHARS = 2_000_000
 
-# split-source: order=652 original-lines=5734-5734 hash=1e5be5a8419a8bef
+# split-source: order=652 original-lines=5733-5733 hash=1e5be5a8419a8bef
 IDE_OFFICE_PREVIEW_MAX_ENTRIES = 20_000
 
-# split-source: order=653 original-lines=5735-5735 hash=104a2545fc3fbc6b
+# split-source: order=653 original-lines=5734-5734 hash=104a2545fc3fbc6b
 IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 
-# split-source: order=654 original-lines=5736-5736 hash=98b123e3ef709833
+# split-source: order=654 original-lines=5735-5735 hash=98b123e3ef709833
 IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES = 96 * 1024 * 1024
 
-# split-source: order=655 original-lines=5737-5737 hash=93d43f8be3af0f7c
+# split-source: order=655 original-lines=5736-5736 hash=93d43f8be3af0f7c
 IDE_COMMAND_TIMEOUT_DEFAULT = 120
 
-# split-source: order=656 original-lines=5738-5738 hash=cd7cfb66322e77a9
+# split-source: order=656 original-lines=5737-5737 hash=cd7cfb66322e77a9
 IDE_TREE_DEFAULT_MAX_NODES = 800
 
-# split-source: order=657 original-lines=5739-5739 hash=2673293f7c17f5ad
+# split-source: order=657 original-lines=5738-5738 hash=2673293f7c17f5ad
 IDE_TREE_MAX_NODES = 5000
 
-# split-source: order=658 original-lines=5740-5740 hash=77d6ca3fd55aa434
+# split-source: order=658 original-lines=5739-5739 hash=77d6ca3fd55aa434
 IDE_SEARCH_MAX_RESULTS = 2000
 
-# split-source: order=659 original-lines=5741-5741 hash=2019e5b5354d60a8
+# split-source: order=659 original-lines=5740-5740 hash=2019e5b5354d60a8
 IDE_SEARCH_MAX_FILE_BYTES = 2 * 1024 * 1024
 
-# split-source: order=660 original-lines=5742-5742 hash=266197634cbc6bc7
+# split-source: order=660 original-lines=5741-5741 hash=266197634cbc6bc7
 IDE_TERMINAL_SCROLLBACK_BYTES = 2 * 1024 * 1024
 
-# split-source: order=661 original-lines=5743-5743 hash=4aec6d90d3f20384
+# split-source: order=661 original-lines=5742-5742 hash=4aec6d90d3f20384
 IDE_TERMINAL_IDLE_SECONDS = 4 * 60 * 60
 
-# split-source: order=662 original-lines=5744-5744 hash=3cf2f0b1f88350d4
+# split-source: order=662 original-lines=5743-5743 hash=3cf2f0b1f88350d4
 IDE_DEBUG_ADAPTER_START_ATTEMPTS = 3
 
-# split-source: order=663 original-lines=5745-5745 hash=dda1bcf5808752a3
+# split-source: order=663 original-lines=5744-5744 hash=dda1bcf5808752a3
 IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS = 5.0
 
-# split-source: order=664 original-lines=5746-5746 hash=4055141fc7b1ff78
+# split-source: order=664 original-lines=5745-5745 hash=4055141fc7b1ff78
 IDE_VSIX_MAX_BYTES = 80 * 1024 * 1024
 
-# split-source: order=665 original-lines=5747-5747 hash=90e489fcef1bc95b
+# split-source: order=665 original-lines=5746-5746 hash=90e489fcef1bc95b
 IDE_VSIX_MAX_EXPANDED_BYTES = 240 * 1024 * 1024
 
-# split-source: order=666 original-lines=5748-5748 hash=f9ece5d8e20013f8
+# split-source: order=666 original-lines=5747-5747 hash=f9ece5d8e20013f8
 IDE_VSIX_MAX_FILES = 8000
 
-# split-source: order=667 original-lines=5749-5749 hash=ee1aebde989533a7
+# split-source: order=667 original-lines=5748-5748 hash=ee1aebde989533a7
 IDE_VSIX_MAX_FILE_BYTES = 40 * 1024 * 1024
 
-# split-source: order=668 original-lines=5750-5758 hash=f30ba8c32f49cc03
+# split-source: order=668 original-lines=5749-5757 hash=f30ba8c32f49cc03
 IDE_TREE_SKIP_DIRS = {
     ".git", ".hg", ".svn",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
@@ -2492,31 +2492,31 @@ IDE_TREE_SKIP_DIRS = {
     "dist", "build", "target", "coverage", "out", "bin", "obj",
 }
 
-# split-source: order=669 original-lines=5759-5759 hash=1765acbe875af029
+# split-source: order=669 original-lines=5758-5758 hash=1765acbe875af029
 RENDER_FRAME_MAX_B64_CHARS = 2_200_000
 
-# split-source: order=670 original-lines=5760-5760 hash=da616551c4bfaa9d
+# split-source: order=670 original-lines=5759-5759 hash=da616551c4bfaa9d
 RENDER_FRAME_MAX_POINTS = 12_000
 
-# split-source: order=671 original-lines=5761-5761 hash=38f30b78946cc962
+# split-source: order=671 original-lines=5760-5760 hash=38f30b78946cc962
 RENDER_FRAME_MAX_LINES = 2_000
 
-# split-source: order=672 original-lines=5762-5762 hash=5f06bf5a6364bc86
+# split-source: order=672 original-lines=5761-5761 hash=5f06bf5a6364bc86
 RENDER_FRAME_MAX_LINE_POINTS = 800
 
-# split-source: order=673 original-lines=5763-5763 hash=932378e266444a69
+# split-source: order=673 original-lines=5762-5762 hash=932378e266444a69
 RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS = 1.2
 
-# split-source: order=674 original-lines=5764-5764 hash=12037c5b5f37f61a
+# split-source: order=674 original-lines=5763-5763 hash=12037c5b5f37f61a
 RAW_TOOLCALL_TEXT_FILTER_THRESHOLD = 3_500
 
-# split-source: order=675 original-lines=5765-5765 hash=e7670e694a0ccbbe
+# split-source: order=675 original-lines=5764-5764 hash=e7670e694a0ccbbe
 ASSISTANT_TEXT_PERSIST_MAX_CHARS = 14_000
 
-# split-source: order=676 original-lines=5766-5766 hash=e36da78fa99dafef
+# split-source: order=676 original-lines=5765-5765 hash=e36da78fa99dafef
 ASSISTANT_MESSAGE_EVENT_MAX_CHARS = 4_000
 
-# split-source: order=677 original-lines=5767-5894 hash=ed2fa4ba6cc2c1fe
+# split-source: order=677 original-lines=5766-5893 hash=ed2fa4ba6cc2c1fe
 CODE_PREVIEW_EXTS = {
     ".html",
     ".htm",
@@ -2646,7 +2646,7 @@ CODE_PREVIEW_EXTS = {
     ".awk", ".sed", ".sparql", ".rq", ".ddl", ".dml", ".psql", ".pgsql",
 }
 
-# split-source: order=678 original-lines=5895-5946 hash=92f5041428cb9858
+# split-source: order=678 original-lines=5894-5945 hash=92f5041428cb9858
 CODE_PREVIEW_FILENAMES = {
     "dockerfile",
     "containerfile",
@@ -2700,7 +2700,7 @@ CODE_PREVIEW_FILENAMES = {
     "changelog",
 }
 
-# split-source: order=679 original-lines=5947-5954 hash=79e3361553eb2e89
+# split-source: order=679 original-lines=5946-5953 hash=79e3361553eb2e89
 MEDIA_CAPABILITY_KEYS = {
     "input_image",
     "input_audio",
@@ -2710,7 +2710,7 @@ MEDIA_CAPABILITY_KEYS = {
     "output_video",
 }
 
-# split-source: order=683 original-lines=5987-6313 hash=aafa6e4f2233e391
+# split-source: order=683 original-lines=5986-6312 hash=aafa6e4f2233e391
 
 OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
     {
@@ -3039,16 +3039,16 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
     },
 ]
 
-# split-source: order=684 original-lines=6314-6314 hash=a3dde32b74501c9b
+# split-source: order=684 original-lines=6313-6313 hash=a3dde32b74501c9b
 OFFLINE_JS_ASSET_LOCK = threading.RLock()
 
-# split-source: order=685 original-lines=6315-6315 hash=12eae3e20bb41a04
+# split-source: order=685 original-lines=6314-6314 hash=12eae3e20bb41a04
 OFFLINE_JS_LIB_INDEX_FILE = "index.json"
 
-# split-source: order=686 original-lines=6316-6316 hash=48655aedbd13d83e
+# split-source: order=686 original-lines=6315-6315 hash=48655aedbd13d83e
 OFFLINE_JS_LIB_README_FILE = "README.md"
 
-# split-source: order=697 original-lines=6522-6593 hash=6efa3f69661023a6
+# split-source: order=697 original-lines=6521-6592 hash=6efa3f69661023a6
 
 
 BACKEND_I18N = {
@@ -3122,7 +3122,7 @@ BACKEND_I18N = {
     },
 }
 
-# split-source: order=698 original-lines=6594-6695 hash=06aa475848b86f52
+# split-source: order=698 original-lines=6593-6694 hash=06aa475848b86f52
 
 BACKEND_I18N["en"].update(
     {
@@ -3226,7 +3226,7 @@ BACKEND_I18N["en"].update(
     }
 )
 
-# split-source: order=699 original-lines=6696-6796 hash=6200995927dae9da
+# split-source: order=699 original-lines=6695-6795 hash=6200995927dae9da
 BACKEND_I18N["zh-CN"].update(
     {
         "todo_node_suffix": " | 当前节点：{topic}",
@@ -3329,7 +3329,7 @@ BACKEND_I18N["zh-CN"].update(
     }
 )
 
-# split-source: order=700 original-lines=6797-6897 hash=1af71834ce8cb90e
+# split-source: order=700 original-lines=6796-6896 hash=1af71834ce8cb90e
 BACKEND_I18N["zh-TW"].update(
     {
         "todo_node_suffix": " | 目前節點：{topic}",
@@ -3432,7 +3432,7 @@ BACKEND_I18N["zh-TW"].update(
     }
 )
 
-# split-source: order=701 original-lines=6898-6998 hash=26c197a7d8238e44
+# split-source: order=701 original-lines=6897-6997 hash=26c197a7d8238e44
 BACKEND_I18N["ja"].update(
     {
         "todo_node_suffix": " | 現在のノード: {topic}",
@@ -3535,7 +3535,7 @@ BACKEND_I18N["ja"].update(
     }
 )
 
-# split-source: order=910 original-lines=13229-13234 hash=fbabf1b8f846d6aa
+# split-source: order=910 original-lines=13228-13233 hash=fbabf1b8f846d6aa
 
 
 MODEL_RUNTIME_SETTING_KEYS = {
@@ -3543,29 +3543,29 @@ MODEL_RUNTIME_SETTING_KEYS = {
     "reasoning_supported", "reasoning_style", "temperature", "request_timeout",
 }
 
-# split-source: order=931 original-lines=14928-14930 hash=5bc39b77a9b81db6
+# split-source: order=931 original-lines=14927-14929 hash=5bc39b77a9b81db6
 
 
 LIQUID_KERNEL_STARTUP_POLICIES = ("inherit", "inject")
 
-# split-source: order=932 original-lines=14931-14931 hash=849990d82af05f45
+# split-source: order=932 original-lines=14930-14930 hash=849990d82af05f45
 LIQUID_KERNEL_BOOTSTRAP_STATE_FILENAME = "liquid_kernel_bootstrap.json"
 
-# split-source: order=962 original-lines=16829-16831 hash=fe64e14cf82a6abb
+# split-source: order=962 original-lines=16828-16830 hash=fe64e14cf82a6abb
 
 
 TABULAR_PREVIEW_EXTS = {".csv", ".tsv"}
 
-# split-source: order=963 original-lines=16832-16832 hash=43ed1e050832d382
+# split-source: order=963 original-lines=16831-16831 hash=43ed1e050832d382
 EXCEL_PREVIEW_EXTS = {".xlsx", ".xls", ".xlsm"}
 
-# split-source: order=964 original-lines=16833-16833 hash=41505360f13ba6a7
+# split-source: order=964 original-lines=16832-16832 hash=41505360f13ba6a7
 PRESENTATION_PREVIEW_EXTS = {".pptx", ".ppt", ".pptm"}
 
-# split-source: order=965 original-lines=16834-16834 hash=8d36725f2e52a335
+# split-source: order=965 original-lines=16833-16833 hash=8d36725f2e52a335
 DOCUMENT_PREVIEW_EXTS = {".docx", ".doc", ".docm"}
 
-# split-source: order=1175 original-lines=116818-116835 hash=58c9260037425107
+# split-source: order=1175 original-lines=116817-116834 hash=58c9260037425107
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -3585,34 +3585,34 @@ DOCUMENT_PREVIEW_EXTS = {".docx", ".doc", ".docm"}
 
 STUDIO_DEVICE_COOKIE = "cc_studio_device"
 
-# split-source: order=1176 original-lines=116836-116836 hash=96e8c851e2302159
+# split-source: order=1176 original-lines=116835-116835 hash=96e8c851e2302159
 STUDIO_SESSION_COOKIE = "cc_studio_session"
 
-# split-source: order=1177 original-lines=116837-116837 hash=d6411ff144d2b2e9
+# split-source: order=1177 original-lines=116836-116836 hash=d6411ff144d2b2e9
 STUDIO_DEVICE_TTL = 180 * 24 * 60 * 60
 
-# split-source: order=1178 original-lines=116838-116838 hash=955afcde4cb400ac
+# split-source: order=1178 original-lines=116837-116837 hash=955afcde4cb400ac
 STUDIO_SESSION_TTL = 24 * 60 * 60
 
-# split-source: order=1179 original-lines=116839-116839 hash=569c087422548fbf
+# split-source: order=1179 original-lines=116838-116838 hash=569c087422548fbf
 STUDIO_MAX_FILE_BYTES = 10 * 1024 * 1024
 
-# split-source: order=1180 original-lines=116840-116840 hash=a9fdb060d056c458
+# split-source: order=1180 original-lines=116839-116839 hash=a9fdb060d056c458
 STUDIO_MAX_PROJECT_BYTES = 50 * 1024 * 1024
 
-# split-source: order=1181 original-lines=116841-116841 hash=349eab79a6a7f9a7
+# split-source: order=1181 original-lines=116840-116840 hash=349eab79a6a7f9a7
 STUDIO_MAX_FILES = 256
 
-# split-source: order=1182 original-lines=116842-116842 hash=1f1795a6e43689f3
+# split-source: order=1182 original-lines=116841-116841 hash=1f1795a6e43689f3
 STUDIO_MAX_JOB_SECONDS = 15 * 60
 
-# split-source: order=1188 original-lines=118741-118743 hash=f4c00c1faeb747fb
+# split-source: order=1188 original-lines=118740-118742 hash=f4c00c1faeb747fb
 
 
 STUDIO_INDEX_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skills Studio 2.0</title><link rel="stylesheet" href="/assets/studio.css"></head><body><div class="studio"><header><div><span class="eyebrow">CLOUDS CODER</span><h1>Skills Studio <em>2.0</em></h1><p>Design private, testable Skill packages. Nothing reaches global agents before approval.</p></div><button id="newProject">New project</button></header><main><aside><div class="side-title">Projects</div><div id="projects"></div></aside><section class="workspace"><div id="empty" class="empty"><h2>Start a private Skill draft</h2><p>Create a project to design requirements, files, workflow and evaluations.</p><button id="emptyNew">Create project</button></div><div id="editor" class="hidden"><div class="project-head"><div><h2 id="projectTitle"></h2><div id="projectMeta" class="meta"></div></div><div class="actions"><button data-action="validate">Validate</button><button data-action="evaluate">Evaluate</button><button data-action="submit" class="primary">Request review</button></div></div><nav class="tabs"><button class="active" data-tab="brief">Brief</button><button data-tab="design">Design</button><button data-tab="files">Files</button><button data-tab="workflow">Workflow</button><button data-tab="evaluation">Evaluation</button></nav><div id="tabContent"></div></div></section><aside class="copilot"><div class="side-title">Copilot</div><p class="muted">Choose stepwise interview or one-click generation. Candidate patches stay private until you accept them.</p><textarea id="copilotInput" placeholder="Describe the skill goal, examples, constraints and references…"></textarea><div class="mode"><button data-mode="stepwise" class="selected">Stepwise</button><button data-mode="one_click">One-click</button></div><button id="copilotRun" class="primary wide">Generate private candidate</button><pre id="copilotStatus" class="status"></pre></aside></main></div><script src="/assets/js_lib/monaco/min/vs/loader.js"></script><script src="/assets/studio.js"></script></body></html>'''
 
-# split-source: order=1189 original-lines=118744-118744 hash=4b782b7dd294d57e
+# split-source: order=1189 original-lines=118743-118743 hash=4b782b7dd294d57e
 STUDIO_CSS = r'''*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#182538;font:14px/1.5 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.studio{min-height:100vh}header{height:90px;background:#0d1b2a;color:#fff;padding:16px 28px;display:flex;align-items:center;justify-content:space-between}h1{margin:2px 0;font-size:25px}h1 em{font-style:normal;color:#64d6ff}.eyebrow{font-size:10px;letter-spacing:.18em;color:#8ba8c4}header p{margin:2px 0;color:#a9bdcf}button{border:1px solid #ccd8e5;background:#fff;color:#29415d;border-radius:8px;padding:8px 13px;cursor:pointer;font-weight:600}button:hover{border-color:#6aa8db}button.primary{background:#1668c7;border-color:#1668c7;color:#fff}button.wide{width:100%;margin-top:10px}.studio main{height:calc(100vh - 90px);display:grid;grid-template-columns:230px minmax(420px,1fr) 310px}.studio aside{background:#fff;border-right:1px solid #dce5ee;padding:16px;overflow:auto}.studio .copilot{border-left:1px solid #dce5ee;border-right:0;background:#fbfdff}.side-title{font-weight:800;color:#526a83;margin-bottom:12px}.project-item{padding:10px;border:1px solid transparent;border-radius:9px;margin-bottom:6px;cursor:pointer}.project-item:hover,.project-item.active{background:#eef6ff;border-color:#b7d7f5}.project-item small,.meta,.muted{color:#70859a;font-size:12px}.workspace{padding:24px;overflow:auto}.empty{max-width:520px;margin:12vh auto;text-align:center}.hidden{display:none!important}.project-head{display:flex;justify-content:space-between;gap:18px;align-items:start;border-bottom:1px solid #dce5ee;padding-bottom:15px}.project-head h2{margin:0}.actions{display:flex;gap:7px}.tabs{display:flex;gap:2px;margin:14px 0;border-bottom:1px solid #dce5ee}.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.tabs button.active{color:#1668c7;border-bottom-color:#1668c7}.panel{background:#fff;border:1px solid #dce5ee;border-radius:12px;padding:18px;margin-bottom:12px}.file-row{display:flex;justify-content:space-between;width:100%;padding:9px;border:0;border-bottom:1px solid #edf1f5;border-radius:0;text-align:left}.file-row code{color:#1668c7}.file-workbench{display:grid;grid-template-columns:minmax(180px,28%) 1fr;gap:12px;min-height:460px}.file-tools{height:38px;display:flex;justify-content:space-between;align-items:center;color:#60768c}.monaco-host,.file-fallback{height:410px;width:100%;border:1px solid #d5e0ea}.file-fallback{display:none;min-height:410px;border-radius:0}textarea{width:100%;min-height:160px;border:1px solid #cbd8e5;border-radius:9px;padding:10px;font:13px/1.5 ui-monospace,monospace;resize:vertical}.mode{display:flex;gap:6px;margin-top:10px}.mode button{flex:1}.mode button.selected{background:#e7f2ff;border-color:#79b4ea;color:#075da9}.status{min-height:140px;white-space:pre-wrap;background:#0e1c2a;color:#bee4ff;border-radius:9px;padding:10px;font-size:11px}@media(max-width:1000px){.studio main{grid-template-columns:190px minmax(300px,1fr)}.copilot{position:fixed;right:0;top:90px;bottom:0;width:300px;box-shadow:-10px 0 30px #9eacbb;display:none}.copilot.open{display:block}}@media(max-width:700px){header{padding:12px 16px;height:auto}.studio main{height:auto;min-height:calc(100vh - 76px);grid-template-columns:1fr}.studio main>aside:first-child{display:none}.workspace{padding:14px}.actions{flex-wrap:wrap}.project-head{display:block}.actions{margin-top:10px}.file-workbench{grid-template-columns:1fr}.monaco-host,.file-fallback{height:330px;min-height:330px}}'''
 
-# split-source: order=1190 original-lines=118745-118745 hash=ca9a737435a250bf
+# split-source: order=1190 original-lines=118744-118744 hash=ca9a737435a250bf
 STUDIO_JS = r'''const S={csrf:'',device:'',session:'',projects:[],project:null,mode:'stepwise',tab:'brief',job:null,monaco:null,editor:null,model:null};const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function api(path,opt={}){const h=new Headers(opt.headers||{});if(opt.body&&!h.has('Content-Type'))h.set('Content-Type','application/json');if(opt.method&&opt.method!=='GET')h.set('X-CSRF-Token',S.csrf);const r=await fetch(path,{credentials:'same-origin',cache:'no-store',...opt,headers:h});const b=await r.json();if(!r.ok)throw Error(b.error||`HTTP ${r.status}`);return b}async function boot(){const b=await api('/api/skillslab/v2/bootstrap');S.csrf=b.csrf_token;S.projects=b.projects||[];renderProjects();if(S.projects[0])openProject(S.projects[0].id)}function renderProjects(){const h=$('projects');h.innerHTML=S.projects.map(p=>`<div class="project-item ${S.project?.id===p.id?'active':''}" data-id="${esc(p.id)}"><strong>${esc(p.title)}</strong><br><small>${esc(p.status)} · v${p.revision}</small></div>`).join('')||'<p class="muted">No private drafts yet.</p>';h.querySelectorAll('[data-id]').forEach(x=>x.onclick=()=>openProject(x.dataset.id))}async function openProject(id){S.project=await api('/api/skillslab/v2/projects/'+encodeURIComponent(id));$('empty').classList.add('hidden');$('editor').classList.remove('hidden');$('projectTitle').textContent=S.project.title;$('projectMeta').textContent=`${S.project.status} · revision ${S.project.revision}`;renderProjects();renderTab()}function renderTab(){const c=$('tabContent');if(!S.project)return;const v=S.project.validation||{};if(S.tab==='files'){c.innerHTML=`<div class="panel"><div class="file-workbench"><div id="studioFileList">${(S.project.files||[]).map(f=>`<button class="file-row" data-file="${esc(f.path)}"><code>${esc(f.path)}</code><span>${f.size} bytes</span></button>`).join('')}</div><div><div class="file-tools"><span id="activeFile">Select a file</span><button id="saveFile" disabled>Save</button></div><div id="monacoHost" class="monaco-host"></div><textarea id="fileFallback" class="file-fallback"></textarea></div></div></div>`;c.querySelectorAll('[data-file]').forEach(x=>x.onclick=()=>openStudioFile(x.dataset.file));}else if(S.tab==='evaluation')c.innerHTML=`<div class="panel"><h3>Deterministic validation</h3><pre>${esc(JSON.stringify(v,null,2))}</pre></div>`;else c.innerHTML=`<div class="panel"><h3>${S.tab==='brief'?'Requirements brief':S.tab==='design'?'Design decisions':'Workflow view'}</h3><p>${esc(S.project.summary?.description||'Describe the target, triggers, inputs/outputs, tools, trust boundary and quality bar in Copilot.')}</p><p class="muted">Private draft only · global agents are unaffected.</p></div>`}async function initStudioEditor(value,path){const host=$('monacoHost'),fallback=$('fileFallback');if(window.require&&window.monaco){if(!S.editor){window.MonacoEnvironment={getWorker:()=>new Worker('/assets/studio-monaco-worker.js')};window.require.config({paths:{vs:'/assets/js_lib/monaco/min/vs'}});await new Promise((resolve,reject)=>window.require(['vs/editor/editor.main'],resolve,reject));S.monaco=window.monaco;S.editor=S.monaco.editor.create(host,{automaticLayout:true,minimap:{enabled:false},fontSize:13,wordWrap:'on'});}if(S.model)S.model.dispose();S.model=S.monaco.editor.createModel(value,path.endsWith('.md')?'markdown':path.endsWith('.yaml')||path.endsWith('.yml')?'yaml':'plaintext');S.editor.setModel(S.model);fallback.classList.add('hidden')}else{fallback.value=value;fallback.classList.remove('hidden')}}async function openStudioFile(path){const f=await api(`/api/skillslab/v2/projects/${S.project.id}/files/${encodeURIComponent(path)}`);S.activeFile=path;$('activeFile').textContent=path;$('saveFile').disabled=!!f.is_binary;if(!f.is_binary){await initStudioEditor(f.content,path);$('saveFile').onclick=async()=>{const content=S.editor&&S.model?S.model.getValue():$('fileFallback').value;await api(`/api/skillslab/v2/projects/${S.project.id}/files`,{method:'POST',body:JSON.stringify({path,content,expected_revision:S.project.revision})});await openProject(S.project.id)}}}async function newProject(){const title=prompt('Skill title');if(!title)return;const p=await api('/api/skillslab/v2/projects',{method:'POST',body:JSON.stringify({title})});S.projects.unshift(p);renderProjects();openProject(p.id)}document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{S.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));renderTab()});document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{S.mode=b.dataset.mode;document.querySelectorAll('[data-mode]').forEach(x=>x.classList.toggle('selected',x===b))});$('newProject').onclick=$('emptyNew').onclick=()=>newProject().catch(e=>alert(e.message));document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{try{if(b.dataset.action==='validate'){$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/projects/${S.project.id}/validate`),null,2)}else if(b.dataset.action==='evaluate'){$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/projects/${S.project.id}/evaluations`,{method:'POST',body:JSON.stringify({expected_revision:S.project.revision})}),null,2)}else{const out=await api(`/api/skillslab/v2/projects/${S.project.id}/submissions`,{method:'POST',body:JSON.stringify({expected_revision:S.project.revision})});$('copilotStatus').textContent=JSON.stringify(out,null,2)}openProject(S.project.id)}catch(e){alert(e.message)}});$('copilotRun').onclick=async()=>{try{const out=await api(`/api/skillslab/v2/projects/${S.project.id}/copilot/jobs`,{method:'POST',body:JSON.stringify({mode:S.mode,goal:$('copilotInput').value,expected_revision:S.project.revision})});$('copilotStatus').textContent=JSON.stringify(out,null,2);setTimeout(async()=>{$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/copilot/jobs/${out.id}`),null,2)},250)}catch(e){alert(e.message)}};boot().catch(e=>{$('copilotStatus').textContent=e.message});'''

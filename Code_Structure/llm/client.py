@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1045 original-lines=26217-26239 hash=ec5cc2a0de1c5071
+# split-source: order=1045 original-lines=26216-26238 hash=ec5cc2a0de1c5071
 
 
 class OllamaError(RuntimeError):
@@ -30,7 +30,7 @@ class OllamaError(RuntimeError):
         self.retryable = retryable
         self.transient = transient
 
-# split-source: order=1046 original-lines=26240-28757 hash=9363dda563535758
+# split-source: order=1046 original-lines=26239-28756 hash=9363dda563535758
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
