@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=954 original-lines=16234-16267 hash=494ce756bc5b35d8
+# split-source: order=973 original-lines=17087-17120 hash=494ce756bc5b35d8
 
 
 def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object]:
@@ -41,7 +41,7 @@ def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object
             break
     return rows
 
-# split-source: order=955 original-lines=16268-16273 hash=4bfe2fe5ea6ce1a8
+# split-source: order=974 original-lines=17121-17126 hash=4bfe2fe5ea6ce1a8
 
 
 def _ask_user_option_value(option: object) -> str:
@@ -49,7 +49,7 @@ def _ask_user_option_value(option: object) -> str:
         return trim(str(option.get("value", option.get("id", option.get("label", ""))) or "").strip(), 400)
     return trim(str(option or "").strip(), 400)
 
-# split-source: order=1028 original-lines=27888-27901 hash=f19c222e839c27ec
+# split-source: order=1047 original-lines=28756-28769 hash=f19c222e839c27ec
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -65,7 +65,7 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
-# split-source: order=1029 original-lines=27902-28449 hash=4b2f915df6112fcb
+# split-source: order=1048 original-lines=28770-29317 hash=4b2f915df6112fcb
 
 TOOLS = [
     tool_def(
@@ -615,14 +615,14 @@ TOOLS = [
     ),
 ]
 
-# split-source: order=1030 original-lines=28450-28451 hash=3ee29b226eaf3576
+# split-source: order=1049 original-lines=29318-29319 hash=3ee29b226eaf3576
 
 TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
 
-# split-source: order=1031 original-lines=28452-28452 hash=08ea091c248842a3
+# split-source: order=1050 original-lines=29320-29320 hash=08ea091c248842a3
 TOOL_SPEC_BY_NAME: dict[str, dict] = {}
 
-# split-source: order=1032 original-lines=28453-28462 hash=5b49546953f9369c
+# split-source: order=1051 original-lines=29321-29330 hash=5b49546953f9369c
 for _tool in TOOLS:
     try:
         _fn = _tool.get("function", {})
@@ -634,17 +634,17 @@ for _tool in TOOLS:
     except Exception:
         continue
 
-# split-source: order=1033 original-lines=28463-28464 hash=bfed07d2aedc6126
+# split-source: order=1052 original-lines=29331-29332 hash=bfed07d2aedc6126
 
 TOOL_NAME_FUZZY_MAP: dict[str, str] = {}
 
-# split-source: order=1034 original-lines=28465-28468 hash=61dd6436d3455b98
+# split-source: order=1053 original-lines=29333-29336 hash=61dd6436d3455b98
 for _name in TOOL_SPEC_BY_NAME.keys():
     _key = re.sub(r"[^a-z0-9]+", "", str(_name or "").lower())
     if _key and _key not in TOOL_NAME_FUZZY_MAP:
         TOOL_NAME_FUZZY_MAP[_key] = str(_name)
 
-# split-source: order=1035 original-lines=28469-28486 hash=8c7992dc17a67107
+# split-source: order=1054 original-lines=29337-29354 hash=8c7992dc17a67107
 
 for _alias, _target in {
     "writefile": "write_file",
@@ -664,7 +664,7 @@ for _alias, _target in {
 }.items():
     TOOL_NAME_FUZZY_MAP[_alias] = _target
 
-# split-source: order=1036 original-lines=28487-28503 hash=a168e414b363725e
+# split-source: order=1055 original-lines=29355-29371 hash=a168e414b363725e
 
 
 def is_todo_resume_tool_name(raw: object) -> bool:
@@ -683,7 +683,7 @@ def is_todo_resume_tool_name(raw: object) -> bool:
         "resumetodos",
     }
 
-# split-source: order=1037 original-lines=28504-28522 hash=b3e6ffc2768f20fa
+# split-source: order=1056 original-lines=29372-29390 hash=b3e6ffc2768f20fa
 
 
 def canonicalize_tool_name(raw: object) -> str:
@@ -704,7 +704,7 @@ def canonicalize_tool_name(raw: object) -> str:
         return lowered
     return mapped or name
 
-# split-source: order=1038 original-lines=28523-28538 hash=b445806005f59898
+# split-source: order=1057 original-lines=29391-29406 hash=b445806005f59898
 
 
 def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
@@ -722,7 +722,7 @@ def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enable
         out.append(tool)
     return out
 
-# split-source: order=1039 original-lines=28539-28549 hash=9ed4253b5af25719
+# split-source: order=1058 original-lines=29407-29417 hash=9ed4253b5af25719
 
 
 # Fix F: orchestration / worktree / teammate-management tools a sync-mode developer
@@ -735,7 +735,7 @@ DEVELOPER_TOOL_DROP: set[str] = {
     "shutdown_request", "plan_approval", "scan_skills", "write_skill",
 }
 
-# split-source: order=1040 original-lines=28550-28613 hash=c3efb64c9011ad20
+# split-source: order=1059 original-lines=29418-29481 hash=c3efb64c9011ad20
 
 AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
     "explorer": {

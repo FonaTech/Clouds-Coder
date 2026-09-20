@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1061 original-lines=29143-89604 hash=218f63fcf8d386bc
+# split-source: order=1080 original-lines=30011-90659 hash=9f3d64cdd58165a0
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
@@ -1271,7 +1271,14 @@ class SessionState:
         profile = self.model_profiles.get(self.active_profile_id)
         if not profile:
             return
-        row = dict(profile)
+        stored = dict(profile)
+        row = dict(stored)
+        # Restore the selected model's persisted runtime controls before the
+        # client is configured. This keeps effort/streaming identical after a
+        # restart and when a session is loaded by the IDE.
+        active_model = str(row.get("model", "") or "").strip()
+        for key, value in model_runtime_settings_for(row, active_model).items():
+            row[key] = value
         timeout_floor = max(MIN_TIMEOUT_SECONDS, int(self.max_run_seconds or 0))
         row["request_timeout"] = normalize_timeout_seconds(
             row.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
@@ -1286,9 +1293,13 @@ class SessionState:
             if cached_caps:
                 merged = merge_multimodal_capabilities(self._capabilities_from_profile(row), cached_caps)
                 row["capabilities"] = merged
-        self.model_profiles[self.active_profile_id] = row
-        profile = row
-        self.ollama.apply_profile(profile)
+                stored["capabilities"] = merged
+        stored["request_timeout"] = row["request_timeout"]
+        self.model_profiles[self.active_profile_id] = stored
+        # Keep per-model controls in ``model_settings``. Applying them to the
+        # client must not promote them to profile-level defaults, otherwise a
+        # later model switch would inherit the previous model's settings.
+        self.ollama.apply_profile(row)
         self.thinking = False
 
     def _profile_is_runnable(self, profile: dict) -> bool:
@@ -1354,6 +1365,7 @@ class SessionState:
         if force_probe:
             self._ensure_active_profile_capabilities(force_probe=True)
         opts = []
+        profiles_changed = False
         ollama_profile_id = ""
         ollama_base = self.ollama.base_url
         for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
@@ -1377,6 +1389,29 @@ class SessionState:
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model,
+                            caps,
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model,
+                            caps,
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                     "capabilities_probed": bool(cache_entry),
                     "capabilities_probed_at": float(cache_entry.get("updated_at", 0.0) or 0.0)
@@ -1393,7 +1428,24 @@ class SessionState:
             base = str(profile.get("base_url", self.ollama.base_url) or self.ollama.base_url).strip()
             if not base:
                 continue
-            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            tags = list_ollama_models_cached(
+                base,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            ollama_records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(
+                profile, ollama_records, model_ids=tags
+            ) or profiles_changed
+            ollama_record_map = {
+                str(record.get("id", "")): record
+                for record in ollama_records
+                if isinstance(record, dict) and str(record.get("id", "")).strip()
+            }
             if tags:
                 if pid == self.active_profile_id:
                     self.ollama_env_tags = list(tags)
@@ -1409,6 +1461,13 @@ class SessionState:
                 tag_cache_key = self._profile_cache_key(tag_profile, tag)
                 tag_cache_entry = self.multimodal_capability_cache.get(tag_cache_key, {})
                 tag_caps = self._capabilities_from_profile(tag_profile, model_override=tag)
+                tag_record = ollama_record_map.get(tag)
+                tag_record_caps = (
+                    tag_record.get("capabilities", {})
+                    if isinstance(tag_record, dict)
+                    else {}
+                )
+                tag_record_probed = isinstance(tag_record, dict)
                 opts.append(
                     {
                         "selection": selection,
@@ -1420,6 +1479,35 @@ class SessionState:
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
                         "response_stream": bool(profile.get("response_stream", self.ollama.response_stream)),
+                        "effort": str(profile.get("effort", "") or ""),
+                        "max_effort": str(profile.get("max_effort", "") or ""),
+                        "reasoning_supported": (
+                            profile.get("reasoning_supported")
+                            if profile.get("reasoning_supported") is not None
+                            else tag_record_caps.get("reasoning_supported")
+                            if isinstance(tag_record_caps, dict)
+                            and tag_record_caps.get("reasoning_supported") is not None
+                            else model_reasoning_style(
+                                str(profile.get("provider", "")),
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            != "none"
+                        ),
+                        "reasoning_style": str(
+                            profile.get("reasoning_style")
+                            or tag_record_caps.get("reasoning_style", "")
+                            or model_reasoning_style(
+                                str(profile.get("provider", "")),
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            or ""
+                        ),
+                        "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                        "title": str(profile.get("title", profile.get("label", pid)) or ""),
                         "capabilities": tag_caps,
                         "capabilities_probed": bool(tag_cache_entry),
                         "capabilities_probed_at": float(tag_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -1427,6 +1515,69 @@ class SessionState:
                         else 0.0,
                     }
                 )
+        # Expand every provider from configured model lists and bounded probes.
+        # The cache prevents status polling from repeatedly hitting vendors.
+        for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": self._capabilities_from_profile(dict(profile, model=model_id), model_override=model_id),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.model_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         runnable_opts = [x for x in opts if self._option_is_runnable(x)]
         if runnable_opts:
             opts = runnable_opts
@@ -1448,6 +1599,27 @@ class SessionState:
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "response_stream": bool(active.get("response_stream", False)),
+                    "effort": str(active.get("effort", "") or ""),
+                    "max_effort": str(active.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        active.get("reasoning_supported")
+                        if active.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        active.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
                     "capabilities_probed": bool(active_cache_entry),
                     "capabilities_probed_at": float(active_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -1455,11 +1627,15 @@ class SessionState:
                     else 0.0,
                 },
             )
+            apply_model_option_runtime_fields(opts[0], active, str(active.get("model", "") or ""))
             option_map.add(selected)
         if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
         active_caps = self._capabilities_from_profile(active if isinstance(active, dict) else {})
         active_cache = self.multimodal_capability_cache.get(self._profile_cache_key(active if isinstance(active, dict) else {}), {})
+        if profiles_changed:
+            self.updated_at = now_ts()
+            self._persist()
         return {
             "provider": active.get("provider", "ollama"),
             "selected": selected,
@@ -1481,6 +1657,7 @@ class SessionState:
         model_override: str | None = None,
         *,
         reset_failures: bool = True,
+        settings: dict | None = None,
     ) -> dict:
         raw = str(selection or "").strip()
         explicit_profile = "::" in raw
@@ -1511,6 +1688,11 @@ class SessionState:
             profile["model"] = str(model_override).strip()
         elif str(selected_model).strip():
             profile["model"] = str(selected_model).strip()
+        profile = apply_model_runtime_settings(profile, str(profile.get("model", "") or ""), settings)
+        for record in probe_provider_models(profile, background=True):
+            if str(record.get("id", "")) == str(profile.get("model", "")):
+                merge_probed_models_into_profile(profile, [record])
+                break
         if not self._profile_is_runnable(profile) and not explicit_profile and str(selected_model).strip():
             fallback = self._pick_runnable_selection(preferred_provider="ollama")
             if fallback:
@@ -1591,6 +1773,9 @@ class SessionState:
         if cfg_user_memory_mode is not None:
             self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
         parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
+        # A config import is also a model-directory import. Probe each provider
+        # once so all advertised models are available to both UIs immediately.
+        probe_and_merge_model_profiles(parsed.get("profiles", []), force_refresh=True)
         self.multimodal_capability_cache = {}
         OllamaClient.clear_global_probe_cache()
         self.ollama.clear_probe_cache()
@@ -20352,6 +20537,7 @@ body{padding:18px}
                     self.set_runtime_selection(
                         selection,
                         model_override if isinstance(model_override, str) else None,
+                        settings=normalize_model_runtime_settings(payload.get("settings", payload)),
                     )
                     applied_notes.append(f"deferred model switch applied: {trim(selection, 120)}")
                     sync_needed = True
@@ -20486,8 +20672,9 @@ body{padding:18px}
             prof = {}
         if not isinstance(prof, dict):
             prof = {}
-        default = str(prof.get("effort", "") or "").strip().lower()
-        ceiling = str(prof.get("max_effort", "") or "").strip().lower()
+        effective = model_runtime_settings_for(prof, str(prof.get("model", "") or ""))
+        default = str(effective.get("effort", "") or "").strip().lower()
+        ceiling = str(effective.get("max_effort", "") or "").strip().lower()
         if ceiling not in EFFORT_ORDER:
             ceiling = EFFORT_MAX
         if default not in EFFORT_ORDER:

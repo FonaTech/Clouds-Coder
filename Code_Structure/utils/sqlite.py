@@ -17,7 +17,7 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
         finally:
             self.close()
 
-# split-source: order=71 original-lines=84-107 hash=4b1c9c3e964a60c7
+# split-source: order=71 original-lines=84-117 hash=a424ca6d643ed008
 
 
 def _connect_sqlite(
@@ -30,15 +30,112 @@ def _connect_sqlite(
 ) -> sqlite3.Connection:
     # sqlite3.Connection's own context manager does not close the connection.
     # Polling/request handlers must not rely on cyclic GC to release DB/WAL FDs.
-    conn = sqlite3.connect(
-        database, timeout=timeout, isolation_level=isolation_level,
-        factory=_ClosingSQLiteConnection,
-    )
+    operation = "connect"
+    try:
+        conn = sqlite3.connect(
+            database, timeout=timeout, isolation_level=isolation_level,
+            factory=_ClosingSQLiteConnection,
+        )
+    except sqlite3.Error as exc:
+        exc.sqlite_database_path = database
+        exc.sqlite_operation = operation
+        raise
     try:
         conn.row_factory = row_factory
         for statement in pragmas:
+            operation = statement
             conn.execute(statement)
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, sqlite3.Error):
+            exc.sqlite_database_path = database
+            exc.sqlite_operation = operation
         conn.close()
         raise
     return conn
+
+# split-source: order=1207 original-lines=136431-136515 hash=3479ea8c39f73747
+
+
+# 第九层：进程入口与服务启动。
+# 第9層：プロセス入口とサーバ起動。
+# ============================================================================
+
+# Bootstrap sequence: load configuration, initialize shared application state,
+# and expose the HTTP service plus background runtime workers.
+def sqlite_failure_diagnostics(exc: BaseException, database=None) -> dict:
+    """Read-only process/storage probes for server logs, never public responses."""
+    details = {
+        "pid": os.getpid(),
+        "python": sys.version.split()[0],
+        "sqlite": sqlite3.sqlite_version,
+        "script": os.path.abspath(__file__),
+        "sqlite_errorcode": getattr(exc, "sqlite_errorcode", None),
+        "sqlite_errorname": getattr(exc, "sqlite_errorname", ""),
+        "operation": getattr(exc, "sqlite_operation", "query"),
+    }
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        details["fd_limit_soft"], details["fd_limit_hard"] = soft, hard
+    except (ImportError, OSError, ValueError):
+        pass
+    try:
+        fd = os.open(os.devnull, os.O_RDONLY)
+    except OSError as probe:
+        details["fd_probe_errno"] = probe.errno
+    else:
+        os.close(fd)
+        details["fd_probe_errno"] = 0
+    fd_directory = "/dev/fd" if sys.platform == "darwin" else "/proc/self/fd"
+    if os.name == "posix":
+        try:
+            names = os.listdir(fd_directory)
+            count = 0
+            for name in names:
+                try:
+                    os.fstat(int(name))
+                    count += 1
+                except (OSError, ValueError):
+                    continue
+            details["open_fds"] = count
+        except OSError as probe:
+            details["fd_count_errno"] = probe.errno
+    path = getattr(exc, "sqlite_database_path", None) or database
+    if path:
+        path = os.path.abspath(os.fspath(path))
+        details["database"] = path
+        states = {}
+        for label, target in (
+            ("parent", os.path.dirname(path)),
+            ("database", path),
+            ("wal", path + "-wal"),
+            ("shm", path + "-shm"),
+        ):
+            try:
+                info = os.stat(target)
+                states[label] = {
+                    "kind": "directory" if stat.S_ISDIR(info.st_mode) else "file",
+                    "mode": oct(stat.S_IMODE(info.st_mode)),
+                    "bytes": info.st_size,
+                }
+            except OSError as probe:
+                states[label] = {"errno": probe.errno}
+        details["paths"] = states
+        # No O_CREAT: a missing authentication/collaboration DB must stay missing.
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError as probe:
+            details["database_open_errno"] = probe.errno
+        else:
+            os.close(fd)
+            details["database_open_errno"] = 0
+    errors = {details.get(key) for key in ("fd_probe_errno", "fd_count_errno", "database_open_errno")}
+    if errors.intersection({errno.EMFILE, errno.ENFILE}):
+        details["cause"] = "file_descriptor_exhaustion"
+    elif details.get("database_open_errno") in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        details["cause"] = "storage_access_denied"
+    elif details.get("database_open_errno") in {errno.ENOENT, errno.ENOTDIR}:
+        details["cause"] = "storage_path_unavailable"
+    else:
+        details["cause"] = "undetermined"
+    return details

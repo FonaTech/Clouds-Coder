@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=687 original-lines=6303-6327 hash=1ba352169adb7a74
+# split-source: order=690 original-lines=6396-6420 hash=1ba352169adb7a74
 
 
 def normalize_ui_language(raw: str | None) -> str:
@@ -32,7 +32,7 @@ def normalize_ui_language(raw: str | None) -> str:
         return mapped
     return DEFAULT_UI_LANGUAGE
 
-# split-source: order=688 original-lines=6328-6347 hash=8cce3c29aa7f9a70
+# split-source: order=691 original-lines=6421-6440 hash=8cce3c29aa7f9a70
 
 
 def normalize_ui_style(raw: str | None) -> str:
@@ -54,13 +54,13 @@ def normalize_ui_style(raw: str | None) -> str:
         return mapped
     return DEFAULT_UI_STYLE
 
-# split-source: order=689 original-lines=6348-6351 hash=8122501e60c7063a
+# split-source: order=692 original-lines=6441-6444 hash=8122501e60c7063a
 
 
 def supported_ui_languages_payload() -> list[dict]:
     return [dict(x) for x in SUPPORTED_UI_LANGUAGES]
 
-# split-source: order=691 original-lines=6364-6373 hash=67b7a36374a83ec8
+# split-source: order=694 original-lines=6457-6466 hash=67b7a36374a83ec8
 
 
 def agent_language_preference_payload(language: str | None) -> dict:
@@ -72,7 +72,7 @@ def agent_language_preference_payload(language: str | None) -> dict:
         row["public_progress_mode"] = "off"
     return row
 
-# split-source: order=692 original-lines=6374-6395 hash=f2169616eec4cc2d
+# split-source: order=695 original-lines=6467-6488 hash=f2169616eec4cc2d
 
 
 def normalize_execution_mode(raw: str | None, default: str = EXECUTION_MODE_SYNC) -> str:
@@ -96,7 +96,7 @@ def normalize_execution_mode(raw: str | None, default: str = EXECUTION_MODE_SYNC
         return fallback
     return EXECUTION_MODE_SYNC
 
-# split-source: order=693 original-lines=6396-6426 hash=1a7837dacd04848d
+# split-source: order=696 original-lines=6489-6519 hash=1a7837dacd04848d
 
 
 def model_language_instruction(lang: str) -> str:
@@ -129,7 +129,7 @@ def model_language_instruction(lang: str) -> str:
         "Do not translate code, file paths, commands, API/tool names, or JSON keys."
     )
 
-# split-source: order=699 original-lines=6904-6916 hash=3282989af9f87290
+# split-source: order=702 original-lines=6997-7009 hash=3282989af9f87290
 
 
 def backend_i18n_text(language: str, key: str, **kwargs) -> str:
@@ -144,7 +144,7 @@ def backend_i18n_text(language: str, key: str, **kwargs) -> str:
             return template
     return template
 
-# split-source: order=700 original-lines=6917-6923 hash=44c5dc8d85b13d9e
+# split-source: order=703 original-lines=7010-7016 hash=44c5dc8d85b13d9e
 
 
 def backend_role_label(role: str, language: str) -> str:
@@ -153,7 +153,7 @@ def backend_role_label(role: str, language: str) -> str:
         return backend_i18n_text(language, f"role_{role_key}")
     return backend_i18n_text(language, "role_agent")
 
-# split-source: order=701 original-lines=6924-6965 hash=efdfecfa720e25dc
+# split-source: order=704 original-lines=7017-7058 hash=efdfecfa720e25dc
 
 
 def _detect_os_shell_instruction() -> str:
@@ -197,7 +197,7 @@ def _detect_os_shell_instruction() -> str:
         "If you must use absolute paths, always quote them with double quotes."
     )
 
-# split-source: order=702 original-lines=6966-6974 hash=af013e3c4e2107c4
+# split-source: order=705 original-lines=7059-7067 hash=af013e3c4e2107c4
 
 def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
     txt = str(raw or "").strip()
@@ -208,7 +208,7 @@ def resolve_web_ui_dir_path(raw: str, base_dir: Path | None = None) -> Path:
         return p.resolve()
     return ((base_dir or WORKDIR).resolve() / p).resolve()
 
-# split-source: order=703 original-lines=6975-6984 hash=12ef97467ee9db28
+# split-source: order=706 original-lines=7068-7077 hash=12ef97467ee9db28
 
 
 def resolve_optional_file_path(raw: str, base_dir: Path | None = None) -> Path:
@@ -220,7 +220,7 @@ def resolve_optional_file_path(raw: str, base_dir: Path | None = None) -> Path:
         return p.resolve()
     return ((base_dir or WORKDIR).resolve() / p).resolve()
 
-# split-source: order=704 original-lines=6985-6994 hash=0eda8ecf40330dc2
+# split-source: order=707 original-lines=7078-7087 hash=0eda8ecf40330dc2
 
 
 def resolve_skills_root_path(raw: str, base_dir: Path | None = None) -> Path:
@@ -232,7 +232,7 @@ def resolve_skills_root_path(raw: str, base_dir: Path | None = None) -> Path:
         return p.resolve()
     return ((base_dir or WORKDIR).resolve() / p).resolve()
 
-# split-source: order=705 original-lines=6995-7008 hash=f260e0a0c0f804f7
+# split-source: order=708 original-lines=7088-7101 hash=f260e0a0c0f804f7
 
 
 def _count_skill_markdown_files(root: Path, limit: int = 2048) -> int:
@@ -248,7 +248,7 @@ def _count_skill_markdown_files(root: Path, limit: int = 2048) -> int:
         return 0
     return total
 
-# split-source: order=706 original-lines=7009-7045 hash=a51220e541abfcba
+# split-source: order=709 original-lines=7102-7138 hash=a51220e541abfcba
 
 
 def select_preferred_skills_root(
@@ -287,7 +287,7 @@ def select_preferred_skills_root(
 
     return ensure_embedded_skills(workdir), "embedded-default"
 
-# split-source: order=707 original-lines=7046-7062 hash=a90f45ee4fbfde32
+# split-source: order=710 original-lines=7139-7155 hash=a90f45ee4fbfde32
 
 
 def load_web_ui_config_file(path: Path) -> dict:
@@ -306,7 +306,7 @@ def load_web_ui_config_file(path: Path) -> dict:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
-# split-source: order=708 original-lines=7063-7079 hash=7af2da604142cd96
+# split-source: order=711 original-lines=7156-7172 hash=7af2da604142cd96
 
 
 def extract_show_upload_list_setting(raw: object) -> bool | None:
@@ -325,7 +325,7 @@ def extract_show_upload_list_setting(raw: object) -> bool | None:
                 return _to_bool_like(section.get(key), default=False)
     return None
 
-# split-source: order=709 original-lines=7080-7096 hash=b8eb5cc95c75642d
+# split-source: order=712 original-lines=7173-7189 hash=b8eb5cc95c75642d
 
 
 def extract_ui_style_setting(raw: object) -> str | None:
@@ -344,7 +344,7 @@ def extract_ui_style_setting(raw: object) -> str | None:
                 return normalize_ui_style(str(section.get(key) or ""))
     return None
 
-# split-source: order=710 original-lines=7097-7118 hash=1700307c7f4f43a3
+# split-source: order=713 original-lines=7190-7211 hash=1700307c7f4f43a3
 
 
 def extract_js_lib_download_setting(raw: object) -> bool | None:
@@ -368,7 +368,7 @@ def extract_js_lib_download_setting(raw: object) -> bool | None:
                 return _to_bool_like(section.get(key), default=True)
     return None
 
-# split-source: order=711 original-lines=7119-7164 hash=bcbbb7bee1d1820d
+# split-source: order=714 original-lines=7212-7257 hash=bcbbb7bee1d1820d
 
 
 def extract_daily_session_limit_setting(raw: object) -> int | None:
@@ -416,7 +416,7 @@ def extract_daily_session_limit_setting(raw: object) -> int | None:
                 return _parse_non_negative_int(section.get(key))
     return None
 
-# split-source: order=712 original-lines=7165-7213 hash=8870893baf59b79f
+# split-source: order=715 original-lines=7258-7306 hash=8870893baf59b79f
 
 
 def extract_shell_command_timeout_setting(raw: object) -> int | None:
@@ -467,7 +467,7 @@ def extract_shell_command_timeout_setting(raw: object) -> int | None:
                 return _parse_timeout(section.get(key))
     return None
 
-# split-source: order=713 original-lines=7214-7231 hash=7266e28c036f18ee
+# split-source: order=716 original-lines=7307-7324 hash=7266e28c036f18ee
 
 
 def normalize_shell_timeout_mode(value: object, default: str = DEFAULT_SHELL_TIMEOUT_MODE) -> str:
@@ -487,7 +487,7 @@ def normalize_shell_timeout_mode(value: object, default: str = DEFAULT_SHELL_TIM
     text = aliases.get(text, text)
     return text if text in SHELL_TIMEOUT_MODES else fallback
 
-# split-source: order=714 original-lines=7232-7244 hash=9328794d105bdf46
+# split-source: order=717 original-lines=7325-7337 hash=9328794d105bdf46
 
 
 def extract_shell_timeout_mode_setting(raw: object) -> str | None:
@@ -502,7 +502,7 @@ def extract_shell_timeout_mode_setting(raw: object) -> str | None:
                 return normalize_shell_timeout_mode(container.get(key))
     return None
 
-# split-source: order=715 original-lines=7245-7272 hash=142ff4da1e2a0e7f
+# split-source: order=718 original-lines=7338-7365 hash=142ff4da1e2a0e7f
 
 
 def extract_shell_async_handoff_setting(raw: object) -> int | None:
@@ -532,7 +532,7 @@ def extract_shell_async_handoff_setting(raw: object) -> int | None:
                 return None
     return None
 
-# split-source: order=716 original-lines=7273-7307 hash=1c6c0fe1eb5e7c93
+# split-source: order=719 original-lines=7366-7400 hash=1c6c0fe1eb5e7c93
 
 
 def extract_context_token_limit_setting(raw: object) -> int | None:
@@ -569,7 +569,7 @@ def extract_context_token_limit_setting(raw: object) -> int | None:
                 return _parse_limit(section.get(key))
     return None
 
-# split-source: order=717 original-lines=7308-7329 hash=f5016fe44e36c4f6
+# split-source: order=720 original-lines=7401-7422 hash=f5016fe44e36c4f6
 
 
 def normalize_auto_task_level_ceiling(value: object, default: int = DEFAULT_AUTO_TASK_LEVEL_CEILING) -> int:
@@ -593,7 +593,7 @@ def normalize_auto_task_level_ceiling(value: object, default: int = DEFAULT_AUTO
         return int(raw)
     return 0
 
-# split-source: order=718 original-lines=7330-7365 hash=eb92ef4ff195cacb
+# split-source: order=721 original-lines=7423-7458 hash=eb92ef4ff195cacb
 
 
 def normalize_l2_todo_policy(value: object, default: str = DEFAULT_L2_TODO_POLICY) -> str:
@@ -631,7 +631,7 @@ def normalize_l2_todo_policy(value: object, default: str = DEFAULT_L2_TODO_POLIC
     fallback = str(default or DEFAULT_L2_TODO_POLICY).strip().lower().replace("_", "-")
     return aliases.get(fallback, DEFAULT_L2_TODO_POLICY)
 
-# split-source: order=719 original-lines=7366-7408 hash=a419cc8181e68fb5
+# split-source: order=722 original-lines=7459-7501 hash=a419cc8181e68fb5
 
 
 def extract_l2_todo_policy_setting(raw: object) -> str | None:
@@ -676,7 +676,7 @@ def extract_l2_todo_policy_setting(raw: object) -> str | None:
                 return "force" if _to_bool_like(section.get(key), default=True) else "off"
     return None
 
-# split-source: order=720 original-lines=7409-7438 hash=d80bbdccf183f77c
+# split-source: order=723 original-lines=7502-7531 hash=d80bbdccf183f77c
 
 
 def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
@@ -708,7 +708,7 @@ def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
                 return normalize_auto_task_level_ceiling(section.get(key))
     return None
 
-# split-source: order=721 original-lines=7439-7459 hash=f5f947766e92c002
+# split-source: order=724 original-lines=7532-7552 hash=f5f947766e92c002
 
 
 def normalize_read_context_policy(value: object, default: str = DEFAULT_READ_CONTEXT_POLICY) -> str:
@@ -731,13 +731,13 @@ def normalize_read_context_policy(value: object, default: str = DEFAULT_READ_CON
         return raw
     return normalize_read_context_policy(default, "auto") if str(default or "").strip().lower() != raw else "auto"
 
-# split-source: order=722 original-lines=7460-7463 hash=146cba5e58468542
+# split-source: order=725 original-lines=7553-7556 hash=146cba5e58468542
 
 
 def normalize_tool_memory_policy(value: object, default: str = DEFAULT_TOOL_MEMORY_POLICY) -> str:
     return normalize_read_context_policy(value, default)
 
-# split-source: order=723 original-lines=7464-7487 hash=0dfb00d55cadcb2a
+# split-source: order=726 original-lines=7557-7580 hash=0dfb00d55cadcb2a
 
 
 def extract_read_context_policy_setting(raw: object) -> str | None:
@@ -763,7 +763,7 @@ def extract_read_context_policy_setting(raw: object) -> str | None:
                 return normalize_read_context_policy(section.get(key))
     return None
 
-# split-source: order=724 original-lines=7488-7511 hash=6c7a96d8cb2de88d
+# split-source: order=727 original-lines=7581-7604 hash=6c7a96d8cb2de88d
 
 
 def extract_tool_memory_policy_setting(raw: object) -> str | None:
@@ -789,7 +789,7 @@ def extract_tool_memory_policy_setting(raw: object) -> str | None:
                 return normalize_tool_memory_policy(section.get(key))
     return extract_read_context_policy_setting(raw)
 
-# split-source: order=726 original-lines=7518-7528 hash=4b6ffdf2995c7b37
+# split-source: order=729 original-lines=7611-7621 hash=4b6ffdf2995c7b37
 
 
 def default_multimodal_capabilities() -> dict[str, bool]:
@@ -802,7 +802,7 @@ def default_multimodal_capabilities() -> dict[str, bool]:
         "output_video": False,
     }
 
-# split-source: order=727 original-lines=7529-7541 hash=2e6d6aae947d1ddf
+# split-source: order=730 original-lines=7622-7634 hash=2e6d6aae947d1ddf
 
 
 def _to_bool_like(raw: object, default: bool = False) -> bool:
@@ -817,7 +817,7 @@ def _to_bool_like(raw: object, default: bool = False) -> bool:
         return False
     return default
 
-# split-source: order=728 original-lines=7542-7554 hash=e5330bd50c006691
+# split-source: order=731 original-lines=7635-7647 hash=e5330bd50c006691
 
 
 def extract_web_search_enabled_setting(raw: object) -> bool | None:
@@ -832,7 +832,7 @@ def extract_web_search_enabled_setting(raw: object) -> bool | None:
             return _to_bool_like(section.get(key), default=DEFAULT_WEB_SEARCH_ENABLED)
     return None
 
-# split-source: order=729 original-lines=7555-7581 hash=b623041feef4cdf6
+# split-source: order=732 original-lines=7648-7674 hash=b623041feef4cdf6
 
 
 def _single_no_plan_todo_setting_sections(raw: dict) -> list[dict]:
@@ -861,7 +861,7 @@ def _single_no_plan_todo_setting_sections(raw: dict) -> list[dict]:
                     sections.append(child)
     return sections
 
-# split-source: order=730 original-lines=7582-7607 hash=f918d26a261d4824
+# split-source: order=733 original-lines=7675-7700 hash=f918d26a261d4824
 
 
 def _single_no_plan_todo_setting_present(raw: object) -> bool:
@@ -889,7 +889,7 @@ def _single_no_plan_todo_setting_present(raw: object) -> bool:
         for key in (*enabled_keys, *prompt_keys)
     )
 
-# split-source: order=731 original-lines=7608-7654 hash=ca48429712a5b828
+# split-source: order=734 original-lines=7701-7747 hash=ca48429712a5b828
 
 
 def extract_single_no_plan_todo_settings(raw: object) -> tuple[bool, str]:
@@ -938,7 +938,7 @@ def extract_single_no_plan_todo_settings(raw: object) -> tuple[bool, str]:
         return True, prompt or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
     return False, ""
 
-# split-source: order=732 original-lines=7655-7685 hash=d98799beafdaf215
+# split-source: order=735 original-lines=7748-7778 hash=d98799beafdaf215
 
 
 def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY_MODE) -> str:
@@ -971,13 +971,13 @@ def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY
     fallback = str(default or DEFAULT_USER_MEMORY_MODE).strip().lower()
     return fallback if fallback in USER_MEMORY_MODE_CHOICES else DEFAULT_USER_MEMORY_MODE
 
-# split-source: order=733 original-lines=7686-7689 hash=81fb3d5ca2ad8058
+# split-source: order=736 original-lines=7779-7782 hash=81fb3d5ca2ad8058
 
 
 def user_memory_enabled_from_mode(mode: object) -> bool:
     return normalize_user_memory_mode(mode) != "off"
 
-# split-source: order=734 original-lines=7690-7729 hash=b0e9dd3a612c2123
+# split-source: order=737 original-lines=7783-7822 hash=b0e9dd3a612c2123
 
 
 def extract_user_memory_mode_setting(raw: object) -> str | None:
@@ -1019,7 +1019,7 @@ def extract_user_memory_mode_setting(raw: object) -> str | None:
                 return "weak" if _to_bool_like(section.get(key), default=True) else "off"
     return None
 
-# split-source: order=735 original-lines=7730-7745 hash=c8140018cfb82faf
+# split-source: order=738 original-lines=7823-7838 hash=c8140018cfb82faf
 
 
 def set_web_search_enabled_on_runtime(target: object, enabled: bool, *, persist: bool = False) -> None:
@@ -1037,7 +1037,7 @@ def set_web_search_enabled_on_runtime(target: object, enabled: bool, *, persist:
     except Exception:
         pass
 
-# split-source: order=736 original-lines=7746-7792 hash=3f0b7008aa45192b
+# split-source: order=739 original-lines=7839-7885 hash=3f0b7008aa45192b
 
 
 def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, bool]:
@@ -1086,7 +1086,7 @@ def infer_model_multimodal_capabilities(provider: str, model: str) -> dict[str, 
             caps["input_image"] = True
     return caps
 
-# split-source: order=737 original-lines=7793-7832 hash=3f6d2a3e97a5dd48
+# split-source: order=740 original-lines=7886-7925 hash=3f6d2a3e97a5dd48
 
 
 def parse_capability_overrides(raw: object) -> dict[str, bool]:
@@ -1128,7 +1128,7 @@ def parse_capability_overrides(raw: object) -> dict[str, bool]:
             out[mapped] = _to_bool_like(value, default=False)
     return out
 
-# split-source: order=738 original-lines=7833-7842 hash=3a4562a324845c0c
+# split-source: order=741 original-lines=7926-7935 hash=3a4562a324845c0c
 
 
 def merge_multimodal_capabilities(base: dict[str, bool], override: dict[str, bool]) -> dict[str, bool]:
@@ -1140,7 +1140,7 @@ def merge_multimodal_capabilities(base: dict[str, bool], override: dict[str, boo
             out[key] = bool(value)
     return out
 
-# split-source: order=739 original-lines=7843-7859 hash=d205fcbaf2f104d3
+# split-source: order=742 original-lines=7936-7952 hash=d205fcbaf2f104d3
 
 
 def parse_media_endpoints(raw: object) -> dict[str, str]:
@@ -1159,7 +1159,7 @@ def parse_media_endpoints(raw: object) -> dict[str, str]:
             out[media_type] = v
     return out
 
-# split-source: order=755 original-lines=8037-8062 hash=380fc2b2a9209690
+# split-source: order=758 original-lines=8130-8155 hash=380fc2b2a9209690
 
 def extract_runtime_region_hint_setting(raw: object) -> str:
     if not isinstance(raw, dict):
@@ -1187,7 +1187,7 @@ def extract_runtime_region_hint_setting(raw: object) -> str:
                 return trim(value, 160)
     return ""
 
-# split-source: order=756 original-lines=8063-8080 hash=be32b3fed30e7bce
+# split-source: order=759 original-lines=8156-8173 hash=be32b3fed30e7bce
 
 def extract_runtime_timezone_hint_setting(raw: object) -> str:
     if not isinstance(raw, dict):
@@ -1207,7 +1207,7 @@ def extract_runtime_timezone_hint_setting(raw: object) -> str:
                 return trim(value, 120)
     return ""
 
-# split-source: order=757 original-lines=8081-8130 hash=06d71d8bf464e298
+# split-source: order=760 original-lines=8174-8223 hash=06d71d8bf464e298
 
 def runtime_environment_context_snapshot(
     *,
@@ -1259,7 +1259,7 @@ def runtime_environment_context_snapshot(
         "workspace": str(files_root or "").strip(),
     }
 
-# split-source: order=758 original-lines=8131-8160 hash=d901fe071f1104e4
+# split-source: order=761 original-lines=8224-8253 hash=d901fe071f1104e4
 
 def runtime_environment_context_block(snapshot: dict) -> str:
     snap = snapshot if isinstance(snapshot, dict) else {}
@@ -1291,7 +1291,7 @@ def runtime_environment_context_block(snapshot: dict) -> str:
         "Do not infer the current year from model memory. If a market or jurisdiction calendar matters and is not in this block, verify it with tools and state any uncertainty."
     )
 
-# split-source: order=794 original-lines=8635-8645 hash=2dc5eec7887c2b9d
+# split-source: order=797 original-lines=8728-8738 hash=2dc5eec7887c2b9d
 
 def load_offline_js_lib_index(js_root: Path) -> dict:
     fp = (js_root / OFFLINE_JS_LIB_INDEX_FILE).resolve()
@@ -1304,7 +1304,31 @@ def load_offline_js_lib_index(js_root: Path) -> dict:
     except Exception:
         return {}
 
-# split-source: order=855 original-lines=12208-12219 hash=bf4350913a845978
+# split-source: order=852 original-lines=12247-12268 hash=8f663dd5fe60a2cc
+
+def extract_ollama_model_capabilities(payload: object) -> dict:
+    """Translate Ollama ``/api/show`` metadata to provider-neutral hints."""
+    if not isinstance(payload, dict):
+        return {}
+    values: set[str] = set()
+    raw = payload.get("capabilities")
+    if isinstance(raw, dict):
+        values.update(str(key).strip().lower() for key, value in raw.items() if value)
+    elif isinstance(raw, (list, tuple, set)):
+        values.update(str(value).strip().lower() for value in raw)
+    elif isinstance(raw, str):
+        values.update(part.strip().lower() for part in re.split(r"[,\s]+", raw) if part.strip())
+    caps: dict[str, object] = {}
+    if any("think" in value or "reason" in value for value in values):
+        caps["reasoning_supported"] = True
+        caps["reasoning_style"] = "ollama"
+    if any("vision" in value or "image" in value for value in values):
+        caps["vision"] = True
+    if any("tool" in value or "function" in value for value in values):
+        caps["tools"] = True
+    return caps
+
+# split-source: order=861 original-lines=12391-12402 hash=bf4350913a845978
 
 def resolve_ollama_model(base_url: str, preferred: str) -> str:
     models = list_ollama_models(base_url)
@@ -1318,13 +1342,13 @@ def resolve_ollama_model(base_url: str, preferred: str) -> str:
             return m
     return models[0]
 
-# split-source: order=856 original-lines=12220-12223 hash=fd13dc6907d09805
+# split-source: order=862 original-lines=12403-12406 hash=fd13dc6907d09805
 
 def infer_thinking_model(model: str) -> bool:
     # Thinking control is disabled globally: do not infer or force it by model name.
     return False
 
-# split-source: order=867 original-lines=12433-12442 hash=9f92f7c16525f0e2
+# split-source: order=873 original-lines=12616-12625 hash=9f92f7c16525f0e2
 
 def extract_base_url(endpoint_or_base: str) -> str:
     s = (endpoint_or_base or "").strip()
@@ -1336,7 +1360,7 @@ def extract_base_url(endpoint_or_base: str) -> str:
             return s[: -len(suffix)] or s
     return s
 
-# split-source: order=869 original-lines=12454-12471 hash=512eb439750bd9a8
+# split-source: order=875 original-lines=12637-12654 hash=512eb439750bd9a8
 
 def infer_user_complexity_value(text: str) -> str:
     low = strip_thinking_content(str(text or "")).strip().lower()
@@ -1356,7 +1380,7 @@ def infer_user_complexity_value(text: str) -> str:
             return "complex"
     return ""
 
-# split-source: order=870 original-lines=12472-12501 hash=ba5fc5d15d62db7c
+# split-source: order=876 original-lines=12655-12684 hash=ba5fc5d15d62db7c
 
 def normalize_task_complexity(raw: object, default: str = "simple") -> str:
     value = str(raw or "").strip().lower()
@@ -1388,17 +1412,17 @@ def normalize_task_complexity(raw: object, default: str = "simple") -> str:
         return ""
     return fallback if fallback in TASK_COMPLEXITY_LEVELS else "simple"
 
-# split-source: order=871 original-lines=12502-12504 hash=13a04b142c411b7a
+# split-source: order=877 original-lines=12685-12687 hash=13a04b142c411b7a
 
 def task_complexity_rank(raw: object, default: str = "simple") -> int:
     return int(TASK_COMPLEXITY_RANKS.get(normalize_task_complexity(raw, default=default), 1))
 
-# split-source: order=872 original-lines=12505-12507 hash=f2cfc12da1138ba7
+# split-source: order=878 original-lines=12688-12690 hash=f2cfc12da1138ba7
 
 def task_complexity_at_least(raw: object, threshold: str) -> bool:
     return task_complexity_rank(raw) >= task_complexity_rank(threshold)
 
-# split-source: order=873 original-lines=12508-12518 hash=95ddd61442a13767
+# split-source: order=879 original-lines=12691-12701 hash=95ddd61442a13767
 
 def max_task_complexity(*values: object, default: str = "simple") -> str:
     best = normalize_task_complexity(default, default=default)
@@ -1411,7 +1435,7 @@ def max_task_complexity(*values: object, default: str = "simple") -> str:
             best_rank = cur_rank
     return best
 
-# split-source: order=874 original-lines=12519-12535 hash=155ddbecefe13b19
+# split-source: order=880 original-lines=12702-12718 hash=155ddbecefe13b19
 
 def normalize_openai_compat_provider_name(raw: str) -> str:
     value = str(raw or "").strip().lower().replace("-", "_")
@@ -1430,7 +1454,7 @@ def normalize_openai_compat_provider_name(raw: str) -> str:
     }
     return aliases.get(value, value or "openai_compat")
 
-# split-source: order=894 original-lines=12657-12707 hash=1fd9e84ad46cf8d2
+# split-source: order=900 original-lines=12846-12897 hash=f819d83005bfa3ae
 
 
 def resolve_reasoning_payload(
@@ -1439,6 +1463,7 @@ def resolve_reasoning_payload(
     effort: str,
     *,
     max_tokens: int = 2000,
+    capabilities: dict | None = None,
 ) -> dict:
     """Map (provider, model, effort) -> concrete request mutations.
 
@@ -1453,7 +1478,7 @@ def resolve_reasoning_payload(
     eff = str(effort or EFFORT_OFF).strip().lower()
     if eff not in EFFORT_ORDER or eff == EFFORT_OFF:
         return {}
-    style = model_reasoning_style(provider, model)
+    style = model_reasoning_style(provider, model, capabilities)
     if style == "none":
         return {}
     if style == "anthropic":
@@ -1483,7 +1508,7 @@ def resolve_reasoning_payload(
         return {"think": True}
     return {}
 
-# split-source: order=897 original-lines=12755-12789 hash=62d57a511ae77d05
+# split-source: order=904 original-lines=12966-13000 hash=62d57a511ae77d05
 
 def extract_openai_compat_model_ids(payload: object) -> list[str]:
     out: list[str] = []
@@ -1520,7 +1545,269 @@ def extract_openai_compat_model_ids(payload: object) -> list[str]:
     _walk(payload, 0)
     return out
 
-# split-source: order=900 original-lines=12822-12857 hash=6145f26539ee9055
+# split-source: order=905 original-lines=13001-13080 hash=39722d42d270d76c
+
+
+def extract_openai_compat_model_records(payload: object) -> list[dict]:
+    """Extract model ids plus conservative capability hints from /models."""
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    def capability_hints(node: dict) -> dict:
+        caps: dict = {}
+        for key in ("reasoning_supported", "supports_reasoning", "reasoning", "thinking"):
+            if key in node:
+                raw = node.get(key)
+                if isinstance(raw, bool):
+                    caps["reasoning_supported"] = raw
+                    break
+                if isinstance(raw, (list, tuple, set)):
+                    caps["reasoning_supported"] = bool(raw)
+                    break
+                if isinstance(raw, str) and raw.strip().lower() in {
+                    "true", "yes", "on", "enabled", "supported"
+                }:
+                    caps["reasoning_supported"] = True
+                    break
+        style = node.get("reasoning_style") or node.get("reasoning_dialect")
+        if isinstance(style, str) and style.strip():
+            normalized_style = style.strip().lower()
+            if normalized_style in {"reasoning_effort", "reasoning-effort", "reasoning"}:
+                normalized_style = "openai"
+            caps["reasoning_style"] = normalized_style
+            caps.setdefault("reasoning_supported", True)
+        for key in ("supported_parameters", "supported_features", "features"):
+            values = node.get(key)
+            if isinstance(values, dict):
+                values = values.keys()
+            if isinstance(values, (list, tuple, set)):
+                names = {str(value or "").strip().lower() for value in values}
+                if any(
+                    any(token in value for token in ("reasoning", "thinking"))
+                    for value in names
+                ):
+                    caps.setdefault("reasoning_supported", True)
+                    if any("reasoning_effort" in value for value in names):
+                        caps.setdefault("reasoning_style", "openai")
+                    break
+        raw_caps = node.get("capabilities")
+        if isinstance(raw_caps, dict):
+            nested = capability_hints(raw_caps)
+            caps.update(nested)
+        elif isinstance(raw_caps, (list, tuple, set)):
+            nested = capability_hints({"supported_features": raw_caps})
+            caps.update(nested)
+        return caps
+
+    def walk(node: object, depth: int = 0):
+        if depth > 5 or node is None:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        model_id = ""
+        for key in ("id", "model", "name"):
+            value = node.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                model_id = trim(str(value).strip(), 240)
+                break
+        if model_id and model_id.lower() not in {"list", "model", "models", "object", "data"}:
+            low = model_id.lower()
+            if low not in seen:
+                seen.add(low)
+                caps = capability_hints(node)
+                records.append({"id": model_id, "capabilities": caps, "raw": node})
+        for key in ("data", "models", "items", "result", "results", "value"):
+            if key in node:
+                walk(node.get(key), depth + 1)
+
+    walk(payload)
+    return records
+
+# split-source: order=911 original-lines=13233-13276 hash=04a3e2b3c671defc
+
+
+def merge_probed_models_into_profile(
+    profile: dict,
+    records: object = None,
+    model_ids: object = None,
+) -> bool:
+    """Persist the provider's discovered model directory and per-model hints."""
+    if not isinstance(profile, dict):
+        return False
+    existing = [str(value).strip() for value in profile.get("models", []) if str(value).strip()]
+    ids = list(existing)
+    for raw in model_ids or []:
+        value = str(raw or "").strip()
+        if value and value not in ids:
+            ids.append(value)
+    settings = dict(profile.get("model_settings", {}) or {}) if isinstance(profile.get("model_settings"), dict) else {}
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        model_id = str(record.get("id") or record.get("model") or record.get("name") or "").strip()
+        if not model_id:
+            continue
+        if model_id not in ids:
+            ids.append(model_id)
+        caps = record.get("capabilities") if isinstance(record.get("capabilities"), dict) else {}
+        if not isinstance(caps, dict):
+            caps = {}
+        if caps.get("reasoning_style") is None and caps.get("reasoning_dialect"):
+            caps = dict(caps)
+            caps["reasoning_style"] = caps.get("reasoning_dialect")
+        normalized = normalize_model_runtime_settings(caps)
+        if normalized:
+            prior = normalize_model_runtime_settings(settings.get(model_id, {}))
+            settings[model_id] = {**prior, **normalized}
+    changed = ids != existing or settings != (profile.get("model_settings") if isinstance(profile.get("model_settings"), dict) else {})
+    if ids:
+        profile["models"] = ids
+        if not str(profile.get("model", "") or "").strip() or str(profile.get("model", "")).strip().lower() in {"auto", "custom-model"}:
+            profile["model"] = ids[0]
+        profile["selection"] = f"{profile.get('id', '')}::{profile.get('model', '')}"
+    if settings:
+        profile["model_settings"] = settings
+    return changed
+
+# split-source: order=912 original-lines=13277-13334 hash=c692ebaf3390e810
+
+
+def probe_and_merge_model_profiles(
+    profiles: object,
+    *,
+    force_refresh: bool = True,
+) -> bool:
+    """Probe every configured provider and merge its complete model directory.
+
+    Import/reset paths use synchronous probing so a newly imported profile is
+    immediately usable with every model the provider exposes. Network errors
+    leave the explicitly configured models intact; the catalog can retry later.
+    """
+    if isinstance(profiles, dict):
+        rows = list(profiles.values())
+    elif isinstance(profiles, list):
+        rows = profiles
+    else:
+        return False
+    valid_rows = [profile for profile in rows if isinstance(profile, dict)]
+    if not valid_rows:
+        return False
+    records_by_index: dict[int, list[dict]] = {}
+
+    def _probe(profile: dict) -> list[dict]:
+        try:
+            return probe_provider_models(
+                profile,
+                force_refresh=bool(force_refresh),
+                background=False,
+            )
+        except Exception:
+            return []
+
+    # Providers are independent network services. Probe them concurrently so
+    # an unavailable vendor contributes one timeout instead of serially
+    # delaying every other imported profile.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, len(valid_rows)),
+        thread_name_prefix="provider-model-import",
+    ) as executor:
+        future_map = {
+            executor.submit(_probe, profile): index
+            for index, profile in enumerate(valid_rows)
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            index = future_map[future]
+            try:
+                records_by_index[index] = future.result()
+            except Exception:
+                records_by_index[index] = []
+
+    changed = False
+    for index, profile in enumerate(valid_rows):
+        changed = merge_probed_models_into_profile(
+            profile, records_by_index.get(index, [])
+        ) or changed
+    return changed
+
+# split-source: order=913 original-lines=13335-13360 hash=6b1d6e07b394ec70
+
+
+def normalize_model_runtime_settings(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key in MODEL_RUNTIME_SETTING_KEYS:
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if key in {"thinking_stream", "response_stream", "reasoning_supported"}:
+            if key == "reasoning_supported" and value is None:
+                continue
+            out[key] = _to_bool_like(value, default=False)
+        elif key in {"effort", "max_effort", "reasoning_style"}:
+            text = str(value or "").strip().lower()
+            if key == "reasoning_style" or text in EFFORT_ORDER or not text:
+                out[key] = text
+        elif key == "temperature":
+            try:
+                out[key] = max(0.0, min(2.0, float(value)))
+            except Exception:
+                continue
+        elif key == "request_timeout":
+            out[key] = normalize_timeout_seconds(value, minimum=MIN_TIMEOUT_SECONDS, maximum=MAX_TIMEOUT_SECONDS, fallback=DEFAULT_REQUEST_TIMEOUT)
+    return out
+
+# split-source: order=914 original-lines=13361-13376 hash=7a37a34172d713be
+
+
+def apply_model_runtime_settings(profile: dict, model: str, settings: object = None) -> dict:
+    row = dict(profile or {})
+    target = str(model or row.get("model", "") or "").strip()
+    per_model = row.get("model_settings")
+    if not isinstance(per_model, dict):
+        per_model = {}
+    merged = normalize_model_runtime_settings(per_model.get(target, {}))
+    merged.update(normalize_model_runtime_settings(settings))
+    if merged:
+        per_model[target] = dict(merged)
+        row["model_settings"] = per_model
+    row["model"] = target or str(row.get("model", "") or "")
+    row["selection"] = f"{row.get('id', '')}::{row.get('model', '')}"
+    return row
+
+# split-source: order=915 original-lines=13377-13387 hash=6ccad9fce2141bc2
+
+
+def model_runtime_settings_for(profile: dict, model: str = "") -> dict:
+    """Return the effective settings for one model without exposing secrets."""
+    row = profile if isinstance(profile, dict) else {}
+    target = str(model or row.get("model", "") or "").strip()
+    out = normalize_model_runtime_settings(row)
+    per_model = row.get("model_settings")
+    if isinstance(per_model, dict):
+        out.update(normalize_model_runtime_settings(per_model.get(target, {})))
+    return out
+
+# split-source: order=916 original-lines=13388-13400 hash=1b887aa820a3a005
+
+
+def apply_model_option_runtime_fields(option: dict, profile: dict, model: str = "") -> dict:
+    """Overlay per-model runtime settings on a public catalog option."""
+    target = str(model or option.get("model", "") or "").strip()
+    settings = model_runtime_settings_for(profile, target)
+    for key in MODEL_RUNTIME_SETTING_KEYS:
+        if key in settings:
+            option[key] = settings[key]
+    if isinstance(profile, dict):
+        option.setdefault("display_name", str(profile.get("display_name", profile.get("label", "")) or ""))
+        option.setdefault("title", str(profile.get("title", profile.get("label", "")) or ""))
+    return option
+
+# split-source: order=919 original-lines=13433-13468 hash=6145f26539ee9055
 
 def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeout: int = 20) -> tuple[dict, str]:
     raw = str(source or "").strip()
@@ -1558,7 +1845,7 @@ def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeou
         )
     return config, source_desc
 
-# split-source: order=901 original-lines=12858-13488 hash=b04eb35c00ad5b9e
+# split-source: order=920 original-lines=13469-14329 hash=355b52fdbbafcae2
 
 def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_ollama_model: str) -> dict:
     model_caps_map = config.get("model_capabilities", {})
@@ -1566,6 +1853,19 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         model_caps_map = parse_json_object(model_caps_map, {})
     if not isinstance(model_caps_map, dict):
         model_caps_map = {}
+
+    # Reasoning metadata is kept separate from multimodal capabilities.  The
+    # importer writes this map from provider model probes, and it must survive
+    # a config round-trip so model-specific effort controls remain available
+    # after restart.
+    raw_reasoning_map = config.get(
+        "model_reasoning_capabilities",
+        config.get("reasoning_capabilities", {}),
+    )
+    if isinstance(raw_reasoning_map, str):
+        raw_reasoning_map = parse_json_object(raw_reasoning_map, {})
+    if not isinstance(raw_reasoning_map, dict):
+        raw_reasoning_map = {}
 
     raw_global_caps = config.get("multimodal_capabilities", config.get("capabilities", {}))
     if isinstance(raw_global_caps, str):
@@ -1667,6 +1967,30 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 return {str(k): str(v) for k, v in parsed.items()}
         return {}
 
+    def parse_profile_model_settings(raw: object, model_ids: list[str] | None = None) -> dict:
+        """Normalize per-model runtime settings from config without secrets."""
+        if isinstance(raw, str):
+            raw = parse_json_object(raw, {})
+        if not isinstance(raw, dict):
+            return {}
+        settings: dict[str, dict] = {}
+        # A flat settings object applies to the profile's default model.
+        if any(key in MODEL_RUNTIME_SETTING_KEYS for key in raw):
+            target = str((model_ids or [""])[0] or "").strip()
+            if target:
+                normalized = normalize_model_runtime_settings(raw)
+                if normalized:
+                    settings[target] = normalized
+            return settings
+        for target, value in raw.items():
+            model_id = str(target or "").strip()
+            if not model_id or not isinstance(value, dict):
+                continue
+            normalized = normalize_model_runtime_settings(value)
+            if normalized:
+                settings[model_id] = normalized
+        return settings
+
     def add_profile(
         out: list[dict],
         *,
@@ -1674,6 +1998,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         provider: str,
         label: str,
         model: str = "",
+        models: list[str] | None = None,
+        display_name: str = "",
+        title: str = "",
         base_url: str = "",
         endpoint: str = "",
         api_key: str = "",
@@ -1688,6 +2015,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         source: str = "config",
         effort: str = "",
         max_effort: str = "",
+        reasoning_supported: bool | None = None,
+        reasoning_style: str = "",
+        model_settings: dict | None = None,
     ):
         out.append(
             {
@@ -1695,6 +2025,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "provider": provider,
                 "label": label,
                 "model": (model or "").strip(),
+                "models": [str(x).strip() for x in (models or []) if str(x).strip()],
+                "display_name": str(display_name or label or "").strip(),
+                "title": str(title or label or "").strip(),
                 "base_url": (base_url or "").strip(),
                 "endpoint": (endpoint or "").strip(),
                 "api_key": (api_key or "").strip(),
@@ -1713,12 +2046,20 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "media_endpoints": media_endpoints or {},
                 "effort": str(effort or "").strip().lower(),
                 "max_effort": str(max_effort or "").strip().lower(),
+                "reasoning_supported": reasoning_supported,
+                "reasoning_style": str(reasoning_style or "").strip().lower(),
+                "model_settings": {
+                    str(model_id).strip(): normalize_model_runtime_settings(values)
+                    for model_id, values in (model_settings or {}).items()
+                    if str(model_id).strip() and normalize_model_runtime_settings(values)
+                },
                 "source": source,
             }
         )
 
     profiles: list[dict] = []
-    provider = str(config.get("provider", "")).strip().lower()
+    config_provider = normalize_profile_provider(str(config.get("provider", "")))
+    provider = config_provider
     temp = float(config.get("temperature", 0.2) or 0.2)
     timeout = normalize_timeout_seconds(
         config.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
@@ -1802,6 +2143,12 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         ).strip()
         if not provider and (base_hint or endpoint):
             provider = "openai_compat"
+        # Arbitrary provider names are transported through the custom HTTP
+        # adapter while preserving the user supplied name for display.
+        provider_name = str(provider_hint or "").strip()
+        if provider and provider not in {"ollama", "anthropic", "custom_http"} and not is_openai_like_provider(provider) and (base_hint or endpoint):
+            provider_name = provider_name or provider
+            provider = "custom_http"
         if not provider:
             continue
         profile_id = sanitize_profile_id(
@@ -1816,9 +2163,12 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         )
         label = str(
             raw_profile.get("label")
+            or raw_profile.get("custom_name")
             or raw_profile.get("name")
             or raw_profile.get("title")
+            or raw_profile.get("custom_title")
             or raw_profile.get("display_name")
+            or provider_name
             or profile_id
         ).strip() or profile_id
         model = str(
@@ -1827,8 +2177,32 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             or raw_profile.get("default_model")
             or ""
         ).strip()
+        raw_models = raw_profile.get("models", raw_profile.get("model_ids", raw_profile.get("available_models", [])))
+        if isinstance(raw_models, str):
+            raw_models = [x.strip() for x in re.split(r"[,\n]", raw_models) if x.strip()]
+        if not isinstance(raw_models, list):
+            raw_models = []
+        model_settings: dict[str, dict] = {}
+        model_values: list[str] = []
+        for value in raw_models:
+            if isinstance(value, dict):
+                model_id = str(value.get("id") or value.get("model") or value.get("name") or "").strip()
+                if not model_id:
+                    continue
+                model_values.append(model_id)
+                inline_settings = normalize_model_runtime_settings(value)
+                if inline_settings:
+                    model_settings[model_id] = inline_settings
+            elif str(value).strip():
+                model_values.append(str(value).strip())
+        models = list(dict.fromkeys(model_values))
+        if model and model not in models:
+            models.insert(0, model)
         if not model:
-            model = default_model_for_provider(provider)
+            # A supplied model directory is already authoritative.  Do not
+            # prepend a synthetic provider default such as ``custom-model``.
+            model = models[0] if models else default_model_for_provider(provider)
+        model_settings.update(parse_profile_model_settings(raw_profile.get("model_settings"), [model] + models))
         base_url = extract_base_url(base_hint or endpoint)
         if provider == "ollama" and not base_url:
             base_url = extract_base_url(default_ollama_url)
@@ -1875,6 +2249,20 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             provider=provider,
             label=label,
             model=model,
+            models=models,
+            display_name=str(
+                raw_profile.get("display_name")
+                or raw_profile.get("provider_name")
+                or raw_profile.get("custom_name")
+                or (raw_profile.get("name") if provider == "custom_http" else "")
+                or (provider_name if provider_name and provider_name.lower() not in {"custom_http", "openai_compat"} else "")
+                or label
+            ),
+            title=str(
+                raw_profile.get("title")
+                or raw_profile.get("custom_title")
+                or label
+            ),
             base_url=base_url,
             endpoint=endpoint,
             api_key=api_key,
@@ -1901,6 +2289,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=media_endpoints,
             effort=str(raw_profile.get("effort", effort_default) or effort_default),
             max_effort=str(raw_profile.get("max_effort", max_effort_default) or max_effort_default),
+            reasoning_supported=(raw_profile.get("reasoning_supported") if isinstance(raw_profile.get("reasoning_supported"), bool) else None),
+            reasoning_style=str(raw_profile.get("reasoning_style") or raw_profile.get("reasoning_dialect") or ""),
+            model_settings=model_settings,
             source=str(raw_profile.get("source", "profiles") or "profiles"),
         )
         if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
@@ -2109,17 +2500,60 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("openrouter"),
         )
 
-    custom_url = str(config.get("custom_url", "")).strip()
+    custom_url = str(
+        config.get("custom_url")
+        or (config.get("provider_url") if config_provider == "custom_http" else "")
+        or (config.get("url") if config_provider == "custom_http" else "")
+        or ""
+    ).strip()
     custom_key = str(config.get("custom_key", "")).strip()
     custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
     custom_payload = str(config.get("custom_payload", "") or "").strip()
     if custom_url:
+        raw_custom_models = config.get(
+            "custom_models",
+            config.get(
+                "custom_model_ids",
+                config.get("models", []) if config_provider == "custom_http" else [],
+            ),
+        )
+        if isinstance(raw_custom_models, str):
+            raw_custom_models = [x.strip() for x in re.split(r"[,\n]", raw_custom_models) if x.strip()]
+        custom_models = [str(x).strip() for x in raw_custom_models] if isinstance(raw_custom_models, list) else []
+        custom_model = str(
+            config.get("custom_model", "")
+            or (config.get("model", "") if config_provider == "custom_http" else "")
+            or config.get("openai_model", "")
+        ).strip()
+        if not custom_model and custom_models:
+            custom_model = custom_models[0]
+        if not custom_model:
+            custom_model = "custom-model"
+        if custom_model and custom_model not in custom_models:
+            custom_models.insert(0, custom_model)
         add_profile(
             profiles,
             profile_id="custom",
             provider=normalize_profile_provider("custom_http"),
-            label="Custom HTTP",
-            model=str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model"),
+            label=str(
+                config.get("custom_name")
+                or (config.get("provider_name") if config_provider == "custom_http" else "")
+                or config.get("custom_title")
+                or "Custom HTTP"
+            ),
+            model=custom_model,
+            models=custom_models,
+            display_name=str(
+                config.get("custom_name")
+                or (config.get("provider_name") if config_provider == "custom_http" else "")
+                or "Custom HTTP"
+            ),
+            title=str(
+                config.get("custom_title")
+                or (config.get("provider_title") if config_provider == "custom_http" else "")
+                or config.get("custom_name")
+                or "Custom HTTP"
+            ),
             base_url=extract_base_url(custom_url),
             endpoint=custom_url,
             api_key=custom_key,
@@ -2150,6 +2584,44 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             source="default",
         )
 
+    # Legacy provider keys may carry a comma/newline separated model list.
+    # Keep the configured default first, then let the catalog append probed
+    # models without creating duplicate profiles.
+    provider_model_keys = {
+        "ollama": "ollama_models", "openai_compat": "openai_models",
+        "siliconflow": "siliconflow_models", "vllm": "vllm_models",
+        "lmstudio": "lmstudio_models", "anthropic": "anthropic_models",
+        "glm": "glm_models", "kimi": "kimi_models", "openrouter": "openrouter_models",
+        "custom_http": "custom_models",
+    }
+    for profile in profiles:
+        prov = str(profile.get("provider", "") or "").lower()
+        model_list_key = provider_model_keys.get(prov, "")
+        raw_list = (
+            config.get(
+                model_list_key,
+                config.get("models", []) if config_provider == prov else [],
+            )
+            if model_list_key
+            else []
+        )
+        if isinstance(raw_list, str):
+            raw_list = [x.strip() for x in re.split(r"[,\n]", raw_list) if x.strip()]
+        existing = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+        if not existing and isinstance(raw_list, list):
+            existing = [str(x).strip() for x in raw_list if str(x).strip()]
+        default_model = str(profile.get("model", "") or "").strip()
+        # ``auto`` is a transport placeholder for local OpenAI-compatible
+        # servers.  Once a model directory is available, make its first
+        # discovered entry the active model so importing a directory is
+        # immediately runnable and stable across restarts.
+        if existing and default_model.lower() == "auto":
+            default_model = existing[0]
+            profile["model"] = default_model
+        if default_model and default_model not in existing:
+            existing.insert(0, default_model)
+        profile["models"] = existing
+
     active_map = {
         "ollama": "ollama",
         "openai": "openai",
@@ -2170,7 +2642,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 default_profile_id = candidate
                 break
     if not default_profile_id:
-        default_profile_id = active_map.get(provider, "")
+        default_profile_id = active_map.get(config_provider or provider, "")
     if not default_profile_id or default_profile_id not in profile_ids:
         # Fallback: first non-ollama profile that was explicitly configured
         for p in profiles:
@@ -2189,9 +2661,54 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 p["effort"] = effort_default
             if max_effort_default and not str(p.get("max_effort", "") or "").strip():
                 p["max_effort"] = max_effort_default
+    raw_runtime_settings = config.get(
+        "model_settings",
+        config.get("model_runtime_settings", config.get("runtime_settings", {})),
+    )
+    if isinstance(raw_runtime_settings, str):
+        raw_runtime_settings = parse_json_object(raw_runtime_settings, {})
+    if isinstance(raw_runtime_settings, dict):
+        for profile in profiles:
+            current = dict(profile.get("model_settings", {}) or {})
+            profile_model = str(profile.get("model", "") or "").strip()
+            provider_id = str(profile.get("id", "") or "").strip()
+            provider_name = str(profile.get("provider", "") or "").strip()
+            for model_id, value in raw_reasoning_map.items():
+                normalized = normalize_model_runtime_settings(value)
+                target = str(model_id or "").strip()
+                if target and normalized:
+                    current[target] = {**current.get(target, {}), **normalized}
+            for key in (profile_model, provider_id, provider_name):
+                value = raw_runtime_settings.get(key) if key else None
+                if isinstance(value, dict) and any(k in MODEL_RUNTIME_SETTING_KEYS for k in value):
+                    normalized = normalize_model_runtime_settings(value)
+                    if profile_model and normalized:
+                        current[profile_model] = {**current.get(profile_model, {}), **normalized}
+            for model_id, value in raw_runtime_settings.items():
+                if not isinstance(value, dict):
+                    continue
+                normalized = normalize_model_runtime_settings(value)
+                if normalized:
+                    current[str(model_id).strip()] = {**current.get(str(model_id).strip(), {}), **normalized}
+                elif str(model_id) in {provider_id, provider_name}:
+                    for nested_model, nested_value in value.items():
+                        nested = normalize_model_runtime_settings(nested_value)
+                        if nested:
+                            target = str(nested_model or "").strip()
+                            current[target] = {**current.get(target, {}), **nested}
+            profile["model_settings"] = current
+    elif raw_reasoning_map:
+        for profile in profiles:
+            current = dict(profile.get("model_settings", {}) or {})
+            for model_id, value in raw_reasoning_map.items():
+                target = str(model_id or "").strip()
+                normalized = normalize_model_runtime_settings(value)
+                if target and normalized:
+                    current[target] = {**current.get(target, {}), **normalized}
+            profile["model_settings"] = current
     return {"profiles": profiles, "default_profile_id": default_profile_id}
 
-# split-source: order=902 original-lines=13489-13566 hash=7d7eceaa565f2e50
+# split-source: order=921 original-lines=14330-14419 hash=c5f9c22e6c982021
 
 def looks_like_llm_config(config: dict) -> bool:
     if not isinstance(config, dict) or not config:
@@ -2232,13 +2749,23 @@ def looks_like_llm_config(config: dict) -> bool:
         "openrouter_model",
         "openrouter_key",
         "custom_url",
+        "provider_url",
+        "provider_name",
+        "provider_title",
+        "name",
+        "title",
+        "custom_name",
+        "custom_title",
         "custom_model",
+        "custom_models",
         "custom_key",
         "custom_headers",
         "custom_payload",
         "capabilities",
         "multimodal_capabilities",
         "model_capabilities",
+        "model_reasoning_capabilities",
+        "reasoning_capabilities",
         "media_endpoints",
         "ollama_capabilities",
         "openai_capabilities",
@@ -2268,10 +2795,12 @@ def looks_like_llm_config(config: dict) -> bool:
         "custom_video_endpoint",
         "temperature",
         "request_timeout",
+        "model_settings",
+        "model_runtime_settings",
     }
     return bool(keys & markers)
 
-# split-source: order=906 original-lines=13762-13990 hash=c72333b87d914997
+# split-source: order=925 original-lines=14615-14843 hash=c72333b87d914997
 
 def parse_front_matter(text: str) -> tuple[dict, str]:
     text = text or ""
@@ -2502,14 +3031,14 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
     meta = _parse_simple_yaml_block(raw_meta)
     return _normalize_front_matter_value(meta), body
 
-# split-source: order=914 original-lines=14077-14081 hash=3121d4770c4e99e8
+# split-source: order=933 original-lines=14930-14934 hash=3121d4770c4e99e8
 
 
 def normalize_liquid_kernel_startup_policy(value: object, default: str = "inherit") -> str:
     normalized = str(value or "").strip().lower()
     return normalized if normalized in LIQUID_KERNEL_STARTUP_POLICIES else str(default or "inherit")
 
-# split-source: order=941 original-lines=15928-15962 hash=33063117770270a8
+# split-source: order=960 original-lines=16781-16815 hash=33063117770270a8
 
 
 def normalize_upload_rel_path(path_text: str) -> str:

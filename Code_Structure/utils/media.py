@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=677 original-lines=5860-5874 hash=7e2e42243d6e04fe
+# split-source: order=680 original-lines=5953-5967 hash=7e2e42243d6e04fe
 
 
 def _capability_probe_png_bytes() -> bytes:
@@ -22,7 +22,7 @@ def _capability_probe_png_bytes() -> bytes:
     pixels = zlib.compress(b"\x00\x00\x00\x00\x00")
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
 
-# split-source: order=678 original-lines=5875-5886 hash=d5baf21b90a6374f
+# split-source: order=681 original-lines=5968-5979 hash=d5baf21b90a6374f
 
 
 def _capability_probe_audio_bytes() -> bytes:
@@ -36,21 +36,21 @@ def _capability_probe_audio_bytes() -> bytes:
         + struct.pack("<I", 0)
     )
 
-# split-source: order=679 original-lines=5887-5891 hash=c538f54f4c828c25
+# split-source: order=682 original-lines=5980-5984 hash=c538f54f4c828c25
 
 
 def _capability_probe_video_bytes() -> bytes:
     """Return a minimal ISO-BMFF header for provider capability probes."""
     return struct.pack(">I", 20) + b"ftypisom" + struct.pack(">I", 0) + b"isomiso2"
 
-# split-source: order=740 original-lines=7860-7864 hash=3c6fc91449015a09
+# split-source: order=743 original-lines=7953-7957 hash=3c6fc91449015a09
 
 
 def guess_mime_from_name(name: str, fallback: str = "application/octet-stream") -> str:
     mime, _ = mimetypes.guess_type(str(name or ""))
     return str(mime or fallback)
 
-# split-source: order=741 original-lines=7865-7884 hash=c9712a640fddd6e2
+# split-source: order=744 original-lines=7958-7977 hash=c9712a640fddd6e2
 
 
 def _convert_image_to_safe_format(fp) -> tuple:
@@ -72,7 +72,7 @@ def _convert_image_to_safe_format(fp) -> tuple:
     except Exception:
         return None, "", ""
 
-# split-source: order=742 original-lines=7885-7893 hash=0412fdcc6759d0d3
+# split-source: order=745 original-lines=7978-7986 hash=0412fdcc6759d0d3
 
 
 def guess_ext_from_mime(mime: str, fallback: str = ".bin") -> str:

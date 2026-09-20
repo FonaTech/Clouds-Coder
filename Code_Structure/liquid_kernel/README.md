@@ -18,6 +18,8 @@ Admin may override the schedule. The mode and schedule are available both in the
 --evolution-schedule off|hourly|daily|every_3_days|weekly
 ```
 
+The application embeds a compressed copy of this package inside `Clouds_Coder.py`. On startup it uses a complete local package when present and atomically restores the embedded copy when the package is missing or incomplete. The Admin startup setting `liquid_kernel_startup_policy` accepts `inherit` (the default) or `inject`: `inherit` keeps the persisted registry and session-pinned versions, while `inject` adds the embedded kernel as a new promoted version without deleting the existing registry or breaking old sessions.
+
 ## Version Boundary
 
 Each immutable artifact contains:
@@ -36,7 +38,7 @@ Authentication, persistence, evaluation, promotion, audit, signing, and sandbox 
 1. Select the active kernel and its two parent versions by default.
 2. Read the configured user, session, and date scope; the default scope is all users, all sessions, and all dates.
 3. Separate experience records by pinned kernel version and redact recognized secrets.
-4. Ask the configured generator profile for one or more independently generated candidates, according to the mode budget; a failed generation is rejected without discarding other candidates.
+4. Ask the configured generator profile for one or more independently generated candidates, according to the mode budget; a failed model request fails the run and cannot become `no_change`.
 5. Require each changed candidate to return a structured patch and optional benchmark cases that exercise the problems it intends to solve.
 6. Enforce file, line, token, case, and timeout budgets and reject immutable-boundary violations.
 7. Merge sanitized model-designed cases with randomized cases under a fixed capacity, then run every incumbent/candidate comparison against the same case set in separate isolated Python processes.
@@ -54,3 +56,18 @@ Every run and state transition is recorded in the SQLite registry with a hash-li
 ## Safety Operations
 
 The Admin `Emergency Off` action atomically changes the mode to `Off`, requests cancellation of an active evolution run, and aborts any current Canary. A candidate cannot be promoted directly: it must reach the 100% Canary stage. Artifact hashes and signatures are checked every time a version is loaded.
+
+
+## Source-bound models (capability version 2)
+
+`GET /api/admin/evolution/models` requires Admin authentication. Its options combine the global model directory, the current Agent user's encrypted profiles, and the authenticated IDE account's encrypted profiles. IDE ownership comes from the existing verified session cookie or `X-Evolution-IDE-Token`; an IP address never substitutes for IDE authentication. Directory reads use the existing provider cache without starting remote probes.
+
+`generator_model_ref` and `judge_model_ref` contain `source`, `owner`, `profile_id`, `model`, and an HMAC fingerprint of the effective invocation configuration. Credentials remain in their original configuration store. Equivalent configurations are merged within a source; different addresses, credentials, or invocation settings keep separate options. The same model can generate and judge through independent requests. Legacy profile IDs remain supported and empty references explicitly inherit the global default.
+
+Save and start are separate operations. Both Admin requests require a saved `revision`; concurrent updates receive HTTP 409. The editor keeps its own base revision and unsaved values while status polling continues. A run resolves and fixes both concrete models before task creation. Deleted profiles, disabled IDE accounts, changed invocation settings, and unknown model IDs fail explicitly. Restarting or signing out does not revoke an already saved private-model reference; disabling its owning account does.
+
+Runs record `generating` and `judging` phases, sanitized model references, results, and errors. Missing or invalid judge scores fail instead of receiving a neutral score. Interrupted computation records are marked failed after restart, while approval and Canary history remain intact. Database task/event creation is atomic; failed task creation, failed thread startup, cancellation completion, and worker exceptions release the run lock.
+
+Standalone startup checks `EVOLUTION_MODEL_CAPABILITY_VERSION`. An older package is backed up under `.package-backups/` before replacing code files. Existing runtime configuration, registry records, signing keys, artifacts, and version history stay in place. Rebuild both entrypoints' embedded packages with `python tools/sync_liquid_kernel_bundle.py`.
+
+Verification commands are recorded in `docs/evolution_verification.md`. Live acceptance is opt-in through `tools/verify_evolution_real.py`; it uses a temporary runtime, one candidate, at most 4096 generation tokens and 2048 judge tokens, and the manual-approval mode without deployment.

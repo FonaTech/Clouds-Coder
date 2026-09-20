@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=920 original-lines=14418-14425 hash=7405d447cbf41aba
+# split-source: order=939 original-lines=15271-15278 hash=7405d447cbf41aba
 
 
 class IDEAuthError(Exception):
@@ -15,7 +15,7 @@ class IDEAuthError(Exception):
         self.status = int(status or 400)
         self.retry_after = max(0, int(retry_after or 0))
 
-# split-source: order=921 original-lines=14426-15149 hash=1a1c531f4009ac86
+# split-source: order=940 original-lines=15279-16002 hash=1a1c531f4009ac86
 
 
 class IDEAuthStore:

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1026 original-lines=25362-25384 hash=ec5cc2a0de1c5071
+# split-source: order=1045 original-lines=26215-26237 hash=ec5cc2a0de1c5071
 
 
 class OllamaError(RuntimeError):
@@ -30,7 +30,7 @@ class OllamaError(RuntimeError):
         self.retryable = retryable
         self.transient = transient
 
-# split-source: order=1027 original-lines=25385-27887 hash=a2b922e1238d414b
+# split-source: order=1046 original-lines=26238-28755 hash=9363dda563535758
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
@@ -67,6 +67,8 @@ class OllamaClient:
         self.thinking_stream = bool(thinking_stream)
         self.response_stream = bool(response_stream)
         self.capabilities = default_multimodal_capabilities()
+        self.reasoning_supported: bool | None = None
+        self.reasoning_style: str = ""
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
         self.telemetry_callback = None
@@ -404,6 +406,8 @@ class OllamaClient:
             infer_model_multimodal_capabilities(self.provider, self.model),
             declared_caps,
         )
+        self.reasoning_supported = profile.get("reasoning_supported") if isinstance(profile.get("reasoning_supported"), bool) else None
+        self.reasoning_style = str(profile.get("reasoning_style", "") or "").strip().lower()
         self.media_endpoints = parse_media_endpoints(profile.get("media_endpoints", {}))
         if "embed_model" in profile:
             self.embed_model = str(profile.get("embed_model") or "").strip()
@@ -2318,7 +2322,14 @@ class OllamaClient:
         # Resolve provider-neutral effort into native reasoning mutations once.
         # probe_mode never reasons (it is a cheap capability ping).
         reasoning = {} if probe_mode else resolve_reasoning_payload(
-            self.provider, self.model, effort, max_tokens=max_tokens,
+            self.provider,
+            self.model,
+            effort,
+            max_tokens=max_tokens,
+            capabilities={
+                "reasoning_supported": self.reasoning_supported,
+                "reasoning_style": self.reasoning_style,
+            },
         )
         if reasoning.get("max_tokens"):
             max_tokens = int(reasoning["max_tokens"])
@@ -2444,7 +2455,11 @@ class OllamaClient:
         # thinking by default when the field is omitted.  Send the explicit
         # boolean for models that advertise the native switch so a bounded
         # no-thinking compatibility turn can actually produce a tool call.
-        if model_reasoning_style(provider, self.model) == "ollama":
+        if provider == "ollama" and self.reasoning_supported is not False:
+            # Ollama accepts an explicit boolean on native chat. Unknown
+            # capability metadata stays conservative because the caller's
+            # ``think`` value defaults to false; no model-name inference is
+            # used to turn reasoning on.
             native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools

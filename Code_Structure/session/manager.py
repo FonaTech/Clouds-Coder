@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=725 original-lines=7512-7517 hash=86ab07aacf89e33f
+# split-source: order=728 original-lines=7605-7610 hash=86ab07aacf89e33f
 
 
 class SessionCreationLimitExceeded(RuntimeError):
@@ -13,7 +13,7 @@ class SessionCreationLimitExceeded(RuntimeError):
         self.status = dict(status or {})
         super().__init__(str(self.status.get("message", "daily session limit reached")))
 
-# split-source: order=1062 original-lines=89605-91947 hash=dfc9e4509cd94f45
+# split-source: order=1081 original-lines=90660-93164 hash=fe2547d884295a52
 
 class SessionManager:
     def __init__(
@@ -1862,6 +1862,7 @@ class SessionManager:
             except Exception:
                 pass
         opts = []
+        profiles_changed = False
         ollama_profile_id = ""
         ollama_base = self.ollama_base
         for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
@@ -1884,6 +1885,23 @@ class SessionManager:
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model, caps
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(str(profile.get("provider", "")), model, caps)
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                 }
             )
@@ -1896,7 +1914,24 @@ class SessionManager:
             base = str(profile.get("base_url", self.ollama_base) or self.ollama_base).strip()
             if not base:
                 continue
-            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            tags = list_ollama_models_cached(
+                base,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            ollama_records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(
+                profile, ollama_records, model_ids=tags
+            ) or profiles_changed
+            ollama_record_map = {
+                str(record.get("id", "")): record
+                for record in ollama_records
+                if isinstance(record, dict) and str(record.get("id", "")).strip()
+            }
             if tags:
                 if pid == self.user_active_profile_id:
                     self.ollama_env_tags = list(tags)
@@ -1911,6 +1946,13 @@ class SessionManager:
                     infer_model_multimodal_capabilities("ollama", tag),
                     parse_capability_overrides(profile.get("capabilities", {})),
                 )
+                tag_record = ollama_record_map.get(tag)
+                tag_record_caps = (
+                    tag_record.get("capabilities", {})
+                    if isinstance(tag_record, dict)
+                    else {}
+                )
+                tag_record_probed = isinstance(tag_record, dict)
                 opts.append(
                     {
                         "selection": selection,
@@ -1922,9 +1964,99 @@ class SessionManager:
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", False)),
                         "response_stream": bool(profile.get("response_stream", False)),
+                        "effort": str(profile.get("effort", "") or ""),
+                        "max_effort": str(profile.get("max_effort", "") or ""),
+                        "reasoning_supported": (
+                            profile.get("reasoning_supported")
+                            if profile.get("reasoning_supported") is not None
+                            else tag_record_caps.get("reasoning_supported")
+                            if isinstance(tag_record_caps, dict)
+                            and tag_record_caps.get("reasoning_supported") is not None
+                            else model_reasoning_style(
+                                "ollama",
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            != "none"
+                        ),
+                        "reasoning_style": str(
+                            profile.get("reasoning_style")
+                            or tag_record_caps.get("reasoning_style", "")
+                            or model_reasoning_style(
+                                "ollama",
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            or ""
+                        ),
+                        "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                        "title": str(profile.get("title", profile.get("label", pid)) or ""),
                         "capabilities": tag_caps,
                     }
                 )
+        for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": merge_multimodal_capabilities(infer_model_multimodal_capabilities(str(profile.get("provider", "")), model_id), parse_capability_overrides(profile.get("capabilities", {}))),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.user_model_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         runnable_opts = [x for x in opts if self._option_is_runnable(x)]
         if runnable_opts:
             opts = runnable_opts
@@ -1948,9 +2080,31 @@ class SessionManager:
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "response_stream": bool(active.get("response_stream", False)),
+                    "effort": str(active.get("effort", "") or ""),
+                    "max_effort": str(active.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        active.get("reasoning_supported")
+                        if active.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        active.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": active_caps,
                 },
             )
+            apply_model_option_runtime_fields(opts[0], active, str(active.get("model", "") or ""))
             option_map.add(selected)
         if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
@@ -1958,6 +2112,8 @@ class SessionManager:
             infer_model_multimodal_capabilities(str(active.get("provider", "")), str(active.get("model", ""))),
             parse_capability_overrides(active.get("capabilities", {})),
         )
+        if profiles_changed:
+            self._persist_user_prefs()
         return {
             "provider": active.get("provider", "ollama"),
             "models": [x["selection"] for x in opts] or [self.model],
@@ -1969,7 +2125,7 @@ class SessionManager:
             "active_capabilities": active_caps,
         }
 
-    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+    def set_runtime_model(self, model: str, thinking: bool | None = None, settings: dict | None = None) -> dict:
         raw = str(model or "").strip()
         if not raw:
             raise ValueError("model required")
@@ -1997,6 +2153,11 @@ class SessionManager:
                     raise ValueError(f"profile not found: {pid}")
             if selected_model.strip():
                 profile["model"] = selected_model.strip()
+            profile = apply_model_runtime_settings(profile, str(profile.get("model", "") or ""), settings)
+            for record in probe_provider_models(profile, background=True):
+                if str(record.get("id", "")) == str(profile.get("model", "")):
+                    merge_probed_models_into_profile(profile, [record])
+                    break
             if str(profile.get("provider", "")).lower() == "ollama" and selected_model.strip():
                 profile["capabilities"] = infer_model_multimodal_capabilities("ollama", selected_model.strip())
             if not self._user_profile_is_runnable(profile) and not explicit_profile and selected_model.strip():
@@ -2056,6 +2217,7 @@ class SessionManager:
         cfg = dict(config or {})
         OllamaClient.clear_global_probe_cache()
         profiles, active = self._profiles_from_config(cfg)
+        probe_and_merge_model_profiles(profiles, force_refresh=True)
         with self.lock:
             normalized: dict[str, dict] = {}
             for pid, row in profiles.items():

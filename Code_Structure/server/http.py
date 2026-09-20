@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=690 original-lines=6352-6363 hash=6073888fd5937940
+# split-source: order=693 original-lines=6445-6456 hash=6073888fd5937940
 
 
 def admin_language_payload(manager: object) -> dict:
@@ -19,12 +19,12 @@ def admin_language_payload(manager: object) -> dict:
         "supported_languages": supported_ui_languages_payload(),
     }
 
-# split-source: order=803 original-lines=8952-8954 hash=ad30cdd414ee4b37
+# split-source: order=806 original-lines=9045-9047 hash=ad30cdd414ee4b37
 
 
 _UI_TRUNCATION_MARKER = "\n…(truncated for UI)"
 
-# split-source: order=804 original-lines=8955-8963 hash=aba447d2c530d053
+# split-source: order=807 original-lines=9048-9056 hash=aba447d2c530d053
 
 
 def _ui_trim_text(value: object, limit: int) -> tuple[str, bool]:
@@ -35,7 +35,7 @@ def _ui_trim_text(value: object, limit: int) -> tuple[str, bool]:
     keep = max(1, limit - len(_UI_TRUNCATION_MARKER))
     return text[:keep] + _UI_TRUNCATION_MARKER, True
 
-# split-source: order=805 original-lines=8964-9024 hash=7ab38ccadacd41cf
+# split-source: order=808 original-lines=9057-9117 hash=7ab38ccadacd41cf
 
 
 def _bounded_ui_value(
@@ -98,7 +98,7 @@ def _bounded_ui_value(
         return out_list, truncated
     return _ui_trim_text(value, text_limit)
 
-# split-source: order=806 original-lines=9025-9076 hash=9ea54ca7928bbed7
+# split-source: order=809 original-lines=9118-9169 hash=9ea54ca7928bbed7
 
 
 def _bounded_ui_row(
@@ -152,7 +152,7 @@ def _bounded_ui_row(
         projected["ui_truncated"] = True
     return projected
 
-# split-source: order=807 original-lines=9077-9125 hash=6a2ea4d9d7a02580
+# split-source: order=810 original-lines=9170-9218 hash=6a2ea4d9d7a02580
 
 
 def _bounded_ui_rows(
@@ -203,7 +203,7 @@ def _bounded_ui_rows(
         selected.reverse()
     return selected, len(selected) < len(source)
 
-# split-source: order=808 original-lines=9126-9170 hash=3b11e1a68491cd75
+# split-source: order=811 original-lines=9219-9263 hash=3b11e1a68491cd75
 
 
 def _enforce_ui_payload_budget(payload: dict, byte_budget: int) -> dict:
@@ -250,7 +250,7 @@ def _enforce_ui_payload_budget(payload: dict, byte_budget: int) -> dict:
                 payload[f"{key}_truncated"] = True
     return payload
 
-# split-source: order=809 original-lines=9171-9226 hash=02abec25163d8472
+# split-source: order=812 original-lines=9264-9319 hash=02abec25163d8472
 
 
 def _apply_lite_snapshot_bounds(payload: dict) -> dict:
@@ -308,7 +308,7 @@ def _apply_lite_snapshot_bounds(payload: dict) -> dict:
     payload["ui_payload_limit_bytes"] = int(LITE_SNAPSHOT_MAX_BYTES)
     return _enforce_ui_payload_budget(payload, LITE_SNAPSHOT_MAX_BYTES)
 
-# split-source: order=1176 original-lines=128137-128176 hash=72f9d812840a61ba
+# split-source: order=1195 original-lines=129628-129667 hash=72f9d812840a61ba
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -350,7 +350,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
-# split-source: order=1179 original-lines=129363-131130 hash=2b1b6922ad7fec45
+# split-source: order=1198 original-lines=130854-132769 hash=04d89bab7fa7967d
 
 
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
@@ -383,6 +383,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
+
+    def _evolution_model_context(self) -> dict:
+        # Admin Authorization is distinct from IDE identity. Verify the IDE
+        # cookie (or explicit IDE session header) using the existing auth store.
+        token = str(self.headers.get("X-Evolution-IDE-Token", "") or "").strip()
+        if not token:
+            for item in str(self.headers.get("Cookie", "") or "").split(";"):
+                key, sep, value = item.strip().partition("=")
+                if sep and key == "clouds_ide_session":
+                    token = unquote(value.strip())
+                    break
+        account = self.app.ide_auth.verify_session(token, self._client_ip()) if token else None
+        if account and (bool(account.get("must_change_password")) or (not bool(getattr(self.app, "ide_password_login_enabled", True)) and account.get("session_kind") != "local_auto")):
+            account = None
+        return {"agent": self._user_id(), "ide": str(account.get("user_id", "")) if account else ""}
+
+    @staticmethod
+    def _evolution_revision(payload: dict) -> int:
+        revision = payload.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise LiquidKernelError("config_revision_required", "load and save the evolution policy before starting; revision is required", 409)
+        return revision
 
     def _session_mgr(self) -> SessionManager:
         return self.app.manager_for_user(self._user_id())
@@ -676,6 +698,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin(query):
                 return
             return self._send_json(self.app.admin_config_payload())
+        if path == "/api/admin/evolution/models":
+            if not self._require_admin():
+                return
+            try:
+                return self._send_json(self.app._evolution_models().catalog(
+                    self._evolution_model_context(), self.app.liquid_kernel.config()))
+            except (LiquidKernelError, IDEAuthError) as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/admin/evolution":
             if not self._require_admin(query):
                 return
@@ -981,10 +1011,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ollama/models":
             ollama_url = str((query.get("base_url", [""]) or [""])[0]).strip() or "http://127.0.0.1:11434"
             try:
-                models = list_ollama_models(ollama_url, timeout=5)
-                return self._send_json({"ok": True, "models": models, "base_url": ollama_url})
+                model_records = probe_ollama_model_records(
+                    ollama_url,
+                    timeout=1.5,
+                )
+                models = [
+                    str(record.get("id", "")).strip()
+                    for record in model_records
+                    if isinstance(record, dict) and str(record.get("id", "")).strip()
+                ]
+                return self._send_json(
+                    {
+                        "ok": True,
+                        "models": models,
+                        "model_records": model_records,
+                        "base_url": ollama_url,
+                    }
+                )
             except Exception as exc:
-                return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": ollama_url})
+                return self._send_json(
+                    {
+                        "ok": False,
+                        "models": [],
+                        "model_records": [],
+                        "error": str(exc)[:300],
+                        "base_url": ollama_url,
+                    }
+                )
         if path == "/api/openai_compat/models":
             base_url = str((query.get("base_url", [""]) or [""])[0]).strip()
             api_key = str((query.get("api_key", [""]) or [""])[0]).strip()
@@ -1001,7 +1054,60 @@ class Handler(BaseHTTPRequestHandler):
                 last_error = ""
                 notes: list[str] = []
                 probe_headers = openai_compat_probe_headers(provider, api_key)
-                for models_url in openai_compat_model_list_urls(normalized_base, provider):
+                model_urls = (
+                    [anthropic_model_list_url(normalized_base)]
+                    if provider == "anthropic"
+                    else openai_compat_model_list_urls(normalized_base, provider)
+                )
+                # Anthropic's Models API is cursor paginated. Fetch the complete
+                # catalog so importing a provider gets every available model.
+                if provider == "anthropic" and model_urls and model_urls[0]:
+                    models_url = model_urls[0]
+                    all_records: list[dict] = []
+                    seen_ids: set[str] = set()
+                    after_id = ""
+                    for _page in range(20):
+                        page_url = f"{models_url}{'&' if '?' in models_url else '?'}limit=1000"
+                        if after_id:
+                            page_url += "&after_id=" + quote(after_id, safe="")
+                        try:
+                            req = urllib.request.Request(page_url, method="GET")
+                            for hk, hv in probe_headers.items():
+                                if str(hk or "").strip() and str(hv or "").strip():
+                                    req.add_header(str(hk), str(hv))
+                            with urlopen(req, timeout=8) as resp:
+                                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                            reachable = True
+                            page_records = extract_openai_compat_model_records(payload)
+                            for record in page_records:
+                                mid = str(record.get("id", "") or "").strip()
+                                if mid and mid not in seen_ids:
+                                    seen_ids.add(mid)
+                                    all_records.append(record)
+                            if not isinstance(payload, dict) or not payload.get("has_more"):
+                                break
+                            next_after = str(payload.get("last_id", "") or "").strip()
+                            if not next_after or next_after == after_id:
+                                break
+                            after_id = next_after
+                        except urllib.error.HTTPError as exc:
+                            reachable = int(getattr(exc, "code", 0) or 0) in {200, 401, 403, 404, 405}
+                            last_error = f"HTTP {int(getattr(exc, 'code', 0) or 0)}"
+                            break
+                        except Exception as exc:
+                            last_error = trim(str(exc), 300)
+                            break
+                    if all_records:
+                        return self._send_json({
+                            "ok": True, "reachable": True, "provider": provider,
+                            "models": [str(r.get("id", "")).strip() for r in all_records],
+                            "model_records": [
+                                {"id": str(r.get("id", "")).strip(), "capabilities": dict(r.get("capabilities", {}))}
+                                for r in all_records
+                            ],
+                            "base_url": normalized_base, "scanned_url": models_url,
+                        })
+                for models_url in model_urls:
                     try:
                         req = urllib.request.Request(models_url, method="GET")
                         for hk, hv in probe_headers.items():
@@ -1014,7 +1120,12 @@ class Handler(BaseHTTPRequestHandler):
                             payload = json.loads(body_text)
                         except Exception:
                             payload = {}
-                        model_ids = extract_openai_compat_model_ids(payload)
+                        model_records = extract_openai_compat_model_records(payload)
+                        model_ids = [
+                            str(record.get("id", "")).strip()
+                            for record in model_records
+                            if isinstance(record, dict) and str(record.get("id", "")).strip()
+                        ]
                         if model_ids:
                             return self._send_json(
                                 {
@@ -1022,6 +1133,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "reachable": True,
                                     "provider": provider,
                                     "models": model_ids,
+                                    "model_records": [
+                                        {
+                                            "id": model_id,
+                                            "capabilities": dict(
+                                                model_records[index].get("capabilities", {})
+                                            )
+                                            if isinstance(model_records[index], dict)
+                                            else {},
+                                        }
+                                        for index, model_id in enumerate(model_ids)
+                                    ],
                                     "base_url": normalized_base,
                                     "scanned_url": models_url,
                                 }
@@ -1040,7 +1162,12 @@ class Handler(BaseHTTPRequestHandler):
                             payload = json.loads(body_text) if body_text else {}
                         except Exception:
                             payload = {}
-                        model_ids = extract_openai_compat_model_ids(payload)
+                        model_records = extract_openai_compat_model_records(payload)
+                        model_ids = [
+                            str(record.get("id", "")).strip()
+                            for record in model_records
+                            if isinstance(record, dict) and str(record.get("id", "")).strip()
+                        ]
                         if model_ids:
                             return self._send_json(
                                 {
@@ -1048,6 +1175,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "reachable": True,
                                     "provider": provider,
                                     "models": model_ids,
+                                    "model_records": [
+                                        {
+                                            "id": model_id,
+                                            "capabilities": dict(
+                                                model_records[index].get("capabilities", {})
+                                            )
+                                            if isinstance(model_records[index], dict)
+                                            else {},
+                                        }
+                                        for index, model_id in enumerate(model_ids)
+                                    ],
                                     "base_url": normalized_base,
                                     "scanned_url": models_url,
                                 }
@@ -1080,6 +1218,7 @@ class Handler(BaseHTTPRequestHandler):
                             "reachable": True,
                             "provider": provider,
                             "models": [],
+                            "model_records": [],
                             "base_url": normalized_base,
                             "note": "endpoint reachable; no standard model list returned",
                             "error": last_error,
@@ -1092,6 +1231,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reachable": False,
                         "provider": provider,
                         "models": [],
+                        "model_records": [],
                         "error": last_error or "unable to reach endpoint",
                         "base_url": normalized_base,
                         "attempts": notes[-6:],
@@ -1104,6 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reachable": False,
                         "provider": provider,
                         "models": [],
+                        "model_records": [],
                         "error": str(exc)[:300],
                         "base_url": extract_base_url(base_url),
                     }
@@ -1353,6 +1494,68 @@ class Handler(BaseHTTPRequestHandler):
                 return self._auth_error(exc)
             except Exception:
                 return self._send_json({"error": "invalid authentication request", "code": "invalid_request"}, status=400)
+        if path == "/api/admin/evolution/config":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.liquid_kernel.save_config(
+                    payload.get("values", payload), expected_revision=self._evolution_revision(payload),
+                    context=self._evolution_model_context(),
+                ))
+            except (LiquidKernelError, IDEAuthError) as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": getattr(exc, "details", {})}, status=exc.status)
+            except (ValueError, TypeError):
+                return self._send_json({"error": "invalid evolution policy values", "code": "invalid_config"}, status=400)
+            except (OSError, sqlite3.Error):
+                return self._send_json({"error": "evolution configuration storage is unavailable", "code": "config_storage_unavailable"}, status=503)
+        if path == "/api/admin/evolution/emergency-off":
+            if not self._require_admin():
+                return
+            try:
+                self._read_json()
+                return self._send_json(self.app.liquid_kernel.emergency_off())
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        if path == "/api/admin/evolution/runs":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.liquid_kernel.trigger("manual", expected_revision=self._evolution_revision(payload)), status=202)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_evolution_run_action = re.match(r"^/api/admin/evolution/runs/([^/]+)/(approve|reject|cancel)$", path)
+        if m_evolution_run_action:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                action = m_evolution_run_action.group(2)
+                if action == "approve":
+                    out = self.app.liquid_kernel.approve(m_evolution_run_action.group(1))
+                elif action == "reject":
+                    out = self.app.liquid_kernel.reject(m_evolution_run_action.group(1), str(payload.get("reason", "") or ""))
+                else:
+                    out = self.app.liquid_kernel.cancel(m_evolution_run_action.group(1))
+                return self._send_json(out)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_evolution_version_action = re.match(r"^/api/admin/evolution/versions/([^/]+)/(promote|rollback)$", path)
+        if m_evolution_version_action:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                if m_evolution_version_action.group(2) == "promote":
+                    out = self.app.liquid_kernel.registry.promote(m_evolution_version_action.group(1))
+                else:
+                    out = self.app.liquid_kernel.registry.rollback(
+                        m_evolution_version_action.group(1), reason=str(payload.get("reason", "manual rollback") or "manual rollback")
+                    )
+                return self._send_json(out)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
         mgr = self._session_mgr()
         m_process_stop = re.match(r"^/api/processes/([^/]+)/stop$", path)
         if m_process_stop:
@@ -1443,63 +1646,6 @@ class Handler(BaseHTTPRequestHandler):
                 expected_revision=str(payload.get("revision", "") or ""),
             )
             return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
-        if path == "/api/admin/evolution/config":
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                return self._send_json(self.app.liquid_kernel.save_config(
-                    payload.get("values", payload), expected_revision=int(payload.get("revision", 0) or 0)
-                ))
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        if path == "/api/admin/evolution/emergency-off":
-            if not self._require_admin():
-                return
-            try:
-                self._read_json()
-                return self._send_json(self.app.liquid_kernel.emergency_off())
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        if path == "/api/admin/evolution/runs":
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                return self._send_json(self.app.liquid_kernel.trigger(str(payload.get("trigger", "manual") or "manual")), status=202)
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        m_evolution_run_action = re.match(r"^/api/admin/evolution/runs/([^/]+)/(approve|reject|cancel)$", path)
-        if m_evolution_run_action:
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                action = m_evolution_run_action.group(2)
-                if action == "approve":
-                    out = self.app.liquid_kernel.approve(m_evolution_run_action.group(1))
-                elif action == "reject":
-                    out = self.app.liquid_kernel.reject(m_evolution_run_action.group(1), str(payload.get("reason", "") or ""))
-                else:
-                    out = self.app.liquid_kernel.cancel(m_evolution_run_action.group(1))
-                return self._send_json(out)
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        m_evolution_version_action = re.match(r"^/api/admin/evolution/versions/([^/]+)/(promote|rollback)$", path)
-        if m_evolution_version_action:
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                if m_evolution_version_action.group(2) == "promote":
-                    out = self.app.liquid_kernel.registry.promote(m_evolution_version_action.group(1))
-                else:
-                    out = self.app.liquid_kernel.registry.rollback(
-                        m_evolution_version_action.group(1), reason=str(payload.get("reason", "manual rollback") or "manual rollback")
-                    )
-                return self._send_json(out)
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
         if path == "/api/admin/config/sync-active":
             if not self._require_admin():
                 return
@@ -1722,7 +1868,7 @@ class Handler(BaseHTTPRequestHandler):
             if not model:
                 return self._send_json({"error": "model required"}, status=400)
             try:
-                return self._send_json(mgr.set_runtime_model(model, None))
+                return self._send_json(mgr.set_runtime_model(model, None, normalize_model_runtime_settings(payload)))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/config/language":
@@ -1779,6 +1925,7 @@ class Handler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             model_override = payload.get("model_override")
+            runtime_settings = normalize_model_runtime_settings(payload)
             if bool(getattr(sess, "running", False)):
                 try:
                     sess._queue_deferred_runtime_update(
@@ -1786,6 +1933,7 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "selection": selection,
                             "model_override": model_override if isinstance(model_override, str) else "",
+                            "settings": runtime_settings,
                         },
                     )
                 except Exception as exc:
@@ -1797,8 +1945,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._send_json(queued)
             try:
-                out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None)
-                mgr._sync_from_session(sess, apply_to_all=False)
+                out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None, settings=runtime_settings)
+                mgr._sync_from_session(sess, apply_to_all=True)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_json(out)
@@ -1905,7 +2053,7 @@ class Handler(BaseHTTPRequestHandler):
             meta = sess.add_upload(filename, raw, mime)
             if isinstance(meta.get("model_catalog"), dict) and not bool(meta.get("model_catalog", {}).get("queued")):
                 try:
-                    mgr._sync_from_session(sess, apply_to_all=False)
+                    mgr._sync_from_session(sess, apply_to_all=True)
                 except Exception:
                     pass
             return self._send_json(meta, status=201)
@@ -2120,7 +2268,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             sess.events.unsubscribe(sub)
 
-# split-source: order=1182 original-lines=131932-132045 hash=79a78cd04af97eeb
+# split-source: order=1201 original-lines=133571-133684 hash=79a78cd04af97eeb
 
 
 class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
@@ -2236,7 +2384,7 @@ class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
         if not self._handle_admin_auth_post(path):
             return self._send_json({"error": "not found"}, 404)
 
-# split-source: order=1186 original-lines=134102-134572 hash=e5c3c84a1d0a44ec
+# split-source: order=1205 original-lines=135742-136212 hash=e5c3c84a1d0a44ec
 
 class CollaborationHandler(IdeHandler):
     server_version = "CloudsCoderCollaboration/1.0"

@@ -5,15 +5,9 @@
 
 from __future__ import annotations
 
-# split-source: order=1188 original-lines=134791-134863 hash=c33d45b5cc87ccd6
+# split-source: order=1208 original-lines=136516-136590 hash=b6deac3b65a75205
 
 
-# 第九层：进程入口与服务启动。
-# 第9層：プロセス入口とサーバ起動。
-# ============================================================================
-
-# Bootstrap sequence: load configuration, initialize shared application state,
-# and expose the HTTP service plus background runtime workers.
 def collaboration_file_watcher_loop(
     app,
     stop_event,
@@ -79,8 +73,16 @@ def collaboration_file_watcher_loop(
                     "[collaboration] file watcher degraded: "
                     f"{trim(str(exc), 240)}; failures={failures}; retry_in={retry_delay:.1f}s"
                 )
+                if isinstance(exc, sqlite3.DatabaseError):
+                    try:
+                        diagnostics = sqlite_failure_diagnostics(
+                            exc, getattr(app.collaboration, "db_path", None)
+                        )
+                        log("[collaboration] storage diagnostics: " + json.dumps(diagnostics, ensure_ascii=True))
+                    except Exception as diagnostic_error:
+                        log(f"[collaboration] storage diagnostics unavailable: {type(diagnostic_error).__name__}")
 
-# split-source: order=1189 original-lines=134864-134881 hash=a921e94f45e639bd
+# split-source: order=1209 original-lines=136591-136608 hash=a921e94f45e639bd
 
 
 def collaboration_watcher_health(app) -> dict:

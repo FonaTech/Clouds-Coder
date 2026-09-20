@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1180 original-lines=131131-131773 hash=cf5146e4330d26f9
+# split-source: order=1199 original-lines=132770-133412 hash=4b9696a37c397365
 
 
 class SkillsHandler(BaseHTTPRequestHandler):
@@ -586,7 +586,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             try:
-                return self._send_json(mgr.set_runtime_model(selection, None))
+                return self._send_json(mgr.set_runtime_model(selection, None, normalize_model_runtime_settings(payload)))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/skillslab/language":

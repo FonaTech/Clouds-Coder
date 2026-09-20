@@ -5,20 +5,19 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import math
 import os
 import random
 import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -26,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 EVOLUTION_MODES = ("Off", "Tuning", "Thinking", "Aggressive")
 CONTROL_SCHEMA_VERSION = 1
+EVOLUTION_MODEL_CAPABILITY_VERSION = 2
 KERNEL_CONTRACT_VERSION = 1
 BASELINE_KERNEL_SOURCE = '''from __future__ import annotations
 
@@ -235,6 +235,27 @@ HARD_BUDGET_LIMITS = {
 }
 
 
+def normalize_model_ref(value: object) -> dict | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, dict) or set(value) - {"source", "owner", "profile_id", "model", "fingerprint"}:
+        raise LiquidKernelError("invalid_model_ref", "model reference must contain only source, owner, profile_id, model and fingerprint")
+    ref = {key: str(value.get(key, "") or "").strip() for key in ("source", "owner", "profile_id", "model")}
+    if ref["source"] not in {"global", "agent", "ide"} or not ref["profile_id"] or not ref["model"]:
+        raise LiquidKernelError("invalid_model_ref", "select a configured model and its source")
+    if (ref["source"] == "global" and ref["owner"]) or (ref["source"] != "global" and not ref["owner"]):
+        raise LiquidKernelError("invalid_model_ref", "model ownership is invalid")
+    if value.get("fingerprint"):
+        ref["fingerprint"] = str(value["fingerprint"])
+    return ref
+
+
+def valid_judge_score(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 100:
+        raise LiquidKernelError("invalid_judge_output", "judge must return numeric scores between 0 and 100")
+    return float(value)
+
+
 def default_evolution_config() -> dict:
     preset = dict(MODE_PRESETS["Off"])
     return {
@@ -254,6 +275,8 @@ def default_evolution_config() -> dict:
         "session_scope": ["*"],
         "generator_profile": "",
         "judge_profile": "",
+        "generator_model_ref": None,
+        "judge_model_ref": None,
         "budget": {
             key: preset[key]
             for key in ("candidate_limit", "max_files", "max_changed_lines", "max_cases", "max_tokens", "timeout_seconds")
@@ -286,7 +309,7 @@ def normalize_evolution_config(raw: object, *, current: dict | None = None) -> d
     previous_mode = str((current or {}).get("mode", "Off") or "Off").strip().title()
     mode_changed = bool(current) and mode != previous_mode
     out = default_evolution_config()
-    out.update(source)
+    out.update({key: value for key, value in source.items() if key in out})
     out["mode"] = mode
     out["timezone"] = _safe_zone(out.get("timezone"))
     submitted_schedule = str(raw_values.get("schedule", "") or "").strip().lower()
@@ -319,6 +342,10 @@ def normalize_evolution_config(raw: object, *, current: dict | None = None) -> d
         out[key] = [str(item).strip() for item in values if str(item).strip()][:500] or ["*"]
     out["generator_profile"] = str(out.get("generator_profile", "") or "").strip()
     out["judge_profile"] = str(out.get("judge_profile", "") or "").strip()
+    for role in ("generator", "judge"):
+        if f"{role}_profile" in raw_values and f"{role}_model_ref" not in raw_values:
+            out[f"{role}_model_ref"] = None
+        out[f"{role}_model_ref"] = normalize_model_ref(out.get(f"{role}_model_ref"))
     supplied_budget = (
         {}
         if mode_changed
@@ -359,7 +386,17 @@ class KernelArtifact:
     status: str
 
 
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, exc_traceback)
+        finally:
+            self.close()
+
+
 class LiquidKernelRegistry:
+    SQLITE_CONNECTIONS_CLOSE_ON_EXIT = True
+
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -400,8 +437,12 @@ class LiquidKernelRegistry:
         return key
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(self.db_path, timeout=30, factory=_ClosingSQLiteConnection)
+        try:
+            conn.row_factory = sqlite3.Row
+        except BaseException:
+            conn.close()
+            raise
         return conn
 
     def _init_db(self) -> None:
@@ -574,7 +615,7 @@ class LiquidKernelRegistry:
         return {"versions": rows, "total": total, "active": self.active_state()}
 
     def version_detail(self, version: str) -> dict:
-        artifact = self.artifact(version)
+        self.artifact(version)
         with self._connect() as conn:
             row = dict(conn.execute("SELECT * FROM versions WHERE version=?", (version,)).fetchone())
             deployments = [dict(item) for item in conn.execute(
@@ -886,7 +927,7 @@ class LiquidKernelRegistry:
                 "INSERT INTO runs(run_id,mode,status,trigger_kind,incumbent_version,config_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                 (run_id, config["mode"], "queued", str(trigger_kind), incumbent, _json(config), now, now),
             )
-        self.event(run_id, "queued", {"mode": config["mode"], "incumbent_version": incumbent, "trigger": trigger_kind})
+            self._event(conn, run_id, "queued", {"mode": config["mode"], "incumbent_version": incumbent, "trigger": trigger_kind})
         return run_id
 
     def update_run(self, run_id: str, status: str, **fields: Any) -> None:
@@ -903,16 +944,19 @@ class LiquidKernelRegistry:
             conn.execute(f"UPDATE runs SET {','.join(assignments)} WHERE run_id=?", values)
 
     def event(self, run_id: str, kind: str, payload: dict) -> None:
-        now = _now()
         with self._connect() as conn:
-            previous = conn.execute("SELECT event_hash FROM run_events ORDER BY event_id DESC LIMIT 1").fetchone()
-            previous_hash = str(previous[0] if previous else "")
-            material = _json({"run_id": run_id, "kind": kind, "payload": payload, "previous_hash": previous_hash, "created_at": now})
-            event_hash = hashlib.sha256(material.encode("utf-8")).hexdigest()
-            conn.execute(
-                "INSERT INTO run_events(run_id,kind,payload_json,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?)",
-                (run_id, kind, _json(payload), previous_hash, event_hash, now),
-            )
+            self._event(conn, run_id, kind, payload)
+
+    def _event(self, conn, run_id: str, kind: str, payload: dict) -> None:
+        now = _now()
+        previous = conn.execute("SELECT event_hash FROM run_events ORDER BY event_id DESC LIMIT 1").fetchone()
+        previous_hash = str(previous[0] if previous else "")
+        material = _json({"run_id": run_id, "kind": kind, "payload": payload, "previous_hash": previous_hash, "created_at": now})
+        event_hash = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO run_events(run_id,kind,payload_json,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?)",
+            (run_id, kind, _json(payload), previous_hash, event_hash, now),
+        )
 
     def events_since(self, after_event_id: int = 0, limit: int = 200) -> dict:
         with self._connect() as conn:
@@ -1247,6 +1291,8 @@ class LiquidKernelControlPlane:
         experience_provider: Callable[[dict, str, list[str]], dict] | None = None,
         model_callback: Callable[[str, str, str, int], dict] | None = None,
         judge_callback: Callable[[dict, str, int], dict] | None = None,
+        model_resolver: Callable[[dict], dict] | None = None,
+        config_validator: Callable[..., dict] | None = None,
     ):
         self.root = Path(root).resolve()
         self.registry = LiquidKernelRegistry(self.root)
@@ -1262,28 +1308,41 @@ class LiquidKernelControlPlane:
         self.experience_provider = experience_provider
         self.model_callback = model_callback
         self.judge_callback = judge_callback
+        self.model_resolver = model_resolver
+        self.config_validator = config_validator
+        self.last_trigger_error = None
         self._stop = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         if not self.config_path.exists():
             _atomic_json(self.config_path, default_evolution_config())
+        # Computation threads cannot survive a process restart. Approval and
+        # Canary records remain governed by their existing deployment rules.
+        self._recover_interrupted_runs()
+
+    def _recover_interrupted_runs(self):
+        with self.registry._connect() as conn:
+            conn.execute("UPDATE runs SET status='failed',error=?,completed_at=?,updated_at=? WHERE status IN ('queued','collecting','assessing','generating','proposal_ready','validating_patch','benchmarking','judging')",
+                         ("Evolution computation interrupted before completion (process restart or worker failure)", _now(), _now()))
 
     def config(self) -> dict:
         with self.config_lock:
             return normalize_evolution_config(_read_json(self.config_path, {}))
 
-    def save_config(self, values: object, expected_revision: int = 0) -> dict:
+    def save_config(self, values: object, expected_revision: int = 0, *, context=None) -> dict:
         with self.config_lock:
             current = self.config()
             if expected_revision and int(current.get("revision", 0)) != int(expected_revision):
                 raise LiquidKernelError("config_conflict", "evolution config changed; reload before saving", 409)
             clean = normalize_evolution_config(values, current=current)
+            if self.config_validator:
+                clean = self.config_validator(clean, context=context, current=current)
             clean["revision"] = int(current.get("revision", 0)) + 1
             _atomic_json(self.config_path, clean)
-        if clean["mode"] == "Off":
-            if self.active_run_id:
-                self.cancelled.add(self.active_run_id)
-                self.registry.event(self.active_run_id, "cancel_requested", {"reason": "evolution mode set to Off"})
-            self.registry.abort_canary(reason="evolution mode set to Off")
+            if clean["mode"] == "Off":
+                if self.active_run_id:
+                    self.cancelled.add(self.active_run_id)
+                    self.registry.event(self.active_run_id, "cancel_requested", {"reason": "evolution mode set to Off"})
+                self.registry.abort_canary(reason="evolution mode set to Off")
         return {"ok": True, "config": clean}
 
     def apply_startup_config(self, mode: str = "", schedule: str = "") -> dict:
@@ -1314,6 +1373,8 @@ class LiquidKernelControlPlane:
 
     def stop_scheduler(self) -> None:
         self._stop.set()
+        if self.active_run_id:
+            self.cancelled.add(self.active_run_id)
 
     def _schedule_due(self, config: dict, last_created: float) -> bool:
         if config["mode"] == "Off" or config["schedule"] == "off":
@@ -1336,19 +1397,45 @@ class LiquidKernelControlPlane:
                 last_created = float(runs[0].get("created_at", 0) or 0) if runs else 0.0
                 if self._schedule_due(config, last_created) and not self.active_run_id:
                     self.trigger("schedule")
+            except LiquidKernelError as exc:
+                self.last_trigger_error = {"code": exc.code, "error": str(exc), "trigger": "schedule", "at": _now()}
             except Exception:
+                self.last_trigger_error = {"code": "scheduler_failed", "error": "Evolution scheduler could not start a run", "at": _now()}
                 continue
 
-    def trigger(self, trigger_kind: str = "manual") -> dict:
-        config = self.config()
-        if config["mode"] == "Off":
-            raise LiquidKernelError("evolution_disabled", "liquid-kernel evolution is Off", 409)
-        if not self.run_lock.acquire(blocking=False):
-            raise LiquidKernelError("run_in_progress", "an evolution run is already active", 409)
-        run_id = self.registry.create_run(config, trigger_kind)
-        self.active_run_id = run_id
-        threading.Thread(target=self._run, args=(run_id, config), daemon=True, name=f"evolution-{run_id[:12]}").start()
-        return {"ok": True, "run_id": run_id, "status": "queued"}
+    def trigger(self, trigger_kind: str = "manual", expected_revision: int = 0) -> dict:
+        with self.config_lock:
+            config = self.config()
+            if expected_revision and expected_revision != config["revision"]:
+                raise LiquidKernelError("config_conflict", "evolution config changed; reload and save before starting", 409)
+            if config["mode"] == "Off":
+                raise LiquidKernelError("evolution_disabled", "liquid-kernel evolution is Off", 409)
+            if not self.run_lock.acquire(blocking=False):
+                raise LiquidKernelError("run_in_progress", "an evolution run is already active", 409)
+            run_id = ""
+            try:
+                if not callable(self.model_callback) or not callable(self.judge_callback):
+                    raise LiquidKernelError("model_unavailable", "generator and judge must both be configured", 409)
+                if self.model_resolver:
+                    config = self.model_resolver(config)
+                run_id = self.registry.create_run(config, trigger_kind)
+                self.active_run_id = run_id
+                threading.Thread(target=self._run, args=(run_id, config), daemon=True, name=f"evolution-{run_id[:12]}").start()
+                self.last_trigger_error = None
+            except BaseException as exc:
+                self.active_run_id = ""
+                self.run_lock.release()
+                if run_id:
+                    try:
+                        self.registry.update_run(run_id, "failed", error="Evolution worker could not start", completed_at=_now())
+                    except (OSError, sqlite3.Error):
+                        pass  # Recovered on the next idle dashboard read/restart.
+
+                if isinstance(exc, LiquidKernelError):
+                    raise
+                raise LiquidKernelError("run_start_failed", "Evolution worker could not start; retry after checking storage and worker availability", 503) from exc
+            return {"ok": True, "run_id": run_id, "status": "queued", "revision": config["revision"],
+                    "models": {role: config.get(f"{role}_model_ref") for role in ("generator", "judge")}}
 
     def inject_embedded_kernel(self, reason: str = "administrator selected embedded kernel") -> dict:
         """Install the bundled kernel without deleting version or session history."""
@@ -1399,18 +1486,23 @@ class LiquidKernelControlPlane:
             raise
 
     def cancel(self, run_id: str) -> dict:
-        detail = self.registry.run_detail(str(run_id))
-        status = str(detail.get("status", "") or "")
-        if status == "canary":
-            rollback = self.registry.abort_canary(reason="evolution run cancelled by administrator")
-            self.registry.update_run(str(run_id), "cancelled", completed_at=_now())
-            self.registry.event(str(run_id), "cancelled", {"rollback": rollback})
-            return {"ok": True, "run_id": str(run_id), "cancel_requested": False, "rollback": rollback}
-        if status in {"rejected", "failed", "cancelled", "no_change"}:
-            raise LiquidKernelError("invalid_run_state", "run is already complete", 409)
-        self.cancelled.add(str(run_id))
-        self.registry.event(str(run_id), "cancel_requested", {})
-        return {"ok": True, "run_id": str(run_id), "cancel_requested": True}
+        with self.config_lock:
+            detail = self.registry.run_detail(str(run_id))
+            status = str(detail.get("status", "") or "")
+            if status == "canary":
+                rollback = self.registry.abort_canary(reason="evolution run cancelled by administrator")
+                self.registry.update_run(str(run_id), "cancelled", completed_at=_now())
+                self.registry.event(str(run_id), "cancelled", {"rollback": rollback})
+                return {"ok": True, "run_id": str(run_id), "cancel_requested": False, "rollback": rollback}
+            if status in {"rejected", "failed", "cancelled", "no_change", "promoted", "rolled_back"}:
+                raise LiquidKernelError("invalid_run_state", "run is already complete", 409)
+            if status == "awaiting_approval":
+                self.registry.update_run(str(run_id), "cancelled", completed_at=_now())
+                self.registry.event(str(run_id), "cancelled", {})
+                return {"ok": True, "run_id": str(run_id), "cancel_requested": False}
+            self.cancelled.add(str(run_id))
+            self.registry.event(str(run_id), "cancel_requested", {})
+            return {"ok": True, "run_id": str(run_id), "cancel_requested": True}
 
     def _check_cancel(self, run_id: str) -> None:
         if run_id in self.cancelled:
@@ -1418,7 +1510,7 @@ class LiquidKernelControlPlane:
 
     def _call_model(self, system: str, prompt: str, profile: str, max_tokens: int) -> dict:
         if not callable(self.model_callback):
-            return {"decision": "no_change", "reason": "Evolution model callback is not configured."}
+            raise LiquidKernelError("model_unavailable", "Evolution model callback is not configured.")
         result = self.model_callback(system, prompt, profile, max_tokens)
         if not isinstance(result, dict):
             raise LiquidKernelError("invalid_model_output", "evolution model did not return a JSON object")
@@ -1470,14 +1562,15 @@ class LiquidKernelControlPlane:
                     "candidate_files": candidate_files,
                     "cases": cases,
                 },
-                str(config.get("judge_profile", "")),
-                min(16_000, int(config["budget"]["max_tokens"])),
+                config.get("judge_model_ref") or str(config.get("judge_profile", "")),
+                min(16_000, int(config["budget"]["max_tokens"]), int(config.get("_judge_token_limit", 16_000))),
             )
             if isinstance(result, dict):
-                a = max(0.0, min(100.0, float(result.get("incumbent", 50) or 50)))
-                b = max(0.0, min(100.0, float(result.get("candidate", 50) or 50)))
+                a = valid_judge_score(result.get("incumbent"))
+                b = valid_judge_score(result.get("candidate"))
                 return {"incumbent": a, "candidate": b, "details": result}
-        return {"incumbent": 50.0, "candidate": 50.0, "details": {"note": "Judge callback unavailable; neutral score."}}
+            raise LiquidKernelError("invalid_judge_output", "Judge did not return scores")
+        raise LiquidKernelError("judge_unavailable", "Judge callback is not configured")
 
     @staticmethod
     def _benchmark_cases(proposals: list[dict], max_cases: int, seed: int) -> list[dict]:
@@ -1555,7 +1648,14 @@ class LiquidKernelControlPlane:
                     "patch": patch_meta,
                 }, {"hard": candidate_hard, "soft": 0.0, "mixed": 0.0}
         self._check_cancel(run_id)
-        soft = self._soft_score(source, candidate_source, cases, config)
+        self.registry.update_run(run_id, "judging")
+        self.registry.event(run_id, "model_call_started", {"stage": "judge", "model": config.get("judge_model_ref")})
+        try:
+            soft = self._soft_score(source, candidate_source, cases, config)
+        except LiquidKernelError as exc:
+            raise LiquidKernelError("judge_call_failed", str(exc), exc.status, {"cause": exc.code}) from exc
+        self._check_cancel(run_id)
+        self.registry.event(run_id, "model_call_completed", {"stage": "judge", "model": config.get("judge_model_ref"), "scores": soft})
         incumbent_mixed = incumbent_hard * 0.30 + float(soft["incumbent"]) * 0.70
         candidate_mixed = candidate_hard * 0.30 + float(soft["candidate"]) * 0.70
         gain = candidate_mixed - incumbent_mixed
@@ -1610,6 +1710,7 @@ class LiquidKernelControlPlane:
                     ],
                     "mode": config["mode"],
                     "mutable_surface": config["mutable_surface"],
+                    "allowed_patch_files": sorted(self.validator.allowed_files(config)),
                     "kernel_files": source,
                     "experience": experience,
                     "benchmark_cases": prompt_cases,
@@ -1628,7 +1729,7 @@ class LiquidKernelControlPlane:
                         }],
                         "patch": {
                             "files": [{
-                                "path": "kernel.py|tool_policy.py|prompt_policy.py|harness.py",
+                                "path": "|".join(sorted(self.validator.allowed_files(config))),
                                 "operation": "replace|replace_file",
                                 "old": "string",
                                 "new": "string",
@@ -1637,51 +1738,23 @@ class LiquidKernelControlPlane:
                         },
                     },
                 })
-                try:
-                    proposal = self._call_model(
-                        system,
-                        prompt,
-                        str(config.get("generator_profile", "")),
-                        generator_tokens,
-                    )
-                except LiquidKernelError as exc:
-                    if exc.code == "run_cancelled":
-                        raise
-                    proposal = {
-                        "decision": "error",
-                        "reason": str(exc),
-                        "error": {"code": exc.code, "details": exc.details},
-                    }
-                except Exception as exc:
-                    proposal = {
-                        "decision": "error",
-                        "reason": str(exc),
-                        "error": {"code": "candidate_generation_failed"},
-                    }
-                if str(proposal.get("decision", "")).strip() not in {"change", "no_change", "error"}:
-                    proposal = {
-                        **proposal,
-                        "decision": "error",
-                        "reason": "Evolution model returned an unsupported decision.",
-                        "error": {"code": "invalid_model_output"},
-                    }
+                self.registry.update_run(run_id, "generating")
+                self.registry.event(run_id, "model_call_started", {"stage": "generator", "candidate_index": candidate_index + 1, "model": config.get("generator_model_ref")})
+                proposal = self._call_model(
+                    system, prompt,
+                    config.get("generator_model_ref") or str(config.get("generator_profile", "")),
+                    generator_tokens,
+                )
+                self._check_cancel(run_id)
+                if proposal.get("decision") not in {"change", "no_change"} or not str(proposal.get("reason", "")).strip():
+                    raise LiquidKernelError("invalid_model_output", "Evolution model must return change or no_change with a reason")
+                self.registry.event(run_id, "model_call_completed", {"stage": "generator", "model": config.get("generator_model_ref"), "decision": proposal["decision"]})
                 proposals.append(proposal)
                 self.registry.update_run(run_id, "proposal_ready", proposal_json={"candidates": proposals})
                 self.registry.event(run_id, "proposal_ready", {
                     "candidate_index": candidate_index + 1,
                     "decision": proposal.get("decision", ""),
                 })
-                if str(proposal.get("decision", "")) == "error":
-                    proposal_error = proposal.get("error") if isinstance(proposal.get("error"), dict) else {}
-                    rejected = {
-                        "candidate_index": candidate_index + 1,
-                        "decision": "reject",
-                        "reason": str(proposal.get("reason", "Candidate generation failed.")),
-                        "code": str(proposal_error.get("code", "candidate_generation_failed")),
-                        "details": proposal_error.get("details", {}),
-                    }
-                    evaluations.append(rejected)
-                    self.registry.event(run_id, "candidate_rejected", rejected)
 
             cases = self._benchmark_cases(proposals, int(config["budget"]["max_cases"]), seed)
             for candidate_index, proposal in enumerate(proposals):
@@ -1708,7 +1781,7 @@ class LiquidKernelControlPlane:
                     if result["decision"] == "promote":
                         accepted.append((candidate_source, proposal, result, scores))
                 except LiquidKernelError as exc:
-                    if exc.code == "run_cancelled":
+                    if exc.code in {"run_cancelled", "judge_call_failed", "model_call_failed", "invalid_model_output", "invalid_judge_output", "judge_unavailable", "model_profile_missing", "model_config_changed", "model_owner_disabled", "model_missing"}:
                         raise
                     rejected = {
                         "candidate_index": candidate_index + 1,
@@ -1722,7 +1795,7 @@ class LiquidKernelControlPlane:
             if not accepted:
                 changed = any(str(proposal.get("decision", "")) == "change" for proposal in proposals)
                 generation_failed = any(str(proposal.get("decision", "")) == "error" for proposal in proposals)
-                status = "rejected" if changed or generation_failed else "no_change"
+                status = "failed" if generation_failed else "rejected" if changed else "no_change"
                 result = {
                     "decision": status,
                     "reason": (
@@ -1737,8 +1810,10 @@ class LiquidKernelControlPlane:
                     "random_seed": seed,
                     "case_count": len(cases),
                 }
-                self.registry.update_run(run_id, status, result_json=result, completed_at=_now())
-                self.registry.event(run_id, status, {"candidate_count": candidate_limit, "reason": result["reason"]})
+                with self.config_lock:
+                    self._check_cancel(run_id)
+                    self.registry.update_run(run_id, status, result_json=result, completed_at=_now())
+                    self.registry.event(run_id, status, {"candidate_count": candidate_limit, "reason": result["reason"]})
                 return
             candidate_source, proposal, result, scores = max(
                 accepted,
@@ -1746,23 +1821,31 @@ class LiquidKernelControlPlane:
             )
             result["candidate_count"] = candidate_limit
             result["evaluations"] = evaluations
-            version = self.registry.register_candidate(
-                run_id, incumbent, candidate_source, mode=config["mode"],
-                changelog=str(proposal.get("changelog", "") or proposal.get("reason", "Candidate kernel update.")), scores=scores,
-            )
-            result["candidate_version"] = version
-            status = "canary" if bool(config["auto_promote"]) else "awaiting_approval"
-            self.registry.update_run(run_id, status, candidate_version=version, result_json=result, completed_at=_now())
-            self.registry.event(run_id, status, {"candidate_version": version, "gain": result.get("gain", 0)})
-            if bool(config["auto_promote"]):
-                self.registry.begin_canary(version, 5)
+            with self.config_lock:
+                self._check_cancel(run_id)
+                version = self.registry.register_candidate(
+                    run_id, incumbent, candidate_source, mode=config["mode"],
+                    changelog=str(proposal.get("changelog", "") or proposal.get("reason", "Candidate kernel update.")), scores=scores,
+                )
+                result["candidate_version"] = version
+                status = "canary" if bool(config["auto_promote"]) else "awaiting_approval"
+                # Complete the control-plane deployment before publishing the
+                # terminal run state. Observers use the run status as a readiness
+                # signal; publishing ``canary`` first can let them tear down a
+                # temporary registry while this thread is still opening SQLite.
+                if bool(config["auto_promote"]):
+                    self.registry.begin_canary(version, 5)
+                self.registry.update_run(run_id, status, candidate_version=version, result_json=result, completed_at=_now())
+                self.registry.event(run_id, status, {"candidate_version": version, "gain": result.get("gain", 0)})
         except LiquidKernelError as exc:
-            status = "cancelled" if exc.code == "run_cancelled" else "failed"
+            status = "cancelled" if exc.code == "run_cancelled" or run_id in self.cancelled else "failed"
             self.registry.update_run(run_id, status, error=str(exc), result_json={"code": exc.code, "details": exc.details}, completed_at=_now())
             self.registry.event(run_id, status, {"code": exc.code, "error": str(exc)})
         except Exception as exc:
-            self.registry.update_run(run_id, "failed", error=str(exc), result_json={"traceback": traceback.format_exc()[-8000:]}, completed_at=_now())
-            self.registry.event(run_id, "failed", {"error": str(exc)})
+            status = "cancelled" if run_id in self.cancelled else "failed"
+            error = "Evolution computation failed (" + type(exc).__name__ + ")"
+            self.registry.update_run(run_id, status, error=error, result_json={"code": "run_failed"}, completed_at=_now())
+            self.registry.event(run_id, status, {"error": error})
         finally:
             self.cancelled.discard(run_id)
             self.active_run_id = ""
@@ -1772,25 +1855,29 @@ class LiquidKernelControlPlane:
                 pass
 
     def approve(self, run_id: str) -> dict:
-        detail = self.registry.run_detail(run_id)
-        if detail["status"] != "awaiting_approval":
-            raise LiquidKernelError("invalid_run_state", "run is not awaiting approval", 409)
-        version = str(detail.get("candidate_version", "") or "")
-        state = self.registry.begin_canary(version, 5)
-        self.registry.update_run(run_id, "canary")
-        self.registry.event(run_id, "approved", {"candidate_version": version, "canary_percent": 5})
-        return {"ok": True, "run_id": run_id, "state": state}
+        with self.config_lock:
+            if self.config()["mode"] == "Off":
+                raise LiquidKernelError("evolution_disabled", "liquid-kernel evolution is Off", 409)
+            detail = self.registry.run_detail(run_id)
+            if detail["status"] != "awaiting_approval":
+                raise LiquidKernelError("invalid_run_state", "run is not awaiting approval", 409)
+            version = str(detail.get("candidate_version", "") or "")
+            state = self.registry.begin_canary(version, 5)
+            self.registry.update_run(run_id, "canary")
+            self.registry.event(run_id, "approved", {"candidate_version": version, "canary_percent": 5})
+            return {"ok": True, "run_id": run_id, "state": state}
 
     def reject(self, run_id: str, reason: str = "") -> dict:
-        detail = self.registry.run_detail(run_id)
-        if detail["status"] not in {"awaiting_approval", "canary"}:
-            raise LiquidKernelError("invalid_run_state", "run cannot be rejected in its current state", 409)
-        rollback = None
-        if detail["status"] == "canary":
-            rollback = self.registry.abort_canary(reason=str(reason or "Rejected by administrator."))
-        self.registry.update_run(run_id, "rejected", error=str(reason or "Rejected by administrator."), completed_at=_now())
-        self.registry.event(run_id, "admin_rejected", {"reason": str(reason or ""), "rollback": rollback})
-        return {"ok": True, "run_id": run_id, "status": "rejected", "rollback": rollback}
+        with self.config_lock:
+            detail = self.registry.run_detail(run_id)
+            if detail["status"] not in {"awaiting_approval", "canary"}:
+                raise LiquidKernelError("invalid_run_state", "run cannot be rejected in its current state", 409)
+            rollback = None
+            if detail["status"] == "canary":
+                rollback = self.registry.abort_canary(reason=str(reason or "Rejected by administrator."))
+            self.registry.update_run(run_id, "rejected", error=str(reason or "Rejected by administrator."), completed_at=_now())
+            self.registry.event(run_id, "admin_rejected", {"reason": str(reason or ""), "rollback": rollback})
+            return {"ok": True, "run_id": run_id, "status": "rejected", "rollback": rollback}
 
     def observe_session_result(
         self,
@@ -1827,8 +1914,8 @@ class LiquidKernelControlPlane:
             try:
                 trigger = self.trigger("metric")
                 observed["evolution_trigger"] = trigger
-            except LiquidKernelError:
-                pass
+            except LiquidKernelError as exc:
+                self.last_trigger_error = {"code": exc.code, "error": str(exc), "trigger": "metric", "at": _now()}
         return observed
 
     def emergency_off(self) -> dict:
@@ -1843,11 +1930,15 @@ class LiquidKernelControlPlane:
         }
 
     def dashboard(self) -> dict:
+        with self.config_lock:
+            if not self.run_lock.locked():
+                self._recover_interrupted_runs()
         return {
             "ok": True,
             "config": self.config(),
             "active": self.registry.active_state(),
             "active_run_id": self.active_run_id,
+            "last_trigger_error": self.last_trigger_error,
             "runs": self.registry.list_runs(limit=50),
             "versions": self.registry.list_versions(limit=100),
             "events": self.registry.events_since(0, limit=200),

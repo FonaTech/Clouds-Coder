@@ -218,7 +218,7 @@ from urllib.request import Request, urlopen
 # split-source: order=69 original-lines=73-73 hash=efd0e58d35bb748e
 from zoneinfo import ZoneInfo
 
-# split-source: order=72 original-lines=108-113 hash=5fc2a35a86810a6f
+# split-source: order=72 original-lines=118-123 hash=5fc2a35a86810a6f
 
 
 try:
@@ -226,7 +226,7 @@ try:
 except Exception:
     _AESGCM = None
 
-# split-source: order=76 original-lines=416-421 hash=e941c12c2f4901ba
+# split-source: order=76 original-lines=485-490 hash=e941c12c2f4901ba
 
 from liquid_kernel import (  # noqa: E402
     EVOLUTION_MODES,
@@ -234,7 +234,14 @@ from liquid_kernel import (  # noqa: E402
     LiquidKernelError,
 )
 
-# split-source: order=116 original-lines=3800-3809 hash=42ec21eda00bbe87
+# split-source: order=78 original-lines=507-511 hash=752512784d9d5e2f
+
+
+# A standalone main-file update can leave an older local liquid_kernel package.
+# Adapt that package in memory as well as shipping the fixed embedded archive.
+from liquid_kernel.control import LiquidKernelRegistry as _LiquidKernelRegistry  # noqa: E402
+
+# split-source: order=119 original-lines=3893-3902 hash=42ec21eda00bbe87
 # END EMBEDDED COLLABORATION WEB ASSETS
 
 try:
@@ -246,14 +253,14 @@ except ImportError:
     _pty = None
     _termios = None
 
-# split-source: order=117 original-lines=3810-3814 hash=2bd8ec70b5d6db71
+# split-source: order=120 original-lines=3903-3907 hash=2bd8ec70b5d6db71
 
 try:
     import certifi as _certifi
 except Exception:
     _certifi = None
 
-# split-source: order=118 original-lines=3815-3818 hash=cba211345467525c
+# split-source: order=121 original-lines=3908-3911 hash=cba211345467525c
 try:
     import yaml as _yaml
 except Exception:

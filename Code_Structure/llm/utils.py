@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=848 original-lines=12139-12153 hash=b6bc62480e297d33
+# split-source: order=851 original-lines=12232-12246 hash=b6bc62480e297d33
 
 def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, list[str], str]:
     url = f"{str(base_url or '').rstrip('/')}/api/tags"
@@ -22,22 +22,100 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     except Exception as exc:
         return False, [], str(exc)
 
-# split-source: order=849 original-lines=12154-12157 hash=809c5486e3290434
+# split-source: order=853 original-lines=12269-12302 hash=57be9b471851f92b
+
+
+def probe_ollama_model_records(
+    base_url: str,
+    *,
+    timeout: float = 1.5,
+    max_models: int | None = None,
+) -> list[dict]:
+    """List Ollama models and inspect each advertised capability by default.
+
+    ``max_models`` remains available for callers that explicitly need a bound;
+    normal discovery must import the complete provider directory.
+    """
+    ok, tags, _ = probe_ollama_environment(base_url, timeout=max(0.5, float(timeout)))
+    if not ok:
+        return []
+    records = [{"id": name, "capabilities": {}} for name in tags]
+    names = tags if max_models is None else tags[: max(0, int(max_models))]
+    for index, name in enumerate(names):
+        try:
+            body = json.dumps({"name": name}).encode("utf-8")
+            req = Request(
+                f"{str(base_url or '').rstrip('/')}/api/show",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            with urlopen(req, timeout=max(0.5, float(timeout))) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            records[index]["capabilities"] = extract_ollama_model_capabilities(payload)
+            records[index]["raw"] = payload
+        except Exception:
+            continue
+    return records
+
+# split-source: order=854 original-lines=12303-12307 hash=a4f53fc70863cd38
+
 
 def list_ollama_models(base_url: str, timeout: int = 4) -> list[str]:
     ok, tags, _ = probe_ollama_environment(base_url, timeout=timeout)
     return tags if ok else []
 
-# split-source: order=850 original-lines=12158-12159 hash=5336afa576b84f38
+# split-source: order=855 original-lines=12308-12309 hash=5336afa576b84f38
 
 _OLLAMA_TAG_CACHE_LOCK = threading.Lock()
 
-# split-source: order=851 original-lines=12160-12160 hash=0e9c32a2e7390246
+# split-source: order=856 original-lines=12310-12310 hash=0e9c32a2e7390246
 _OLLAMA_TAG_CACHE: dict[str, dict] = {}
 
-# split-source: order=854 original-lines=12169-12207 hash=027209aa5e1968b3
+# split-source: order=859 original-lines=12319-12344 hash=91d4292d35ee6bfb
 
-def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refresh: bool = False) -> list[str]:
+def _fetch_ollama_models_cached(key: str, base_url: str, cached_tags: list[str]) -> None:
+    """Fetch Ollama tags and publish one cache snapshot.
+
+    The caller marks the cache row as fetching before starting this worker, so
+    concurrent catalog requests can keep returning the last snapshot while the
+    network request is in flight.
+    """
+    try:
+        ok, tags, _ = probe_ollama_environment(base_url)
+    except Exception:
+        ok, tags = False, []
+    finally:
+        with _OLLAMA_TAG_CACHE_LOCK:
+            if ok:
+                _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": list(tags)}
+            else:
+                row_now = _OLLAMA_TAG_CACHE.get(key, {})
+                row_now.pop("_fetching", None)
+                if cached_tags:
+                    _OLLAMA_TAG_CACHE[key] = {
+                        "ts": time.time(),
+                        "tags": list(cached_tags),
+                    }
+                else:
+                    _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
+
+# split-source: order=860 original-lines=12345-12390 hash=0a5b233c8dd8fde4
+
+
+def list_ollama_models_cached(
+    base_url: str,
+    ttl_seconds: int = 30,
+    force_refresh: bool = False,
+    *,
+    background: bool = False,
+) -> list[str]:
+    """Return cached Ollama tags, optionally refreshing without blocking.
+
+    UI/catalog reads use ``background=True`` so an unavailable local daemon
+    cannot delay the first render. Explicit scan endpoints keep the historical
+    synchronous behaviour by leaving it false.
+    """
     key = str(base_url or "").rstrip("/")
     now = time.time()
     cached_tags: list[str] = []
@@ -56,27 +134,21 @@ def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refres
             row = {"ts": 0.0, "tags": []}
         row["_fetching"] = True
         _OLLAMA_TAG_CACHE[key] = row
-    try:
-        ok, tags, _ = probe_ollama_environment(base_url)
-    except Exception:
-        ok, tags = False, []
-    finally:
-        with _OLLAMA_TAG_CACHE_LOCK:
-            if ok:
-                _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": list(tags)}
-            else:
-                # Clear fetching flag, keep old cache if available
-                row_now = _OLLAMA_TAG_CACHE.get(key, {})
-                row_now.pop("_fetching", None)
-                if not cached_tags:
-                    _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
-    if ok:
-        return list(tags)
-    if cached_tags:
+    if background:
+        threading.Thread(
+            target=_fetch_ollama_models_cached,
+            args=(key, base_url, cached_tags),
+            name="ollama-model-probe",
+            daemon=True,
+        ).start()
         return list(cached_tags)
-    return []
+    _fetch_ollama_models_cached(key, base_url, cached_tags)
+    with _OLLAMA_TAG_CACHE_LOCK:
+        row = _OLLAMA_TAG_CACHE.get(key, {})
+        tags = row.get("tags", []) if isinstance(row, dict) else []
+    return list(tags) if isinstance(tags, list) else list(cached_tags)
 
-# split-source: order=857 original-lines=12224-12268 hash=869060a204c81ba4
+# split-source: order=863 original-lines=12407-12451 hash=869060a204c81ba4
 
 def split_thinking_content(text: str) -> tuple[str, str]:
     if not text:
@@ -123,12 +195,12 @@ def split_thinking_content(text: str) -> tuple[str, str]:
     thinking = "\n\n".join(part for part in thinking_parts if part).strip()
     return body, trim(thinking, 24_000) if thinking else ""
 
-# split-source: order=858 original-lines=12269-12271 hash=84300145b305a8f9
+# split-source: order=864 original-lines=12452-12454 hash=84300145b305a8f9
 
 def strip_thinking_content(text: str) -> str:
     return split_thinking_content(text)[0]
 
-# split-source: order=859 original-lines=12272-12297 hash=dcb58a8b1e81d434
+# split-source: order=865 original-lines=12455-12480 hash=dcb58a8b1e81d434
 
 def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tuple[bool, str]:
     if not model:
@@ -156,7 +228,7 @@ def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tu
     except Exception as exc:
         return False, str(exc)
 
-# split-source: order=860 original-lines=12298-12312 hash=0e6bd9e34bd84ee7
+# split-source: order=866 original-lines=12481-12495 hash=0e6bd9e34bd84ee7
 
 def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     url = f"{str(base_url or '').rstrip('/')}/api/ps"
@@ -173,7 +245,7 @@ def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     except Exception:
         return []
 
-# split-source: order=861 original-lines=12313-12344 hash=e1a3cc4af04a7227
+# split-source: order=867 original-lines=12496-12527 hash=e1a3cc4af04a7227
 
 def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[bool, str]:
     target = str(model or "").strip()
@@ -207,7 +279,7 @@ def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[boo
     except Exception as exc:
         return False, trim(str(exc), 180)
 
-# split-source: order=862 original-lines=12345-12363 hash=593b4b2efdfdfc26
+# split-source: order=868 original-lines=12528-12546 hash=593b4b2efdfdfc26
 
 def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
     cli = shutil.which("ollama")
@@ -228,7 +300,7 @@ def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"pull failed for '{model}': {exc}"
 
-# split-source: order=863 original-lines=12364-12383 hash=5e190838582bfe71
+# split-source: order=869 original-lines=12547-12566 hash=5e190838582bfe71
 
 def ordered_model_candidates(base_url: str, preferred: str, exclude: set[str] | None = None) -> list[str]:
     blocked = set(exclude or set())
@@ -250,7 +322,7 @@ def ordered_model_candidates(base_url: str, preferred: str, exclude: set[str] | 
         dedup.append(item)
     return dedup
 
-# split-source: order=864 original-lines=12384-12401 hash=94d20ab520ec1fcb
+# split-source: order=870 original-lines=12567-12584 hash=94d20ab520ec1fcb
 
 def pick_working_ollama_model(
     base_url: str,
@@ -270,7 +342,7 @@ def pick_working_ollama_model(
             errors.append(f"{candidate}: {err}")
     return None, "; ".join(errors)
 
-# split-source: order=868 original-lines=12443-12453 hash=5cd2e8ebe2b3c672
+# split-source: order=874 original-lines=12626-12636 hash=5cd2e8ebe2b3c672
 
 def complete_chat_endpoint(endpoint_or_base: str) -> str:
     s = (endpoint_or_base or "").strip()
@@ -283,17 +355,17 @@ def complete_chat_endpoint(endpoint_or_base: str) -> str:
         return s.rstrip("/") + "/chat/completions"
     return s.rstrip("/") + "/v1/chat/completions"
 
-# split-source: order=877 original-lines=12548-12550 hash=35e7f0d901bff49a
+# split-source: order=883 original-lines=12731-12733 hash=35e7f0d901bff49a
 
 def is_openai_compat_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_COMPAT_PROVIDER_NAMES
 
-# split-source: order=878 original-lines=12551-12553 hash=13cd547ebeda1f0d
+# split-source: order=884 original-lines=12734-12736 hash=13cd547ebeda1f0d
 
 def is_openai_like_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_LIKE_PROVIDER_NAMES
 
-# split-source: order=892 original-lines=12608-12619 hash=18bd1763e9c788d2
+# split-source: order=898 original-lines=12791-12802 hash=18bd1763e9c788d2
 
 
 def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_OFF) -> str:
@@ -307,61 +379,73 @@ def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_
         hi = lo
     return EFFORT_LEVELS[min(max(EFFORT_ORDER[e], lo), hi)]
 
-# split-source: order=893 original-lines=12620-12656 hash=e46f2d8721997de2
+# split-source: order=899 original-lines=12803-12845 hash=da8e3c5f5941b610
 
 
-def model_reasoning_style(provider: str, model: str) -> str:
+def model_reasoning_style(
+    provider: str,
+    model: str,
+    capabilities: dict | None = None,
+    *,
+    capabilities_probed: bool = False,
+) -> str:
     """Return which reasoning dialect a (provider, model) pair speaks.
 
     One of: "anthropic" | "openai" | "deepseek" | "glm" | "ollama" | "none".
     Conservative: only models known to support reasoning return a non-"none"
     style, so unknown models are never sent reasoning fields.
     """
-    prov = normalize_openai_compat_provider_name(provider) if provider else ""
-    raw_prov = str(provider or "").strip().lower()
-    m = str(model or "").strip().lower()
-    if raw_prov == "anthropic":
-        # Extended thinking on Claude 3.7+ / 4.x families.
-        if any(tok in m for tok in ("claude-3-7", "claude-3.7", "claude-sonnet-4",
-                                    "claude-opus-4", "claude-haiku-4", "claude-4",
-                                    "-thinking", "claude-sonnet-5", "claude-opus-5")):
-            return "anthropic"
-        return "none"
-    if raw_prov == "ollama":
-        # Local reasoning models (qwen3, deepseek-r1, etc.) accept native think flag.
-        if any(tok in m for tok in ("r1", "qwen3", "deepseek", "thinking", "reasoner", "magistral")):
-            return "ollama"
-        return "none"
-    if prov in OPENAI_COMPAT_PROVIDER_NAMES or raw_prov == "custom_http":
-        if prov == "glm" or m.startswith("glm-") or "glm" in m:
-            # GLM 4.5/4.6/5.x + coding endpoints use {"thinking": {...}}.
-            return "glm"
-        if "deepseek" in m or m in ("deepseek-reasoner",):
-            return "deepseek"
-        # OpenAI o-series / gpt-5 reasoning, and openrouter slugs that wrap them.
-        if (m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
-                or "gpt-5" in m or "/o1" in m or "/o3" in m or "/o4" in m
-                or "reasoning" in m):
+    # Probe metadata is authoritative.  A model name is never evidence of a
+    # reasoning API: providers may alias, fine-tune, or proxy models freely.
+    if isinstance(capabilities, dict):
+        explicit_style = str(
+            capabilities.get("reasoning_style")
+            or capabilities.get("reasoning_dialect")
+            or ""
+        ).strip().lower()
+        supported = capabilities.get("reasoning_supported")
+        if explicit_style in {"anthropic", "openai", "deepseek", "glm", "ollama", "none"}:
+            return explicit_style
+        if supported is False:
+            return "none"
+        if supported is True:
+            # A provider can advertise reasoning without a dialect; use its
+            # transport dialect rather than guessing from the model name.
+            raw_provider = str(provider or "").strip().lower()
+            if raw_provider == "anthropic":
+                return "anthropic"
+            if raw_provider == "ollama":
+                return "ollama"
+            if normalize_openai_compat_provider_name(provider) == "glm":
+                return "glm"
             return "openai"
+        if supported is None and not explicit_style:
+            return "none"
         return "none"
     return "none"
 
-# split-source: order=895 original-lines=12708-12720 hash=621dda42895b6558
+# split-source: order=901 original-lines=12898-12916 hash=295e33cfad729bd0
 
 def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, str]:
+    raw_provider = str(provider or "").strip().lower().replace("-", "_")
     normalized = normalize_openai_compat_provider_name(provider)
     headers = {
         "Accept": "application/json",
         "User-Agent": "Clouds-Coder/1.0",
     }
     if str(api_key or "").strip():
-        headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+        if raw_provider == "anthropic":
+            headers["x-api-key"] = str(api_key).strip()
+        else:
+            headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+    if raw_provider == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     if normalized == "openrouter":
         headers.setdefault("HTTP-Referer", "https://clouds-coder.local")
         headers.setdefault("X-Title", "Clouds Coder")
     return headers
 
-# split-source: order=896 original-lines=12721-12754 hash=1abf019732b65984
+# split-source: order=902 original-lines=12917-12950 hash=1abf019732b65984
 
 def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> list[str]:
     base = extract_base_url(endpoint_or_base).rstrip("/")
@@ -397,7 +481,178 @@ def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> 
         out.append(url)
     return out
 
-# split-source: order=898 original-lines=12790-12803 hash=267da5b275a37edb
+# split-source: order=903 original-lines=12951-12965 hash=c9c6503140863a55
+
+
+def anthropic_model_list_url(endpoint_or_base: str) -> str:
+    """Return the Anthropic Models API URL for an API base or Messages URL."""
+    base = str(endpoint_or_base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    low = base.lower()
+    for suffix in ("/v1/messages", "/messages"):
+        if low.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+    if base.lower().endswith("/v1"):
+        return base + "/models"
+    return base + "/v1/models"
+
+# split-source: order=906 original-lines=13081-13083 hash=f510f7fa62bb9c96
+
+
+_PROVIDER_MODEL_CACHE_LOCK = threading.Lock()
+
+# split-source: order=907 original-lines=13084-13084 hash=fd12c2e776ffc328
+_PROVIDER_MODEL_CACHE: dict[str, dict] = {}
+
+# split-source: order=908 original-lines=13085-13158 hash=bd11795609769247
+
+
+def _fetch_provider_models_cached(
+    key: str,
+    profile: dict,
+    cached_models: list[dict],
+) -> None:
+    """Fetch provider models and publish one cache snapshot."""
+    if not isinstance(profile, dict):
+        return
+    provider = str(profile.get("provider", "") or "").strip().lower()
+    base_url = str(profile.get("base_url", "") or "").strip().rstrip("/")
+    endpoint = str(profile.get("endpoint", "") or "").strip()
+    api_key = str(profile.get("api_key", "") or "").strip()
+    custom_headers = profile.get("headers", {})
+    custom_headers = (
+        {str(k): str(v) for k, v in custom_headers.items() if str(k).strip()}
+        if isinstance(custom_headers, dict)
+        else {}
+    )
+    records: list[dict] = []
+    try:
+        if provider == "ollama" and base_url:
+            records = probe_ollama_model_records(base_url, timeout=1.5)
+        elif provider == "anthropic":
+            models_url = anthropic_model_list_url(base_url or endpoint)
+            headers = openai_compat_probe_headers(provider, api_key)
+            headers.update(custom_headers)
+            seen: set[str] = set()
+            after_id = ""
+            for _page in range(20):
+                if not models_url:
+                    break
+                separator = "&" if "?" in models_url else "?"
+                page_url = f"{models_url}{separator}limit=1000"
+                if after_id:
+                    page_url += f"&after_id={quote(after_id, safe='')}"
+                req = Request(page_url, method="GET", headers=headers)
+                with urlopen(req, timeout=3) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                page_records = extract_openai_compat_model_records(payload)
+                for record in page_records:
+                    model_id = str(record.get("id", "") or "").strip()
+                    if model_id and model_id not in seen:
+                        seen.add(model_id)
+                        records.append(record)
+                if not isinstance(payload, dict) or not bool(payload.get("has_more")):
+                    break
+                next_after = str(payload.get("last_id", "") or "").strip()
+                if not next_after or next_after == after_id:
+                    break
+                after_id = next_after
+        elif is_openai_compat_provider(provider) or provider == "custom_http":
+            headers = openai_compat_probe_headers(provider, api_key)
+            headers.update(custom_headers)
+            for url in openai_compat_model_list_urls(base_url or endpoint, provider):
+                try:
+                    req = Request(url, method="GET", headers=headers)
+                    with urlopen(req, timeout=3) as resp:
+                        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    records = extract_openai_compat_model_records(payload)
+                    if records:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        records = []
+    finally:
+        with _PROVIDER_MODEL_CACHE_LOCK:
+            previous = _PROVIDER_MODEL_CACHE.get(key, {})
+            _PROVIDER_MODEL_CACHE[key] = {
+                "ts": time.time(),
+                "models": records or previous.get("models", cached_models),
+            }
+
+# split-source: order=909 original-lines=13159-13226 hash=c7683721fb27e656
+
+
+def probe_provider_models(
+    profile: dict,
+    *,
+    force_refresh: bool = False,
+    ttl_seconds: int = 30,
+    background: bool = False,
+    cached_only: bool = False,
+) -> list[dict]:
+    """Return cached provider models and optionally refresh them in the background.
+
+    Direct callers retain synchronous probing by default. Model catalog reads
+    pass ``background=True`` so a cold network cache never blocks a UI request.
+    """
+    if not isinstance(profile, dict):
+        return []
+    provider = str(profile.get("provider", "") or "").strip().lower()
+    base_url = str(profile.get("base_url", "") or "").strip().rstrip("/")
+    endpoint = str(profile.get("endpoint", "") or "").strip()
+    api_key = str(profile.get("api_key", "") or "").strip()
+    raw_headers = profile.get("headers", {})
+    header_secret = (
+        json.dumps(
+            {str(k): str(v) for k, v in raw_headers.items()},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        if isinstance(raw_headers, dict)
+        else ""
+    )
+    auth_material = f"{api_key}\0{header_secret}"
+    key_fingerprint = (
+        hashlib.sha256(auth_material.encode("utf-8")).hexdigest()[:12]
+        if api_key or header_secret
+        else "-"
+    )
+    key = hashlib.sha256(
+        f"{provider}|{base_url}|{endpoint}|{key_fingerprint}".encode()
+    ).hexdigest()[:24]
+    now = time.time()
+    with _PROVIDER_MODEL_CACHE_LOCK:
+        cached = _PROVIDER_MODEL_CACHE.get(key, {})
+        cached_models = [
+            dict(x) for x in cached.get("models", []) if isinstance(x, dict)
+        ]
+        if cached_only:
+            return cached_models
+        if cached and not force_refresh and now - float(cached.get("ts", 0.0) or 0.0) <= ttl_seconds:
+            return cached_models
+        if cached.get("fetching"):
+            return cached_models
+        cached["fetching"] = True
+        _PROVIDER_MODEL_CACHE[key] = cached
+    profile_snapshot = dict(profile)
+    if background:
+        threading.Thread(
+            target=_fetch_provider_models_cached,
+            args=(key, profile_snapshot, cached_models),
+            name=f"model-probe-{provider or 'provider'}",
+            daemon=True,
+        ).start()
+        return cached_models
+    _fetch_provider_models_cached(key, profile_snapshot, cached_models)
+    with _PROVIDER_MODEL_CACHE_LOCK:
+        row = _PROVIDER_MODEL_CACHE.get(key, {})
+        models = row.get("models", []) if isinstance(row, dict) else []
+    return [dict(x) for x in models if isinstance(x, dict)]
+
+# split-source: order=917 original-lines=13401-13414 hash=267da5b275a37edb
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -413,7 +668,7 @@ def _is_http_url(text: str) -> bool:
     except Exception:
         return False
 
-# split-source: order=899 original-lines=12804-12821 hash=cf2e2cc8977a7264
+# split-source: order=918 original-lines=13415-13432 hash=cf2e2cc8977a7264
 
 def _resolve_local_path(raw: str, base_dir: Path) -> Path:
     src = str(raw or "").strip()

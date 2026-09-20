@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1175 original-lines=117420-128136 hash=27c44b14c80da282
+# split-source: order=1194 original-lines=118748-129627 hash=8f80f82905556104
 
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.
@@ -73,25 +73,47 @@ class AppContext:
         if base:
             self.base_url = base
 
-    def _liquid_kernel_profile(self, profile_id: str = "") -> dict:
-        requested = sanitize_profile_id(str(profile_id or ""))
-        if requested and requested in self.global_profiles:
-            return dict(self.global_profiles[requested])
-        active = dict(self.global_profiles.get(self.global_active_profile_id, {}))
-        if active:
-            return active
-        return {
-            "provider": "ollama",
-            "model": self.model,
-            "base_url": self.base_url,
-            "temperature": 0.1,
-        }
+    def _evolution_profile_source(self, source: str, owner: str) -> tuple[dict, str]:
+        if source == "global":
+            return copy.deepcopy(self.global_profiles), self.global_active_profile_id
+        if not owner or owner in {".", ".."} or "/" in owner or "\\" in owner:
+            raise LiquidKernelError("invalid_model_owner", "model owner is invalid", 403)
+        if source == "ide":
+            try:
+                with self.ide_auth._connect() as conn:
+                    account = conn.execute("SELECT disabled FROM ide_accounts WHERE user_id=?", (owner,)).fetchone()
+            except sqlite3.Error as exc:
+                raise LiquidKernelError("model_owner_unavailable", "IDE model ownership cannot be verified", 503) from exc
+            if account is None or bool(account["disabled"]):
+                raise LiquidKernelError("model_owner_disabled", "IDE model owner was deleted or disabled", 409)
+        path = self.codes_root / owner / "user_prefs.json"
+        if not path.is_file():
+            raise LiquidKernelError("model_profile_missing", "private model configuration no longer exists", 409)
+        raw = self.crypto.read_json(path, {})
+        profiles = raw.get("model_profiles", {}) if isinstance(raw, dict) else {}
+        if not isinstance(profiles, dict):
+            raise LiquidKernelError("model_profile_missing", "private model configuration cannot be read", 409)
+        return profiles, str(raw.get("active_profile_id", ""))
 
-    def _liquid_kernel_model_call(self, system: str, prompt: str, profile_id: str, max_tokens: int) -> dict:
+    def _evolution_models(self):
+        from liquid_kernel.models import EvolutionModels
+        return EvolutionModels(
+            self._evolution_profile_source,
+            lambda profile: probe_provider_models(profile, cached_only=True),
+            model_runtime_settings_for,
+            self.liquid_kernel.registry.signing_key,
+        )
+
+    def _liquid_kernel_profile(self, profile_id="") -> dict:
+        reference = profile_id if isinstance(profile_id, dict) else None
+        _, profile = self._evolution_models().resolve(reference, "" if reference else profile_id)
+        return profile
+
+    def _liquid_kernel_model_call(self, system: str, prompt: str, profile_id, max_tokens: int) -> dict:
         profile = self._liquid_kernel_profile(profile_id)
         client = OllamaClient(
-            base_url=str(profile.get("base_url", self.base_url) or self.base_url),
-            model=str(profile.get("model", self.model) or self.model),
+            base_url=str(profile.get("base_url", "") or ""),
+            model=str(profile["model"]),
             timeout=max(DEFAULT_REQUEST_TIMEOUT, min(MAX_TIMEOUT_SECONDS, 900)),
             provider=str(profile.get("provider", "ollama") or "ollama"),
             endpoint=str(profile.get("endpoint", "") or ""),
@@ -102,27 +124,43 @@ class AppContext:
             response_stream=False,
         )
         client.apply_profile(profile)
-        client.set_telemetry(self.telemetry.record, context_provider=lambda: {}, name="liquid_kernel_evolution")
-        response = client.chat(
-            [{"role": "user", "content": str(prompt or "")}],
-            system=str(system or ""),
-            max_tokens=max(512, min(int(max_tokens or 4096), 32_000)),
-            temperature=max(0.0, min(0.3, float(profile.get("temperature", 0.1) or 0.1))),
-            think=False,
-            response_stream=False,
-        )
+        # Custom templates may contain a literal model. Bind it to the selected
+        # model too, without changing the template in its encrypted source.
+        if client.provider == "custom_http" and client.payload_template:
+            template = client.payload_template.strip()
+            if not template.startswith("{"):
+                raise LiquidKernelError("invalid_model_template", "custom model template must be a JSON object")
+            client.payload_template = template[:-1] + ',"model":' + json.dumps(client.model) + ',"max_tokens":' + str(max(512, min(int(max_tokens or 4096), 32_000))) + '}'
+        active_run = self.liquid_kernel.active_run_id
+        try:
+            response = client.chat(
+                [{"role": "user", "content": str(prompt or "")}],
+                system=str(system or ""),
+                max_tokens=max(512, min(int(max_tokens or 4096), 32_000)),
+                temperature=max(0.0, min(0.3, float(profile.get("temperature", 0.1)))),
+                think=False,
+                response_stream=False,
+                cancel_check=lambda: bool(active_run and active_run in self.liquid_kernel.cancelled),
+            )
+        except Exception as exc:
+            if active_run in self.liquid_kernel.cancelled:
+                raise LiquidKernelError("run_cancelled", "evolution run was cancelled", 409) from exc
+            # Provider exceptions may contain credentials, URLs or request data.
+            raise LiquidKernelError("model_call_failed", "Selected model request failed (" + type(exc).__name__ + "); check its service, credentials and model availability", 502) from exc
         text = str(response.get("content", "") or "")
+        secrets = [profile.get("api_key", ""), *list((profile.get("headers") or {}).values())]
+        for secret in secrets:
+            if isinstance(secret, str) and len(secret) >= 4:
+                text = text.replace(secret, "[secret redacted]")
+        text = self._liquid_kernel_redact_text(text)
         parsed = parse_json_object(text, {})
         if not isinstance(parsed, dict) or not parsed:
-            raise LiquidKernelError(
-                "invalid_model_output",
-                "evolution model must return a JSON object",
-                details={"output": trim(text, 1200)},
-            )
+            raise LiquidKernelError("invalid_model_output", "evolution model must return a JSON object")
         return parsed
 
     def _liquid_kernel_judge_call(self, payload: dict, profile_id: str, max_tokens: int) -> dict:
-        profile = str(profile_id or "").strip()
+        from liquid_kernel.control import valid_judge_score
+        profile = profile_id
         order = ["incumbent", "candidate"]
         random.SystemRandom().shuffle(order)
         source_a = str(payload.get(f"{order[0]}_source", "") or "")
@@ -151,8 +189,8 @@ class AppContext:
             profile,
             max_tokens,
         )
-        score_a = max(0.0, min(100.0, float(result.get("score_a", 50) or 50)))
-        score_b = max(0.0, min(100.0, float(result.get("score_b", 50) or 50)))
+        score_a = valid_judge_score(result.get("score_a"))
+        score_b = valid_judge_score(result.get("score_b"))
         mapped = {order[0]: score_a, order[1]: score_b}
         return {
             "incumbent": mapped["incumbent"],
@@ -578,6 +616,8 @@ class AppContext:
             experience_provider=self._liquid_kernel_experience,
             model_callback=self._liquid_kernel_model_call,
             judge_callback=self._liquid_kernel_judge_call,
+            model_resolver=lambda config: self._evolution_models().bind_run(config),
+            config_validator=lambda config, **kwargs: self._evolution_models().validate_config(config, **kwargs),
         )
         if self.liquid_kernel_startup_policy == "inject":
             injection = self.liquid_kernel.inject_embedded_kernel()
@@ -6333,6 +6373,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         selection: str,
         *,
         client_ip: str = "",
+        settings: dict | None = None,
     ) -> dict:
         collaboration = str(user_id or "").startswith("collab:")
         source_manager = None
@@ -6351,20 +6392,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "Stop active Agents in the main Web UI before changing its model."
             )
         if bool(getattr(sess, "running", False)):
-            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": ""})
+            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": "", "settings": normalize_model_runtime_settings(settings)})
             if source_manager is not None:
-                source_manager.set_runtime_model(picked, None)
+                source_manager.set_runtime_model(picked, None, settings)
             queued = sess.model_catalog()
             queued["queued"] = True
             queued["note"] = "Model switch queued until the current run finishes."
             return queued
         if source_manager is not None:
-            out = source_manager.set_runtime_model(picked, None)
+            out = source_manager.set_runtime_model(picked, None, settings)
             if target_manager is not source_manager:
                 self._sync_ordinary_ide_llm_source(user_id, client_ip, force=True)
                 out = sess.model_catalog()
             return out
-        out = sess.set_runtime_selection(picked)
+        out = sess.set_runtime_selection(picked, settings=settings)
         self.manager_for_user(user_id)._sync_from_session(sess, apply_to_all=False)
         return out
 
@@ -9038,7 +9079,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             mgr = self.manager_for_user(user_id)
             sess = mgr.get(session_id)
             if sess and bool(getattr(sess, "_deferred_runtime_sync_requested", False)):
-                mgr._sync_from_session(sess, apply_to_all=False)
+                # Model selection and its per-model runtime controls are user
+                # preferences. Propagate them to every existing session so the
+                # WebUI and IDE observe the same state immediately.
+                mgr._sync_from_session(sess, apply_to_all=True)
                 sess._deferred_runtime_sync_requested = False
         except Exception:
             pass
@@ -9850,6 +9894,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         cfg = dict(config or {})
         OllamaClient.clear_global_probe_cache()
         parsed = parse_llm_config_profiles(cfg, self.base_url, self.model)
+        probe_and_merge_model_profiles(parsed.get("profiles", []), force_refresh=True)
         self.default_llm_config = cfg
         revision = self._llm_config_revision(cfg)
         self.global_llm_config_revision = revision
@@ -10621,6 +10666,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
 
     def model_catalog(self) -> dict:
         opts = []
+        profiles_changed = False
         for pid, profile in self.global_profiles.items():
             model = str(profile.get("model", ""))
             caps = merge_multimodal_capabilities(
@@ -10638,9 +10684,80 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model, caps
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(str(profile.get("provider", "")), model, caps)
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                 }
             )
+        seen = {str(x.get("selection", "")) for x in opts}
+        for pid, profile in self.global_profiles.items():
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(profile, background=True)
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", ""), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")), model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": merge_multimodal_capabilities(infer_model_multimodal_capabilities(str(profile.get("provider", "")), model_id), parse_capability_overrides(profile.get("capabilities", {}))),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.global_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         selected_profile = self.global_profiles.get(self.global_active_profile_id, {})
         selected = f"{self.global_active_profile_id}::{selected_profile.get('model', self.model)}"
         option_map = {str(x.get("selection", "")) for x in opts}
@@ -10657,6 +10774,25 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "thinking_hint": bool(selected_profile.get("thinking_hint", False)),
                     "thinking_stream": bool(selected_profile.get("thinking_stream", False)),
                     "response_stream": bool(selected_profile.get("response_stream", False)),
+                    "reasoning_supported": (
+                        selected_profile.get("reasoning_supported")
+                        if selected_profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                            selected_profile.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        selected_profile.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                            selected_profile.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": merge_multimodal_capabilities(
                         infer_model_multimodal_capabilities(
                             str(selected_profile.get("provider", "")),
@@ -10666,6 +10802,13 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     ),
                 },
             )
+        selected_option = next((item for item in opts if str(item.get("selection", "")) == selected), None)
+        if selected_option is not None:
+            apply_model_option_runtime_fields(
+                selected_option,
+                selected_profile,
+                str(selected_option.get("model", "") or ""),
+            )
         active_caps = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(
                 str(selected_profile.get("provider", "")),
@@ -10673,6 +10816,21 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             ),
             parse_capability_overrides(selected_profile.get("capabilities", {})),
         )
+        if profiles_changed:
+            self.global_profiles_payload = {
+                **(self.global_profiles_payload if isinstance(self.global_profiles_payload, dict) else {}),
+                "profiles": [dict(item) for item in self.global_profiles.values()],
+            }
+            # Keep the discovered directory in the system config so a restart
+            # can render the same provider/model choices before the next probe.
+            persisted = dict(self.default_llm_config or {})
+            persisted["profiles"] = [dict(item) for item in self.global_profiles.values()]
+            persisted["default_profile_id"] = self.global_active_profile_id
+            self.default_llm_config = persisted
+            try:
+                LLM_CONFIG_PATH.write_text(json_dumps(persisted, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         return {
             "provider": selected_profile.get("provider", "ollama"),
             "models": [x["selection"] for x in opts] or [self.model],
@@ -10684,7 +10842,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             "active_capabilities": active_caps,
         }
 
-    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+    def set_runtime_model(self, model: str, thinking: bool | None = None, settings: dict | None = None) -> dict:
         raw = str(model or "").strip()
         if not raw:
             raise ValueError("model required")
@@ -10712,6 +10870,11 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                 self.global_profiles[pid]["capabilities"] = infer_model_multimodal_capabilities(
                     "ollama", selected_model.strip()
                 )
+        self.global_profiles[pid] = apply_model_runtime_settings(
+            self.global_profiles.get(pid, {}),
+            str(self.global_profiles[pid].get("model", "") or ""),
+            settings,
+        )
         self.global_active_profile_id = pid
         selected_profile = dict(self.global_profiles.get(pid, {}))
         self._sync_global_ollama_defaults(selected_profile)
@@ -10720,7 +10883,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
         with self._lock:
             for mgr in self._session_mgrs.values():
                 try:
-                    mgr.set_runtime_model(selection, self.thinking)
+                    mgr.set_runtime_model(selection, self.thinking, settings)
                 except Exception:
                     pass
         return self.model_catalog()

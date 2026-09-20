@@ -5,51 +5,51 @@
 
 from __future__ import annotations
 
-# split-source: order=125 original-lines=3825-3825 hash=ba75d7debc8faf30
+# split-source: order=128 original-lines=3918-3918 hash=ba75d7debc8faf30
 ADMIN_STATE_DIRNAME = ".clouds_coder_admin"
 
-# split-source: order=126 original-lines=3826-3826 hash=a7fc266725f53e4c
+# split-source: order=129 original-lines=3919-3919 hash=a7fc266725f53e4c
 ADMIN_CONFIG_FILENAME = "startup_config.json"
 
-# split-source: order=127 original-lines=3827-3827 hash=de32f15d9bd5d6fc
+# split-source: order=130 original-lines=3920-3920 hash=de32f15d9bd5d6fc
 ADMIN_APPS_FILENAME = "shared_apps.json"
 
-# split-source: order=128 original-lines=3828-3828 hash=43a96d0e5164b2d4
+# split-source: order=131 original-lines=3921-3921 hash=43a96d0e5164b2d4
 ADMIN_TELEMETRY_FILENAME = "telemetry.sqlite"
 
-# split-source: order=129 original-lines=3829-3829 hash=df177de1f99d6676
+# split-source: order=132 original-lines=3922-3922 hash=df177de1f99d6676
 ADMIN_AUTH_FILENAME = "auth.sqlite"
 
-# split-source: order=139 original-lines=3876-3876 hash=def27da409b9ad7d
+# split-source: order=142 original-lines=3969-3969 hash=def27da409b9ad7d
 ADMIN_MAX_APP_SKILLS = 8
 
-# split-source: order=140 original-lines=3877-3877 hash=de3edd9e47c1fd02
+# split-source: order=143 original-lines=3970-3970 hash=de3edd9e47c1fd02
 ADMIN_MAX_APP_CAPSULE_CHARS = 12_000
 
-# split-source: order=141 original-lines=3878-3878 hash=e166449a5f670908
+# split-source: order=144 original-lines=3971-3971 hash=e166449a5f670908
 ADMIN_MAX_APP_RESOURCE_FILES = 128
 
-# split-source: order=142 original-lines=3879-3879 hash=3c0c67698e4d1dd4
+# split-source: order=145 original-lines=3972-3972 hash=3c0c67698e4d1dd4
 ADMIN_MAX_APP_RESOURCE_BYTES = 64_000_000
 
-# split-source: order=143 original-lines=3880-3880 hash=d7b3d490cabf04c5
+# split-source: order=146 original-lines=3973-3973 hash=d7b3d490cabf04c5
 ADMIN_APP_INLINE_BLOB_BYTES = 256_000
 
-# split-source: order=144 original-lines=3881-3881 hash=2269cfe84a5c17ac
+# split-source: order=147 original-lines=3974-3974 hash=2269cfe84a5c17ac
 ADMIN_AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
 
-# split-source: order=145 original-lines=3882-3882 hash=881b2fd32105454d
+# split-source: order=148 original-lines=3975-3975 hash=881b2fd32105454d
 ADMIN_AUTH_PASSWORD_ITERATIONS = 600_000
 
-# split-source: order=146 original-lines=3883-3883 hash=525aa27e7d272210
+# split-source: order=149 original-lines=3976-3976 hash=525aa27e7d272210
 ADMIN_AUTH_MAX_ACTIVE_SESSIONS = 32
 
-# split-source: order=1172 original-lines=117416-117417 hash=7bcb3d1e676e0c51
+# split-source: order=1191 original-lines=118744-118745 hash=7bcb3d1e676e0c51
 
 ADMIN_SKILLS_REVIEW_HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skills Review</title><link rel="stylesheet" href="/assets/skills-review.css"></head><body><header><div><span>ADMIN GOVERNANCE</span><h1>Skills Review</h1></div><div><input id="token" type="password" placeholder="Admin token"><button id="load">Load submissions</button></div></header><main><aside><select id="status"><option value="">All states</option><option>submitted</option><option>changes_requested</option><option>rejected</option><option>published</option><option>unpublished</option></select><div id="list"></div></aside><section id="detail"><div class="empty">Select a frozen submission.</div></section></main><script src="/assets/skills-review.js"></script></body></html>'''
 
-# split-source: order=1173 original-lines=117418-117418 hash=29bbe2e6437d616a
+# split-source: order=1192 original-lines=118746-118746 hash=29bbe2e6437d616a
 ADMIN_SKILLS_REVIEW_CSS = r'''*{box-sizing:border-box}body{margin:0;background:#f5f7fa;color:#1d2b3a;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}header{height:78px;padding:13px 24px;background:#15273a;color:#fff;display:flex;justify-content:space-between;align-items:center}header span{font-size:10px;letter-spacing:.16em;color:#8db4d5}h1{margin:0;font-size:24px}input,select,button,textarea{font:inherit;border:1px solid #c5d2df;border-radius:7px;padding:8px}button{cursor:pointer;background:#fff}main{display:grid;grid-template-columns:300px 1fr;height:calc(100vh - 78px)}aside{background:#fff;border-right:1px solid #dbe3eb;padding:14px;overflow:auto}aside select{width:100%;margin-bottom:10px}.row{padding:11px;border:1px solid #dbe3eb;border-radius:9px;margin-bottom:8px;cursor:pointer}.row:hover{border-color:#5b9dd2}.row small{display:block;color:#6d8297}.detail{padding:24px;overflow:auto}.card{background:#fff;border:1px solid #dbe3eb;border-radius:10px;padding:16px;margin-bottom:12px}.files{display:grid;gap:5px}.file{display:flex;justify-content:space-between;padding:7px;background:#f3f7fb}pre{white-space:pre-wrap;max-height:50vh;overflow:auto;background:#102235;color:#d8edff;padding:14px;border-radius:8px}.actions{display:flex;gap:7px}.approve{background:#167044;color:#fff;border-color:#167044}.danger{color:#a12626}.empty{padding:15vh;text-align:center;color:#708397}@media(max-width:700px){main{grid-template-columns:1fr;height:auto}aside{border-right:0}header{height:auto;gap:10px;align-items:start;flex-direction:column}}'''
 
-# split-source: order=1174 original-lines=117419-117419 hash=a175af8ed0ed550b
+# split-source: order=1193 original-lines=118747-118747 hash=a175af8ed0ed550b
 ADMIN_SKILLS_REVIEW_JS = r'''const A={token:sessionStorage.getItem('cc_admin_token')||'',rows:[]};const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));$('token').value=A.token;async function api(path,opt={}){A.token=$('token').value.trim();sessionStorage.setItem('cc_admin_token',A.token);const h=new Headers(opt.headers||{});h.set('Authorization','Bearer '+A.token);if(opt.body)h.set('Content-Type','application/json');const r=await fetch(path,{...opt,headers:h,cache:'no-store'}),b=await r.json();if(!r.ok)throw Error(b.error||`HTTP ${r.status}`);return b}async function load(){const b=await api('/api/admin/skills/submissions?status='+encodeURIComponent($('status').value));A.rows=b.submissions||[];$('list').innerHTML=A.rows.map(x=>`<div class="row" data-id="${esc(x.id)}"><strong>${esc(x.summary?.name||x.project_id.slice(0,8))}</strong><small>${esc(x.status)} · revision ${x.revision}</small><small>${x.files.length} files</small></div>`).join('')||'<div class="empty">No submissions</div>';document.querySelectorAll('[data-id]').forEach(x=>x.onclick=()=>detail(x.dataset.id))}async function detail(id){const b=await api('/api/admin/skills/submissions/'+encodeURIComponent(id)),s=b.snapshot||{},row=A.rows.find(x=>x.id===id)||b;$('detail').innerHTML=`<div class="detail"><div class="card"><h2>${esc(s.project?.title||s.project?.slug||id)}</h2><p>Frozen revision ${b.revision} · ${esc(b.status)}</p><div class="actions"><button class="approve" data-act="approve">Approve & publish</button><button data-act="changes_requested">Request changes</button><button class="danger" data-act="reject">Reject</button>${b.status==='published'?'<button class="danger" data-act="unpublish">Unpublish</button>':''}</div></div><div class="card"><h3>Frozen file tree</h3><div class="files">${(s.files||[]).map(f=>`<div class="file"><code>${esc(f.path)}</code><span>${f.size} B · ${esc((f.digest||'').slice(0,12))}</span></div>`).join('')}</div></div><div class="card"><h3>Snapshot metadata</h3><pre>${esc(JSON.stringify({project:s.project,frozen_at:s.frozen_at},null,2))}</pre></div></div>`;document.querySelectorAll('[data-act]').forEach(x=>x.onclick=async()=>{const note=prompt('Review note')||'';await api(`/api/admin/skills/submissions/${id}/${x.dataset.act}`,{method:'POST',body:JSON.stringify({note})});await load();$('detail').innerHTML='<div class="empty">Review action completed.</div>'})}$('load').onclick=()=>load().catch(e=>alert(e.message));$('status').onchange=()=>load().catch(e=>alert(e.message));if(A.token)load().catch(()=>{});'''

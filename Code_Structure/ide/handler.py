@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1185 original-lines=132446-134101 hash=c4ad9cebbb7f8185
+# split-source: order=1204 original-lines=134085-135741 hash=a78001f9d91d590e
 
 
 class IdeHandler(BaseHTTPRequestHandler):
@@ -1422,6 +1422,7 @@ class IdeHandler(BaseHTTPRequestHandler):
                         m.group(1),
                         str(payload.get("selection", payload.get("model", "")) or ""),
                         client_ip=self._client_ip(),
+                        settings=normalize_model_runtime_settings(payload),
                     )
                 )
             except Exception as exc:

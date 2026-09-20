@@ -2,7 +2,7 @@
 
 ## Overview
 
-- Source snapshot: `Clouds_Coder.py` (1192 top-level statements)
+- Source snapshot: `Clouds_Coder.py` (1212 top-level statements)
 - Generated source modules: 64
 - Unclassified statements: 0
 - Execution model: real source fragments initialized in original top-level order
@@ -103,70 +103,70 @@ Code_Structure/
 
 | Module | Statements | Exported names | Dependencies | Original line span |
 | --- | ---: | ---: | --- | --- |
-| `_imports.py` | 75 | 93 | — | 1–3818 |
-| `admin/auth.py` | 3 | 3 | `admin/constants.py`, `utils/misc.py`, `utils/sqlite.py` | 13575–14417 |
-| `admin/config.py` | 8 | 8 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 15165–15628 |
-| `admin/constants.py` | 16 | 16 | — | 3825–117419 |
-| `agent/background.py` | 1 | 1 | `agent/process.py`, `config/constants.py`, `ide/sandbox.py`, `utils/misc.py`, `utils/text.py` | 23075–23700 |
-| `agent/bus.py` | 1 | 1 | `config/constants.py`, `utils/crypto.py`, `utils/misc.py` | 23701–23766 |
-| `agent/errors.py` | 1 | 1 | — | 12165–12168 |
-| `agent/events.py` | 1 | 1 | — | 16355–16409 |
-| `agent/process.py` | 7 | 7 | `ide/sandbox.py`, `utils/errors.py`, `utils/misc.py`, `utils/text.py` | 8204–23074 |
-| `agent/tasks.py` | 1 | 1 | `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py` | 22574–22708 |
-| `agent/todo.py` | 1 | 1 | `config/constants.py`, `config/settings.py`, `utils/misc.py`, `utils/text.py` | 16410–16770 |
-| `agent/tools.py` | 15 | 19 | `config/constants.py`, `utils/text.py` | 16234–28613 |
-| `agent/worktree.py` | 1 | 1 | `agent/process.py`, `agent/tasks.py`, `config/constants.py`, `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 23767–23979 |
-| `app/context.py` | 1 | 1 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `agent/tools.py`, `app/services.py`, `collaboration/core.py`, `config/bootstrap.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/assets.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/driver.py`, `rag/assets.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `rag/store.py`, `server/http.py`, `session/manager.py`, `session/state.py`, `skills/provisioning.py`, `skills/store.py`, `skills/studio.py`, `utils/crypto.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/assets.py`, `web/skills_assets.py` | 117420–128136 |
-| `app/main.py` | 2 | 1 | `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/context.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/service.py`, `rag/constants.py`, `server/http.py`, `server/rag_admin.py`, `server/skills.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 134882–136833 |
-| `app/services.py` | 2 | 2 | `admin/constants.py`, `config/settings.py`, `skills/embedded.py`, `skills/store.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 128177–129362 |
-| `collaboration/core.py` | 23 | 23 | `config/constants.py`, `utils/sqlite.py` | 437–3678 |
-| `collaboration/watcher.py` | 2 | 2 | `utils/misc.py`, `utils/text.py` | 134791–134881 |
-| `config/bootstrap.py` | 5 | 5 | `config/constants.py`, `config/settings.py`, `utils/json_utils.py`, `utils/misc.py` | 114–14130 |
-| `config/constants.py` | 502 | 498 | `config/bootstrap.py`, `rag/constants.py` | 413–117415 |
-| `config/paths.py` | 13 | 13 | `agent/process.py`, `utils/crypto.py`, `utils/text.py` | 3824–8364 |
-| `config/settings.py` | 68 | 68 | `agent/tools.py`, `config/constants.py`, `config/paths.py`, `ide/preview.py`, `llm/constants.py`, `llm/utils.py`, `rag/constants.py`, `skills/provisioning.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 6303–15962 |
-| `ide/assets.py` | 8 | 3 | — | 114359–115487 |
-| `ide/auth.py` | 2 | 2 | `admin/auth.py`, `admin/constants.py`, `config/constants.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 14418–15149 |
-| `ide/errors.py` | 2 | 2 | — | 15150–15164 |
-| `ide/events.py` | 1 | 1 | `config/constants.py`, `utils/text.py` | 9247–9298 |
-| `ide/handler.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `session/manager.py`, `session/state.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 132446–134101 |
-| `ide/preview.py` | 12 | 12 | `config/constants.py`, `utils/text.py` | 15914–16354 |
-| `ide/sandbox.py` | 21 | 21 | `agent/process.py`, `utils/misc.py` | 8186–29142 |
-| `llm/client.py` | 2 | 2 | `agent/tools.py`, `config/constants.py`, `config/settings.py`, `llm/utils.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 25362–27887 |
-| `llm/constants.py` | 17 | 17 | — | 3822–12607 |
-| `llm/utils.py` | 22 | 22 | `agent/process.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/text.py` | 12139–12821 |
-| `mcp/constants.py` | 8 | 8 | — | 4194–24015 |
-| `mcp/driver.py` | 13 | 13 | `mcp/constants.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 24016–25361 |
-| `mcp/service.py` | 1 | 1 | `app/context.py`, `config/constants.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 134573–134790 |
-| `rag/assets.py` | 6 | 6 | — | 111752–114358 |
-| `rag/constants.py` | 77 | 77 | — | 4190–104710 |
-| `rag/index.py` | 5 | 5 | `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `utils/misc.py`, `utils/text.py` | 104735–111372 |
-| `rag/ingestion.py` | 13 | 13 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/parsers.py`, `rag/store.py`, `session/state.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 104057–111751 |
-| `rag/parsers.py` | 31 | 31 | `agent/process.py`, `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/text.py` | 103680–105906 |
-| `rag/store.py` | 7 | 7 | `config/constants.py`, `config/settings.py`, `ide/preview.py`, `rag/constants.py`, `rag/index.py`, `rag/ingestion.py`, `rag/parsers.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 107602–111663 |
-| `rag/web_search.py` | 15 | 15 | `config/constants.py`, `config/paths.py`, `rag/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 9333–11491 |
-| `server/http.py` | 12 | 12 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `app/context.py`, `collaboration/core.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `ide/preview.py`, `llm/utils.py`, `server/rag_admin.py`, `session/manager.py`, `session/state.py`, `skills/studio.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/admin_assets.py` | 6352–134572 |
-| `server/rag_admin.py` | 3 | 3 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `rag/constants.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 131774–132445 |
-| `server/skills.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `session/manager.py`, `skills/provisioning.py`, `skills/studio.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 131131–131773 |
-| `session/manager.py` | 2 | 2 | `agent/process.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/store.py`, `session/state.py`, `skills/store.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 7512–91947 |
-| `session/state.py` | 1 | 1 | `admin/constants.py`, `agent/background.py`, `agent/bus.py`, `agent/errors.py`, `agent/events.py`, `agent/process.py`, `agent/tasks.py`, `agent/todo.py`, `agent/tools.py`, `agent/worktree.py`, `collaboration/core.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/events.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/driver.py`, `rag/constants.py`, `rag/parsers.py`, `rag/web_search.py`, `server/http.py`, `skills/provisioning.py`, `skills/store.py`, `utils/compress.py`, `utils/crypto.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 29143–89604 |
-| `skills/embedded.py` | 10 | 10 | — | 16771–20570 |
-| `skills/provisioning.py` | 26 | 26 | `config/paths.py`, `skills/embedded.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py` | 16797–20533 |
-| `skills/store.py` | 2 | 2 | `config/constants.py`, `config/settings.py`, `llm/utils.py`, `skills/embedded.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 20571–22573 |
-| `skills/studio.py` | 5 | 5 | `agent/process.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 115513–117410 |
-| `utils/compress.py` | 2 | 2 | — | 11656–11672 |
-| `utils/crypto.py` | 1 | 1 | `utils/json_utils.py` | 13608–13761 |
-| `utils/errors.py` | 2 | 2 | — | 12161–22714 |
-| `utils/files.py` | 27 | 27 | `config/constants.py`, `config/paths.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 6222–14014 |
-| `utils/http.py` | 7 | 7 | `utils/json_utils.py`, `utils/text.py` | 3819–8340 |
-| `utils/json_utils.py` | 13 | 13 | `utils/text.py` | 4189–14072 |
-| `utils/media.py` | 6 | 6 | — | 5860–7893 |
-| `utils/misc.py` | 16 | 16 | `config/constants.py` | 7894–16872 |
-| `utils/sqlite.py` | 2 | 2 | — | 74–107 |
-| `utils/text.py` | 30 | 30 | `config/constants.py` | 4177–15913 |
-| `web/admin_assets.py` | 3 | 3 | — | 97932–98745 |
-| `web/assets.py` | 5 | 4 | — | 91948–97529 |
-| `web/skills_assets.py` | 3 | 3 | — | 97530–97931 |
+| `_imports.py` | 76 | 94 | — | 1–3911 |
+| `admin/auth.py` | 3 | 3 | `admin/constants.py`, `utils/misc.py`, `utils/sqlite.py` | 14428–15270 |
+| `admin/config.py` | 8 | 8 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 16018–16481 |
+| `admin/constants.py` | 16 | 16 | — | 3918–118747 |
+| `agent/background.py` | 1 | 1 | `agent/process.py`, `config/constants.py`, `ide/sandbox.py`, `utils/misc.py`, `utils/text.py` | 23928–24553 |
+| `agent/bus.py` | 1 | 1 | `config/constants.py`, `utils/crypto.py`, `utils/misc.py` | 24554–24619 |
+| `agent/errors.py` | 1 | 1 | — | 12315–12318 |
+| `agent/events.py` | 1 | 1 | — | 17208–17262 |
+| `agent/process.py` | 7 | 7 | `ide/sandbox.py`, `utils/errors.py`, `utils/misc.py`, `utils/text.py` | 8297–23927 |
+| `agent/tasks.py` | 1 | 1 | `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py` | 23427–23561 |
+| `agent/todo.py` | 1 | 1 | `config/constants.py`, `config/settings.py`, `utils/misc.py`, `utils/text.py` | 17263–17623 |
+| `agent/tools.py` | 15 | 19 | `config/constants.py`, `utils/text.py` | 17087–29481 |
+| `agent/worktree.py` | 1 | 1 | `agent/process.py`, `agent/tasks.py`, `config/constants.py`, `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 24620–24832 |
+| `app/context.py` | 1 | 1 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `agent/tools.py`, `app/services.py`, `collaboration/core.py`, `config/bootstrap.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/assets.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/driver.py`, `rag/assets.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `rag/store.py`, `server/http.py`, `session/manager.py`, `session/state.py`, `skills/provisioning.py`, `skills/store.py`, `skills/studio.py`, `utils/crypto.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/assets.py`, `web/skills_assets.py` | 118748–129627 |
+| `app/main.py` | 2 | 1 | `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/context.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/service.py`, `rag/constants.py`, `server/http.py`, `server/rag_admin.py`, `server/skills.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 136609–138560 |
+| `app/services.py` | 2 | 2 | `admin/constants.py`, `config/settings.py`, `skills/embedded.py`, `skills/store.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 129668–130853 |
+| `collaboration/core.py` | 23 | 23 | `config/constants.py`, `utils/sqlite.py` | 530–3771 |
+| `collaboration/watcher.py` | 2 | 2 | `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 136516–136608 |
+| `config/bootstrap.py` | 6 | 6 | `config/constants.py`, `config/settings.py`, `utils/json_utils.py`, `utils/misc.py` | 124–14983 |
+| `config/constants.py` | 504 | 499 | `config/bootstrap.py`, `rag/constants.py` | 483–118743 |
+| `config/paths.py` | 13 | 13 | `agent/process.py`, `utils/crypto.py`, `utils/text.py` | 3917–8457 |
+| `config/settings.py` | 76 | 76 | `agent/tools.py`, `config/constants.py`, `config/paths.py`, `ide/preview.py`, `llm/constants.py`, `llm/utils.py`, `rag/constants.py`, `skills/provisioning.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 6396–16815 |
+| `ide/assets.py` | 8 | 3 | — | 115687–116815 |
+| `ide/auth.py` | 2 | 2 | `admin/auth.py`, `admin/constants.py`, `config/constants.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 15271–16002 |
+| `ide/errors.py` | 2 | 2 | — | 16003–16017 |
+| `ide/events.py` | 1 | 1 | `config/constants.py`, `utils/text.py` | 9340–9391 |
+| `ide/handler.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `session/manager.py`, `session/state.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 134085–135741 |
+| `ide/preview.py` | 12 | 12 | `config/constants.py`, `utils/text.py` | 16767–17207 |
+| `ide/sandbox.py` | 21 | 21 | `agent/process.py`, `utils/misc.py` | 8279–30010 |
+| `llm/client.py` | 2 | 2 | `agent/tools.py`, `config/constants.py`, `config/settings.py`, `llm/utils.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 26215–28755 |
+| `llm/constants.py` | 17 | 17 | — | 3915–12790 |
+| `llm/utils.py` | 29 | 29 | `agent/process.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/text.py` | 12232–13432 |
+| `mcp/constants.py` | 8 | 8 | — | 4287–24868 |
+| `mcp/driver.py` | 13 | 13 | `mcp/constants.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 24869–26214 |
+| `mcp/service.py` | 1 | 1 | `app/context.py`, `config/constants.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 136213–136430 |
+| `rag/assets.py` | 6 | 6 | — | 113080–115686 |
+| `rag/constants.py` | 77 | 77 | — | 4283–106038 |
+| `rag/index.py` | 5 | 5 | `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `utils/misc.py`, `utils/text.py` | 106063–112700 |
+| `rag/ingestion.py` | 13 | 13 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/parsers.py`, `rag/store.py`, `session/state.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 105385–113079 |
+| `rag/parsers.py` | 31 | 31 | `agent/process.py`, `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/text.py` | 105008–107234 |
+| `rag/store.py` | 7 | 7 | `config/constants.py`, `config/settings.py`, `ide/preview.py`, `rag/constants.py`, `rag/index.py`, `rag/ingestion.py`, `rag/parsers.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 108930–112991 |
+| `rag/web_search.py` | 15 | 15 | `config/constants.py`, `config/paths.py`, `rag/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 9426–11584 |
+| `server/http.py` | 12 | 12 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `app/context.py`, `collaboration/core.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/auth.py`, `ide/handler.py`, `ide/preview.py`, `llm/utils.py`, `server/rag_admin.py`, `session/manager.py`, `session/state.py`, `skills/studio.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/admin_assets.py` | 6445–136212 |
+| `server/rag_admin.py` | 3 | 3 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `rag/constants.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 133413–134084 |
+| `server/skills.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `session/manager.py`, `skills/provisioning.py`, `skills/studio.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 132770–133412 |
+| `session/manager.py` | 2 | 2 | `agent/process.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/store.py`, `session/state.py`, `skills/store.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 7605–93164 |
+| `session/state.py` | 1 | 1 | `admin/constants.py`, `agent/background.py`, `agent/bus.py`, `agent/errors.py`, `agent/events.py`, `agent/process.py`, `agent/tasks.py`, `agent/todo.py`, `agent/tools.py`, `agent/worktree.py`, `collaboration/core.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/events.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/driver.py`, `rag/constants.py`, `rag/parsers.py`, `rag/web_search.py`, `server/http.py`, `skills/provisioning.py`, `skills/store.py`, `utils/compress.py`, `utils/crypto.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 30011–90659 |
+| `skills/embedded.py` | 10 | 10 | — | 17624–21423 |
+| `skills/provisioning.py` | 26 | 26 | `config/paths.py`, `skills/embedded.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py` | 17650–21386 |
+| `skills/store.py` | 2 | 2 | `config/constants.py`, `config/settings.py`, `llm/utils.py`, `skills/embedded.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 21424–23426 |
+| `skills/studio.py` | 5 | 5 | `agent/process.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/sqlite.py`, `utils/text.py` | 116841–118738 |
+| `utils/compress.py` | 2 | 2 | — | 11749–11765 |
+| `utils/crypto.py` | 1 | 1 | `utils/json_utils.py` | 14461–14614 |
+| `utils/errors.py` | 2 | 2 | — | 12311–23567 |
+| `utils/files.py` | 27 | 27 | `config/constants.py`, `config/paths.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 6315–14867 |
+| `utils/http.py` | 7 | 7 | `utils/json_utils.py`, `utils/text.py` | 3912–8433 |
+| `utils/json_utils.py` | 13 | 13 | `utils/text.py` | 4282–14925 |
+| `utils/media.py` | 6 | 6 | — | 5953–7986 |
+| `utils/misc.py` | 16 | 16 | `config/constants.py` | 7987–17725 |
+| `utils/sqlite.py` | 3 | 3 | — | 74–136515 |
+| `utils/text.py` | 30 | 30 | `config/constants.py` | 4270–16766 |
+| `web/admin_assets.py` | 3 | 3 | — | 99191–100073 |
+| `web/assets.py` | 5 | 4 | — | 93165–98788 |
+| `web/skills_assets.py` | 3 | 3 | — | 98789–99190 |
 
 ## Source Mapping
 
@@ -242,1314 +242,1334 @@ Code_Structure/
 - order 67: `_import_71` (import), lines 71-71, exports `parse_qs`, `quote`, `unquote`, `urljoin`, `urlparse`, `urlunparse`
 - order 68: `_import_72` (import), lines 72-72, exports `Request`, `urlopen`
 - order 69: `_import_73` (import), lines 73-73, exports `ZoneInfo`
-- order 72: `_try_import_110` (import), lines 108-113, exports `_AESGCM`
-- order 76: `_import_417` (import), lines 416-421, exports `EVOLUTION_MODES`, `LiquidKernelControlPlane`, `LiquidKernelError`
-- order 116: `_try_import_3802` (import), lines 3800-3809, exports `_fcntl`, `_pty`, `_termios`
-- order 117: `_try_import_3811` (import), lines 3810-3814, exports `_certifi`
-- order 118: `_try_import_3815` (import), lines 3815-3818, exports `_yaml`
+- order 72: `_try_import_120` (import), lines 118-123, exports `_AESGCM`
+- order 76: `_import_486` (import), lines 485-490, exports `EVOLUTION_MODES`, `LiquidKernelControlPlane`, `LiquidKernelError`
+- order 78: `_import_511` (import), lines 507-511, exports `_LiquidKernelRegistry`
+- order 119: `_try_import_3895` (import), lines 3893-3902, exports `_fcntl`, `_pty`, `_termios`
+- order 120: `_try_import_3904` (import), lines 3903-3907, exports `_certifi`
+- order 121: `_try_import_3908` (import), lines 3908-3911, exports `_yaml`
 
 ### `admin/auth.py`
 
-- order 904: `trusted_client_ip` (function), lines 13575-13607, exports `trusted_client_ip`
-- order 918: `AdminAuthError` (class), lines 14131-14138, exports `AdminAuthError`
-- order 919: `AdminAuthStore` (class), lines 14139-14417, exports `AdminAuthStore`
+- order 923: `trusted_client_ip` (function), lines 14428-14460, exports `trusted_client_ip`
+- order 937: `AdminAuthError` (class), lines 14984-14991, exports `AdminAuthError`
+- order 938: `AdminAuthStore` (class), lines 14992-15270, exports `AdminAuthStore`
 
 ### `admin/config.py`
 
-- order 924: `_admin_config_schema` (function), lines 15165-15285, exports `_admin_config_schema`
-- order 925: `_admin_factory_config` (function), lines 15286-15289, exports `_admin_factory_config`
-- order 926: `_admin_coerce_config` (function), lines 15290-15445, exports `_admin_coerce_config`
-- order 927: `_admin_config_to_argv` (function), lines 15446-15482, exports `_admin_config_to_argv`
-- order 928: `_admin_restart_probe_url` (function), lines 15483-15498, exports `_admin_restart_probe_url`
-- order 929: `_admin_supervised_restart` (function), lines 15499-15585, exports `_admin_supervised_restart`
-- order 930: `_admin_argparse_defaults` (function), lines 15586-15607, exports `_admin_argparse_defaults`
-- order 931: `_admin_config_from_namespace` (function), lines 15608-15628, exports `_admin_config_from_namespace`
+- order 943: `_admin_config_schema` (function), lines 16018-16138, exports `_admin_config_schema`
+- order 944: `_admin_factory_config` (function), lines 16139-16142, exports `_admin_factory_config`
+- order 945: `_admin_coerce_config` (function), lines 16143-16298, exports `_admin_coerce_config`
+- order 946: `_admin_config_to_argv` (function), lines 16299-16335, exports `_admin_config_to_argv`
+- order 947: `_admin_restart_probe_url` (function), lines 16336-16351, exports `_admin_restart_probe_url`
+- order 948: `_admin_supervised_restart` (function), lines 16352-16438, exports `_admin_supervised_restart`
+- order 949: `_admin_argparse_defaults` (function), lines 16439-16460, exports `_admin_argparse_defaults`
+- order 950: `_admin_config_from_namespace` (function), lines 16461-16481, exports `_admin_config_from_namespace`
 
 ### `admin/constants.py`
 
-- order 125: `ADMIN_STATE_DIRNAME` (constant), lines 3825-3825, exports `ADMIN_STATE_DIRNAME`
-- order 126: `ADMIN_CONFIG_FILENAME` (constant), lines 3826-3826, exports `ADMIN_CONFIG_FILENAME`
-- order 127: `ADMIN_APPS_FILENAME` (constant), lines 3827-3827, exports `ADMIN_APPS_FILENAME`
-- order 128: `ADMIN_TELEMETRY_FILENAME` (constant), lines 3828-3828, exports `ADMIN_TELEMETRY_FILENAME`
-- order 129: `ADMIN_AUTH_FILENAME` (constant), lines 3829-3829, exports `ADMIN_AUTH_FILENAME`
-- order 139: `ADMIN_MAX_APP_SKILLS` (constant), lines 3876-3876, exports `ADMIN_MAX_APP_SKILLS`
-- order 140: `ADMIN_MAX_APP_CAPSULE_CHARS` (constant), lines 3877-3877, exports `ADMIN_MAX_APP_CAPSULE_CHARS`
-- order 141: `ADMIN_MAX_APP_RESOURCE_FILES` (constant), lines 3878-3878, exports `ADMIN_MAX_APP_RESOURCE_FILES`
-- order 142: `ADMIN_MAX_APP_RESOURCE_BYTES` (constant), lines 3879-3879, exports `ADMIN_MAX_APP_RESOURCE_BYTES`
-- order 143: `ADMIN_APP_INLINE_BLOB_BYTES` (constant), lines 3880-3880, exports `ADMIN_APP_INLINE_BLOB_BYTES`
-- order 144: `ADMIN_AUTH_SESSION_TTL_SECONDS` (constant), lines 3881-3881, exports `ADMIN_AUTH_SESSION_TTL_SECONDS`
-- order 145: `ADMIN_AUTH_PASSWORD_ITERATIONS` (constant), lines 3882-3882, exports `ADMIN_AUTH_PASSWORD_ITERATIONS`
-- order 146: `ADMIN_AUTH_MAX_ACTIVE_SESSIONS` (constant), lines 3883-3883, exports `ADMIN_AUTH_MAX_ACTIVE_SESSIONS`
-- order 1172: `ADMIN_SKILLS_REVIEW_HTML` (constant), lines 117416-117417, exports `ADMIN_SKILLS_REVIEW_HTML`
-- order 1173: `ADMIN_SKILLS_REVIEW_CSS` (constant), lines 117418-117418, exports `ADMIN_SKILLS_REVIEW_CSS`
-- order 1174: `ADMIN_SKILLS_REVIEW_JS` (constant), lines 117419-117419, exports `ADMIN_SKILLS_REVIEW_JS`
+- order 128: `ADMIN_STATE_DIRNAME` (constant), lines 3918-3918, exports `ADMIN_STATE_DIRNAME`
+- order 129: `ADMIN_CONFIG_FILENAME` (constant), lines 3919-3919, exports `ADMIN_CONFIG_FILENAME`
+- order 130: `ADMIN_APPS_FILENAME` (constant), lines 3920-3920, exports `ADMIN_APPS_FILENAME`
+- order 131: `ADMIN_TELEMETRY_FILENAME` (constant), lines 3921-3921, exports `ADMIN_TELEMETRY_FILENAME`
+- order 132: `ADMIN_AUTH_FILENAME` (constant), lines 3922-3922, exports `ADMIN_AUTH_FILENAME`
+- order 142: `ADMIN_MAX_APP_SKILLS` (constant), lines 3969-3969, exports `ADMIN_MAX_APP_SKILLS`
+- order 143: `ADMIN_MAX_APP_CAPSULE_CHARS` (constant), lines 3970-3970, exports `ADMIN_MAX_APP_CAPSULE_CHARS`
+- order 144: `ADMIN_MAX_APP_RESOURCE_FILES` (constant), lines 3971-3971, exports `ADMIN_MAX_APP_RESOURCE_FILES`
+- order 145: `ADMIN_MAX_APP_RESOURCE_BYTES` (constant), lines 3972-3972, exports `ADMIN_MAX_APP_RESOURCE_BYTES`
+- order 146: `ADMIN_APP_INLINE_BLOB_BYTES` (constant), lines 3973-3973, exports `ADMIN_APP_INLINE_BLOB_BYTES`
+- order 147: `ADMIN_AUTH_SESSION_TTL_SECONDS` (constant), lines 3974-3974, exports `ADMIN_AUTH_SESSION_TTL_SECONDS`
+- order 148: `ADMIN_AUTH_PASSWORD_ITERATIONS` (constant), lines 3975-3975, exports `ADMIN_AUTH_PASSWORD_ITERATIONS`
+- order 149: `ADMIN_AUTH_MAX_ACTIVE_SESSIONS` (constant), lines 3976-3976, exports `ADMIN_AUTH_MAX_ACTIVE_SESSIONS`
+- order 1191: `ADMIN_SKILLS_REVIEW_HTML` (constant), lines 118744-118745, exports `ADMIN_SKILLS_REVIEW_HTML`
+- order 1192: `ADMIN_SKILLS_REVIEW_CSS` (constant), lines 118746-118746, exports `ADMIN_SKILLS_REVIEW_CSS`
+- order 1193: `ADMIN_SKILLS_REVIEW_JS` (constant), lines 118747-118747, exports `ADMIN_SKILLS_REVIEW_JS`
 
 ### `agent/background.py`
 
-- order 1003: `BackgroundManager` (class), lines 23075-23700, exports `BackgroundManager`
+- order 1022: `BackgroundManager` (class), lines 23928-24553, exports `BackgroundManager`
 
 ### `agent/bus.py`
 
-- order 1004: `MessageBus` (class), lines 23701-23766, exports `MessageBus`
+- order 1023: `MessageBus` (class), lines 24554-24619, exports `MessageBus`
 
 ### `agent/errors.py`
 
-- order 853: `CircuitBreakerTriggered` (class), lines 12165-12168, exports `CircuitBreakerTriggered`
+- order 858: `CircuitBreakerTriggered` (class), lines 12315-12318, exports `CircuitBreakerTriggered`
 
 ### `agent/events.py`
 
-- order 959: `EventHub` (class), lines 16355-16409, exports `EventHub`
+- order 978: `EventHub` (class), lines 17208-17262, exports `EventHub`
 
 ### `agent/process.py`
 
-- order 764: `subprocess_text_encodings` (function), lines 8204-8225, exports `subprocess_text_encodings`
-- order 765: `decode_subprocess_bytes` (function), lines 8226-8252, exports `decode_subprocess_bytes`
-- order 766: `run_subprocess_text` (function), lines 8253-8275, exports `run_subprocess_text`
-- order 767: `windows_utf8_shell_command` (function), lines 8276-8282, exports `windows_utf8_shell_command`
-- order 768: `shell_process_invocation` (function), lines 8283-8293, exports `shell_process_invocation`
-- order 769: `join_shell_task_command` (function), lines 8294-8305, exports `join_shell_task_command`
-- order 1002: `UserProcessManager` (class), lines 22715-23074, exports `UserProcessManager`
+- order 767: `subprocess_text_encodings` (function), lines 8297-8318, exports `subprocess_text_encodings`
+- order 768: `decode_subprocess_bytes` (function), lines 8319-8345, exports `decode_subprocess_bytes`
+- order 769: `run_subprocess_text` (function), lines 8346-8368, exports `run_subprocess_text`
+- order 770: `windows_utf8_shell_command` (function), lines 8369-8375, exports `windows_utf8_shell_command`
+- order 771: `shell_process_invocation` (function), lines 8376-8386, exports `shell_process_invocation`
+- order 772: `join_shell_task_command` (function), lines 8387-8398, exports `join_shell_task_command`
+- order 1021: `UserProcessManager` (class), lines 23568-23927, exports `UserProcessManager`
 
 ### `agent/tasks.py`
 
-- order 1000: `TaskManager` (class), lines 22574-22708, exports `TaskManager`
+- order 1019: `TaskManager` (class), lines 23427-23561, exports `TaskManager`
 
 ### `agent/todo.py`
 
-- order 960: `TodoManager` (class), lines 16410-16770, exports `TodoManager`
+- order 979: `TodoManager` (class), lines 17263-17623, exports `TodoManager`
 
 ### `agent/tools.py`
 
-- order 954: `_ask_user_option_rows` (function), lines 16234-16267, exports `_ask_user_option_rows`
-- order 955: `_ask_user_option_value` (function), lines 16268-16273, exports `_ask_user_option_value`
-- order 1028: `tool_def` (function), lines 27888-27901, exports `tool_def`
-- order 1029: `TOOLS` (constant), lines 27902-28449, exports `TOOLS`
-- order 1030: `TOOL_REQUIRED_ARGS` (constant), lines 28450-28451, exports `TOOL_REQUIRED_ARGS`
-- order 1031: `TOOL_SPEC_BY_NAME` (constant), lines 28452-28452, exports `TOOL_SPEC_BY_NAME`
-- order 1032: `_for_28453` (statement), lines 28453-28462, exports `_tool`, `_fn`, `_name`, `_required`
-- order 1033: `TOOL_NAME_FUZZY_MAP` (constant), lines 28463-28464, exports `TOOL_NAME_FUZZY_MAP`
-- order 1034: `_for_28465` (statement), lines 28465-28468, exports `_name`, `_key`
-- order 1035: `_for_28470` (statement), lines 28469-28486, exports `_alias`, `_target`
-- order 1036: `is_todo_resume_tool_name` (function), lines 28487-28503, exports `is_todo_resume_tool_name`
-- order 1037: `canonicalize_tool_name` (function), lines 28504-28522, exports `canonicalize_tool_name`
-- order 1038: `filter_tool_specs_for_runtime` (function), lines 28523-28538, exports `filter_tool_specs_for_runtime`
-- order 1039: `DEVELOPER_TOOL_DROP` (constant), lines 28539-28549, exports `DEVELOPER_TOOL_DROP`
-- order 1040: `AGENT_TOOL_ALLOWLIST` (constant), lines 28550-28613, exports `AGENT_TOOL_ALLOWLIST`
+- order 973: `_ask_user_option_rows` (function), lines 17087-17120, exports `_ask_user_option_rows`
+- order 974: `_ask_user_option_value` (function), lines 17121-17126, exports `_ask_user_option_value`
+- order 1047: `tool_def` (function), lines 28756-28769, exports `tool_def`
+- order 1048: `TOOLS` (constant), lines 28770-29317, exports `TOOLS`
+- order 1049: `TOOL_REQUIRED_ARGS` (constant), lines 29318-29319, exports `TOOL_REQUIRED_ARGS`
+- order 1050: `TOOL_SPEC_BY_NAME` (constant), lines 29320-29320, exports `TOOL_SPEC_BY_NAME`
+- order 1051: `_for_29321` (statement), lines 29321-29330, exports `_tool`, `_fn`, `_name`, `_required`
+- order 1052: `TOOL_NAME_FUZZY_MAP` (constant), lines 29331-29332, exports `TOOL_NAME_FUZZY_MAP`
+- order 1053: `_for_29333` (statement), lines 29333-29336, exports `_name`, `_key`
+- order 1054: `_for_29338` (statement), lines 29337-29354, exports `_alias`, `_target`
+- order 1055: `is_todo_resume_tool_name` (function), lines 29355-29371, exports `is_todo_resume_tool_name`
+- order 1056: `canonicalize_tool_name` (function), lines 29372-29390, exports `canonicalize_tool_name`
+- order 1057: `filter_tool_specs_for_runtime` (function), lines 29391-29406, exports `filter_tool_specs_for_runtime`
+- order 1058: `DEVELOPER_TOOL_DROP` (constant), lines 29407-29417, exports `DEVELOPER_TOOL_DROP`
+- order 1059: `AGENT_TOOL_ALLOWLIST` (constant), lines 29418-29481, exports `AGENT_TOOL_ALLOWLIST`
 
 ### `agent/worktree.py`
 
-- order 1005: `WorktreeManager` (class), lines 23767-23979, exports `WorktreeManager`
+- order 1024: `WorktreeManager` (class), lines 24620-24832, exports `WorktreeManager`
 
 ### `app/context.py`
 
-- order 1175: `AppContext` (class), lines 117420-128136, exports `AppContext`
+- order 1194: `AppContext` (class), lines 118748-129627, exports `AppContext`
 
 ### `app/main.py`
 
-- order 1190: `main` (function), lines 134882-136830, exports `main`
-- order 1191: `_main_guard_136832` (main_guard), lines 136831-136833, exports —
+- order 1210: `main` (function), lines 136609-138557, exports `main`
+- order 1211: `_main_guard_138559` (main_guard), lines 138558-138560, exports —
 
 ### `app/services.py`
 
-- order 1177: `TelemetryStore` (class), lines 128177-128552, exports `TelemetryStore`
-- order 1178: `ApplicationRegistry` (class), lines 128553-129362, exports `ApplicationRegistry`
+- order 1196: `TelemetryStore` (class), lines 129668-130043, exports `TelemetryStore`
+- order 1197: `ApplicationRegistry` (class), lines 130044-130853, exports `ApplicationRegistry`
 
 ### `collaboration/core.py`
 
-- order 90: `_now` (function), lines 437-440, exports `_now`
-- order 91: `_json` (function), lines 441-444, exports `_json`
-- order 92: `_load_json` (function), lines 445-451, exports `_load_json`
-- order 93: `_b64_token` (function), lines 452-455, exports `_b64_token`
-- order 94: `_branch_label` (function), lines 456-464, exports `_branch_label`
-- order 95: `_digest` (function), lines 465-468, exports `_digest`
-- order 96: `_password_hash` (function), lines 469-472, exports `_password_hash`
-- order 97: `_normalize_ip` (function), lines 473-482, exports `_normalize_ip`
-- order 98: `_normalize_name` (function), lines 483-489, exports `_normalize_name`
-- order 99: `_COLLAB_PUBLIC_SECRET_PATTERNS` (assignment), lines 490-501, exports `_COLLAB_PUBLIC_SECRET_PATTERNS`
-- order 100: `_collaboration_public_text` (function), lines 502-532, exports `_collaboration_public_text`
-- order 101: `_collaboration_task_objective` (function), lines 533-557, exports `_collaboration_task_objective`
-- order 102: `_collaboration_task_title` (function), lines 558-565, exports `_collaboration_task_title`
-- order 103: `_collaboration_task_key` (function), lines 566-572, exports `_collaboration_task_key`
-- order 104: `_collaboration_plan_steps` (function), lines 573-591, exports `_collaboration_plan_steps`
-- order 105: `CollaborationError` (class), lines 592-599, exports `CollaborationError`
-- order 106: `CollaborationPrincipal` (class), lines 600-610, exports `CollaborationPrincipal`
-- order 107: `_normalize_operation` (function), lines 611-644, exports `_normalize_operation`
-- order 108: `operation_input_length` (function), lines 645-648, exports `operation_input_length`
-- order 109: `apply_text_operation` (function), lines 649-671, exports `apply_text_operation`
-- order 110: `transform_text_operation` (function), lines 672-748, exports `transform_text_operation`
-- order 111: `CollaborationStore` (class), lines 749-3464, exports `CollaborationStore`
-- order 112: `CollaborationWriteCoordinator` (class), lines 3465-3678, exports `CollaborationWriteCoordinator`
+- order 93: `_now` (function), lines 530-533, exports `_now`
+- order 94: `_json` (function), lines 534-537, exports `_json`
+- order 95: `_load_json` (function), lines 538-544, exports `_load_json`
+- order 96: `_b64_token` (function), lines 545-548, exports `_b64_token`
+- order 97: `_branch_label` (function), lines 549-557, exports `_branch_label`
+- order 98: `_digest` (function), lines 558-561, exports `_digest`
+- order 99: `_password_hash` (function), lines 562-565, exports `_password_hash`
+- order 100: `_normalize_ip` (function), lines 566-575, exports `_normalize_ip`
+- order 101: `_normalize_name` (function), lines 576-582, exports `_normalize_name`
+- order 102: `_COLLAB_PUBLIC_SECRET_PATTERNS` (assignment), lines 583-594, exports `_COLLAB_PUBLIC_SECRET_PATTERNS`
+- order 103: `_collaboration_public_text` (function), lines 595-625, exports `_collaboration_public_text`
+- order 104: `_collaboration_task_objective` (function), lines 626-650, exports `_collaboration_task_objective`
+- order 105: `_collaboration_task_title` (function), lines 651-658, exports `_collaboration_task_title`
+- order 106: `_collaboration_task_key` (function), lines 659-665, exports `_collaboration_task_key`
+- order 107: `_collaboration_plan_steps` (function), lines 666-684, exports `_collaboration_plan_steps`
+- order 108: `CollaborationError` (class), lines 685-692, exports `CollaborationError`
+- order 109: `CollaborationPrincipal` (class), lines 693-703, exports `CollaborationPrincipal`
+- order 110: `_normalize_operation` (function), lines 704-737, exports `_normalize_operation`
+- order 111: `operation_input_length` (function), lines 738-741, exports `operation_input_length`
+- order 112: `apply_text_operation` (function), lines 742-764, exports `apply_text_operation`
+- order 113: `transform_text_operation` (function), lines 765-841, exports `transform_text_operation`
+- order 114: `CollaborationStore` (class), lines 842-3557, exports `CollaborationStore`
+- order 115: `CollaborationWriteCoordinator` (class), lines 3558-3771, exports `CollaborationWriteCoordinator`
 
 ### `collaboration/watcher.py`
 
-- order 1188: `collaboration_file_watcher_loop` (function), lines 134791-134863, exports `collaboration_file_watcher_loop`
-- order 1189: `collaboration_watcher_health` (function), lines 134864-134881, exports `collaboration_watcher_health`
+- order 1208: `collaboration_file_watcher_loop` (function), lines 136516-136590, exports `collaboration_file_watcher_loop`
+- order 1209: `collaboration_watcher_health` (function), lines 136591-136608, exports `collaboration_watcher_health`
 
 ### `config/bootstrap.py`
 
-- order 73: `_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64` (assignment), lines 114-366, exports `_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64`
-- order 74: `_ensure_embedded_liquid_kernel_package` (function), lines 367-412, exports `_ensure_embedded_liquid_kernel_package`
-- order 915: `_liquid_kernel_history_present` (function), lines 14082-14086, exports `_liquid_kernel_history_present`
-- order 916: `prepare_liquid_kernel_runtime` (function), lines 14087-14116, exports `prepare_liquid_kernel_runtime`
-- order 917: `_persist_liquid_kernel_bootstrap` (function), lines 14117-14130, exports `_persist_liquid_kernel_bootstrap`
+- order 73: `_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64` (assignment), lines 124-435, exports `_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64`
+- order 74: `_ensure_embedded_liquid_kernel_package` (function), lines 436-482, exports `_ensure_embedded_liquid_kernel_package`
+- order 77: `_ensure_liquid_kernel_sqlite_lifecycle` (function), lines 491-506, exports `_ensure_liquid_kernel_sqlite_lifecycle`
+- order 934: `_liquid_kernel_history_present` (function), lines 14935-14939, exports `_liquid_kernel_history_present`
+- order 935: `prepare_liquid_kernel_runtime` (function), lines 14940-14969, exports `prepare_liquid_kernel_runtime`
+- order 936: `_persist_liquid_kernel_bootstrap` (function), lines 14970-14983, exports `_persist_liquid_kernel_bootstrap`
 
 ### `config/constants.py`
 
-- order 75: `LIQUID_KERNEL_PACKAGE_STATUS` (constant), lines 413-415, exports `LIQUID_KERNEL_PACKAGE_STATUS`
-- order 77: `COLLAB_DB_FILENAME` (constant), lines 422-424, exports `COLLAB_DB_FILENAME`
-- order 78: `COLLAB_SESSION_TTL_SECONDS` (constant), lines 425-425, exports `COLLAB_SESSION_TTL_SECONDS`
-- order 79: `COLLAB_PRESENCE_TTL_SECONDS` (constant), lines 426-426, exports `COLLAB_PRESENCE_TTL_SECONDS`
-- order 80: `COLLAB_PASSWORD_ITERATIONS` (constant), lines 427-427, exports `COLLAB_PASSWORD_ITERATIONS`
-- order 81: `COLLAB_MAX_AVATAR_BYTES` (constant), lines 428-428, exports `COLLAB_MAX_AVATAR_BYTES`
-- order 82: `COLLAB_MAX_TEXT_BYTES` (constant), lines 429-429, exports `COLLAB_MAX_TEXT_BYTES`
-- order 83: `COLLAB_DELETE_RETENTION_DAYS` (constant), lines 430-430, exports `COLLAB_DELETE_RETENTION_DAYS`
-- order 84: `COLLAB_EVENT_RETENTION` (constant), lines 431-431, exports `COLLAB_EVENT_RETENTION`
-- order 85: `COLLAB_AGENT_STALE_SECONDS` (constant), lines 432-432, exports `COLLAB_AGENT_STALE_SECONDS`
-- order 86: `COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS` (constant), lines 433-433, exports `COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS`
-- order 87: `COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS` (constant), lines 434-434, exports `COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS`
-- order 88: `COLLAB_EXTERNAL_WRITE_CONFIRMATIONS` (constant), lines 435-435, exports `COLLAB_EXTERNAL_WRITE_CONFIRMATIONS`
-- order 89: `COLLAB_SCHEMA_VERSION` (constant), lines 436-436, exports `COLLAB_SCHEMA_VERSION`
-- order 113: `COLLAB_INDEX_HTML` (constant), lines 3679-3750, exports `COLLAB_INDEX_HTML`
-- order 114: `COLLAB_CSS` (constant), lines 3751-3758, exports `COLLAB_CSS`
-- order 115: `COLLAB_JS` (constant), lines 3759-3799, exports `COLLAB_JS`
-- order 121: `APP_VERSION` (constant), lines 3821-3821, exports `APP_VERSION`
-- order 130: `IDE_AUTH_FILENAME` (constant), lines 3830-3830, exports `IDE_AUTH_FILENAME`
-- order 131: `IDE_AUTH_SESSION_TTL_SECONDS` (constant), lines 3831-3831, exports `IDE_AUTH_SESSION_TTL_SECONDS`
-- order 132: `IDE_AUTH_MAX_ACTIVE_SESSIONS` (constant), lines 3832-3832, exports `IDE_AUTH_MAX_ACTIVE_SESSIONS`
-- order 133: `IDE_DEVICE_SECRET_MIN_BYTES` (constant), lines 3833-3833, exports `IDE_DEVICE_SECRET_MIN_BYTES`
-- order 134: `IDE_DEVICE_LABEL_MAX_CHARS` (constant), lines 3834-3834, exports `IDE_DEVICE_LABEL_MAX_CHARS`
-- order 135: `IDE_DEVICE_PAIRING_TTL_SECONDS` (constant), lines 3835-3835, exports `IDE_DEVICE_PAIRING_TTL_SECONDS`
-- order 136: `IDE_WORKBENCH_STATE_FILENAME` (constant), lines 3836-3836, exports `IDE_WORKBENCH_STATE_FILENAME`
-- order 137: `IDE_PROMPT_ENHANCEMENT_BUDGETS` (constant), lines 3837-3874, exports `IDE_PROMPT_ENHANCEMENT_BUDGETS`
-- order 138: `IDE_EXTENSIONS_DIRNAME` (constant), lines 3875-3875, exports `IDE_EXTENSIONS_DIRNAME`
-- order 160: `LONG_OUTPUT_MODEL_PAGE_CHARS` (constant), lines 4178-4178, exports `LONG_OUTPUT_MODEL_PAGE_CHARS`
-- order 161: `LONG_OUTPUT_UI_PAGE_CHARS` (constant), lines 4179-4179, exports `LONG_OUTPUT_UI_PAGE_CHARS`
-- order 162: `LONG_OUTPUT_UI_PREVIEW_MAX_PAGES` (constant), lines 4180-4180, exports `LONG_OUTPUT_UI_PREVIEW_MAX_PAGES`
-- order 163: `LONG_OUTPUT_LISTING_OFFLOAD_CHARS` (constant), lines 4181-4181, exports `LONG_OUTPUT_LISTING_OFFLOAD_CHARS`
-- order 164: `LONG_OUTPUT_READ_PAGE_LINES` (constant), lines 4182-4182, exports `LONG_OUTPUT_READ_PAGE_LINES`
-- order 165: `LONG_OUTPUT_READ_PAGE_MAX_CHARS` (constant), lines 4183-4183, exports `LONG_OUTPUT_READ_PAGE_MAX_CHARS`
-- order 166: `LONG_OUTPUT_TEMP_MAX_FILES` (constant), lines 4184-4184, exports `LONG_OUTPUT_TEMP_MAX_FILES`
-- order 167: `READ_FILE_DEFAULT_MAX_CHARS` (constant), lines 4185-4185, exports `READ_FILE_DEFAULT_MAX_CHARS`
-- order 168: `READ_FILE_HARD_MAX_CHARS` (constant), lines 4186-4186, exports `READ_FILE_HARD_MAX_CHARS`
-- order 169: `READ_FILE_OVERVIEW_HEAD_LINES` (constant), lines 4187-4187, exports `READ_FILE_OVERVIEW_HEAD_LINES`
-- order 170: `READ_FILE_SEARCH_MAX_MATCHES` (constant), lines 4188-4188, exports `READ_FILE_SEARCH_MAX_MATCHES`
-- order 175: `CODE_ADMIN_PORT_OFFSET` (constant), lines 4193-4193, exports `CODE_ADMIN_PORT_OFFSET`
-- order 177: `IDE_PORT_OFFSET` (constant), lines 4195-4198, exports `IDE_PORT_OFFSET`
-- order 178: `IDE_DEFAULT_PORT` (constant), lines 4199-4199, exports `IDE_DEFAULT_PORT`
-- order 179: `COLLAB_PORT_OFFSET` (constant), lines 4200-4200, exports `COLLAB_PORT_OFFSET`
-- order 181: `DEFAULT_WEB_SEARCH_ENABLED` (constant), lines 4202-4202, exports `DEFAULT_WEB_SEARCH_ENABLED`
-- order 186: `DEFAULT_USER_MEMORY_MODE` (constant), lines 4207-4207, exports `DEFAULT_USER_MEMORY_MODE`
-- order 194: `AGENT_WEB_SEARCH_USER_AGENT` (constant), lines 4218-4218, exports `AGENT_WEB_SEARCH_USER_AGENT`
-- order 195: `AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS` (constant), lines 4219-4219, exports `AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS`
-- order 196: `AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES` (constant), lines 4220-4220, exports `AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES`
-- order 197: `AGENT_WEB_SEARCH_HARD_MAX_PAGES` (constant), lines 4221-4221, exports `AGENT_WEB_SEARCH_HARD_MAX_PAGES`
-- order 198: `AGENT_WEB_SEARCH_DEFAULT_DEPTH` (constant), lines 4222-4222, exports `AGENT_WEB_SEARCH_DEFAULT_DEPTH`
-- order 199: `AGENT_WEB_SEARCH_HARD_DEPTH` (constant), lines 4223-4223, exports `AGENT_WEB_SEARCH_HARD_DEPTH`
-- order 200: `AGENT_WEB_SEARCH_FETCH_TIMEOUT` (constant), lines 4224-4224, exports `AGENT_WEB_SEARCH_FETCH_TIMEOUT`
-- order 201: `AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT` (constant), lines 4225-4225, exports `AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT`
-- order 202: `AGENT_WEB_SEARCH_MAX_PAGE_BYTES` (constant), lines 4226-4226, exports `AGENT_WEB_SEARCH_MAX_PAGE_BYTES`
-- order 203: `AGENT_WEB_SEARCH_MAX_TEXT_CHARS` (constant), lines 4227-4227, exports `AGENT_WEB_SEARCH_MAX_TEXT_CHARS`
-- order 204: `AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED` (constant), lines 4228-4230, exports `AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED`
-- order 205: `AGENT_WEB_SEARCH_PUBLIC_FEED_URL` (constant), lines 4231-4231, exports `AGENT_WEB_SEARCH_PUBLIC_FEED_URL`
-- order 206: `AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES` (constant), lines 4232-4232, exports `AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES`
-- order 207: `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES` (constant), lines 4233-4233, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES`
-- order 208: `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES` (constant), lines 4234-4234, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES`
-- order 209: `AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER` (constant), lines 4235-4235, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER`
-- order 210: `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS` (constant), lines 4236-4236, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS`
-- order 211: `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING` (constant), lines 4237-4237, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING`
-- order 212: `AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX` (constant), lines 4238-4238, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX`
-- order 222: `CODE_CHUNK_CHARS` (constant), lines 4260-4260, exports `CODE_CHUNK_CHARS`
-- order 223: `CODE_CHUNK_OVERLAP` (constant), lines 4261-4261, exports `CODE_CHUNK_OVERLAP`
-- order 224: `CODE_MAX_CHUNKS_PER_DOC` (constant), lines 4262-4262, exports `CODE_MAX_CHUNKS_PER_DOC`
-- order 225: `CODE_SOURCE_ANALYSIS_MAX_CHARS` (constant), lines 4263-4272, exports `CODE_SOURCE_ANALYSIS_MAX_CHARS`
-- order 266: `CODE_IMPORT_WORKER_COUNT` (constant), lines 4341-4344, exports `CODE_IMPORT_WORKER_COUNT`
-- order 268: `CODE_PARSE_TIMEOUT_SECONDS` (constant), lines 4349-4352, exports `CODE_PARSE_TIMEOUT_SECONDS`
-- order 269: `DEFAULT_CONTEXT_TOKEN_LIMIT` (constant), lines 4353-4353, exports `DEFAULT_CONTEXT_TOKEN_LIMIT`
-- order 270: `TOKEN_THRESHOLD` (constant), lines 4354-4354, exports `TOKEN_THRESHOLD`
-- order 271: `CONTEXT_AUTO_COMPACT_RESERVE_RATIO` (constant), lines 4355-4358, exports `CONTEXT_AUTO_COMPACT_RESERVE_RATIO`
-- order 272: `CONTEXT_ESTIMATE_SAFETY_MULTIPLIER` (constant), lines 4359-4362, exports `CONTEXT_ESTIMATE_SAFETY_MULTIPLIER`
-- order 273: `CONTEXT_USAGE_CALIBRATION_MAX` (constant), lines 4363-4366, exports `CONTEXT_USAGE_CALIBRATION_MAX`
-- order 274: `CONTEXT_ACTUAL_USAGE_RECENT_SECONDS` (constant), lines 4367-4370, exports `CONTEXT_ACTUAL_USAGE_RECENT_SECONDS`
-- order 275: `LARGE_FILE_AUTO_PAGE_BYTES` (constant), lines 4371-4374, exports `LARGE_FILE_AUTO_PAGE_BYTES`
-- order 276: `LARGE_FILE_AUTO_PAGE_LINES` (constant), lines 4375-4378, exports `LARGE_FILE_AUTO_PAGE_LINES`
-- order 277: `LARGE_SOURCE_UPLOAD_EXCERPT_CHARS` (constant), lines 4379-4382, exports `LARGE_SOURCE_UPLOAD_EXCERPT_CHARS`
-- order 278: `CHAT_UPLOAD_PARSE_QUEUE_MAX` (constant), lines 4383-4386, exports `CHAT_UPLOAD_PARSE_QUEUE_MAX`
-- order 279: `CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS` (constant), lines 4387-4390, exports `CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS`
-- order 280: `CHAT_UPLOAD_INLINE_TEXT_BYTES` (constant), lines 4391-4394, exports `CHAT_UPLOAD_INLINE_TEXT_BYTES`
-- order 281: `CHAT_UPLOAD_PARSE_MAX_BYTES` (constant), lines 4395-4401, exports `CHAT_UPLOAD_PARSE_MAX_BYTES`
-- order 282: `CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES` (constant), lines 4402-4408, exports `CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES`
-- order 283: `CHAT_UPLOAD_TEXT_CONTEXT_CHARS` (constant), lines 4409-4412, exports `CHAT_UPLOAD_TEXT_CONTEXT_CHARS`
-- order 284: `CHAT_UPLOAD_PROMPT_MAX_FILES` (constant), lines 4413-4416, exports `CHAT_UPLOAD_PROMPT_MAX_FILES`
-- order 285: `CHAT_UPLOAD_PROMPT_MAX_CHARS` (constant), lines 4417-4420, exports `CHAT_UPLOAD_PROMPT_MAX_CHARS`
-- order 286: `CHAT_UPLOAD_PROMPT_PER_FILE_CHARS` (constant), lines 4421-4424, exports `CHAT_UPLOAD_PROMPT_PER_FILE_CHARS`
-- order 287: `CHAT_UPLOAD_FRONTEND_WAIT_MS` (constant), lines 4425-4428, exports `CHAT_UPLOAD_FRONTEND_WAIT_MS`
-- order 288: `CHAT_UPLOAD_AUTO_LIBRARY_INGEST` (constant), lines 4429-4432, exports `CHAT_UPLOAD_AUTO_LIBRARY_INGEST`
-- order 289: `CHAT_UPLOAD_INGEST_QUEUE_MAX` (constant), lines 4433-4436, exports `CHAT_UPLOAD_INGEST_QUEUE_MAX`
-- order 290: `SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS` (constant), lines 4437-4440, exports `SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS`
-- order 291: `SESSION_DEFERRED_START_QUEUE_MAX` (constant), lines 4441-4444, exports `SESSION_DEFERRED_START_QUEUE_MAX`
-- order 292: `SESSION_SUBMISSION_DEDUPE_MAX` (constant), lines 4445-4445, exports `SESSION_SUBMISSION_DEDUPE_MAX`
-- order 293: `SESSION_SUBMISSION_DEDUPE_SECONDS` (constant), lines 4446-4446, exports `SESSION_SUBMISSION_DEDUPE_SECONDS`
-- order 294: `SCHEDULER_SUBMISSION_DEDUPE_MAX` (constant), lines 4447-4447, exports `SCHEDULER_SUBMISSION_DEDUPE_MAX`
-- order 295: `FAST_START_LOCAL_CLASSIFICATION` (constant), lines 4448-4450, exports `FAST_START_LOCAL_CLASSIFICATION`
-- order 296: `FAST_START_LOCAL_TITLE` (constant), lines 4451-4453, exports `FAST_START_LOCAL_TITLE`
-- order 297: `AUTO_TITLE_MODEL_REFINE` (constant), lines 4454-4456, exports `AUTO_TITLE_MODEL_REFINE`
-- order 298: `AUTO_TITLE_MODEL_TIMEOUT_SECONDS` (constant), lines 4457-4460, exports `AUTO_TITLE_MODEL_TIMEOUT_SECONDS`
-- order 299: `AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS` (constant), lines 4461-4467, exports `AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS`
-- order 300: `FAST_START_DEFER_CAPABILITY_PROBE` (constant), lines 4468-4470, exports `FAST_START_DEFER_CAPABILITY_PROBE`
-- order 301: `SESSION_RUNTIME_MESSAGE_WINDOW` (constant), lines 4471-4471, exports `SESSION_RUNTIME_MESSAGE_WINDOW`
-- order 302: `SESSION_RUNTIME_ACTIVITY_WINDOW` (constant), lines 4472-4472, exports `SESSION_RUNTIME_ACTIVITY_WINDOW`
-- order 303: `SESSION_RUNTIME_OPERATION_WINDOW` (constant), lines 4473-4473, exports `SESSION_RUNTIME_OPERATION_WINDOW`
-- order 304: `SESSION_RUNTIME_UPLOAD_WINDOW` (constant), lines 4474-4474, exports `SESSION_RUNTIME_UPLOAD_WINDOW`
-- order 305: `LITE_SNAPSHOT_MAX_BYTES` (constant), lines 4475-4478, exports `LITE_SNAPSHOT_MAX_BYTES`
-- order 306: `LITE_SNAPSHOT_MESSAGES_BYTES` (constant), lines 4479-4479, exports `LITE_SNAPSHOT_MESSAGES_BYTES`
-- order 307: `LITE_SNAPSHOT_FEED_BYTES` (constant), lines 4480-4480, exports `LITE_SNAPSHOT_FEED_BYTES`
-- order 308: `LITE_SNAPSHOT_OPERATIONS_BYTES` (constant), lines 4481-4481, exports `LITE_SNAPSHOT_OPERATIONS_BYTES`
-- order 309: `IDE_AGENT_STATE_MAX_BYTES` (constant), lines 4482-4485, exports `IDE_AGENT_STATE_MAX_BYTES`
-- order 310: `IDE_AGENT_FEED_BYTES` (constant), lines 4486-4486, exports `IDE_AGENT_FEED_BYTES`
-- order 311: `IDE_AGENT_OPERATIONS_BYTES` (constant), lines 4487-4487, exports `IDE_AGENT_OPERATIONS_BYTES`
-- order 312: `SESSION_WATCHDOG_INTERVAL_SECONDS` (constant), lines 4488-4491, exports `SESSION_WATCHDOG_INTERVAL_SECONDS`
-- order 313: `SESSION_HEARTBEAT_STALE_SECONDS` (constant), lines 4492-4495, exports `SESSION_HEARTBEAT_STALE_SECONDS`
-- order 314: `SESSION_LIST_DEFAULT_LIMIT` (constant), lines 4496-4499, exports `SESSION_LIST_DEFAULT_LIMIT`
-- order 315: `SESSION_INDEX_SYNC_SNAPSHOT_MAX` (constant), lines 4500-4503, exports `SESSION_INDEX_SYNC_SNAPSHOT_MAX`
-- order 316: `SESSION_INDEX_JOURNAL_COMPACT_RECORDS` (constant), lines 4504-4507, exports `SESSION_INDEX_JOURNAL_COMPACT_RECORDS`
-- order 317: `SESSION_INDEX_JOURNAL_COMPACT_BYTES` (constant), lines 4508-4511, exports `SESSION_INDEX_JOURNAL_COMPACT_BYTES`
-- order 318: `SESSION_CATALOG_RECENT_MAX` (constant), lines 4512-4515, exports `SESSION_CATALOG_RECENT_MAX`
-- order 319: `IDE_SESSION_LIST_DEFAULT_LIMIT` (constant), lines 4516-4519, exports `IDE_SESSION_LIST_DEFAULT_LIMIT`
-- order 320: `IDLE_TIMEOUT` (constant), lines 4520-4520, exports `IDLE_TIMEOUT`
-- order 321: `POLL_INTERVAL` (constant), lines 4521-4521, exports `POLL_INTERVAL`
-- order 322: `SSE_HEARTBEAT_SECONDS` (constant), lines 4522-4522, exports `SSE_HEARTBEAT_SECONDS`
-- order 323: `MODEL_CALL_PROGRESS_DELAY` (constant), lines 4523-4523, exports `MODEL_CALL_PROGRESS_DELAY`
-- order 324: `MODEL_CALL_PROGRESS_INTERVAL` (constant), lines 4524-4524, exports `MODEL_CALL_PROGRESS_INTERVAL`
-- order 325: `RUN_COMPLETION_SUMMARY_ENABLED` (constant), lines 4525-4528, exports `RUN_COMPLETION_SUMMARY_ENABLED`
-- order 326: `LLM_HTTP_RETRY_MAX_ATTEMPTS` (constant), lines 4529-4532, exports `LLM_HTTP_RETRY_MAX_ATTEMPTS`
-- order 327: `LLM_HTTP_RETRY_DELAY_SECONDS` (constant), lines 4533-4536, exports `LLM_HTTP_RETRY_DELAY_SECONDS`
-- order 328: `LLM_HTTP_RETRY_MAX_SECONDS` (constant), lines 4537-4540, exports `LLM_HTTP_RETRY_MAX_SECONDS`
-- order 329: `LLM_HTTP_RETRY_404_ON_VLLM` (constant), lines 4541-4544, exports `LLM_HTTP_RETRY_404_ON_VLLM`
-- order 330: `LLM_HTTP_RETRY_STATUSES` (constant), lines 4545-4545, exports `LLM_HTTP_RETRY_STATUSES`
-- order 331: `MAX_AGENT_ROUNDS` (constant), lines 4546-4546, exports `MAX_AGENT_ROUNDS`
-- order 332: `MIN_AGENT_ROUNDS` (constant), lines 4547-4547, exports `MIN_AGENT_ROUNDS`
-- order 333: `MAX_AGENT_ROUNDS_CAP` (constant), lines 4548-4548, exports `MAX_AGENT_ROUNDS_CAP`
-- order 334: `REPEATED_TOOL_LOOP_THRESHOLD` (constant), lines 4549-4549, exports `REPEATED_TOOL_LOOP_THRESHOLD`
-- order 335: `BASH_READ_LOOP_THRESHOLD` (constant), lines 4550-4550, exports `BASH_READ_LOOP_THRESHOLD`
-- order 336: `READ_FILE_LOOP_THRESHOLD` (constant), lines 4551-4551, exports `READ_FILE_LOOP_THRESHOLD`
-- order 337: `READ_FILE_LOOP_DISTINCT_SOFT_LIMIT` (constant), lines 4552-4552, exports `READ_FILE_LOOP_DISTINCT_SOFT_LIMIT`
-- order 338: `READ_FILE_COMPACT_PIN_DISTINCT` (constant), lines 4553-4553, exports `READ_FILE_COMPACT_PIN_DISTINCT`
-- order 339: `READ_FILE_COMPACT_PIN_MAX_CHARS` (constant), lines 4554-4554, exports `READ_FILE_COMPACT_PIN_MAX_CHARS`
-- order 340: `READ_CONTEXT_REGISTRY_MAX` (constant), lines 4555-4555, exports `READ_CONTEXT_REGISTRY_MAX`
-- order 341: `READ_CONTEXT_PROMPT_MAX_ITEMS` (constant), lines 4556-4556, exports `READ_CONTEXT_PROMPT_MAX_ITEMS`
-- order 342: `READ_CONTEXT_PROMPT_MAX_CHARS` (constant), lines 4557-4557, exports `READ_CONTEXT_PROMPT_MAX_CHARS`
-- order 343: `READ_CONTEXT_SUMMARY_MAX_CHARS` (constant), lines 4558-4558, exports `READ_CONTEXT_SUMMARY_MAX_CHARS`
-- order 344: `READ_CONTEXT_SHARED_MAX_ITEMS` (constant), lines 4559-4559, exports `READ_CONTEXT_SHARED_MAX_ITEMS`
-- order 345: `READ_CONTEXT_POLICY_CHOICES` (constant), lines 4560-4560, exports `READ_CONTEXT_POLICY_CHOICES`
-- order 346: `DEFAULT_READ_CONTEXT_POLICY` (constant), lines 4561-4561, exports `DEFAULT_READ_CONTEXT_POLICY`
-- order 347: `READ_CONTEXT_CACHE_SEARCH_MAX_BYTES` (constant), lines 4562-4568, exports `READ_CONTEXT_CACHE_SEARCH_MAX_BYTES`
-- order 348: `READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES` (constant), lines 4569-4569, exports `READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES`
-- order 349: `READ_CONTEXT_CACHE_SNIPPET_CHARS` (constant), lines 4570-4570, exports `READ_CONTEXT_CACHE_SNIPPET_CHARS`
-- order 350: `READ_CONTEXT_CACHE_LINE_CONTEXT` (constant), lines 4571-4571, exports `READ_CONTEXT_CACHE_LINE_CONTEXT`
-- order 351: `LONG_CONTENT_SOURCE_CACHE_MAX_BYTES` (constant), lines 4572-4578, exports `LONG_CONTENT_SOURCE_CACHE_MAX_BYTES`
-- order 352: `LONG_CONTENT_SOURCE_CACHE_MAX_FILES` (constant), lines 4579-4582, exports `LONG_CONTENT_SOURCE_CACHE_MAX_FILES`
-- order 353: `LONG_CONTENT_SYMBOL_MEMORY_MAX` (constant), lines 4583-4586, exports `LONG_CONTENT_SYMBOL_MEMORY_MAX`
-- order 354: `TOOL_MEMORY_REGISTRY_MAX` (constant), lines 4587-4587, exports `TOOL_MEMORY_REGISTRY_MAX`
-- order 355: `TOOL_MEMORY_PROMPT_MAX_ITEMS` (constant), lines 4588-4588, exports `TOOL_MEMORY_PROMPT_MAX_ITEMS`
-- order 356: `TOOL_MEMORY_PROMPT_MAX_CHARS` (constant), lines 4589-4589, exports `TOOL_MEMORY_PROMPT_MAX_CHARS`
-- order 357: `TOOL_MEMORY_SUMMARY_MAX_CHARS` (constant), lines 4590-4590, exports `TOOL_MEMORY_SUMMARY_MAX_CHARS`
-- order 358: `TOOL_MEMORY_SHARED_MAX_ITEMS` (constant), lines 4591-4591, exports `TOOL_MEMORY_SHARED_MAX_ITEMS`
-- order 359: `TOOL_MEMORY_COMPACT_PIN_DISTINCT` (constant), lines 4592-4592, exports `TOOL_MEMORY_COMPACT_PIN_DISTINCT`
-- order 360: `TOOL_MEMORY_COMPACT_PIN_MAX_CHARS` (constant), lines 4593-4593, exports `TOOL_MEMORY_COMPACT_PIN_MAX_CHARS`
-- order 361: `TOOL_MEMORY_POLICY_CHOICES` (constant), lines 4594-4594, exports `TOOL_MEMORY_POLICY_CHOICES`
-- order 362: `DEFAULT_TOOL_MEMORY_POLICY` (constant), lines 4595-4595, exports `DEFAULT_TOOL_MEMORY_POLICY`
-- order 363: `LONG_CONTENT_MEMORY_VERSION` (constant), lines 4596-4608, exports `LONG_CONTENT_MEMORY_VERSION`
-- order 364: `LONG_CONTENT_MEMORY_MAX_ITEMS` (constant), lines 4609-4612, exports `LONG_CONTENT_MEMORY_MAX_ITEMS`
-- order 365: `LONG_CONTENT_MEMORY_MAX_SEGMENTS` (constant), lines 4613-4616, exports `LONG_CONTENT_MEMORY_MAX_SEGMENTS`
-- order 366: `LONG_CONTENT_TEXT_SEGMENT_LINES` (constant), lines 4617-4620, exports `LONG_CONTENT_TEXT_SEGMENT_LINES`
-- order 367: `LONG_CONTENT_CODE_SEGMENT_LINES` (constant), lines 4621-4624, exports `LONG_CONTENT_CODE_SEGMENT_LINES`
-- order 368: `LONG_CONTENT_CARD_CHARS` (constant), lines 4625-4628, exports `LONG_CONTENT_CARD_CHARS`
-- order 369: `LONG_CONTENT_STRUCTURE_MAX_CHARS` (constant), lines 4629-4632, exports `LONG_CONTENT_STRUCTURE_MAX_CHARS`
-- order 370: `LONG_CONTENT_SEMANTIC_ENABLED` (constant), lines 4633-4640, exports `LONG_CONTENT_SEMANTIC_ENABLED`
-- order 371: `LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS` (constant), lines 4641-4644, exports `LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS`
-- order 372: `LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS` (constant), lines 4645-4648, exports `LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS`
-- order 373: `LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS` (constant), lines 4649-4652, exports `LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS`
-- order 374: `LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS` (constant), lines 4653-4653, exports `LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS`
-- order 375: `LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS` (constant), lines 4654-4654, exports `LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS`
-- order 376: `LONG_CONTENT_SEMANTIC_MAX_RELATIONS` (constant), lines 4655-4655, exports `LONG_CONTENT_SEMANTIC_MAX_RELATIONS`
-- order 377: `LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES` (constant), lines 4656-4656, exports `LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES`
-- order 378: `LONG_CONTENT_SEMANTIC_MAX_EVIDENCE` (constant), lines 4657-4657, exports `LONG_CONTENT_SEMANTIC_MAX_EVIDENCE`
-- order 379: `LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS` (constant), lines 4658-4658, exports `LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS`
-- order 380: `LONG_CONTENT_SEMANTIC_MAX_COVERED` (constant), lines 4659-4659, exports `LONG_CONTENT_SEMANTIC_MAX_COVERED`
-- order 381: `LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS` (constant), lines 4660-4660, exports `LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS`
-- order 382: `LONG_CONTENT_SEMANTIC_MAX_REFRESHES` (constant), lines 4661-4664, exports `LONG_CONTENT_SEMANTIC_MAX_REFRESHES`
-- order 383: `LONG_CONTENT_OBSERVATION_MAX` (constant), lines 4665-4668, exports `LONG_CONTENT_OBSERVATION_MAX`
-- order 384: `LONG_CONTENT_OBSERVATION_MAX_RANGES` (constant), lines 4669-4669, exports `LONG_CONTENT_OBSERVATION_MAX_RANGES`
-- order 385: `LONG_CONTENT_OBSERVATION_MAX_EXCERPTS` (constant), lines 4670-4670, exports `LONG_CONTENT_OBSERVATION_MAX_EXCERPTS`
-- order 386: `LONG_CONTENT_OBSERVATION_EXCERPT_CHARS` (constant), lines 4671-4671, exports `LONG_CONTENT_OBSERVATION_EXCERPT_CHARS`
-- order 387: `LONG_CONTENT_RELATED_SOURCE_MAX` (constant), lines 4672-4672, exports `LONG_CONTENT_RELATED_SOURCE_MAX`
-- order 388: `SHELL_SOURCE_CANDIDATE_MAX` (constant), lines 4673-4673, exports `SHELL_SOURCE_CANDIDATE_MAX`
-- order 389: `LONG_CONTENT_TEXT_EXTS` (constant), lines 4674-4676, exports `LONG_CONTENT_TEXT_EXTS`
-- order 390: `LONG_CONTENT_DATA_EXTS` (constant), lines 4677-4681, exports `LONG_CONTENT_DATA_EXTS`
-- order 391: `DEFAULT_AUTO_TASK_LEVEL_CEILING` (constant), lines 4682-4682, exports `DEFAULT_AUTO_TASK_LEVEL_CEILING`
-- order 392: `HARD_BREAK_TOOL_ERROR_THRESHOLD` (constant), lines 4683-4683, exports `HARD_BREAK_TOOL_ERROR_THRESHOLD`
-- order 393: `HARD_BREAK_RECOVERY_ROUND_THRESHOLD` (constant), lines 4684-4686, exports `HARD_BREAK_RECOVERY_ROUND_THRESHOLD`
-- order 394: `FUSED_FAULT_BREAK_THRESHOLD` (constant), lines 4687-4687, exports `FUSED_FAULT_BREAK_THRESHOLD`
-- order 395: `STALL_SEVERITY_ESCALATION_THRESHOLD` (constant), lines 4688-4688, exports `STALL_SEVERITY_ESCALATION_THRESHOLD`
-- order 396: `STALL_SEVERITY_WEIGHT_BASH_READ_LOOP` (constant), lines 4689-4689, exports `STALL_SEVERITY_WEIGHT_BASH_READ_LOOP`
-- order 397: `STALL_SEVERITY_WEIGHT_REPEATED_TOOL` (constant), lines 4690-4690, exports `STALL_SEVERITY_WEIGHT_REPEATED_TOOL`
-- order 398: `STALL_SEVERITY_WEIGHT_FAULT` (constant), lines 4691-4691, exports `STALL_SEVERITY_WEIGHT_FAULT`
-- order 399: `STALL_SEVERITY_WEIGHT_RECOVERY_RETRY` (constant), lines 4692-4692, exports `STALL_SEVERITY_WEIGHT_RECOVERY_RETRY`
-- order 400: `STALL_SEVERITY_WEIGHT_WATCHDOG` (constant), lines 4693-4693, exports `STALL_SEVERITY_WEIGHT_WATCHDOG`
-- order 401: `STALL_SEVERITY_DECAY_ON_SUCCESS` (constant), lines 4694-4694, exports `STALL_SEVERITY_DECAY_ON_SUCCESS`
-- order 402: `STALL_ESCALATION_MIN_LEVEL` (constant), lines 4695-4695, exports `STALL_ESCALATION_MIN_LEVEL`
-- order 403: `STALL_PLAN_SYNTHESIS_MAX_TOKENS` (constant), lines 4696-4696, exports `STALL_PLAN_SYNTHESIS_MAX_TOKENS`
-- order 404: `STALL_ESCALATION_CONTEXT_MAX_CHARS` (constant), lines 4697-4697, exports `STALL_ESCALATION_CONTEXT_MAX_CHARS`
-- order 405: `MAX_RUN_SECONDS` (constant), lines 4698-4698, exports `MAX_RUN_SECONDS`
-- order 406: `MIN_RUN_TIMEOUT_SECONDS` (constant), lines 4699-4699, exports `MIN_RUN_TIMEOUT_SECONDS`
-- order 407: `MAX_RUN_TIMEOUT_SECONDS` (constant), lines 4700-4700, exports `MAX_RUN_TIMEOUT_SECONDS`
-- order 408: `MIN_TIMEOUT_SECONDS` (constant), lines 4701-4701, exports `MIN_TIMEOUT_SECONDS`
-- order 409: `MAX_TIMEOUT_SECONDS` (constant), lines 4702-4702, exports `MAX_TIMEOUT_SECONDS`
-- order 410: `DEFAULT_TIMEOUT_SECONDS` (constant), lines 4703-4709, exports `DEFAULT_TIMEOUT_SECONDS`
-- order 411: `DEFAULT_REQUEST_TIMEOUT` (constant), lines 4710-4710, exports `DEFAULT_REQUEST_TIMEOUT`
-- order 412: `_SHELL_AUTO_CONFIRM_PATTERNS` (assignment), lines 4711-4726, exports `_SHELL_AUTO_CONFIRM_PATTERNS`
-- order 413: `MIN_SHELL_COMMAND_TIMEOUT_SECONDS` (constant), lines 4727-4727, exports `MIN_SHELL_COMMAND_TIMEOUT_SECONDS`
-- order 414: `MAX_SHELL_COMMAND_TIMEOUT_SECONDS` (constant), lines 4728-4728, exports `MAX_SHELL_COMMAND_TIMEOUT_SECONDS`
-- order 415: `SHELL_TIMEOUT_MODES` (constant), lines 4729-4729, exports `SHELL_TIMEOUT_MODES`
-- order 416: `_DEFAULT_SHELL_TIMEOUT_MODE_RAW` (assignment), lines 4730-4733, exports `_DEFAULT_SHELL_TIMEOUT_MODE_RAW`
-- order 417: `DEFAULT_SHELL_TIMEOUT_MODE` (constant), lines 4734-4738, exports `DEFAULT_SHELL_TIMEOUT_MODE`
-- order 418: `MIN_SHELL_ASYNC_HANDOFF_SECONDS` (constant), lines 4739-4739, exports `MIN_SHELL_ASYNC_HANDOFF_SECONDS`
-- order 419: `MAX_SHELL_ASYNC_HANDOFF_SECONDS` (constant), lines 4740-4740, exports `MAX_SHELL_ASYNC_HANDOFF_SECONDS`
-- order 420: `SHELL_FAILURE_GUIDANCE_SECONDS` (constant), lines 4741-4743, exports `SHELL_FAILURE_GUIDANCE_SECONDS`
-- order 421: `DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS` (constant), lines 4744-4758, exports `DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS`
-- order 422: `DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS` (constant), lines 4759-4773, exports `DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS`
-- order 423: `DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT` (constant), lines 4774-4788, exports `DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT`
-- order 424: `SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS` (constant), lines 4789-4789, exports `SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS`
-- order 425: `AUTO_CONTINUE_BUDGET_DEFAULT` (constant), lines 4790-4790, exports `AUTO_CONTINUE_BUDGET_DEFAULT`
-- order 426: `AGENT_MAX_OUTPUT_TOKENS` (constant), lines 4791-4791, exports `AGENT_MAX_OUTPUT_TOKENS`
-- order 427: `OLLAMA_THINKING_TOOL_BUFFER` (constant), lines 4792-4792, exports `OLLAMA_THINKING_TOOL_BUFFER`
-- order 428: `WATCHDOG_INTENT_NO_TOOL_THRESHOLD` (constant), lines 4793-4793, exports `WATCHDOG_INTENT_NO_TOOL_THRESHOLD`
-- order 429: `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD` (constant), lines 4794-4794, exports `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD`
-- order 430: `WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE` (constant), lines 4795-4795, exports `WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE`
-- order 431: `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE` (constant), lines 4796-4796, exports `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE`
-- order 432: `WATCHDOG_STATE_STALL_THRESHOLD` (constant), lines 4797-4797, exports `WATCHDOG_STATE_STALL_THRESHOLD`
-- order 433: `WATCHDOG_CONTEXT_STALL_THRESHOLD` (constant), lines 4798-4798, exports `WATCHDOG_CONTEXT_STALL_THRESHOLD`
-- order 434: `WATCHDOG_REPEAT_SIMILARITY_THRESHOLD` (constant), lines 4799-4799, exports `WATCHDOG_REPEAT_SIMILARITY_THRESHOLD`
-- order 435: `WATCHDOG_CONTEXT_NEAR_RATIO` (constant), lines 4800-4800, exports `WATCHDOG_CONTEXT_NEAR_RATIO`
-- order 436: `WATCHDOG_MAX_DECOMPOSE_STEPS` (constant), lines 4801-4801, exports `WATCHDOG_MAX_DECOMPOSE_STEPS`
-- order 437: `WATCHDOG_STEP_MAX_ATTEMPTS` (constant), lines 4802-4802, exports `WATCHDOG_STEP_MAX_ATTEMPTS`
-- order 438: `EMPTY_ACTION_MIN_CONTENT_CHARS` (constant), lines 4803-4803, exports `EMPTY_ACTION_MIN_CONTENT_CHARS`
-- order 439: `EMPTY_ACTION_WAKEUP_RETRY_LIMIT` (constant), lines 4804-4804, exports `EMPTY_ACTION_WAKEUP_RETRY_LIMIT`
-- order 440: `EMPTY_ACTION_INTERVENTION_THRESHOLD` (constant), lines 4805-4811, exports `EMPTY_ACTION_INTERVENTION_THRESHOLD`
-- order 441: `EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS` (constant), lines 4812-4816, exports `EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS`
-- order 442: `EMPTY_ACTION_RECOVERY_MAX_TOKENS` (constant), lines 4817-4817, exports `EMPTY_ACTION_RECOVERY_MAX_TOKENS`
-- order 443: `THINKING_BUDGET_FORCE_RATIO` (constant), lines 4818-4818, exports `THINKING_BUDGET_FORCE_RATIO`
-- order 444: `_TOOL_TIMEOUT_MAP` (assignment), lines 4819-4840, exports `_TOOL_TIMEOUT_MAP`
-- order 445: `_DEFAULT_TOOL_TIMEOUT` (assignment), lines 4841-4841, exports `_DEFAULT_TOOL_TIMEOUT`
-- order 446: `CONVERSATION_VISIBLE_TOOL_EVENTS` (constant), lines 4842-4854, exports `CONVERSATION_VISIBLE_TOOL_EVENTS`
-- order 447: `PERSIST_ON_EVENT_TYPES` (constant), lines 4855-4873, exports `PERSIST_ON_EVENT_TYPES`
-- order 448: `PERSIST_EVENT_MIN_INTERVAL_SECONDS` (constant), lines 4874-4874, exports `PERSIST_EVENT_MIN_INTERVAL_SECONDS`
-- order 449: `TRUNCATION_CONTINUATION_MAX_PASSES` (constant), lines 4875-4875, exports `TRUNCATION_CONTINUATION_MAX_PASSES`
-- order 450: `TRUNCATION_CONTINUATION_MAX_TOKENS` (constant), lines 4876-4876, exports `TRUNCATION_CONTINUATION_MAX_TOKENS`
-- order 451: `TRUNCATION_CONTINUATION_TAIL_CHARS` (constant), lines 4877-4877, exports `TRUNCATION_CONTINUATION_TAIL_CHARS`
-- order 452: `TRUNCATION_CONTINUATION_ECHO_CHARS` (constant), lines 4878-4878, exports `TRUNCATION_CONTINUATION_ECHO_CHARS`
-- order 453: `TRUNCATION_OVERLAP_SCAN_CHARS` (constant), lines 4879-4879, exports `TRUNCATION_OVERLAP_SCAN_CHARS`
-- order 454: `TRUNCATION_PAIR_SCAN_CHARS` (constant), lines 4880-4880, exports `TRUNCATION_PAIR_SCAN_CHARS`
-- order 455: `TRUNCATION_LIVE_BUFFER_MAX_CHARS` (constant), lines 4881-4881, exports `TRUNCATION_LIVE_BUFFER_MAX_CHARS`
-- order 456: `MIN_CONTEXT_TOKEN_LIMIT` (constant), lines 4882-4882, exports `MIN_CONTEXT_TOKEN_LIMIT`
-- order 457: `COMPACT_TIER1_PCT` (constant), lines 4883-4884, exports `COMPACT_TIER1_PCT`
-- order 458: `COMPACT_TIER2_PCT` (constant), lines 4885-4885, exports `COMPACT_TIER2_PCT`
-- order 459: `COMPACT_TIER3_PCT` (constant), lines 4886-4886, exports `COMPACT_TIER3_PCT`
-- order 460: `COMPACT_TIER1_ABS` (constant), lines 4887-4888, exports `COMPACT_TIER1_ABS`
-- order 461: `COMPACT_TIER2_ABS` (constant), lines 4889-4889, exports `COMPACT_TIER2_ABS`
-- order 462: `CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS` (constant), lines 4890-4896, exports `CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS`
-- order 463: `FILE_BUFFER_CONTENT_THRESHOLD` (constant), lines 4897-4898, exports `FILE_BUFFER_CONTENT_THRESHOLD`
-- order 464: `FILE_BUFFER_MAX_FILES` (constant), lines 4899-4899, exports `FILE_BUFFER_MAX_FILES`
-- order 465: `AUTHORITATIVE_USER_GOAL_OPEN` (constant), lines 4900-4900, exports `AUTHORITATIVE_USER_GOAL_OPEN`
-- order 466: `AUTHORITATIVE_USER_GOAL_CLOSE` (constant), lines 4901-4901, exports `AUTHORITATIVE_USER_GOAL_CLOSE`
-- order 467: `AGENT_MSG_LIMIT_TIER0` (constant), lines 4902-4903, exports `AGENT_MSG_LIMIT_TIER0`
-- order 468: `AGENT_MSG_LIMIT_TIER1` (constant), lines 4904-4904, exports `AGENT_MSG_LIMIT_TIER1`
-- order 469: `AGENT_MSG_LIMIT_TIER2` (constant), lines 4905-4905, exports `AGENT_MSG_LIMIT_TIER2`
-- order 470: `AGENT_MSG_LIMIT_TIER3` (constant), lines 4906-4906, exports `AGENT_MSG_LIMIT_TIER3`
-- order 471: `AGENT_CTX_LIMIT_TIER0` (constant), lines 4907-4907, exports `AGENT_CTX_LIMIT_TIER0`
-- order 472: `AGENT_CTX_LIMIT_TIER1` (constant), lines 4908-4908, exports `AGENT_CTX_LIMIT_TIER1`
-- order 473: `AGENT_CTX_LIMIT_TIER2` (constant), lines 4909-4909, exports `AGENT_CTX_LIMIT_TIER2`
-- order 474: `AGENT_CTX_LIMIT_TIER3` (constant), lines 4910-4910, exports `AGENT_CTX_LIMIT_TIER3`
-- order 475: `MANAGER_CTX_LIMIT_TIER0` (constant), lines 4911-4911, exports `MANAGER_CTX_LIMIT_TIER0`
-- order 476: `MANAGER_CTX_LIMIT_TIER1` (constant), lines 4912-4912, exports `MANAGER_CTX_LIMIT_TIER1`
-- order 477: `MANAGER_CTX_LIMIT_TIER2` (constant), lines 4913-4913, exports `MANAGER_CTX_LIMIT_TIER2`
-- order 478: `MANAGER_CTX_LIMIT_TIER3` (constant), lines 4914-4914, exports `MANAGER_CTX_LIMIT_TIER3`
-- order 479: `MAX_CONTEXT_ARCHIVE_SEGMENTS` (constant), lines 4915-4915, exports `MAX_CONTEXT_ARCHIVE_SEGMENTS`
-- order 480: `MAX_USER_BUBBLE_LOG` (constant), lines 4916-4917, exports `MAX_USER_BUBBLE_LOG`
-- order 481: `MANAGER_INSTRUCTION_MAX_CHARS` (constant), lines 4918-4922, exports `MANAGER_INSTRUCTION_MAX_CHARS`
-- order 482: `MANAGER_MOMENTUM_MAX_SKIPS` (constant), lines 4923-4928, exports `MANAGER_MOMENTUM_MAX_SKIPS`
-- order 483: `MODEL_OUTPUT_RETRY_TIMES` (constant), lines 4929-4933, exports `MODEL_OUTPUT_RETRY_TIMES`
-- order 484: `ARBITER_TRIGGER_MIN_CONTENT_CHARS` (constant), lines 4934-4934, exports `ARBITER_TRIGGER_MIN_CONTENT_CHARS`
-- order 485: `ARBITER_VALID_PLANNING_STREAK_LIMIT` (constant), lines 4935-4935, exports `ARBITER_VALID_PLANNING_STREAK_LIMIT`
-- order 486: `ARBITER_DEFAULT_TIMEOUT_SECONDS` (constant), lines 4936-4936, exports `ARBITER_DEFAULT_TIMEOUT_SECONDS`
-- order 487: `ARBITER_DEFAULT_MAX_TOKENS` (constant), lines 4937-4937, exports `ARBITER_DEFAULT_MAX_TOKENS`
-- order 488: `ARBITER_DEFAULT_TEMPERATURE` (constant), lines 4938-4938, exports `ARBITER_DEFAULT_TEMPERATURE`
-- order 489: `LIVE_INPUT_DELAY_WRITE_ROUNDS` (constant), lines 4939-4939, exports `LIVE_INPUT_DELAY_WRITE_ROUNDS`
-- order 490: `LIVE_INPUT_DELAY_TOOL_ROUNDS` (constant), lines 4940-4940, exports `LIVE_INPUT_DELAY_TOOL_ROUNDS`
-- order 491: `LIVE_INPUT_DELAY_NORMAL_ROUNDS` (constant), lines 4941-4941, exports `LIVE_INPUT_DELAY_NORMAL_ROUNDS`
-- order 492: `LIVE_INPUT_MAX_INJECTIONS` (constant), lines 4942-4942, exports `LIVE_INPUT_MAX_INJECTIONS`
-- order 493: `LIVE_INPUT_REINJECT_INTERVAL` (constant), lines 4943-4943, exports `LIVE_INPUT_REINJECT_INTERVAL`
-- order 494: `LIVE_INPUT_WEIGHT_BASE_DELAYED` (constant), lines 4944-4944, exports `LIVE_INPUT_WEIGHT_BASE_DELAYED`
-- order 495: `LIVE_INPUT_WEIGHT_BASE_NORMAL` (constant), lines 4945-4945, exports `LIVE_INPUT_WEIGHT_BASE_NORMAL`
-- order 496: `LIVE_INPUT_WEIGHT_STEP_DELAYED` (constant), lines 4946-4946, exports `LIVE_INPUT_WEIGHT_STEP_DELAYED`
-- order 497: `LIVE_INPUT_WEIGHT_STEP_NORMAL` (constant), lines 4947-4947, exports `LIVE_INPUT_WEIGHT_STEP_NORMAL`
-- order 499: `BENIGN_SOCKET_DEBUG_LOG_ENABLED` (constant), lines 4954-4960, exports `BENIGN_SOCKET_DEBUG_LOG_ENABLED`
-- order 500: `BENIGN_SOCKET_LOG_INTERVAL_SECONDS` (constant), lines 4961-4961, exports `BENIGN_SOCKET_LOG_INTERVAL_SECONDS`
-- order 501: `FINAL_SUMMARY_MIN_CHARS` (constant), lines 4962-4962, exports `FINAL_SUMMARY_MIN_CHARS`
-- order 502: `FINAL_SUMMARY_STRICT_MIN_CHARS` (constant), lines 4963-4963, exports `FINAL_SUMMARY_STRICT_MIN_CHARS`
-- order 503: `RUNTIME_CONTROL_HINT_PREFIXES` (constant), lines 4964-4984, exports `RUNTIME_CONTROL_HINT_PREFIXES`
-- order 504: `UI_HIDDEN_RUNTIME_CONTROL_PREFIXES` (constant), lines 4985-5013, exports `UI_HIDDEN_RUNTIME_CONTROL_PREFIXES`
-- order 505: `UI_PROJECTED_RUNTIME_CONTROL_TAGS` (constant), lines 5014-5036, exports `UI_PROJECTED_RUNTIME_CONTROL_TAGS`
-- order 506: `UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS` (constant), lines 5037-5039, exports `UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS`
-- order 507: `RETRY_RUNTIME_HINT_PREFIXES` (constant), lines 5040-5054, exports `RETRY_RUNTIME_HINT_PREFIXES`
-- order 508: `EXECUTION_MODE_SINGLE` (constant), lines 5055-5055, exports `EXECUTION_MODE_SINGLE`
-- order 509: `EXECUTION_MODE_SEQUENTIAL` (constant), lines 5056-5056, exports `EXECUTION_MODE_SEQUENTIAL`
-- order 510: `EXECUTION_MODE_SYNC` (constant), lines 5057-5057, exports `EXECUTION_MODE_SYNC`
-- order 511: `EXECUTION_MODE_CHOICES` (constant), lines 5058-5062, exports `EXECUTION_MODE_CHOICES`
-- order 512: `AGENT_ROLES` (constant), lines 5063-5063, exports `AGENT_ROLES`
-- order 513: `AGENT_BUBBLE_ROLES` (constant), lines 5064-5064, exports `AGENT_BUBBLE_ROLES`
-- order 514: `AGENT_ROLE_LABELS` (constant), lines 5065-5071, exports `AGENT_ROLE_LABELS`
-- order 515: `AGENT_ROLE_BUBBLE_COLORS` (constant), lines 5072-5078, exports `AGENT_ROLE_BUBBLE_COLORS`
-- order 516: `BLACKBOARD_STATUSES` (constant), lines 5079-5088, exports `BLACKBOARD_STATUSES`
-- order 517: `TASK_COMPLEXITY_LEVELS` (constant), lines 5089-5089, exports `TASK_COMPLEXITY_LEVELS`
-- order 518: `TASK_COMPLEXITY_RANKS` (constant), lines 5090-5095, exports `TASK_COMPLEXITY_RANKS`
-- order 519: `TASK_PROFILE_TYPES` (constant), lines 5096-5102, exports `TASK_PROFILE_TYPES`
-- order 520: `TASK_LEVEL_CHOICES` (constant), lines 5103-5103, exports `TASK_LEVEL_CHOICES`
-- order 521: `TASK_SCALE_PREFERENCES` (constant), lines 5104-5104, exports `TASK_SCALE_PREFERENCES`
-- order 522: `SEMANTIC_CONFIDENCE_CHOICES` (constant), lines 5105-5105, exports `SEMANTIC_CONFIDENCE_CHOICES`
-- order 523: `L2_TODO_POLICY_CHOICES` (constant), lines 5106-5110, exports `L2_TODO_POLICY_CHOICES`
-- order 524: `DEFAULT_L2_TODO_POLICY` (constant), lines 5111-5111, exports `DEFAULT_L2_TODO_POLICY`
-- order 525: `TASK_LEVEL_POLICIES` (constant), lines 5112-5165, exports `TASK_LEVEL_POLICIES`
-- order 526: `MANAGER_ROUTE_TARGETS` (constant), lines 5166-5166, exports `MANAGER_ROUTE_TARGETS`
-- order 527: `BLACKBOARD_MAX_LOG_ENTRIES` (constant), lines 5167-5167, exports `BLACKBOARD_MAX_LOG_ENTRIES`
-- order 528: `BLACKBOARD_MAX_TEXT` (constant), lines 5168-5168, exports `BLACKBOARD_MAX_TEXT`
-- order 529: `BLACKBOARD_MEMORY_SHORT_MAX` (constant), lines 5169-5169, exports `BLACKBOARD_MEMORY_SHORT_MAX`
-- order 530: `BLACKBOARD_MEMORY_MID_MAX_STEPS` (constant), lines 5170-5170, exports `BLACKBOARD_MEMORY_MID_MAX_STEPS`
-- order 531: `BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP` (constant), lines 5171-5171, exports `BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP`
-- order 532: `BLACKBOARD_MEMORY_LONG_MAX` (constant), lines 5172-5172, exports `BLACKBOARD_MEMORY_LONG_MAX`
-- order 533: `BLACKBOARD_MEMORY_INDEX_MAX` (constant), lines 5173-5173, exports `BLACKBOARD_MEMORY_INDEX_MAX`
-- order 534: `SKILL_REFRESH_MIN_INTERVAL_SECONDS` (constant), lines 5174-5174, exports `SKILL_REFRESH_MIN_INTERVAL_SECONDS`
-- order 535: `SKILL_CATALOG_FULL_REFRESH_SECONDS` (constant), lines 5175-5178, exports `SKILL_CATALOG_FULL_REFRESH_SECONDS`
-- order 536: `SKILL_PROMPT_MAX_ITEMS` (constant), lines 5179-5179, exports `SKILL_PROMPT_MAX_ITEMS`
-- order 537: `SKILL_PROMPT_MAX_CHARS` (constant), lines 5180-5180, exports `SKILL_PROMPT_MAX_CHARS`
-- order 538: `SKILL_RUNTIME_CACHE_MAX_ENTRIES` (constant), lines 5181-5181, exports `SKILL_RUNTIME_CACHE_MAX_ENTRIES`
-- order 539: `SKILL_RUNTIME_CACHE_MAX_BYTES` (constant), lines 5182-5182, exports `SKILL_RUNTIME_CACHE_MAX_BYTES`
-- order 540: `SKILL_AUTOLOAD_SCORE_THRESHOLD` (constant), lines 5183-5186, exports `SKILL_AUTOLOAD_SCORE_THRESHOLD`
-- order 541: `SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD` (constant), lines 5187-5187, exports `SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD`
-- order 542: `SKILL_RUNTIME_EVALUATION_TTL_SECONDS` (constant), lines 5188-5188, exports `SKILL_RUNTIME_EVALUATION_TTL_SECONDS`
-- order 543: `SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS` (constant), lines 5189-5189, exports `SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS`
-- order 544: `SKILL_RUNTIME_UNLOAD_CONFIDENCE_THRESHOLD` (constant), lines 5190-5190, exports `SKILL_RUNTIME_UNLOAD_CONFIDENCE_THRESHOLD`
-- order 545: `SKILL_RUNTIME_KEY_TOOL_INTERVAL` (constant), lines 5191-5191, exports `SKILL_RUNTIME_KEY_TOOL_INTERVAL`
-- order 546: `SKILL_RUNTIME_EVENTS_MAX` (constant), lines 5192-5192, exports `SKILL_RUNTIME_EVENTS_MAX`
-- order 547: `SKILL_METADATA_CAPSULE_MAX_CHARS` (constant), lines 5193-5193, exports `SKILL_METADATA_CAPSULE_MAX_CHARS`
-- order 548: `SKILL_DEPENDENCY_MAX_DEPTH` (constant), lines 5194-5194, exports `SKILL_DEPENDENCY_MAX_DEPTH`
-- order 549: `AUTO_SKILLS_ROOT_CANDIDATES` (constant), lines 5195-5195, exports `AUTO_SKILLS_ROOT_CANDIDATES`
-- order 550: `SKILL_DEFAULT_ATTACHMENT_GLOBS` (constant), lines 5196-5226, exports `SKILL_DEFAULT_ATTACHMENT_GLOBS`
-- order 551: `SKILL_INLINE_ATTACHMENT_MAX_FILES` (constant), lines 5227-5227, exports `SKILL_INLINE_ATTACHMENT_MAX_FILES`
-- order 552: `SKILL_INLINE_ATTACHMENT_MAX_CHARS` (constant), lines 5228-5228, exports `SKILL_INLINE_ATTACHMENT_MAX_CHARS`
-- order 553: `SKILL_RESOURCE_MANIFEST_MAX_ITEMS` (constant), lines 5229-5229, exports `SKILL_RESOURCE_MANIFEST_MAX_ITEMS`
-- order 554: `SKILL_BODY_COMPACT_THRESHOLD_CHARS` (constant), lines 5230-5230, exports `SKILL_BODY_COMPACT_THRESHOLD_CHARS`
-- order 555: `SKILL_BODY_PREVIEW_CHARS` (constant), lines 5231-5231, exports `SKILL_BODY_PREVIEW_CHARS`
-- order 556: `SKILLS_VIRTUAL_PREFIX` (constant), lines 5232-5232, exports `SKILLS_VIRTUAL_PREFIX`
-- order 557: `SKILLS_EXTERNAL_MOUNT` (constant), lines 5233-5233, exports `SKILLS_EXTERNAL_MOUNT`
-- order 558: `PLAN_MODE_ENABLED_LEVELS` (constant), lines 5234-5234, exports `PLAN_MODE_ENABLED_LEVELS`
-- order 559: `PLAN_MODE_FORCED_LEVELS` (constant), lines 5235-5235, exports `PLAN_MODE_FORCED_LEVELS`
-- order 560: `PLAN_MODE_USER_CHOICES` (constant), lines 5236-5236, exports `PLAN_MODE_USER_CHOICES`
-- order 561: `TASK_PHASES` (constant), lines 5237-5238, exports `TASK_PHASES`
-- order 562: `TASK_PHASE_ROUTING` (constant), lines 5239-5246, exports `TASK_PHASE_ROUTING`
-- order 563: `COMPLEXITY_KEYWORDS` (constant), lines 5247-5253, exports `COMPLEXITY_KEYWORDS`
-- order 564: `USER_COMPLEXITY_SIMPLE_TOKENS` (constant), lines 5254-5258, exports `USER_COMPLEXITY_SIMPLE_TOKENS`
-- order 565: `USER_COMPLEXITY_MODERATE_TOKENS` (constant), lines 5259-5263, exports `USER_COMPLEXITY_MODERATE_TOKENS`
-- order 566: `USER_COMPLEXITY_COMPLEX_TOKENS` (constant), lines 5264-5268, exports `USER_COMPLEXITY_COMPLEX_TOKENS`
-- order 567: `USER_COMPLEXITY_EXPERT_TOKENS` (constant), lines 5269-5273, exports `USER_COMPLEXITY_EXPERT_TOKENS`
-- order 568: `PLAN_MODE_EXPLORER_MAX_ROUNDS` (constant), lines 5274-5277, exports `PLAN_MODE_EXPLORER_MAX_ROUNDS`
-- order 569: `PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS` (constant), lines 5278-5278, exports `PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS`
-- order 570: `PLAN_MODE_EXPLORER_STALE_ROUNDS` (constant), lines 5279-5279, exports `PLAN_MODE_EXPLORER_STALE_ROUNDS`
-- order 571: `PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS` (constant), lines 5280-5280, exports `PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS`
-- order 572: `REVIEWER_DEBUG_MODE_MAX_ROUNDS` (constant), lines 5281-5282, exports `REVIEWER_DEBUG_MODE_MAX_ROUNDS`
-- order 573: `REVIEWER_DEBUG_TOOL_ALLOWLIST` (constant), lines 5283-5288, exports `REVIEWER_DEBUG_TOOL_ALLOWLIST`
-- order 574: `EXPLORER_STALL_THRESHOLD` (constant), lines 5289-5289, exports `EXPLORER_STALL_THRESHOLD`
-- order 575: `DEVELOPER_EDIT_STALL_THRESHOLD` (constant), lines 5290-5290, exports `DEVELOPER_EDIT_STALL_THRESHOLD`
-- order 576: `ACCEPTANCE_GATE_STALL_THRESHOLD` (constant), lines 5291-5294, exports `ACCEPTANCE_GATE_STALL_THRESHOLD`
-- order 577: `ACCEPTANCE_GATE_HARD_CEILING` (constant), lines 5295-5298, exports `ACCEPTANCE_GATE_HARD_CEILING`
-- order 578: `ACCEPTANCE_GATE_TOTAL_ROUND_CEILING` (constant), lines 5299-5299, exports `ACCEPTANCE_GATE_TOTAL_ROUND_CEILING`
-- order 579: `PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS` (constant), lines 5300-5300, exports `PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS`
-- order 580: `PLAN_MODE_MAX_OPTIONS` (constant), lines 5301-5301, exports `PLAN_MODE_MAX_OPTIONS`
-- order 581: `PLAN_FILE_RELATIVE_PATH` (constant), lines 5302-5302, exports `PLAN_FILE_RELATIVE_PATH`
-- order 582: `PLAN_BUBBLE_MAX_CHARS` (constant), lines 5303-5303, exports `PLAN_BUBBLE_MAX_CHARS`
-- order 583: `PLAN_NOTICE_BODY_MAX_CHARS` (constant), lines 5304-5304, exports `PLAN_NOTICE_BODY_MAX_CHARS`
-- order 584: `PLAN_MESSAGE_EVENT_MAX_CHARS` (constant), lines 5305-5305, exports `PLAN_MESSAGE_EVENT_MAX_CHARS`
-- order 585: `PLAN_STEP_FULL_CONTENT_MAX_CHARS` (constant), lines 5306-5306, exports `PLAN_STEP_FULL_CONTENT_MAX_CHARS`
-- order 586: `PLAN_MODE_RESEARCH_TOOL_ALLOWLIST` (constant), lines 5307-5314, exports `PLAN_MODE_RESEARCH_TOOL_ALLOWLIST`
-- order 587: `FAILURE_LEDGER_MAX_FIXES` (constant), lines 5315-5315, exports `FAILURE_LEDGER_MAX_FIXES`
-- order 588: `FAILURE_LEDGER_MAX_COMPILE_ERRORS` (constant), lines 5316-5316, exports `FAILURE_LEDGER_MAX_COMPILE_ERRORS`
-- order 589: `FAILURE_LEDGER_MAX_DELEGATIONS` (constant), lines 5317-5317, exports `FAILURE_LEDGER_MAX_DELEGATIONS`
-- order 590: `FAILURE_LEDGER_MAX_STALLS` (constant), lines 5318-5318, exports `FAILURE_LEDGER_MAX_STALLS`
-- order 591: `FAILURE_LEDGER_MAX_TOOL_FPS` (constant), lines 5319-5319, exports `FAILURE_LEDGER_MAX_TOOL_FPS`
-- order 592: `FAILURE_LEDGER_MAX_ERRORS` (constant), lines 5320-5320, exports `FAILURE_LEDGER_MAX_ERRORS`
-- order 593: `ERROR_CATEGORY_DEFS` (constant), lines 5321-5360, exports `ERROR_CATEGORY_DEFS`
-- order 594: `CHECKPOINT_MAX_COUNT` (constant), lines 5361-5361, exports `CHECKPOINT_MAX_COUNT`
-- order 595: `CHECKPOINT_INTERVAL_ROUNDS` (constant), lines 5362-5362, exports `CHECKPOINT_INTERVAL_ROUNDS`
-- order 596: `PERSISTED_ROUTES_MAX` (constant), lines 5363-5363, exports `PERSISTED_ROUTES_MAX`
-- order 597: `HTML_FRONTEND_REQUEST_KEYWORDS` (constant), lines 5364-5403, exports `HTML_FRONTEND_REQUEST_KEYWORDS`
-- order 598: `DEEP_RESEARCH_REQUEST_KEYWORDS` (constant), lines 5404-5426, exports `DEEP_RESEARCH_REQUEST_KEYWORDS`
-- order 599: `DEEP_RESEARCH_RETRIEVAL_KEYWORDS` (constant), lines 5427-5446, exports `DEEP_RESEARCH_RETRIEVAL_KEYWORDS`
-- order 600: `DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS` (constant), lines 5447-5464, exports `DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS`
-- order 601: `DANGEROUS_PATTERNS` (constant), lines 5465-5466, exports `DANGEROUS_PATTERNS`
-- order 602: `VALID_MSG_TYPES` (constant), lines 5467-5473, exports `VALID_MSG_TYPES`
-- order 603: `SUPPORTED_UI_LANGUAGES` (constant), lines 5474-5480, exports `SUPPORTED_UI_LANGUAGES`
-- order 604: `UI_LANGUAGE_LABELS` (constant), lines 5481-5481, exports `UI_LANGUAGE_LABELS`
-- order 605: `DEFAULT_UI_LANGUAGE` (constant), lines 5482-5482, exports `DEFAULT_UI_LANGUAGE`
-- order 606: `PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED` (constant), lines 5483-5485, exports `PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED`
-- order 607: `AGENT_LANGUAGE_PREFERENCES` (constant), lines 5486-5527, exports `AGENT_LANGUAGE_PREFERENCES`
-- order 608: `UI_STYLE_CHOICES` (constant), lines 5528-5528, exports `UI_STYLE_CHOICES`
-- order 609: `UI_STYLE_LABELS` (constant), lines 5529-5529, exports `UI_STYLE_LABELS`
-- order 610: `DEFAULT_UI_STYLE` (constant), lines 5530-5530, exports `DEFAULT_UI_STYLE`
-- order 611: `DEFAULT_WEB_UI_DIR` (constant), lines 5531-5531, exports `DEFAULT_WEB_UI_DIR`
-- order 612: `DEFAULT_WEB_UI_CONFIG` (constant), lines 5532-5532, exports `DEFAULT_WEB_UI_CONFIG`
-- order 613: `WEB_UI_REQUIRED_FILES` (constant), lines 5533-5540, exports `WEB_UI_REQUIRED_FILES`
-- order 614: `WEB_UI_OPTIONAL_FILES` (constant), lines 5541-5541, exports `WEB_UI_OPTIONAL_FILES`
-- order 615: `WEB_UI_APPLICATION_CONTRACT_VERSION` (constant), lines 5542-5542, exports `WEB_UI_APPLICATION_CONTRACT_VERSION`
-- order 616: `WEB_UI_APPLICATION_FEATURE_MARKERS` (constant), lines 5543-5562, exports `WEB_UI_APPLICATION_FEATURE_MARKERS`
-- order 617: `IMAGE_EXTS` (constant), lines 5563-5577, exports `IMAGE_EXTS`
-- order 618: `IMAGE_FORMATS_NEED_CONVERSION` (constant), lines 5578-5578, exports `IMAGE_FORMATS_NEED_CONVERSION`
-- order 619: `IMAGE_SAFE_FORMATS` (constant), lines 5579-5579, exports `IMAGE_SAFE_FORMATS`
-- order 620: `AUDIO_EXTS` (constant), lines 5580-5590, exports `AUDIO_EXTS`
-- order 621: `VIDEO_EXTS` (constant), lines 5591-5601, exports `VIDEO_EXTS`
-- order 622: `CODE_PREVIEW_STAGE_MAX_BYTES` (constant), lines 5602-5602, exports `CODE_PREVIEW_STAGE_MAX_BYTES`
-- order 623: `CODE_PREVIEW_STAGE_MAX_ROWS` (constant), lines 5603-5603, exports `CODE_PREVIEW_STAGE_MAX_ROWS`
-- order 624: `CODE_PREVIEW_STAGE_MAX_PER_FILE` (constant), lines 5604-5604, exports `CODE_PREVIEW_STAGE_MAX_PER_FILE`
-- order 625: `CODE_PREVIEW_STAGE_MAX_TOTAL` (constant), lines 5605-5605, exports `CODE_PREVIEW_STAGE_MAX_TOTAL`
-- order 626: `CODE_PREVIEW_DIFF_CONTEXT_LINES` (constant), lines 5606-5606, exports `CODE_PREVIEW_DIFF_CONTEXT_LINES`
-- order 627: `CODE_PREVIEW_DIFF_MERGE_GAP` (constant), lines 5607-5607, exports `CODE_PREVIEW_DIFF_MERGE_GAP`
-- order 628: `PREVIEW_DOWNLOAD_MAX_FILES` (constant), lines 5608-5608, exports `PREVIEW_DOWNLOAD_MAX_FILES`
-- order 629: `PREVIEW_DOWNLOAD_MAX_BYTES` (constant), lines 5609-5609, exports `PREVIEW_DOWNLOAD_MAX_BYTES`
-- order 630: `FILES_TREE_DEFAULT_MAX_NODES` (constant), lines 5610-5610, exports `FILES_TREE_DEFAULT_MAX_NODES`
-- order 631: `FILES_TREE_DEFAULT_MAX_DEPTH` (constant), lines 5611-5611, exports `FILES_TREE_DEFAULT_MAX_DEPTH`
-- order 632: `FILES_TREE_SKIP_DIRS` (constant), lines 5612-5620, exports `FILES_TREE_SKIP_DIRS`
-- order 633: `FILES_TREE_SKIP_REL_DIRS` (constant), lines 5621-5623, exports `FILES_TREE_SKIP_REL_DIRS`
-- order 634: `IDE_FILE_MAX_BYTES` (constant), lines 5624-5624, exports `IDE_FILE_MAX_BYTES`
-- order 635: `IDE_UPLOAD_MAX_BYTES` (constant), lines 5625-5625, exports `IDE_UPLOAD_MAX_BYTES`
-- order 636: `IDE_UPLOAD_TOTAL_MAX_BYTES` (constant), lines 5626-5626, exports `IDE_UPLOAD_TOTAL_MAX_BYTES`
-- order 637: `IDE_UPLOAD_MAX_ITEMS` (constant), lines 5627-5627, exports `IDE_UPLOAD_MAX_ITEMS`
-- order 638: `IDE_UPLOAD_CHUNK_MAX_BYTES` (constant), lines 5628-5628, exports `IDE_UPLOAD_CHUNK_MAX_BYTES`
-- order 639: `IDE_UPLOAD_STREAM_MAX_BYTES` (constant), lines 5629-5629, exports `IDE_UPLOAD_STREAM_MAX_BYTES`
-- order 640: `IDE_TEXT_PREVIEW_MAX_BYTES` (constant), lines 5630-5630, exports `IDE_TEXT_PREVIEW_MAX_BYTES`
-- order 641: `IDE_MARKDOWN_PREVIEW_MAX_LINES` (constant), lines 5631-5631, exports `IDE_MARKDOWN_PREVIEW_MAX_LINES`
-- order 642: `IDE_IMAGE_PREVIEW_MAX_EDGE` (constant), lines 5632-5632, exports `IDE_IMAGE_PREVIEW_MAX_EDGE`
-- order 643: `IDE_IMAGE_PREVIEW_MAX_PIXELS` (constant), lines 5633-5633, exports `IDE_IMAGE_PREVIEW_MAX_PIXELS`
-- order 644: `IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS` (constant), lines 5634-5634, exports `IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS`
-- order 645: `IDE_VECTOR_PREVIEW_MAX_BYTES` (constant), lines 5635-5635, exports `IDE_VECTOR_PREVIEW_MAX_BYTES`
-- order 646: `IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES` (constant), lines 5636-5636, exports `IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES`
-- order 647: `IDE_TABLE_PREVIEW_CELL_MAX_CHARS` (constant), lines 5637-5637, exports `IDE_TABLE_PREVIEW_CELL_MAX_CHARS`
-- order 648: `IDE_TABLE_PREVIEW_TOTAL_CHARS` (constant), lines 5638-5638, exports `IDE_TABLE_PREVIEW_TOTAL_CHARS`
-- order 649: `IDE_OFFICE_PREVIEW_MAX_ENTRIES` (constant), lines 5639-5639, exports `IDE_OFFICE_PREVIEW_MAX_ENTRIES`
-- order 650: `IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES` (constant), lines 5640-5640, exports `IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES`
-- order 651: `IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES` (constant), lines 5641-5641, exports `IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES`
-- order 652: `IDE_COMMAND_TIMEOUT_DEFAULT` (constant), lines 5642-5642, exports `IDE_COMMAND_TIMEOUT_DEFAULT`
-- order 653: `IDE_TREE_DEFAULT_MAX_NODES` (constant), lines 5643-5643, exports `IDE_TREE_DEFAULT_MAX_NODES`
-- order 654: `IDE_TREE_MAX_NODES` (constant), lines 5644-5644, exports `IDE_TREE_MAX_NODES`
-- order 655: `IDE_SEARCH_MAX_RESULTS` (constant), lines 5645-5645, exports `IDE_SEARCH_MAX_RESULTS`
-- order 656: `IDE_SEARCH_MAX_FILE_BYTES` (constant), lines 5646-5646, exports `IDE_SEARCH_MAX_FILE_BYTES`
-- order 657: `IDE_TERMINAL_SCROLLBACK_BYTES` (constant), lines 5647-5647, exports `IDE_TERMINAL_SCROLLBACK_BYTES`
-- order 658: `IDE_TERMINAL_IDLE_SECONDS` (constant), lines 5648-5648, exports `IDE_TERMINAL_IDLE_SECONDS`
-- order 659: `IDE_DEBUG_ADAPTER_START_ATTEMPTS` (constant), lines 5649-5649, exports `IDE_DEBUG_ADAPTER_START_ATTEMPTS`
-- order 660: `IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS` (constant), lines 5650-5650, exports `IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS`
-- order 661: `IDE_VSIX_MAX_BYTES` (constant), lines 5651-5651, exports `IDE_VSIX_MAX_BYTES`
-- order 662: `IDE_VSIX_MAX_EXPANDED_BYTES` (constant), lines 5652-5652, exports `IDE_VSIX_MAX_EXPANDED_BYTES`
-- order 663: `IDE_VSIX_MAX_FILES` (constant), lines 5653-5653, exports `IDE_VSIX_MAX_FILES`
-- order 664: `IDE_VSIX_MAX_FILE_BYTES` (constant), lines 5654-5654, exports `IDE_VSIX_MAX_FILE_BYTES`
-- order 665: `IDE_TREE_SKIP_DIRS` (constant), lines 5655-5663, exports `IDE_TREE_SKIP_DIRS`
-- order 666: `RENDER_FRAME_MAX_B64_CHARS` (constant), lines 5664-5664, exports `RENDER_FRAME_MAX_B64_CHARS`
-- order 667: `RENDER_FRAME_MAX_POINTS` (constant), lines 5665-5665, exports `RENDER_FRAME_MAX_POINTS`
-- order 668: `RENDER_FRAME_MAX_LINES` (constant), lines 5666-5666, exports `RENDER_FRAME_MAX_LINES`
-- order 669: `RENDER_FRAME_MAX_LINE_POINTS` (constant), lines 5667-5667, exports `RENDER_FRAME_MAX_LINE_POINTS`
-- order 670: `RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS` (constant), lines 5668-5668, exports `RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS`
-- order 671: `RAW_TOOLCALL_TEXT_FILTER_THRESHOLD` (constant), lines 5669-5669, exports `RAW_TOOLCALL_TEXT_FILTER_THRESHOLD`
-- order 672: `ASSISTANT_TEXT_PERSIST_MAX_CHARS` (constant), lines 5670-5670, exports `ASSISTANT_TEXT_PERSIST_MAX_CHARS`
-- order 673: `ASSISTANT_MESSAGE_EVENT_MAX_CHARS` (constant), lines 5671-5671, exports `ASSISTANT_MESSAGE_EVENT_MAX_CHARS`
-- order 674: `CODE_PREVIEW_EXTS` (constant), lines 5672-5799, exports `CODE_PREVIEW_EXTS`
-- order 675: `CODE_PREVIEW_FILENAMES` (constant), lines 5800-5851, exports `CODE_PREVIEW_FILENAMES`
-- order 676: `MEDIA_CAPABILITY_KEYS` (constant), lines 5852-5859, exports `MEDIA_CAPABILITY_KEYS`
-- order 680: `OFFLINE_JS_LIB_CATALOG` (constant), lines 5892-6218, exports `OFFLINE_JS_LIB_CATALOG`
-- order 681: `OFFLINE_JS_ASSET_LOCK` (constant), lines 6219-6219, exports `OFFLINE_JS_ASSET_LOCK`
-- order 682: `OFFLINE_JS_LIB_INDEX_FILE` (constant), lines 6220-6220, exports `OFFLINE_JS_LIB_INDEX_FILE`
-- order 683: `OFFLINE_JS_LIB_README_FILE` (constant), lines 6221-6221, exports `OFFLINE_JS_LIB_README_FILE`
-- order 694: `BACKEND_I18N` (constant), lines 6427-6498, exports `BACKEND_I18N`
-- order 695: `_call_backend_i18n_en_update_6500` (expression), lines 6499-6600, exports —
-- order 696: `_call_backend_i18n_zh_cn_update_6601` (expression), lines 6601-6701, exports —
-- order 697: `_call_backend_i18n_zh_tw_update_6702` (expression), lines 6702-6802, exports —
-- order 698: `_call_backend_i18n_ja_update_6803` (expression), lines 6803-6903, exports —
-- order 912: `LIQUID_KERNEL_STARTUP_POLICIES` (constant), lines 14073-14075, exports `LIQUID_KERNEL_STARTUP_POLICIES`
-- order 913: `LIQUID_KERNEL_BOOTSTRAP_STATE_FILENAME` (constant), lines 14076-14076, exports `LIQUID_KERNEL_BOOTSTRAP_STATE_FILENAME`
-- order 943: `TABULAR_PREVIEW_EXTS` (constant), lines 15974-15976, exports `TABULAR_PREVIEW_EXTS`
-- order 944: `EXCEL_PREVIEW_EXTS` (constant), lines 15977-15977, exports `EXCEL_PREVIEW_EXTS`
-- order 945: `PRESENTATION_PREVIEW_EXTS` (constant), lines 15978-15978, exports `PRESENTATION_PREVIEW_EXTS`
-- order 946: `DOCUMENT_PREVIEW_EXTS` (constant), lines 15979-15979, exports `DOCUMENT_PREVIEW_EXTS`
-- order 1156: `STUDIO_DEVICE_COOKIE` (constant), lines 115488-115505, exports `STUDIO_DEVICE_COOKIE`
-- order 1157: `STUDIO_SESSION_COOKIE` (constant), lines 115506-115506, exports `STUDIO_SESSION_COOKIE`
-- order 1158: `STUDIO_DEVICE_TTL` (constant), lines 115507-115507, exports `STUDIO_DEVICE_TTL`
-- order 1159: `STUDIO_SESSION_TTL` (constant), lines 115508-115508, exports `STUDIO_SESSION_TTL`
-- order 1160: `STUDIO_MAX_FILE_BYTES` (constant), lines 115509-115509, exports `STUDIO_MAX_FILE_BYTES`
-- order 1161: `STUDIO_MAX_PROJECT_BYTES` (constant), lines 115510-115510, exports `STUDIO_MAX_PROJECT_BYTES`
-- order 1162: `STUDIO_MAX_FILES` (constant), lines 115511-115511, exports `STUDIO_MAX_FILES`
-- order 1163: `STUDIO_MAX_JOB_SECONDS` (constant), lines 115512-115512, exports `STUDIO_MAX_JOB_SECONDS`
-- order 1169: `STUDIO_INDEX_HTML` (constant), lines 117411-117413, exports `STUDIO_INDEX_HTML`
-- order 1170: `STUDIO_CSS` (constant), lines 117414-117414, exports `STUDIO_CSS`
-- order 1171: `STUDIO_JS` (constant), lines 117415-117415, exports `STUDIO_JS`
+- order 75: `LIQUID_KERNEL_PACKAGE_STATUS` (constant), lines 483-484, exports `LIQUID_KERNEL_PACKAGE_STATUS`
+- order 79: `_call_ensure_liquid_kernel_sqlite_lifecycle_513` (expression), lines 512-513, exports —
+- order 80: `COLLAB_DB_FILENAME` (constant), lines 514-517, exports `COLLAB_DB_FILENAME`
+- order 81: `COLLAB_SESSION_TTL_SECONDS` (constant), lines 518-518, exports `COLLAB_SESSION_TTL_SECONDS`
+- order 82: `COLLAB_PRESENCE_TTL_SECONDS` (constant), lines 519-519, exports `COLLAB_PRESENCE_TTL_SECONDS`
+- order 83: `COLLAB_PASSWORD_ITERATIONS` (constant), lines 520-520, exports `COLLAB_PASSWORD_ITERATIONS`
+- order 84: `COLLAB_MAX_AVATAR_BYTES` (constant), lines 521-521, exports `COLLAB_MAX_AVATAR_BYTES`
+- order 85: `COLLAB_MAX_TEXT_BYTES` (constant), lines 522-522, exports `COLLAB_MAX_TEXT_BYTES`
+- order 86: `COLLAB_DELETE_RETENTION_DAYS` (constant), lines 523-523, exports `COLLAB_DELETE_RETENTION_DAYS`
+- order 87: `COLLAB_EVENT_RETENTION` (constant), lines 524-524, exports `COLLAB_EVENT_RETENTION`
+- order 88: `COLLAB_AGENT_STALE_SECONDS` (constant), lines 525-525, exports `COLLAB_AGENT_STALE_SECONDS`
+- order 89: `COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS` (constant), lines 526-526, exports `COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS`
+- order 90: `COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS` (constant), lines 527-527, exports `COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS`
+- order 91: `COLLAB_EXTERNAL_WRITE_CONFIRMATIONS` (constant), lines 528-528, exports `COLLAB_EXTERNAL_WRITE_CONFIRMATIONS`
+- order 92: `COLLAB_SCHEMA_VERSION` (constant), lines 529-529, exports `COLLAB_SCHEMA_VERSION`
+- order 116: `COLLAB_INDEX_HTML` (constant), lines 3772-3843, exports `COLLAB_INDEX_HTML`
+- order 117: `COLLAB_CSS` (constant), lines 3844-3851, exports `COLLAB_CSS`
+- order 118: `COLLAB_JS` (constant), lines 3852-3892, exports `COLLAB_JS`
+- order 124: `APP_VERSION` (constant), lines 3914-3914, exports `APP_VERSION`
+- order 133: `IDE_AUTH_FILENAME` (constant), lines 3923-3923, exports `IDE_AUTH_FILENAME`
+- order 134: `IDE_AUTH_SESSION_TTL_SECONDS` (constant), lines 3924-3924, exports `IDE_AUTH_SESSION_TTL_SECONDS`
+- order 135: `IDE_AUTH_MAX_ACTIVE_SESSIONS` (constant), lines 3925-3925, exports `IDE_AUTH_MAX_ACTIVE_SESSIONS`
+- order 136: `IDE_DEVICE_SECRET_MIN_BYTES` (constant), lines 3926-3926, exports `IDE_DEVICE_SECRET_MIN_BYTES`
+- order 137: `IDE_DEVICE_LABEL_MAX_CHARS` (constant), lines 3927-3927, exports `IDE_DEVICE_LABEL_MAX_CHARS`
+- order 138: `IDE_DEVICE_PAIRING_TTL_SECONDS` (constant), lines 3928-3928, exports `IDE_DEVICE_PAIRING_TTL_SECONDS`
+- order 139: `IDE_WORKBENCH_STATE_FILENAME` (constant), lines 3929-3929, exports `IDE_WORKBENCH_STATE_FILENAME`
+- order 140: `IDE_PROMPT_ENHANCEMENT_BUDGETS` (constant), lines 3930-3967, exports `IDE_PROMPT_ENHANCEMENT_BUDGETS`
+- order 141: `IDE_EXTENSIONS_DIRNAME` (constant), lines 3968-3968, exports `IDE_EXTENSIONS_DIRNAME`
+- order 163: `LONG_OUTPUT_MODEL_PAGE_CHARS` (constant), lines 4271-4271, exports `LONG_OUTPUT_MODEL_PAGE_CHARS`
+- order 164: `LONG_OUTPUT_UI_PAGE_CHARS` (constant), lines 4272-4272, exports `LONG_OUTPUT_UI_PAGE_CHARS`
+- order 165: `LONG_OUTPUT_UI_PREVIEW_MAX_PAGES` (constant), lines 4273-4273, exports `LONG_OUTPUT_UI_PREVIEW_MAX_PAGES`
+- order 166: `LONG_OUTPUT_LISTING_OFFLOAD_CHARS` (constant), lines 4274-4274, exports `LONG_OUTPUT_LISTING_OFFLOAD_CHARS`
+- order 167: `LONG_OUTPUT_READ_PAGE_LINES` (constant), lines 4275-4275, exports `LONG_OUTPUT_READ_PAGE_LINES`
+- order 168: `LONG_OUTPUT_READ_PAGE_MAX_CHARS` (constant), lines 4276-4276, exports `LONG_OUTPUT_READ_PAGE_MAX_CHARS`
+- order 169: `LONG_OUTPUT_TEMP_MAX_FILES` (constant), lines 4277-4277, exports `LONG_OUTPUT_TEMP_MAX_FILES`
+- order 170: `READ_FILE_DEFAULT_MAX_CHARS` (constant), lines 4278-4278, exports `READ_FILE_DEFAULT_MAX_CHARS`
+- order 171: `READ_FILE_HARD_MAX_CHARS` (constant), lines 4279-4279, exports `READ_FILE_HARD_MAX_CHARS`
+- order 172: `READ_FILE_OVERVIEW_HEAD_LINES` (constant), lines 4280-4280, exports `READ_FILE_OVERVIEW_HEAD_LINES`
+- order 173: `READ_FILE_SEARCH_MAX_MATCHES` (constant), lines 4281-4281, exports `READ_FILE_SEARCH_MAX_MATCHES`
+- order 178: `CODE_ADMIN_PORT_OFFSET` (constant), lines 4286-4286, exports `CODE_ADMIN_PORT_OFFSET`
+- order 180: `IDE_PORT_OFFSET` (constant), lines 4288-4291, exports `IDE_PORT_OFFSET`
+- order 181: `IDE_DEFAULT_PORT` (constant), lines 4292-4292, exports `IDE_DEFAULT_PORT`
+- order 182: `COLLAB_PORT_OFFSET` (constant), lines 4293-4293, exports `COLLAB_PORT_OFFSET`
+- order 184: `DEFAULT_WEB_SEARCH_ENABLED` (constant), lines 4295-4295, exports `DEFAULT_WEB_SEARCH_ENABLED`
+- order 189: `DEFAULT_USER_MEMORY_MODE` (constant), lines 4300-4300, exports `DEFAULT_USER_MEMORY_MODE`
+- order 197: `AGENT_WEB_SEARCH_USER_AGENT` (constant), lines 4311-4311, exports `AGENT_WEB_SEARCH_USER_AGENT`
+- order 198: `AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS` (constant), lines 4312-4312, exports `AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS`
+- order 199: `AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES` (constant), lines 4313-4313, exports `AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES`
+- order 200: `AGENT_WEB_SEARCH_HARD_MAX_PAGES` (constant), lines 4314-4314, exports `AGENT_WEB_SEARCH_HARD_MAX_PAGES`
+- order 201: `AGENT_WEB_SEARCH_DEFAULT_DEPTH` (constant), lines 4315-4315, exports `AGENT_WEB_SEARCH_DEFAULT_DEPTH`
+- order 202: `AGENT_WEB_SEARCH_HARD_DEPTH` (constant), lines 4316-4316, exports `AGENT_WEB_SEARCH_HARD_DEPTH`
+- order 203: `AGENT_WEB_SEARCH_FETCH_TIMEOUT` (constant), lines 4317-4317, exports `AGENT_WEB_SEARCH_FETCH_TIMEOUT`
+- order 204: `AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT` (constant), lines 4318-4318, exports `AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT`
+- order 205: `AGENT_WEB_SEARCH_MAX_PAGE_BYTES` (constant), lines 4319-4319, exports `AGENT_WEB_SEARCH_MAX_PAGE_BYTES`
+- order 206: `AGENT_WEB_SEARCH_MAX_TEXT_CHARS` (constant), lines 4320-4320, exports `AGENT_WEB_SEARCH_MAX_TEXT_CHARS`
+- order 207: `AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED` (constant), lines 4321-4323, exports `AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED`
+- order 208: `AGENT_WEB_SEARCH_PUBLIC_FEED_URL` (constant), lines 4324-4324, exports `AGENT_WEB_SEARCH_PUBLIC_FEED_URL`
+- order 209: `AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES` (constant), lines 4325-4325, exports `AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES`
+- order 210: `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES` (constant), lines 4326-4326, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES`
+- order 211: `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES` (constant), lines 4327-4327, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES`
+- order 212: `AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER` (constant), lines 4328-4328, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER`
+- order 213: `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS` (constant), lines 4329-4329, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS`
+- order 214: `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING` (constant), lines 4330-4330, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING`
+- order 215: `AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX` (constant), lines 4331-4331, exports `AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX`
+- order 225: `CODE_CHUNK_CHARS` (constant), lines 4353-4353, exports `CODE_CHUNK_CHARS`
+- order 226: `CODE_CHUNK_OVERLAP` (constant), lines 4354-4354, exports `CODE_CHUNK_OVERLAP`
+- order 227: `CODE_MAX_CHUNKS_PER_DOC` (constant), lines 4355-4355, exports `CODE_MAX_CHUNKS_PER_DOC`
+- order 228: `CODE_SOURCE_ANALYSIS_MAX_CHARS` (constant), lines 4356-4365, exports `CODE_SOURCE_ANALYSIS_MAX_CHARS`
+- order 269: `CODE_IMPORT_WORKER_COUNT` (constant), lines 4434-4437, exports `CODE_IMPORT_WORKER_COUNT`
+- order 271: `CODE_PARSE_TIMEOUT_SECONDS` (constant), lines 4442-4445, exports `CODE_PARSE_TIMEOUT_SECONDS`
+- order 272: `DEFAULT_CONTEXT_TOKEN_LIMIT` (constant), lines 4446-4446, exports `DEFAULT_CONTEXT_TOKEN_LIMIT`
+- order 273: `TOKEN_THRESHOLD` (constant), lines 4447-4447, exports `TOKEN_THRESHOLD`
+- order 274: `CONTEXT_AUTO_COMPACT_RESERVE_RATIO` (constant), lines 4448-4451, exports `CONTEXT_AUTO_COMPACT_RESERVE_RATIO`
+- order 275: `CONTEXT_ESTIMATE_SAFETY_MULTIPLIER` (constant), lines 4452-4455, exports `CONTEXT_ESTIMATE_SAFETY_MULTIPLIER`
+- order 276: `CONTEXT_USAGE_CALIBRATION_MAX` (constant), lines 4456-4459, exports `CONTEXT_USAGE_CALIBRATION_MAX`
+- order 277: `CONTEXT_ACTUAL_USAGE_RECENT_SECONDS` (constant), lines 4460-4463, exports `CONTEXT_ACTUAL_USAGE_RECENT_SECONDS`
+- order 278: `LARGE_FILE_AUTO_PAGE_BYTES` (constant), lines 4464-4467, exports `LARGE_FILE_AUTO_PAGE_BYTES`
+- order 279: `LARGE_FILE_AUTO_PAGE_LINES` (constant), lines 4468-4471, exports `LARGE_FILE_AUTO_PAGE_LINES`
+- order 280: `LARGE_SOURCE_UPLOAD_EXCERPT_CHARS` (constant), lines 4472-4475, exports `LARGE_SOURCE_UPLOAD_EXCERPT_CHARS`
+- order 281: `CHAT_UPLOAD_PARSE_QUEUE_MAX` (constant), lines 4476-4479, exports `CHAT_UPLOAD_PARSE_QUEUE_MAX`
+- order 282: `CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS` (constant), lines 4480-4483, exports `CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS`
+- order 283: `CHAT_UPLOAD_INLINE_TEXT_BYTES` (constant), lines 4484-4487, exports `CHAT_UPLOAD_INLINE_TEXT_BYTES`
+- order 284: `CHAT_UPLOAD_PARSE_MAX_BYTES` (constant), lines 4488-4494, exports `CHAT_UPLOAD_PARSE_MAX_BYTES`
+- order 285: `CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES` (constant), lines 4495-4501, exports `CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES`
+- order 286: `CHAT_UPLOAD_TEXT_CONTEXT_CHARS` (constant), lines 4502-4505, exports `CHAT_UPLOAD_TEXT_CONTEXT_CHARS`
+- order 287: `CHAT_UPLOAD_PROMPT_MAX_FILES` (constant), lines 4506-4509, exports `CHAT_UPLOAD_PROMPT_MAX_FILES`
+- order 288: `CHAT_UPLOAD_PROMPT_MAX_CHARS` (constant), lines 4510-4513, exports `CHAT_UPLOAD_PROMPT_MAX_CHARS`
+- order 289: `CHAT_UPLOAD_PROMPT_PER_FILE_CHARS` (constant), lines 4514-4517, exports `CHAT_UPLOAD_PROMPT_PER_FILE_CHARS`
+- order 290: `CHAT_UPLOAD_FRONTEND_WAIT_MS` (constant), lines 4518-4521, exports `CHAT_UPLOAD_FRONTEND_WAIT_MS`
+- order 291: `CHAT_UPLOAD_AUTO_LIBRARY_INGEST` (constant), lines 4522-4525, exports `CHAT_UPLOAD_AUTO_LIBRARY_INGEST`
+- order 292: `CHAT_UPLOAD_INGEST_QUEUE_MAX` (constant), lines 4526-4529, exports `CHAT_UPLOAD_INGEST_QUEUE_MAX`
+- order 293: `SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS` (constant), lines 4530-4533, exports `SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS`
+- order 294: `SESSION_DEFERRED_START_QUEUE_MAX` (constant), lines 4534-4537, exports `SESSION_DEFERRED_START_QUEUE_MAX`
+- order 295: `SESSION_SUBMISSION_DEDUPE_MAX` (constant), lines 4538-4538, exports `SESSION_SUBMISSION_DEDUPE_MAX`
+- order 296: `SESSION_SUBMISSION_DEDUPE_SECONDS` (constant), lines 4539-4539, exports `SESSION_SUBMISSION_DEDUPE_SECONDS`
+- order 297: `SCHEDULER_SUBMISSION_DEDUPE_MAX` (constant), lines 4540-4540, exports `SCHEDULER_SUBMISSION_DEDUPE_MAX`
+- order 298: `FAST_START_LOCAL_CLASSIFICATION` (constant), lines 4541-4543, exports `FAST_START_LOCAL_CLASSIFICATION`
+- order 299: `FAST_START_LOCAL_TITLE` (constant), lines 4544-4546, exports `FAST_START_LOCAL_TITLE`
+- order 300: `AUTO_TITLE_MODEL_REFINE` (constant), lines 4547-4549, exports `AUTO_TITLE_MODEL_REFINE`
+- order 301: `AUTO_TITLE_MODEL_TIMEOUT_SECONDS` (constant), lines 4550-4553, exports `AUTO_TITLE_MODEL_TIMEOUT_SECONDS`
+- order 302: `AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS` (constant), lines 4554-4560, exports `AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS`
+- order 303: `FAST_START_DEFER_CAPABILITY_PROBE` (constant), lines 4561-4563, exports `FAST_START_DEFER_CAPABILITY_PROBE`
+- order 304: `SESSION_RUNTIME_MESSAGE_WINDOW` (constant), lines 4564-4564, exports `SESSION_RUNTIME_MESSAGE_WINDOW`
+- order 305: `SESSION_RUNTIME_ACTIVITY_WINDOW` (constant), lines 4565-4565, exports `SESSION_RUNTIME_ACTIVITY_WINDOW`
+- order 306: `SESSION_RUNTIME_OPERATION_WINDOW` (constant), lines 4566-4566, exports `SESSION_RUNTIME_OPERATION_WINDOW`
+- order 307: `SESSION_RUNTIME_UPLOAD_WINDOW` (constant), lines 4567-4567, exports `SESSION_RUNTIME_UPLOAD_WINDOW`
+- order 308: `LITE_SNAPSHOT_MAX_BYTES` (constant), lines 4568-4571, exports `LITE_SNAPSHOT_MAX_BYTES`
+- order 309: `LITE_SNAPSHOT_MESSAGES_BYTES` (constant), lines 4572-4572, exports `LITE_SNAPSHOT_MESSAGES_BYTES`
+- order 310: `LITE_SNAPSHOT_FEED_BYTES` (constant), lines 4573-4573, exports `LITE_SNAPSHOT_FEED_BYTES`
+- order 311: `LITE_SNAPSHOT_OPERATIONS_BYTES` (constant), lines 4574-4574, exports `LITE_SNAPSHOT_OPERATIONS_BYTES`
+- order 312: `IDE_AGENT_STATE_MAX_BYTES` (constant), lines 4575-4578, exports `IDE_AGENT_STATE_MAX_BYTES`
+- order 313: `IDE_AGENT_FEED_BYTES` (constant), lines 4579-4579, exports `IDE_AGENT_FEED_BYTES`
+- order 314: `IDE_AGENT_OPERATIONS_BYTES` (constant), lines 4580-4580, exports `IDE_AGENT_OPERATIONS_BYTES`
+- order 315: `SESSION_WATCHDOG_INTERVAL_SECONDS` (constant), lines 4581-4584, exports `SESSION_WATCHDOG_INTERVAL_SECONDS`
+- order 316: `SESSION_HEARTBEAT_STALE_SECONDS` (constant), lines 4585-4588, exports `SESSION_HEARTBEAT_STALE_SECONDS`
+- order 317: `SESSION_LIST_DEFAULT_LIMIT` (constant), lines 4589-4592, exports `SESSION_LIST_DEFAULT_LIMIT`
+- order 318: `SESSION_INDEX_SYNC_SNAPSHOT_MAX` (constant), lines 4593-4596, exports `SESSION_INDEX_SYNC_SNAPSHOT_MAX`
+- order 319: `SESSION_INDEX_JOURNAL_COMPACT_RECORDS` (constant), lines 4597-4600, exports `SESSION_INDEX_JOURNAL_COMPACT_RECORDS`
+- order 320: `SESSION_INDEX_JOURNAL_COMPACT_BYTES` (constant), lines 4601-4604, exports `SESSION_INDEX_JOURNAL_COMPACT_BYTES`
+- order 321: `SESSION_CATALOG_RECENT_MAX` (constant), lines 4605-4608, exports `SESSION_CATALOG_RECENT_MAX`
+- order 322: `IDE_SESSION_LIST_DEFAULT_LIMIT` (constant), lines 4609-4612, exports `IDE_SESSION_LIST_DEFAULT_LIMIT`
+- order 323: `IDLE_TIMEOUT` (constant), lines 4613-4613, exports `IDLE_TIMEOUT`
+- order 324: `POLL_INTERVAL` (constant), lines 4614-4614, exports `POLL_INTERVAL`
+- order 325: `SSE_HEARTBEAT_SECONDS` (constant), lines 4615-4615, exports `SSE_HEARTBEAT_SECONDS`
+- order 326: `MODEL_CALL_PROGRESS_DELAY` (constant), lines 4616-4616, exports `MODEL_CALL_PROGRESS_DELAY`
+- order 327: `MODEL_CALL_PROGRESS_INTERVAL` (constant), lines 4617-4617, exports `MODEL_CALL_PROGRESS_INTERVAL`
+- order 328: `RUN_COMPLETION_SUMMARY_ENABLED` (constant), lines 4618-4621, exports `RUN_COMPLETION_SUMMARY_ENABLED`
+- order 329: `LLM_HTTP_RETRY_MAX_ATTEMPTS` (constant), lines 4622-4625, exports `LLM_HTTP_RETRY_MAX_ATTEMPTS`
+- order 330: `LLM_HTTP_RETRY_DELAY_SECONDS` (constant), lines 4626-4629, exports `LLM_HTTP_RETRY_DELAY_SECONDS`
+- order 331: `LLM_HTTP_RETRY_MAX_SECONDS` (constant), lines 4630-4633, exports `LLM_HTTP_RETRY_MAX_SECONDS`
+- order 332: `LLM_HTTP_RETRY_404_ON_VLLM` (constant), lines 4634-4637, exports `LLM_HTTP_RETRY_404_ON_VLLM`
+- order 333: `LLM_HTTP_RETRY_STATUSES` (constant), lines 4638-4638, exports `LLM_HTTP_RETRY_STATUSES`
+- order 334: `MAX_AGENT_ROUNDS` (constant), lines 4639-4639, exports `MAX_AGENT_ROUNDS`
+- order 335: `MIN_AGENT_ROUNDS` (constant), lines 4640-4640, exports `MIN_AGENT_ROUNDS`
+- order 336: `MAX_AGENT_ROUNDS_CAP` (constant), lines 4641-4641, exports `MAX_AGENT_ROUNDS_CAP`
+- order 337: `REPEATED_TOOL_LOOP_THRESHOLD` (constant), lines 4642-4642, exports `REPEATED_TOOL_LOOP_THRESHOLD`
+- order 338: `BASH_READ_LOOP_THRESHOLD` (constant), lines 4643-4643, exports `BASH_READ_LOOP_THRESHOLD`
+- order 339: `READ_FILE_LOOP_THRESHOLD` (constant), lines 4644-4644, exports `READ_FILE_LOOP_THRESHOLD`
+- order 340: `READ_FILE_LOOP_DISTINCT_SOFT_LIMIT` (constant), lines 4645-4645, exports `READ_FILE_LOOP_DISTINCT_SOFT_LIMIT`
+- order 341: `READ_FILE_COMPACT_PIN_DISTINCT` (constant), lines 4646-4646, exports `READ_FILE_COMPACT_PIN_DISTINCT`
+- order 342: `READ_FILE_COMPACT_PIN_MAX_CHARS` (constant), lines 4647-4647, exports `READ_FILE_COMPACT_PIN_MAX_CHARS`
+- order 343: `READ_CONTEXT_REGISTRY_MAX` (constant), lines 4648-4648, exports `READ_CONTEXT_REGISTRY_MAX`
+- order 344: `READ_CONTEXT_PROMPT_MAX_ITEMS` (constant), lines 4649-4649, exports `READ_CONTEXT_PROMPT_MAX_ITEMS`
+- order 345: `READ_CONTEXT_PROMPT_MAX_CHARS` (constant), lines 4650-4650, exports `READ_CONTEXT_PROMPT_MAX_CHARS`
+- order 346: `READ_CONTEXT_SUMMARY_MAX_CHARS` (constant), lines 4651-4651, exports `READ_CONTEXT_SUMMARY_MAX_CHARS`
+- order 347: `READ_CONTEXT_SHARED_MAX_ITEMS` (constant), lines 4652-4652, exports `READ_CONTEXT_SHARED_MAX_ITEMS`
+- order 348: `READ_CONTEXT_POLICY_CHOICES` (constant), lines 4653-4653, exports `READ_CONTEXT_POLICY_CHOICES`
+- order 349: `DEFAULT_READ_CONTEXT_POLICY` (constant), lines 4654-4654, exports `DEFAULT_READ_CONTEXT_POLICY`
+- order 350: `READ_CONTEXT_CACHE_SEARCH_MAX_BYTES` (constant), lines 4655-4661, exports `READ_CONTEXT_CACHE_SEARCH_MAX_BYTES`
+- order 351: `READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES` (constant), lines 4662-4662, exports `READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES`
+- order 352: `READ_CONTEXT_CACHE_SNIPPET_CHARS` (constant), lines 4663-4663, exports `READ_CONTEXT_CACHE_SNIPPET_CHARS`
+- order 353: `READ_CONTEXT_CACHE_LINE_CONTEXT` (constant), lines 4664-4664, exports `READ_CONTEXT_CACHE_LINE_CONTEXT`
+- order 354: `LONG_CONTENT_SOURCE_CACHE_MAX_BYTES` (constant), lines 4665-4671, exports `LONG_CONTENT_SOURCE_CACHE_MAX_BYTES`
+- order 355: `LONG_CONTENT_SOURCE_CACHE_MAX_FILES` (constant), lines 4672-4675, exports `LONG_CONTENT_SOURCE_CACHE_MAX_FILES`
+- order 356: `LONG_CONTENT_SYMBOL_MEMORY_MAX` (constant), lines 4676-4679, exports `LONG_CONTENT_SYMBOL_MEMORY_MAX`
+- order 357: `TOOL_MEMORY_REGISTRY_MAX` (constant), lines 4680-4680, exports `TOOL_MEMORY_REGISTRY_MAX`
+- order 358: `TOOL_MEMORY_PROMPT_MAX_ITEMS` (constant), lines 4681-4681, exports `TOOL_MEMORY_PROMPT_MAX_ITEMS`
+- order 359: `TOOL_MEMORY_PROMPT_MAX_CHARS` (constant), lines 4682-4682, exports `TOOL_MEMORY_PROMPT_MAX_CHARS`
+- order 360: `TOOL_MEMORY_SUMMARY_MAX_CHARS` (constant), lines 4683-4683, exports `TOOL_MEMORY_SUMMARY_MAX_CHARS`
+- order 361: `TOOL_MEMORY_SHARED_MAX_ITEMS` (constant), lines 4684-4684, exports `TOOL_MEMORY_SHARED_MAX_ITEMS`
+- order 362: `TOOL_MEMORY_COMPACT_PIN_DISTINCT` (constant), lines 4685-4685, exports `TOOL_MEMORY_COMPACT_PIN_DISTINCT`
+- order 363: `TOOL_MEMORY_COMPACT_PIN_MAX_CHARS` (constant), lines 4686-4686, exports `TOOL_MEMORY_COMPACT_PIN_MAX_CHARS`
+- order 364: `TOOL_MEMORY_POLICY_CHOICES` (constant), lines 4687-4687, exports `TOOL_MEMORY_POLICY_CHOICES`
+- order 365: `DEFAULT_TOOL_MEMORY_POLICY` (constant), lines 4688-4688, exports `DEFAULT_TOOL_MEMORY_POLICY`
+- order 366: `LONG_CONTENT_MEMORY_VERSION` (constant), lines 4689-4701, exports `LONG_CONTENT_MEMORY_VERSION`
+- order 367: `LONG_CONTENT_MEMORY_MAX_ITEMS` (constant), lines 4702-4705, exports `LONG_CONTENT_MEMORY_MAX_ITEMS`
+- order 368: `LONG_CONTENT_MEMORY_MAX_SEGMENTS` (constant), lines 4706-4709, exports `LONG_CONTENT_MEMORY_MAX_SEGMENTS`
+- order 369: `LONG_CONTENT_TEXT_SEGMENT_LINES` (constant), lines 4710-4713, exports `LONG_CONTENT_TEXT_SEGMENT_LINES`
+- order 370: `LONG_CONTENT_CODE_SEGMENT_LINES` (constant), lines 4714-4717, exports `LONG_CONTENT_CODE_SEGMENT_LINES`
+- order 371: `LONG_CONTENT_CARD_CHARS` (constant), lines 4718-4721, exports `LONG_CONTENT_CARD_CHARS`
+- order 372: `LONG_CONTENT_STRUCTURE_MAX_CHARS` (constant), lines 4722-4725, exports `LONG_CONTENT_STRUCTURE_MAX_CHARS`
+- order 373: `LONG_CONTENT_SEMANTIC_ENABLED` (constant), lines 4726-4733, exports `LONG_CONTENT_SEMANTIC_ENABLED`
+- order 374: `LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS` (constant), lines 4734-4737, exports `LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS`
+- order 375: `LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS` (constant), lines 4738-4741, exports `LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS`
+- order 376: `LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS` (constant), lines 4742-4745, exports `LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS`
+- order 377: `LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS` (constant), lines 4746-4746, exports `LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS`
+- order 378: `LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS` (constant), lines 4747-4747, exports `LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS`
+- order 379: `LONG_CONTENT_SEMANTIC_MAX_RELATIONS` (constant), lines 4748-4748, exports `LONG_CONTENT_SEMANTIC_MAX_RELATIONS`
+- order 380: `LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES` (constant), lines 4749-4749, exports `LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES`
+- order 381: `LONG_CONTENT_SEMANTIC_MAX_EVIDENCE` (constant), lines 4750-4750, exports `LONG_CONTENT_SEMANTIC_MAX_EVIDENCE`
+- order 382: `LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS` (constant), lines 4751-4751, exports `LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS`
+- order 383: `LONG_CONTENT_SEMANTIC_MAX_COVERED` (constant), lines 4752-4752, exports `LONG_CONTENT_SEMANTIC_MAX_COVERED`
+- order 384: `LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS` (constant), lines 4753-4753, exports `LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS`
+- order 385: `LONG_CONTENT_SEMANTIC_MAX_REFRESHES` (constant), lines 4754-4757, exports `LONG_CONTENT_SEMANTIC_MAX_REFRESHES`
+- order 386: `LONG_CONTENT_OBSERVATION_MAX` (constant), lines 4758-4761, exports `LONG_CONTENT_OBSERVATION_MAX`
+- order 387: `LONG_CONTENT_OBSERVATION_MAX_RANGES` (constant), lines 4762-4762, exports `LONG_CONTENT_OBSERVATION_MAX_RANGES`
+- order 388: `LONG_CONTENT_OBSERVATION_MAX_EXCERPTS` (constant), lines 4763-4763, exports `LONG_CONTENT_OBSERVATION_MAX_EXCERPTS`
+- order 389: `LONG_CONTENT_OBSERVATION_EXCERPT_CHARS` (constant), lines 4764-4764, exports `LONG_CONTENT_OBSERVATION_EXCERPT_CHARS`
+- order 390: `LONG_CONTENT_RELATED_SOURCE_MAX` (constant), lines 4765-4765, exports `LONG_CONTENT_RELATED_SOURCE_MAX`
+- order 391: `SHELL_SOURCE_CANDIDATE_MAX` (constant), lines 4766-4766, exports `SHELL_SOURCE_CANDIDATE_MAX`
+- order 392: `LONG_CONTENT_TEXT_EXTS` (constant), lines 4767-4769, exports `LONG_CONTENT_TEXT_EXTS`
+- order 393: `LONG_CONTENT_DATA_EXTS` (constant), lines 4770-4774, exports `LONG_CONTENT_DATA_EXTS`
+- order 394: `DEFAULT_AUTO_TASK_LEVEL_CEILING` (constant), lines 4775-4775, exports `DEFAULT_AUTO_TASK_LEVEL_CEILING`
+- order 395: `HARD_BREAK_TOOL_ERROR_THRESHOLD` (constant), lines 4776-4776, exports `HARD_BREAK_TOOL_ERROR_THRESHOLD`
+- order 396: `HARD_BREAK_RECOVERY_ROUND_THRESHOLD` (constant), lines 4777-4779, exports `HARD_BREAK_RECOVERY_ROUND_THRESHOLD`
+- order 397: `FUSED_FAULT_BREAK_THRESHOLD` (constant), lines 4780-4780, exports `FUSED_FAULT_BREAK_THRESHOLD`
+- order 398: `STALL_SEVERITY_ESCALATION_THRESHOLD` (constant), lines 4781-4781, exports `STALL_SEVERITY_ESCALATION_THRESHOLD`
+- order 399: `STALL_SEVERITY_WEIGHT_BASH_READ_LOOP` (constant), lines 4782-4782, exports `STALL_SEVERITY_WEIGHT_BASH_READ_LOOP`
+- order 400: `STALL_SEVERITY_WEIGHT_REPEATED_TOOL` (constant), lines 4783-4783, exports `STALL_SEVERITY_WEIGHT_REPEATED_TOOL`
+- order 401: `STALL_SEVERITY_WEIGHT_FAULT` (constant), lines 4784-4784, exports `STALL_SEVERITY_WEIGHT_FAULT`
+- order 402: `STALL_SEVERITY_WEIGHT_RECOVERY_RETRY` (constant), lines 4785-4785, exports `STALL_SEVERITY_WEIGHT_RECOVERY_RETRY`
+- order 403: `STALL_SEVERITY_WEIGHT_WATCHDOG` (constant), lines 4786-4786, exports `STALL_SEVERITY_WEIGHT_WATCHDOG`
+- order 404: `STALL_SEVERITY_DECAY_ON_SUCCESS` (constant), lines 4787-4787, exports `STALL_SEVERITY_DECAY_ON_SUCCESS`
+- order 405: `STALL_ESCALATION_MIN_LEVEL` (constant), lines 4788-4788, exports `STALL_ESCALATION_MIN_LEVEL`
+- order 406: `STALL_PLAN_SYNTHESIS_MAX_TOKENS` (constant), lines 4789-4789, exports `STALL_PLAN_SYNTHESIS_MAX_TOKENS`
+- order 407: `STALL_ESCALATION_CONTEXT_MAX_CHARS` (constant), lines 4790-4790, exports `STALL_ESCALATION_CONTEXT_MAX_CHARS`
+- order 408: `MAX_RUN_SECONDS` (constant), lines 4791-4791, exports `MAX_RUN_SECONDS`
+- order 409: `MIN_RUN_TIMEOUT_SECONDS` (constant), lines 4792-4792, exports `MIN_RUN_TIMEOUT_SECONDS`
+- order 410: `MAX_RUN_TIMEOUT_SECONDS` (constant), lines 4793-4793, exports `MAX_RUN_TIMEOUT_SECONDS`
+- order 411: `MIN_TIMEOUT_SECONDS` (constant), lines 4794-4794, exports `MIN_TIMEOUT_SECONDS`
+- order 412: `MAX_TIMEOUT_SECONDS` (constant), lines 4795-4795, exports `MAX_TIMEOUT_SECONDS`
+- order 413: `DEFAULT_TIMEOUT_SECONDS` (constant), lines 4796-4802, exports `DEFAULT_TIMEOUT_SECONDS`
+- order 414: `DEFAULT_REQUEST_TIMEOUT` (constant), lines 4803-4803, exports `DEFAULT_REQUEST_TIMEOUT`
+- order 415: `_SHELL_AUTO_CONFIRM_PATTERNS` (assignment), lines 4804-4819, exports `_SHELL_AUTO_CONFIRM_PATTERNS`
+- order 416: `MIN_SHELL_COMMAND_TIMEOUT_SECONDS` (constant), lines 4820-4820, exports `MIN_SHELL_COMMAND_TIMEOUT_SECONDS`
+- order 417: `MAX_SHELL_COMMAND_TIMEOUT_SECONDS` (constant), lines 4821-4821, exports `MAX_SHELL_COMMAND_TIMEOUT_SECONDS`
+- order 418: `SHELL_TIMEOUT_MODES` (constant), lines 4822-4822, exports `SHELL_TIMEOUT_MODES`
+- order 419: `_DEFAULT_SHELL_TIMEOUT_MODE_RAW` (assignment), lines 4823-4826, exports `_DEFAULT_SHELL_TIMEOUT_MODE_RAW`
+- order 420: `DEFAULT_SHELL_TIMEOUT_MODE` (constant), lines 4827-4831, exports `DEFAULT_SHELL_TIMEOUT_MODE`
+- order 421: `MIN_SHELL_ASYNC_HANDOFF_SECONDS` (constant), lines 4832-4832, exports `MIN_SHELL_ASYNC_HANDOFF_SECONDS`
+- order 422: `MAX_SHELL_ASYNC_HANDOFF_SECONDS` (constant), lines 4833-4833, exports `MAX_SHELL_ASYNC_HANDOFF_SECONDS`
+- order 423: `SHELL_FAILURE_GUIDANCE_SECONDS` (constant), lines 4834-4836, exports `SHELL_FAILURE_GUIDANCE_SECONDS`
+- order 424: `DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS` (constant), lines 4837-4851, exports `DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS`
+- order 425: `DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS` (constant), lines 4852-4866, exports `DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS`
+- order 426: `DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT` (constant), lines 4867-4881, exports `DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT`
+- order 427: `SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS` (constant), lines 4882-4882, exports `SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS`
+- order 428: `AUTO_CONTINUE_BUDGET_DEFAULT` (constant), lines 4883-4883, exports `AUTO_CONTINUE_BUDGET_DEFAULT`
+- order 429: `AGENT_MAX_OUTPUT_TOKENS` (constant), lines 4884-4884, exports `AGENT_MAX_OUTPUT_TOKENS`
+- order 430: `OLLAMA_THINKING_TOOL_BUFFER` (constant), lines 4885-4885, exports `OLLAMA_THINKING_TOOL_BUFFER`
+- order 431: `WATCHDOG_INTENT_NO_TOOL_THRESHOLD` (constant), lines 4886-4886, exports `WATCHDOG_INTENT_NO_TOOL_THRESHOLD`
+- order 432: `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD` (constant), lines 4887-4887, exports `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD`
+- order 433: `WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE` (constant), lines 4888-4888, exports `WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE`
+- order 434: `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE` (constant), lines 4889-4889, exports `WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE`
+- order 435: `WATCHDOG_STATE_STALL_THRESHOLD` (constant), lines 4890-4890, exports `WATCHDOG_STATE_STALL_THRESHOLD`
+- order 436: `WATCHDOG_CONTEXT_STALL_THRESHOLD` (constant), lines 4891-4891, exports `WATCHDOG_CONTEXT_STALL_THRESHOLD`
+- order 437: `WATCHDOG_REPEAT_SIMILARITY_THRESHOLD` (constant), lines 4892-4892, exports `WATCHDOG_REPEAT_SIMILARITY_THRESHOLD`
+- order 438: `WATCHDOG_CONTEXT_NEAR_RATIO` (constant), lines 4893-4893, exports `WATCHDOG_CONTEXT_NEAR_RATIO`
+- order 439: `WATCHDOG_MAX_DECOMPOSE_STEPS` (constant), lines 4894-4894, exports `WATCHDOG_MAX_DECOMPOSE_STEPS`
+- order 440: `WATCHDOG_STEP_MAX_ATTEMPTS` (constant), lines 4895-4895, exports `WATCHDOG_STEP_MAX_ATTEMPTS`
+- order 441: `EMPTY_ACTION_MIN_CONTENT_CHARS` (constant), lines 4896-4896, exports `EMPTY_ACTION_MIN_CONTENT_CHARS`
+- order 442: `EMPTY_ACTION_WAKEUP_RETRY_LIMIT` (constant), lines 4897-4897, exports `EMPTY_ACTION_WAKEUP_RETRY_LIMIT`
+- order 443: `EMPTY_ACTION_INTERVENTION_THRESHOLD` (constant), lines 4898-4904, exports `EMPTY_ACTION_INTERVENTION_THRESHOLD`
+- order 444: `EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS` (constant), lines 4905-4909, exports `EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS`
+- order 445: `EMPTY_ACTION_RECOVERY_MAX_TOKENS` (constant), lines 4910-4910, exports `EMPTY_ACTION_RECOVERY_MAX_TOKENS`
+- order 446: `THINKING_BUDGET_FORCE_RATIO` (constant), lines 4911-4911, exports `THINKING_BUDGET_FORCE_RATIO`
+- order 447: `_TOOL_TIMEOUT_MAP` (assignment), lines 4912-4933, exports `_TOOL_TIMEOUT_MAP`
+- order 448: `_DEFAULT_TOOL_TIMEOUT` (assignment), lines 4934-4934, exports `_DEFAULT_TOOL_TIMEOUT`
+- order 449: `CONVERSATION_VISIBLE_TOOL_EVENTS` (constant), lines 4935-4947, exports `CONVERSATION_VISIBLE_TOOL_EVENTS`
+- order 450: `PERSIST_ON_EVENT_TYPES` (constant), lines 4948-4966, exports `PERSIST_ON_EVENT_TYPES`
+- order 451: `PERSIST_EVENT_MIN_INTERVAL_SECONDS` (constant), lines 4967-4967, exports `PERSIST_EVENT_MIN_INTERVAL_SECONDS`
+- order 452: `TRUNCATION_CONTINUATION_MAX_PASSES` (constant), lines 4968-4968, exports `TRUNCATION_CONTINUATION_MAX_PASSES`
+- order 453: `TRUNCATION_CONTINUATION_MAX_TOKENS` (constant), lines 4969-4969, exports `TRUNCATION_CONTINUATION_MAX_TOKENS`
+- order 454: `TRUNCATION_CONTINUATION_TAIL_CHARS` (constant), lines 4970-4970, exports `TRUNCATION_CONTINUATION_TAIL_CHARS`
+- order 455: `TRUNCATION_CONTINUATION_ECHO_CHARS` (constant), lines 4971-4971, exports `TRUNCATION_CONTINUATION_ECHO_CHARS`
+- order 456: `TRUNCATION_OVERLAP_SCAN_CHARS` (constant), lines 4972-4972, exports `TRUNCATION_OVERLAP_SCAN_CHARS`
+- order 457: `TRUNCATION_PAIR_SCAN_CHARS` (constant), lines 4973-4973, exports `TRUNCATION_PAIR_SCAN_CHARS`
+- order 458: `TRUNCATION_LIVE_BUFFER_MAX_CHARS` (constant), lines 4974-4974, exports `TRUNCATION_LIVE_BUFFER_MAX_CHARS`
+- order 459: `MIN_CONTEXT_TOKEN_LIMIT` (constant), lines 4975-4975, exports `MIN_CONTEXT_TOKEN_LIMIT`
+- order 460: `COMPACT_TIER1_PCT` (constant), lines 4976-4977, exports `COMPACT_TIER1_PCT`
+- order 461: `COMPACT_TIER2_PCT` (constant), lines 4978-4978, exports `COMPACT_TIER2_PCT`
+- order 462: `COMPACT_TIER3_PCT` (constant), lines 4979-4979, exports `COMPACT_TIER3_PCT`
+- order 463: `COMPACT_TIER1_ABS` (constant), lines 4980-4981, exports `COMPACT_TIER1_ABS`
+- order 464: `COMPACT_TIER2_ABS` (constant), lines 4982-4982, exports `COMPACT_TIER2_ABS`
+- order 465: `CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS` (constant), lines 4983-4989, exports `CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS`
+- order 466: `FILE_BUFFER_CONTENT_THRESHOLD` (constant), lines 4990-4991, exports `FILE_BUFFER_CONTENT_THRESHOLD`
+- order 467: `FILE_BUFFER_MAX_FILES` (constant), lines 4992-4992, exports `FILE_BUFFER_MAX_FILES`
+- order 468: `AUTHORITATIVE_USER_GOAL_OPEN` (constant), lines 4993-4993, exports `AUTHORITATIVE_USER_GOAL_OPEN`
+- order 469: `AUTHORITATIVE_USER_GOAL_CLOSE` (constant), lines 4994-4994, exports `AUTHORITATIVE_USER_GOAL_CLOSE`
+- order 470: `AGENT_MSG_LIMIT_TIER0` (constant), lines 4995-4996, exports `AGENT_MSG_LIMIT_TIER0`
+- order 471: `AGENT_MSG_LIMIT_TIER1` (constant), lines 4997-4997, exports `AGENT_MSG_LIMIT_TIER1`
+- order 472: `AGENT_MSG_LIMIT_TIER2` (constant), lines 4998-4998, exports `AGENT_MSG_LIMIT_TIER2`
+- order 473: `AGENT_MSG_LIMIT_TIER3` (constant), lines 4999-4999, exports `AGENT_MSG_LIMIT_TIER3`
+- order 474: `AGENT_CTX_LIMIT_TIER0` (constant), lines 5000-5000, exports `AGENT_CTX_LIMIT_TIER0`
+- order 475: `AGENT_CTX_LIMIT_TIER1` (constant), lines 5001-5001, exports `AGENT_CTX_LIMIT_TIER1`
+- order 476: `AGENT_CTX_LIMIT_TIER2` (constant), lines 5002-5002, exports `AGENT_CTX_LIMIT_TIER2`
+- order 477: `AGENT_CTX_LIMIT_TIER3` (constant), lines 5003-5003, exports `AGENT_CTX_LIMIT_TIER3`
+- order 478: `MANAGER_CTX_LIMIT_TIER0` (constant), lines 5004-5004, exports `MANAGER_CTX_LIMIT_TIER0`
+- order 479: `MANAGER_CTX_LIMIT_TIER1` (constant), lines 5005-5005, exports `MANAGER_CTX_LIMIT_TIER1`
+- order 480: `MANAGER_CTX_LIMIT_TIER2` (constant), lines 5006-5006, exports `MANAGER_CTX_LIMIT_TIER2`
+- order 481: `MANAGER_CTX_LIMIT_TIER3` (constant), lines 5007-5007, exports `MANAGER_CTX_LIMIT_TIER3`
+- order 482: `MAX_CONTEXT_ARCHIVE_SEGMENTS` (constant), lines 5008-5008, exports `MAX_CONTEXT_ARCHIVE_SEGMENTS`
+- order 483: `MAX_USER_BUBBLE_LOG` (constant), lines 5009-5010, exports `MAX_USER_BUBBLE_LOG`
+- order 484: `MANAGER_INSTRUCTION_MAX_CHARS` (constant), lines 5011-5015, exports `MANAGER_INSTRUCTION_MAX_CHARS`
+- order 485: `MANAGER_MOMENTUM_MAX_SKIPS` (constant), lines 5016-5021, exports `MANAGER_MOMENTUM_MAX_SKIPS`
+- order 486: `MODEL_OUTPUT_RETRY_TIMES` (constant), lines 5022-5026, exports `MODEL_OUTPUT_RETRY_TIMES`
+- order 487: `ARBITER_TRIGGER_MIN_CONTENT_CHARS` (constant), lines 5027-5027, exports `ARBITER_TRIGGER_MIN_CONTENT_CHARS`
+- order 488: `ARBITER_VALID_PLANNING_STREAK_LIMIT` (constant), lines 5028-5028, exports `ARBITER_VALID_PLANNING_STREAK_LIMIT`
+- order 489: `ARBITER_DEFAULT_TIMEOUT_SECONDS` (constant), lines 5029-5029, exports `ARBITER_DEFAULT_TIMEOUT_SECONDS`
+- order 490: `ARBITER_DEFAULT_MAX_TOKENS` (constant), lines 5030-5030, exports `ARBITER_DEFAULT_MAX_TOKENS`
+- order 491: `ARBITER_DEFAULT_TEMPERATURE` (constant), lines 5031-5031, exports `ARBITER_DEFAULT_TEMPERATURE`
+- order 492: `LIVE_INPUT_DELAY_WRITE_ROUNDS` (constant), lines 5032-5032, exports `LIVE_INPUT_DELAY_WRITE_ROUNDS`
+- order 493: `LIVE_INPUT_DELAY_TOOL_ROUNDS` (constant), lines 5033-5033, exports `LIVE_INPUT_DELAY_TOOL_ROUNDS`
+- order 494: `LIVE_INPUT_DELAY_NORMAL_ROUNDS` (constant), lines 5034-5034, exports `LIVE_INPUT_DELAY_NORMAL_ROUNDS`
+- order 495: `LIVE_INPUT_MAX_INJECTIONS` (constant), lines 5035-5035, exports `LIVE_INPUT_MAX_INJECTIONS`
+- order 496: `LIVE_INPUT_REINJECT_INTERVAL` (constant), lines 5036-5036, exports `LIVE_INPUT_REINJECT_INTERVAL`
+- order 497: `LIVE_INPUT_WEIGHT_BASE_DELAYED` (constant), lines 5037-5037, exports `LIVE_INPUT_WEIGHT_BASE_DELAYED`
+- order 498: `LIVE_INPUT_WEIGHT_BASE_NORMAL` (constant), lines 5038-5038, exports `LIVE_INPUT_WEIGHT_BASE_NORMAL`
+- order 499: `LIVE_INPUT_WEIGHT_STEP_DELAYED` (constant), lines 5039-5039, exports `LIVE_INPUT_WEIGHT_STEP_DELAYED`
+- order 500: `LIVE_INPUT_WEIGHT_STEP_NORMAL` (constant), lines 5040-5040, exports `LIVE_INPUT_WEIGHT_STEP_NORMAL`
+- order 502: `BENIGN_SOCKET_DEBUG_LOG_ENABLED` (constant), lines 5047-5053, exports `BENIGN_SOCKET_DEBUG_LOG_ENABLED`
+- order 503: `BENIGN_SOCKET_LOG_INTERVAL_SECONDS` (constant), lines 5054-5054, exports `BENIGN_SOCKET_LOG_INTERVAL_SECONDS`
+- order 504: `FINAL_SUMMARY_MIN_CHARS` (constant), lines 5055-5055, exports `FINAL_SUMMARY_MIN_CHARS`
+- order 505: `FINAL_SUMMARY_STRICT_MIN_CHARS` (constant), lines 5056-5056, exports `FINAL_SUMMARY_STRICT_MIN_CHARS`
+- order 506: `RUNTIME_CONTROL_HINT_PREFIXES` (constant), lines 5057-5077, exports `RUNTIME_CONTROL_HINT_PREFIXES`
+- order 507: `UI_HIDDEN_RUNTIME_CONTROL_PREFIXES` (constant), lines 5078-5106, exports `UI_HIDDEN_RUNTIME_CONTROL_PREFIXES`
+- order 508: `UI_PROJECTED_RUNTIME_CONTROL_TAGS` (constant), lines 5107-5129, exports `UI_PROJECTED_RUNTIME_CONTROL_TAGS`
+- order 509: `UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS` (constant), lines 5130-5132, exports `UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS`
+- order 510: `RETRY_RUNTIME_HINT_PREFIXES` (constant), lines 5133-5147, exports `RETRY_RUNTIME_HINT_PREFIXES`
+- order 511: `EXECUTION_MODE_SINGLE` (constant), lines 5148-5148, exports `EXECUTION_MODE_SINGLE`
+- order 512: `EXECUTION_MODE_SEQUENTIAL` (constant), lines 5149-5149, exports `EXECUTION_MODE_SEQUENTIAL`
+- order 513: `EXECUTION_MODE_SYNC` (constant), lines 5150-5150, exports `EXECUTION_MODE_SYNC`
+- order 514: `EXECUTION_MODE_CHOICES` (constant), lines 5151-5155, exports `EXECUTION_MODE_CHOICES`
+- order 515: `AGENT_ROLES` (constant), lines 5156-5156, exports `AGENT_ROLES`
+- order 516: `AGENT_BUBBLE_ROLES` (constant), lines 5157-5157, exports `AGENT_BUBBLE_ROLES`
+- order 517: `AGENT_ROLE_LABELS` (constant), lines 5158-5164, exports `AGENT_ROLE_LABELS`
+- order 518: `AGENT_ROLE_BUBBLE_COLORS` (constant), lines 5165-5171, exports `AGENT_ROLE_BUBBLE_COLORS`
+- order 519: `BLACKBOARD_STATUSES` (constant), lines 5172-5181, exports `BLACKBOARD_STATUSES`
+- order 520: `TASK_COMPLEXITY_LEVELS` (constant), lines 5182-5182, exports `TASK_COMPLEXITY_LEVELS`
+- order 521: `TASK_COMPLEXITY_RANKS` (constant), lines 5183-5188, exports `TASK_COMPLEXITY_RANKS`
+- order 522: `TASK_PROFILE_TYPES` (constant), lines 5189-5195, exports `TASK_PROFILE_TYPES`
+- order 523: `TASK_LEVEL_CHOICES` (constant), lines 5196-5196, exports `TASK_LEVEL_CHOICES`
+- order 524: `TASK_SCALE_PREFERENCES` (constant), lines 5197-5197, exports `TASK_SCALE_PREFERENCES`
+- order 525: `SEMANTIC_CONFIDENCE_CHOICES` (constant), lines 5198-5198, exports `SEMANTIC_CONFIDENCE_CHOICES`
+- order 526: `L2_TODO_POLICY_CHOICES` (constant), lines 5199-5203, exports `L2_TODO_POLICY_CHOICES`
+- order 527: `DEFAULT_L2_TODO_POLICY` (constant), lines 5204-5204, exports `DEFAULT_L2_TODO_POLICY`
+- order 528: `TASK_LEVEL_POLICIES` (constant), lines 5205-5258, exports `TASK_LEVEL_POLICIES`
+- order 529: `MANAGER_ROUTE_TARGETS` (constant), lines 5259-5259, exports `MANAGER_ROUTE_TARGETS`
+- order 530: `BLACKBOARD_MAX_LOG_ENTRIES` (constant), lines 5260-5260, exports `BLACKBOARD_MAX_LOG_ENTRIES`
+- order 531: `BLACKBOARD_MAX_TEXT` (constant), lines 5261-5261, exports `BLACKBOARD_MAX_TEXT`
+- order 532: `BLACKBOARD_MEMORY_SHORT_MAX` (constant), lines 5262-5262, exports `BLACKBOARD_MEMORY_SHORT_MAX`
+- order 533: `BLACKBOARD_MEMORY_MID_MAX_STEPS` (constant), lines 5263-5263, exports `BLACKBOARD_MEMORY_MID_MAX_STEPS`
+- order 534: `BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP` (constant), lines 5264-5264, exports `BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP`
+- order 535: `BLACKBOARD_MEMORY_LONG_MAX` (constant), lines 5265-5265, exports `BLACKBOARD_MEMORY_LONG_MAX`
+- order 536: `BLACKBOARD_MEMORY_INDEX_MAX` (constant), lines 5266-5266, exports `BLACKBOARD_MEMORY_INDEX_MAX`
+- order 537: `SKILL_REFRESH_MIN_INTERVAL_SECONDS` (constant), lines 5267-5267, exports `SKILL_REFRESH_MIN_INTERVAL_SECONDS`
+- order 538: `SKILL_CATALOG_FULL_REFRESH_SECONDS` (constant), lines 5268-5271, exports `SKILL_CATALOG_FULL_REFRESH_SECONDS`
+- order 539: `SKILL_PROMPT_MAX_ITEMS` (constant), lines 5272-5272, exports `SKILL_PROMPT_MAX_ITEMS`
+- order 540: `SKILL_PROMPT_MAX_CHARS` (constant), lines 5273-5273, exports `SKILL_PROMPT_MAX_CHARS`
+- order 541: `SKILL_RUNTIME_CACHE_MAX_ENTRIES` (constant), lines 5274-5274, exports `SKILL_RUNTIME_CACHE_MAX_ENTRIES`
+- order 542: `SKILL_RUNTIME_CACHE_MAX_BYTES` (constant), lines 5275-5275, exports `SKILL_RUNTIME_CACHE_MAX_BYTES`
+- order 543: `SKILL_AUTOLOAD_SCORE_THRESHOLD` (constant), lines 5276-5279, exports `SKILL_AUTOLOAD_SCORE_THRESHOLD`
+- order 544: `SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD` (constant), lines 5280-5280, exports `SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD`
+- order 545: `SKILL_RUNTIME_EVALUATION_TTL_SECONDS` (constant), lines 5281-5281, exports `SKILL_RUNTIME_EVALUATION_TTL_SECONDS`
+- order 546: `SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS` (constant), lines 5282-5282, exports `SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS`
+- order 547: `SKILL_RUNTIME_UNLOAD_CONFIDENCE_THRESHOLD` (constant), lines 5283-5283, exports `SKILL_RUNTIME_UNLOAD_CONFIDENCE_THRESHOLD`
+- order 548: `SKILL_RUNTIME_KEY_TOOL_INTERVAL` (constant), lines 5284-5284, exports `SKILL_RUNTIME_KEY_TOOL_INTERVAL`
+- order 549: `SKILL_RUNTIME_EVENTS_MAX` (constant), lines 5285-5285, exports `SKILL_RUNTIME_EVENTS_MAX`
+- order 550: `SKILL_METADATA_CAPSULE_MAX_CHARS` (constant), lines 5286-5286, exports `SKILL_METADATA_CAPSULE_MAX_CHARS`
+- order 551: `SKILL_DEPENDENCY_MAX_DEPTH` (constant), lines 5287-5287, exports `SKILL_DEPENDENCY_MAX_DEPTH`
+- order 552: `AUTO_SKILLS_ROOT_CANDIDATES` (constant), lines 5288-5288, exports `AUTO_SKILLS_ROOT_CANDIDATES`
+- order 553: `SKILL_DEFAULT_ATTACHMENT_GLOBS` (constant), lines 5289-5319, exports `SKILL_DEFAULT_ATTACHMENT_GLOBS`
+- order 554: `SKILL_INLINE_ATTACHMENT_MAX_FILES` (constant), lines 5320-5320, exports `SKILL_INLINE_ATTACHMENT_MAX_FILES`
+- order 555: `SKILL_INLINE_ATTACHMENT_MAX_CHARS` (constant), lines 5321-5321, exports `SKILL_INLINE_ATTACHMENT_MAX_CHARS`
+- order 556: `SKILL_RESOURCE_MANIFEST_MAX_ITEMS` (constant), lines 5322-5322, exports `SKILL_RESOURCE_MANIFEST_MAX_ITEMS`
+- order 557: `SKILL_BODY_COMPACT_THRESHOLD_CHARS` (constant), lines 5323-5323, exports `SKILL_BODY_COMPACT_THRESHOLD_CHARS`
+- order 558: `SKILL_BODY_PREVIEW_CHARS` (constant), lines 5324-5324, exports `SKILL_BODY_PREVIEW_CHARS`
+- order 559: `SKILLS_VIRTUAL_PREFIX` (constant), lines 5325-5325, exports `SKILLS_VIRTUAL_PREFIX`
+- order 560: `SKILLS_EXTERNAL_MOUNT` (constant), lines 5326-5326, exports `SKILLS_EXTERNAL_MOUNT`
+- order 561: `PLAN_MODE_ENABLED_LEVELS` (constant), lines 5327-5327, exports `PLAN_MODE_ENABLED_LEVELS`
+- order 562: `PLAN_MODE_FORCED_LEVELS` (constant), lines 5328-5328, exports `PLAN_MODE_FORCED_LEVELS`
+- order 563: `PLAN_MODE_USER_CHOICES` (constant), lines 5329-5329, exports `PLAN_MODE_USER_CHOICES`
+- order 564: `TASK_PHASES` (constant), lines 5330-5331, exports `TASK_PHASES`
+- order 565: `TASK_PHASE_ROUTING` (constant), lines 5332-5339, exports `TASK_PHASE_ROUTING`
+- order 566: `COMPLEXITY_KEYWORDS` (constant), lines 5340-5346, exports `COMPLEXITY_KEYWORDS`
+- order 567: `USER_COMPLEXITY_SIMPLE_TOKENS` (constant), lines 5347-5351, exports `USER_COMPLEXITY_SIMPLE_TOKENS`
+- order 568: `USER_COMPLEXITY_MODERATE_TOKENS` (constant), lines 5352-5356, exports `USER_COMPLEXITY_MODERATE_TOKENS`
+- order 569: `USER_COMPLEXITY_COMPLEX_TOKENS` (constant), lines 5357-5361, exports `USER_COMPLEXITY_COMPLEX_TOKENS`
+- order 570: `USER_COMPLEXITY_EXPERT_TOKENS` (constant), lines 5362-5366, exports `USER_COMPLEXITY_EXPERT_TOKENS`
+- order 571: `PLAN_MODE_EXPLORER_MAX_ROUNDS` (constant), lines 5367-5370, exports `PLAN_MODE_EXPLORER_MAX_ROUNDS`
+- order 572: `PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS` (constant), lines 5371-5371, exports `PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS`
+- order 573: `PLAN_MODE_EXPLORER_STALE_ROUNDS` (constant), lines 5372-5372, exports `PLAN_MODE_EXPLORER_STALE_ROUNDS`
+- order 574: `PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS` (constant), lines 5373-5373, exports `PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS`
+- order 575: `REVIEWER_DEBUG_MODE_MAX_ROUNDS` (constant), lines 5374-5375, exports `REVIEWER_DEBUG_MODE_MAX_ROUNDS`
+- order 576: `REVIEWER_DEBUG_TOOL_ALLOWLIST` (constant), lines 5376-5381, exports `REVIEWER_DEBUG_TOOL_ALLOWLIST`
+- order 577: `EXPLORER_STALL_THRESHOLD` (constant), lines 5382-5382, exports `EXPLORER_STALL_THRESHOLD`
+- order 578: `DEVELOPER_EDIT_STALL_THRESHOLD` (constant), lines 5383-5383, exports `DEVELOPER_EDIT_STALL_THRESHOLD`
+- order 579: `ACCEPTANCE_GATE_STALL_THRESHOLD` (constant), lines 5384-5387, exports `ACCEPTANCE_GATE_STALL_THRESHOLD`
+- order 580: `ACCEPTANCE_GATE_HARD_CEILING` (constant), lines 5388-5391, exports `ACCEPTANCE_GATE_HARD_CEILING`
+- order 581: `ACCEPTANCE_GATE_TOTAL_ROUND_CEILING` (constant), lines 5392-5392, exports `ACCEPTANCE_GATE_TOTAL_ROUND_CEILING`
+- order 582: `PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS` (constant), lines 5393-5393, exports `PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS`
+- order 583: `PLAN_MODE_MAX_OPTIONS` (constant), lines 5394-5394, exports `PLAN_MODE_MAX_OPTIONS`
+- order 584: `PLAN_FILE_RELATIVE_PATH` (constant), lines 5395-5395, exports `PLAN_FILE_RELATIVE_PATH`
+- order 585: `PLAN_BUBBLE_MAX_CHARS` (constant), lines 5396-5396, exports `PLAN_BUBBLE_MAX_CHARS`
+- order 586: `PLAN_NOTICE_BODY_MAX_CHARS` (constant), lines 5397-5397, exports `PLAN_NOTICE_BODY_MAX_CHARS`
+- order 587: `PLAN_MESSAGE_EVENT_MAX_CHARS` (constant), lines 5398-5398, exports `PLAN_MESSAGE_EVENT_MAX_CHARS`
+- order 588: `PLAN_STEP_FULL_CONTENT_MAX_CHARS` (constant), lines 5399-5399, exports `PLAN_STEP_FULL_CONTENT_MAX_CHARS`
+- order 589: `PLAN_MODE_RESEARCH_TOOL_ALLOWLIST` (constant), lines 5400-5407, exports `PLAN_MODE_RESEARCH_TOOL_ALLOWLIST`
+- order 590: `FAILURE_LEDGER_MAX_FIXES` (constant), lines 5408-5408, exports `FAILURE_LEDGER_MAX_FIXES`
+- order 591: `FAILURE_LEDGER_MAX_COMPILE_ERRORS` (constant), lines 5409-5409, exports `FAILURE_LEDGER_MAX_COMPILE_ERRORS`
+- order 592: `FAILURE_LEDGER_MAX_DELEGATIONS` (constant), lines 5410-5410, exports `FAILURE_LEDGER_MAX_DELEGATIONS`
+- order 593: `FAILURE_LEDGER_MAX_STALLS` (constant), lines 5411-5411, exports `FAILURE_LEDGER_MAX_STALLS`
+- order 594: `FAILURE_LEDGER_MAX_TOOL_FPS` (constant), lines 5412-5412, exports `FAILURE_LEDGER_MAX_TOOL_FPS`
+- order 595: `FAILURE_LEDGER_MAX_ERRORS` (constant), lines 5413-5413, exports `FAILURE_LEDGER_MAX_ERRORS`
+- order 596: `ERROR_CATEGORY_DEFS` (constant), lines 5414-5453, exports `ERROR_CATEGORY_DEFS`
+- order 597: `CHECKPOINT_MAX_COUNT` (constant), lines 5454-5454, exports `CHECKPOINT_MAX_COUNT`
+- order 598: `CHECKPOINT_INTERVAL_ROUNDS` (constant), lines 5455-5455, exports `CHECKPOINT_INTERVAL_ROUNDS`
+- order 599: `PERSISTED_ROUTES_MAX` (constant), lines 5456-5456, exports `PERSISTED_ROUTES_MAX`
+- order 600: `HTML_FRONTEND_REQUEST_KEYWORDS` (constant), lines 5457-5496, exports `HTML_FRONTEND_REQUEST_KEYWORDS`
+- order 601: `DEEP_RESEARCH_REQUEST_KEYWORDS` (constant), lines 5497-5519, exports `DEEP_RESEARCH_REQUEST_KEYWORDS`
+- order 602: `DEEP_RESEARCH_RETRIEVAL_KEYWORDS` (constant), lines 5520-5539, exports `DEEP_RESEARCH_RETRIEVAL_KEYWORDS`
+- order 603: `DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS` (constant), lines 5540-5557, exports `DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS`
+- order 604: `DANGEROUS_PATTERNS` (constant), lines 5558-5559, exports `DANGEROUS_PATTERNS`
+- order 605: `VALID_MSG_TYPES` (constant), lines 5560-5566, exports `VALID_MSG_TYPES`
+- order 606: `SUPPORTED_UI_LANGUAGES` (constant), lines 5567-5573, exports `SUPPORTED_UI_LANGUAGES`
+- order 607: `UI_LANGUAGE_LABELS` (constant), lines 5574-5574, exports `UI_LANGUAGE_LABELS`
+- order 608: `DEFAULT_UI_LANGUAGE` (constant), lines 5575-5575, exports `DEFAULT_UI_LANGUAGE`
+- order 609: `PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED` (constant), lines 5576-5578, exports `PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED`
+- order 610: `AGENT_LANGUAGE_PREFERENCES` (constant), lines 5579-5620, exports `AGENT_LANGUAGE_PREFERENCES`
+- order 611: `UI_STYLE_CHOICES` (constant), lines 5621-5621, exports `UI_STYLE_CHOICES`
+- order 612: `UI_STYLE_LABELS` (constant), lines 5622-5622, exports `UI_STYLE_LABELS`
+- order 613: `DEFAULT_UI_STYLE` (constant), lines 5623-5623, exports `DEFAULT_UI_STYLE`
+- order 614: `DEFAULT_WEB_UI_DIR` (constant), lines 5624-5624, exports `DEFAULT_WEB_UI_DIR`
+- order 615: `DEFAULT_WEB_UI_CONFIG` (constant), lines 5625-5625, exports `DEFAULT_WEB_UI_CONFIG`
+- order 616: `WEB_UI_REQUIRED_FILES` (constant), lines 5626-5633, exports `WEB_UI_REQUIRED_FILES`
+- order 617: `WEB_UI_OPTIONAL_FILES` (constant), lines 5634-5634, exports `WEB_UI_OPTIONAL_FILES`
+- order 618: `WEB_UI_APPLICATION_CONTRACT_VERSION` (constant), lines 5635-5635, exports `WEB_UI_APPLICATION_CONTRACT_VERSION`
+- order 619: `WEB_UI_APPLICATION_FEATURE_MARKERS` (constant), lines 5636-5655, exports `WEB_UI_APPLICATION_FEATURE_MARKERS`
+- order 620: `IMAGE_EXTS` (constant), lines 5656-5670, exports `IMAGE_EXTS`
+- order 621: `IMAGE_FORMATS_NEED_CONVERSION` (constant), lines 5671-5671, exports `IMAGE_FORMATS_NEED_CONVERSION`
+- order 622: `IMAGE_SAFE_FORMATS` (constant), lines 5672-5672, exports `IMAGE_SAFE_FORMATS`
+- order 623: `AUDIO_EXTS` (constant), lines 5673-5683, exports `AUDIO_EXTS`
+- order 624: `VIDEO_EXTS` (constant), lines 5684-5694, exports `VIDEO_EXTS`
+- order 625: `CODE_PREVIEW_STAGE_MAX_BYTES` (constant), lines 5695-5695, exports `CODE_PREVIEW_STAGE_MAX_BYTES`
+- order 626: `CODE_PREVIEW_STAGE_MAX_ROWS` (constant), lines 5696-5696, exports `CODE_PREVIEW_STAGE_MAX_ROWS`
+- order 627: `CODE_PREVIEW_STAGE_MAX_PER_FILE` (constant), lines 5697-5697, exports `CODE_PREVIEW_STAGE_MAX_PER_FILE`
+- order 628: `CODE_PREVIEW_STAGE_MAX_TOTAL` (constant), lines 5698-5698, exports `CODE_PREVIEW_STAGE_MAX_TOTAL`
+- order 629: `CODE_PREVIEW_DIFF_CONTEXT_LINES` (constant), lines 5699-5699, exports `CODE_PREVIEW_DIFF_CONTEXT_LINES`
+- order 630: `CODE_PREVIEW_DIFF_MERGE_GAP` (constant), lines 5700-5700, exports `CODE_PREVIEW_DIFF_MERGE_GAP`
+- order 631: `PREVIEW_DOWNLOAD_MAX_FILES` (constant), lines 5701-5701, exports `PREVIEW_DOWNLOAD_MAX_FILES`
+- order 632: `PREVIEW_DOWNLOAD_MAX_BYTES` (constant), lines 5702-5702, exports `PREVIEW_DOWNLOAD_MAX_BYTES`
+- order 633: `FILES_TREE_DEFAULT_MAX_NODES` (constant), lines 5703-5703, exports `FILES_TREE_DEFAULT_MAX_NODES`
+- order 634: `FILES_TREE_DEFAULT_MAX_DEPTH` (constant), lines 5704-5704, exports `FILES_TREE_DEFAULT_MAX_DEPTH`
+- order 635: `FILES_TREE_SKIP_DIRS` (constant), lines 5705-5713, exports `FILES_TREE_SKIP_DIRS`
+- order 636: `FILES_TREE_SKIP_REL_DIRS` (constant), lines 5714-5716, exports `FILES_TREE_SKIP_REL_DIRS`
+- order 637: `IDE_FILE_MAX_BYTES` (constant), lines 5717-5717, exports `IDE_FILE_MAX_BYTES`
+- order 638: `IDE_UPLOAD_MAX_BYTES` (constant), lines 5718-5718, exports `IDE_UPLOAD_MAX_BYTES`
+- order 639: `IDE_UPLOAD_TOTAL_MAX_BYTES` (constant), lines 5719-5719, exports `IDE_UPLOAD_TOTAL_MAX_BYTES`
+- order 640: `IDE_UPLOAD_MAX_ITEMS` (constant), lines 5720-5720, exports `IDE_UPLOAD_MAX_ITEMS`
+- order 641: `IDE_UPLOAD_CHUNK_MAX_BYTES` (constant), lines 5721-5721, exports `IDE_UPLOAD_CHUNK_MAX_BYTES`
+- order 642: `IDE_UPLOAD_STREAM_MAX_BYTES` (constant), lines 5722-5722, exports `IDE_UPLOAD_STREAM_MAX_BYTES`
+- order 643: `IDE_TEXT_PREVIEW_MAX_BYTES` (constant), lines 5723-5723, exports `IDE_TEXT_PREVIEW_MAX_BYTES`
+- order 644: `IDE_MARKDOWN_PREVIEW_MAX_LINES` (constant), lines 5724-5724, exports `IDE_MARKDOWN_PREVIEW_MAX_LINES`
+- order 645: `IDE_IMAGE_PREVIEW_MAX_EDGE` (constant), lines 5725-5725, exports `IDE_IMAGE_PREVIEW_MAX_EDGE`
+- order 646: `IDE_IMAGE_PREVIEW_MAX_PIXELS` (constant), lines 5726-5726, exports `IDE_IMAGE_PREVIEW_MAX_PIXELS`
+- order 647: `IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS` (constant), lines 5727-5727, exports `IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS`
+- order 648: `IDE_VECTOR_PREVIEW_MAX_BYTES` (constant), lines 5728-5728, exports `IDE_VECTOR_PREVIEW_MAX_BYTES`
+- order 649: `IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES` (constant), lines 5729-5729, exports `IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES`
+- order 650: `IDE_TABLE_PREVIEW_CELL_MAX_CHARS` (constant), lines 5730-5730, exports `IDE_TABLE_PREVIEW_CELL_MAX_CHARS`
+- order 651: `IDE_TABLE_PREVIEW_TOTAL_CHARS` (constant), lines 5731-5731, exports `IDE_TABLE_PREVIEW_TOTAL_CHARS`
+- order 652: `IDE_OFFICE_PREVIEW_MAX_ENTRIES` (constant), lines 5732-5732, exports `IDE_OFFICE_PREVIEW_MAX_ENTRIES`
+- order 653: `IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES` (constant), lines 5733-5733, exports `IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES`
+- order 654: `IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES` (constant), lines 5734-5734, exports `IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES`
+- order 655: `IDE_COMMAND_TIMEOUT_DEFAULT` (constant), lines 5735-5735, exports `IDE_COMMAND_TIMEOUT_DEFAULT`
+- order 656: `IDE_TREE_DEFAULT_MAX_NODES` (constant), lines 5736-5736, exports `IDE_TREE_DEFAULT_MAX_NODES`
+- order 657: `IDE_TREE_MAX_NODES` (constant), lines 5737-5737, exports `IDE_TREE_MAX_NODES`
+- order 658: `IDE_SEARCH_MAX_RESULTS` (constant), lines 5738-5738, exports `IDE_SEARCH_MAX_RESULTS`
+- order 659: `IDE_SEARCH_MAX_FILE_BYTES` (constant), lines 5739-5739, exports `IDE_SEARCH_MAX_FILE_BYTES`
+- order 660: `IDE_TERMINAL_SCROLLBACK_BYTES` (constant), lines 5740-5740, exports `IDE_TERMINAL_SCROLLBACK_BYTES`
+- order 661: `IDE_TERMINAL_IDLE_SECONDS` (constant), lines 5741-5741, exports `IDE_TERMINAL_IDLE_SECONDS`
+- order 662: `IDE_DEBUG_ADAPTER_START_ATTEMPTS` (constant), lines 5742-5742, exports `IDE_DEBUG_ADAPTER_START_ATTEMPTS`
+- order 663: `IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS` (constant), lines 5743-5743, exports `IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS`
+- order 664: `IDE_VSIX_MAX_BYTES` (constant), lines 5744-5744, exports `IDE_VSIX_MAX_BYTES`
+- order 665: `IDE_VSIX_MAX_EXPANDED_BYTES` (constant), lines 5745-5745, exports `IDE_VSIX_MAX_EXPANDED_BYTES`
+- order 666: `IDE_VSIX_MAX_FILES` (constant), lines 5746-5746, exports `IDE_VSIX_MAX_FILES`
+- order 667: `IDE_VSIX_MAX_FILE_BYTES` (constant), lines 5747-5747, exports `IDE_VSIX_MAX_FILE_BYTES`
+- order 668: `IDE_TREE_SKIP_DIRS` (constant), lines 5748-5756, exports `IDE_TREE_SKIP_DIRS`
+- order 669: `RENDER_FRAME_MAX_B64_CHARS` (constant), lines 5757-5757, exports `RENDER_FRAME_MAX_B64_CHARS`
+- order 670: `RENDER_FRAME_MAX_POINTS` (constant), lines 5758-5758, exports `RENDER_FRAME_MAX_POINTS`
+- order 671: `RENDER_FRAME_MAX_LINES` (constant), lines 5759-5759, exports `RENDER_FRAME_MAX_LINES`
+- order 672: `RENDER_FRAME_MAX_LINE_POINTS` (constant), lines 5760-5760, exports `RENDER_FRAME_MAX_LINE_POINTS`
+- order 673: `RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS` (constant), lines 5761-5761, exports `RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS`
+- order 674: `RAW_TOOLCALL_TEXT_FILTER_THRESHOLD` (constant), lines 5762-5762, exports `RAW_TOOLCALL_TEXT_FILTER_THRESHOLD`
+- order 675: `ASSISTANT_TEXT_PERSIST_MAX_CHARS` (constant), lines 5763-5763, exports `ASSISTANT_TEXT_PERSIST_MAX_CHARS`
+- order 676: `ASSISTANT_MESSAGE_EVENT_MAX_CHARS` (constant), lines 5764-5764, exports `ASSISTANT_MESSAGE_EVENT_MAX_CHARS`
+- order 677: `CODE_PREVIEW_EXTS` (constant), lines 5765-5892, exports `CODE_PREVIEW_EXTS`
+- order 678: `CODE_PREVIEW_FILENAMES` (constant), lines 5893-5944, exports `CODE_PREVIEW_FILENAMES`
+- order 679: `MEDIA_CAPABILITY_KEYS` (constant), lines 5945-5952, exports `MEDIA_CAPABILITY_KEYS`
+- order 683: `OFFLINE_JS_LIB_CATALOG` (constant), lines 5985-6311, exports `OFFLINE_JS_LIB_CATALOG`
+- order 684: `OFFLINE_JS_ASSET_LOCK` (constant), lines 6312-6312, exports `OFFLINE_JS_ASSET_LOCK`
+- order 685: `OFFLINE_JS_LIB_INDEX_FILE` (constant), lines 6313-6313, exports `OFFLINE_JS_LIB_INDEX_FILE`
+- order 686: `OFFLINE_JS_LIB_README_FILE` (constant), lines 6314-6314, exports `OFFLINE_JS_LIB_README_FILE`
+- order 697: `BACKEND_I18N` (constant), lines 6520-6591, exports `BACKEND_I18N`
+- order 698: `_call_backend_i18n_en_update_6593` (expression), lines 6592-6693, exports —
+- order 699: `_call_backend_i18n_zh_cn_update_6694` (expression), lines 6694-6794, exports —
+- order 700: `_call_backend_i18n_zh_tw_update_6795` (expression), lines 6795-6895, exports —
+- order 701: `_call_backend_i18n_ja_update_6896` (expression), lines 6896-6996, exports —
+- order 910: `MODEL_RUNTIME_SETTING_KEYS` (constant), lines 13227-13232, exports `MODEL_RUNTIME_SETTING_KEYS`
+- order 931: `LIQUID_KERNEL_STARTUP_POLICIES` (constant), lines 14926-14928, exports `LIQUID_KERNEL_STARTUP_POLICIES`
+- order 932: `LIQUID_KERNEL_BOOTSTRAP_STATE_FILENAME` (constant), lines 14929-14929, exports `LIQUID_KERNEL_BOOTSTRAP_STATE_FILENAME`
+- order 962: `TABULAR_PREVIEW_EXTS` (constant), lines 16827-16829, exports `TABULAR_PREVIEW_EXTS`
+- order 963: `EXCEL_PREVIEW_EXTS` (constant), lines 16830-16830, exports `EXCEL_PREVIEW_EXTS`
+- order 964: `PRESENTATION_PREVIEW_EXTS` (constant), lines 16831-16831, exports `PRESENTATION_PREVIEW_EXTS`
+- order 965: `DOCUMENT_PREVIEW_EXTS` (constant), lines 16832-16832, exports `DOCUMENT_PREVIEW_EXTS`
+- order 1175: `STUDIO_DEVICE_COOKIE` (constant), lines 116816-116833, exports `STUDIO_DEVICE_COOKIE`
+- order 1176: `STUDIO_SESSION_COOKIE` (constant), lines 116834-116834, exports `STUDIO_SESSION_COOKIE`
+- order 1177: `STUDIO_DEVICE_TTL` (constant), lines 116835-116835, exports `STUDIO_DEVICE_TTL`
+- order 1178: `STUDIO_SESSION_TTL` (constant), lines 116836-116836, exports `STUDIO_SESSION_TTL`
+- order 1179: `STUDIO_MAX_FILE_BYTES` (constant), lines 116837-116837, exports `STUDIO_MAX_FILE_BYTES`
+- order 1180: `STUDIO_MAX_PROJECT_BYTES` (constant), lines 116838-116838, exports `STUDIO_MAX_PROJECT_BYTES`
+- order 1181: `STUDIO_MAX_FILES` (constant), lines 116839-116839, exports `STUDIO_MAX_FILES`
+- order 1182: `STUDIO_MAX_JOB_SECONDS` (constant), lines 116840-116840, exports `STUDIO_MAX_JOB_SECONDS`
+- order 1188: `STUDIO_INDEX_HTML` (constant), lines 118739-118741, exports `STUDIO_INDEX_HTML`
+- order 1189: `STUDIO_CSS` (constant), lines 118742-118742, exports `STUDIO_CSS`
+- order 1190: `STUDIO_JS` (constant), lines 118743-118743, exports `STUDIO_JS`
 
 ### `config/paths.py`
 
-- order 124: `SCRIPT_DIR` (constant), lines 3824-3824, exports `SCRIPT_DIR`
-- order 149: `_resolve_default_agent_workdir` (function), lines 3918-3927, exports `_resolve_default_agent_workdir`
-- order 150: `_is_installed_python_runtime` (function), lines 3928-3931, exports `_is_installed_python_runtime`
-- order 151: `_runtime_storage_mode` (function), lines 3932-3938, exports `_runtime_storage_mode`
-- order 152: `_runtime_tree_has_content` (function), lines 3939-3944, exports `_runtime_tree_has_content`
-- order 153: `_copy_runtime_tree_with_crypto_migration` (function), lines 3945-4015, exports `_copy_runtime_tree_with_crypto_migration`
-- order 154: `_merge_legacy_codes_root` (function), lines 4016-4081, exports `_merge_legacy_codes_root`
-- order 155: `_migrate_legacy_runtime_roots` (function), lines 4082-4172, exports `_migrate_legacy_runtime_roots`
-- order 156: `WORKDIR` (constant), lines 4173-4174, exports `WORKDIR`
-- order 157: `CODES_ROOT` (constant), lines 4175-4175, exports `CODES_ROOT`
-- order 158: `LLM_CONFIG_PATH` (constant), lines 4176-4176, exports `LLM_CONFIG_PATH`
-- order 776: `detect_repo_root` (function), lines 8348-8362, exports `detect_repo_root`
-- order 777: `REPO_ROOT` (constant), lines 8363-8364, exports `REPO_ROOT`
+- order 127: `SCRIPT_DIR` (constant), lines 3917-3917, exports `SCRIPT_DIR`
+- order 152: `_resolve_default_agent_workdir` (function), lines 4011-4020, exports `_resolve_default_agent_workdir`
+- order 153: `_is_installed_python_runtime` (function), lines 4021-4024, exports `_is_installed_python_runtime`
+- order 154: `_runtime_storage_mode` (function), lines 4025-4031, exports `_runtime_storage_mode`
+- order 155: `_runtime_tree_has_content` (function), lines 4032-4037, exports `_runtime_tree_has_content`
+- order 156: `_copy_runtime_tree_with_crypto_migration` (function), lines 4038-4108, exports `_copy_runtime_tree_with_crypto_migration`
+- order 157: `_merge_legacy_codes_root` (function), lines 4109-4174, exports `_merge_legacy_codes_root`
+- order 158: `_migrate_legacy_runtime_roots` (function), lines 4175-4265, exports `_migrate_legacy_runtime_roots`
+- order 159: `WORKDIR` (constant), lines 4266-4267, exports `WORKDIR`
+- order 160: `CODES_ROOT` (constant), lines 4268-4268, exports `CODES_ROOT`
+- order 161: `LLM_CONFIG_PATH` (constant), lines 4269-4269, exports `LLM_CONFIG_PATH`
+- order 779: `detect_repo_root` (function), lines 8441-8455, exports `detect_repo_root`
+- order 780: `REPO_ROOT` (constant), lines 8456-8457, exports `REPO_ROOT`
 
 ### `config/settings.py`
 
-- order 687: `normalize_ui_language` (function), lines 6303-6327, exports `normalize_ui_language`
-- order 688: `normalize_ui_style` (function), lines 6328-6347, exports `normalize_ui_style`
-- order 689: `supported_ui_languages_payload` (function), lines 6348-6351, exports `supported_ui_languages_payload`
-- order 691: `agent_language_preference_payload` (function), lines 6364-6373, exports `agent_language_preference_payload`
-- order 692: `normalize_execution_mode` (function), lines 6374-6395, exports `normalize_execution_mode`
-- order 693: `model_language_instruction` (function), lines 6396-6426, exports `model_language_instruction`
-- order 699: `backend_i18n_text` (function), lines 6904-6916, exports `backend_i18n_text`
-- order 700: `backend_role_label` (function), lines 6917-6923, exports `backend_role_label`
-- order 701: `_detect_os_shell_instruction` (function), lines 6924-6965, exports `_detect_os_shell_instruction`
-- order 702: `resolve_web_ui_dir_path` (function), lines 6966-6974, exports `resolve_web_ui_dir_path`
-- order 703: `resolve_optional_file_path` (function), lines 6975-6984, exports `resolve_optional_file_path`
-- order 704: `resolve_skills_root_path` (function), lines 6985-6994, exports `resolve_skills_root_path`
-- order 705: `_count_skill_markdown_files` (function), lines 6995-7008, exports `_count_skill_markdown_files`
-- order 706: `select_preferred_skills_root` (function), lines 7009-7045, exports `select_preferred_skills_root`
-- order 707: `load_web_ui_config_file` (function), lines 7046-7062, exports `load_web_ui_config_file`
-- order 708: `extract_show_upload_list_setting` (function), lines 7063-7079, exports `extract_show_upload_list_setting`
-- order 709: `extract_ui_style_setting` (function), lines 7080-7096, exports `extract_ui_style_setting`
-- order 710: `extract_js_lib_download_setting` (function), lines 7097-7118, exports `extract_js_lib_download_setting`
-- order 711: `extract_daily_session_limit_setting` (function), lines 7119-7164, exports `extract_daily_session_limit_setting`
-- order 712: `extract_shell_command_timeout_setting` (function), lines 7165-7213, exports `extract_shell_command_timeout_setting`
-- order 713: `normalize_shell_timeout_mode` (function), lines 7214-7231, exports `normalize_shell_timeout_mode`
-- order 714: `extract_shell_timeout_mode_setting` (function), lines 7232-7244, exports `extract_shell_timeout_mode_setting`
-- order 715: `extract_shell_async_handoff_setting` (function), lines 7245-7272, exports `extract_shell_async_handoff_setting`
-- order 716: `extract_context_token_limit_setting` (function), lines 7273-7307, exports `extract_context_token_limit_setting`
-- order 717: `normalize_auto_task_level_ceiling` (function), lines 7308-7329, exports `normalize_auto_task_level_ceiling`
-- order 718: `normalize_l2_todo_policy` (function), lines 7330-7365, exports `normalize_l2_todo_policy`
-- order 719: `extract_l2_todo_policy_setting` (function), lines 7366-7408, exports `extract_l2_todo_policy_setting`
-- order 720: `extract_auto_task_level_ceiling_setting` (function), lines 7409-7438, exports `extract_auto_task_level_ceiling_setting`
-- order 721: `normalize_read_context_policy` (function), lines 7439-7459, exports `normalize_read_context_policy`
-- order 722: `normalize_tool_memory_policy` (function), lines 7460-7463, exports `normalize_tool_memory_policy`
-- order 723: `extract_read_context_policy_setting` (function), lines 7464-7487, exports `extract_read_context_policy_setting`
-- order 724: `extract_tool_memory_policy_setting` (function), lines 7488-7511, exports `extract_tool_memory_policy_setting`
-- order 726: `default_multimodal_capabilities` (function), lines 7518-7528, exports `default_multimodal_capabilities`
-- order 727: `_to_bool_like` (function), lines 7529-7541, exports `_to_bool_like`
-- order 728: `extract_web_search_enabled_setting` (function), lines 7542-7554, exports `extract_web_search_enabled_setting`
-- order 729: `_single_no_plan_todo_setting_sections` (function), lines 7555-7581, exports `_single_no_plan_todo_setting_sections`
-- order 730: `_single_no_plan_todo_setting_present` (function), lines 7582-7607, exports `_single_no_plan_todo_setting_present`
-- order 731: `extract_single_no_plan_todo_settings` (function), lines 7608-7654, exports `extract_single_no_plan_todo_settings`
-- order 732: `normalize_user_memory_mode` (function), lines 7655-7685, exports `normalize_user_memory_mode`
-- order 733: `user_memory_enabled_from_mode` (function), lines 7686-7689, exports `user_memory_enabled_from_mode`
-- order 734: `extract_user_memory_mode_setting` (function), lines 7690-7729, exports `extract_user_memory_mode_setting`
-- order 735: `set_web_search_enabled_on_runtime` (function), lines 7730-7745, exports `set_web_search_enabled_on_runtime`
-- order 736: `infer_model_multimodal_capabilities` (function), lines 7746-7792, exports `infer_model_multimodal_capabilities`
-- order 737: `parse_capability_overrides` (function), lines 7793-7832, exports `parse_capability_overrides`
-- order 738: `merge_multimodal_capabilities` (function), lines 7833-7842, exports `merge_multimodal_capabilities`
-- order 739: `parse_media_endpoints` (function), lines 7843-7859, exports `parse_media_endpoints`
-- order 755: `extract_runtime_region_hint_setting` (function), lines 8037-8062, exports `extract_runtime_region_hint_setting`
-- order 756: `extract_runtime_timezone_hint_setting` (function), lines 8063-8080, exports `extract_runtime_timezone_hint_setting`
-- order 757: `runtime_environment_context_snapshot` (function), lines 8081-8130, exports `runtime_environment_context_snapshot`
-- order 758: `runtime_environment_context_block` (function), lines 8131-8160, exports `runtime_environment_context_block`
-- order 794: `load_offline_js_lib_index` (function), lines 8635-8645, exports `load_offline_js_lib_index`
-- order 855: `resolve_ollama_model` (function), lines 12208-12219, exports `resolve_ollama_model`
-- order 856: `infer_thinking_model` (function), lines 12220-12223, exports `infer_thinking_model`
-- order 867: `extract_base_url` (function), lines 12433-12442, exports `extract_base_url`
-- order 869: `infer_user_complexity_value` (function), lines 12454-12471, exports `infer_user_complexity_value`
-- order 870: `normalize_task_complexity` (function), lines 12472-12501, exports `normalize_task_complexity`
-- order 871: `task_complexity_rank` (function), lines 12502-12504, exports `task_complexity_rank`
-- order 872: `task_complexity_at_least` (function), lines 12505-12507, exports `task_complexity_at_least`
-- order 873: `max_task_complexity` (function), lines 12508-12518, exports `max_task_complexity`
-- order 874: `normalize_openai_compat_provider_name` (function), lines 12519-12535, exports `normalize_openai_compat_provider_name`
-- order 894: `resolve_reasoning_payload` (function), lines 12657-12707, exports `resolve_reasoning_payload`
-- order 897: `extract_openai_compat_model_ids` (function), lines 12755-12789, exports `extract_openai_compat_model_ids`
-- order 900: `load_llm_config_from_source` (function), lines 12822-12857, exports `load_llm_config_from_source`
-- order 901: `parse_llm_config_profiles` (function), lines 12858-13488, exports `parse_llm_config_profiles`
-- order 902: `looks_like_llm_config` (function), lines 13489-13566, exports `looks_like_llm_config`
-- order 906: `parse_front_matter` (function), lines 13762-13990, exports `parse_front_matter`
-- order 914: `normalize_liquid_kernel_startup_policy` (function), lines 14077-14081, exports `normalize_liquid_kernel_startup_policy`
-- order 941: `normalize_upload_rel_path` (function), lines 15928-15962, exports `normalize_upload_rel_path`
+- order 690: `normalize_ui_language` (function), lines 6396-6420, exports `normalize_ui_language`
+- order 691: `normalize_ui_style` (function), lines 6421-6440, exports `normalize_ui_style`
+- order 692: `supported_ui_languages_payload` (function), lines 6441-6444, exports `supported_ui_languages_payload`
+- order 694: `agent_language_preference_payload` (function), lines 6457-6466, exports `agent_language_preference_payload`
+- order 695: `normalize_execution_mode` (function), lines 6467-6488, exports `normalize_execution_mode`
+- order 696: `model_language_instruction` (function), lines 6489-6519, exports `model_language_instruction`
+- order 702: `backend_i18n_text` (function), lines 6997-7009, exports `backend_i18n_text`
+- order 703: `backend_role_label` (function), lines 7010-7016, exports `backend_role_label`
+- order 704: `_detect_os_shell_instruction` (function), lines 7017-7058, exports `_detect_os_shell_instruction`
+- order 705: `resolve_web_ui_dir_path` (function), lines 7059-7067, exports `resolve_web_ui_dir_path`
+- order 706: `resolve_optional_file_path` (function), lines 7068-7077, exports `resolve_optional_file_path`
+- order 707: `resolve_skills_root_path` (function), lines 7078-7087, exports `resolve_skills_root_path`
+- order 708: `_count_skill_markdown_files` (function), lines 7088-7101, exports `_count_skill_markdown_files`
+- order 709: `select_preferred_skills_root` (function), lines 7102-7138, exports `select_preferred_skills_root`
+- order 710: `load_web_ui_config_file` (function), lines 7139-7155, exports `load_web_ui_config_file`
+- order 711: `extract_show_upload_list_setting` (function), lines 7156-7172, exports `extract_show_upload_list_setting`
+- order 712: `extract_ui_style_setting` (function), lines 7173-7189, exports `extract_ui_style_setting`
+- order 713: `extract_js_lib_download_setting` (function), lines 7190-7211, exports `extract_js_lib_download_setting`
+- order 714: `extract_daily_session_limit_setting` (function), lines 7212-7257, exports `extract_daily_session_limit_setting`
+- order 715: `extract_shell_command_timeout_setting` (function), lines 7258-7306, exports `extract_shell_command_timeout_setting`
+- order 716: `normalize_shell_timeout_mode` (function), lines 7307-7324, exports `normalize_shell_timeout_mode`
+- order 717: `extract_shell_timeout_mode_setting` (function), lines 7325-7337, exports `extract_shell_timeout_mode_setting`
+- order 718: `extract_shell_async_handoff_setting` (function), lines 7338-7365, exports `extract_shell_async_handoff_setting`
+- order 719: `extract_context_token_limit_setting` (function), lines 7366-7400, exports `extract_context_token_limit_setting`
+- order 720: `normalize_auto_task_level_ceiling` (function), lines 7401-7422, exports `normalize_auto_task_level_ceiling`
+- order 721: `normalize_l2_todo_policy` (function), lines 7423-7458, exports `normalize_l2_todo_policy`
+- order 722: `extract_l2_todo_policy_setting` (function), lines 7459-7501, exports `extract_l2_todo_policy_setting`
+- order 723: `extract_auto_task_level_ceiling_setting` (function), lines 7502-7531, exports `extract_auto_task_level_ceiling_setting`
+- order 724: `normalize_read_context_policy` (function), lines 7532-7552, exports `normalize_read_context_policy`
+- order 725: `normalize_tool_memory_policy` (function), lines 7553-7556, exports `normalize_tool_memory_policy`
+- order 726: `extract_read_context_policy_setting` (function), lines 7557-7580, exports `extract_read_context_policy_setting`
+- order 727: `extract_tool_memory_policy_setting` (function), lines 7581-7604, exports `extract_tool_memory_policy_setting`
+- order 729: `default_multimodal_capabilities` (function), lines 7611-7621, exports `default_multimodal_capabilities`
+- order 730: `_to_bool_like` (function), lines 7622-7634, exports `_to_bool_like`
+- order 731: `extract_web_search_enabled_setting` (function), lines 7635-7647, exports `extract_web_search_enabled_setting`
+- order 732: `_single_no_plan_todo_setting_sections` (function), lines 7648-7674, exports `_single_no_plan_todo_setting_sections`
+- order 733: `_single_no_plan_todo_setting_present` (function), lines 7675-7700, exports `_single_no_plan_todo_setting_present`
+- order 734: `extract_single_no_plan_todo_settings` (function), lines 7701-7747, exports `extract_single_no_plan_todo_settings`
+- order 735: `normalize_user_memory_mode` (function), lines 7748-7778, exports `normalize_user_memory_mode`
+- order 736: `user_memory_enabled_from_mode` (function), lines 7779-7782, exports `user_memory_enabled_from_mode`
+- order 737: `extract_user_memory_mode_setting` (function), lines 7783-7822, exports `extract_user_memory_mode_setting`
+- order 738: `set_web_search_enabled_on_runtime` (function), lines 7823-7838, exports `set_web_search_enabled_on_runtime`
+- order 739: `infer_model_multimodal_capabilities` (function), lines 7839-7885, exports `infer_model_multimodal_capabilities`
+- order 740: `parse_capability_overrides` (function), lines 7886-7925, exports `parse_capability_overrides`
+- order 741: `merge_multimodal_capabilities` (function), lines 7926-7935, exports `merge_multimodal_capabilities`
+- order 742: `parse_media_endpoints` (function), lines 7936-7952, exports `parse_media_endpoints`
+- order 758: `extract_runtime_region_hint_setting` (function), lines 8130-8155, exports `extract_runtime_region_hint_setting`
+- order 759: `extract_runtime_timezone_hint_setting` (function), lines 8156-8173, exports `extract_runtime_timezone_hint_setting`
+- order 760: `runtime_environment_context_snapshot` (function), lines 8174-8223, exports `runtime_environment_context_snapshot`
+- order 761: `runtime_environment_context_block` (function), lines 8224-8253, exports `runtime_environment_context_block`
+- order 797: `load_offline_js_lib_index` (function), lines 8728-8738, exports `load_offline_js_lib_index`
+- order 852: `extract_ollama_model_capabilities` (function), lines 12247-12268, exports `extract_ollama_model_capabilities`
+- order 861: `resolve_ollama_model` (function), lines 12391-12402, exports `resolve_ollama_model`
+- order 862: `infer_thinking_model` (function), lines 12403-12406, exports `infer_thinking_model`
+- order 873: `extract_base_url` (function), lines 12616-12625, exports `extract_base_url`
+- order 875: `infer_user_complexity_value` (function), lines 12637-12654, exports `infer_user_complexity_value`
+- order 876: `normalize_task_complexity` (function), lines 12655-12684, exports `normalize_task_complexity`
+- order 877: `task_complexity_rank` (function), lines 12685-12687, exports `task_complexity_rank`
+- order 878: `task_complexity_at_least` (function), lines 12688-12690, exports `task_complexity_at_least`
+- order 879: `max_task_complexity` (function), lines 12691-12701, exports `max_task_complexity`
+- order 880: `normalize_openai_compat_provider_name` (function), lines 12702-12718, exports `normalize_openai_compat_provider_name`
+- order 900: `resolve_reasoning_payload` (function), lines 12846-12897, exports `resolve_reasoning_payload`
+- order 904: `extract_openai_compat_model_ids` (function), lines 12966-13000, exports `extract_openai_compat_model_ids`
+- order 905: `extract_openai_compat_model_records` (function), lines 13001-13080, exports `extract_openai_compat_model_records`
+- order 911: `merge_probed_models_into_profile` (function), lines 13233-13276, exports `merge_probed_models_into_profile`
+- order 912: `probe_and_merge_model_profiles` (function), lines 13277-13334, exports `probe_and_merge_model_profiles`
+- order 913: `normalize_model_runtime_settings` (function), lines 13335-13360, exports `normalize_model_runtime_settings`
+- order 914: `apply_model_runtime_settings` (function), lines 13361-13376, exports `apply_model_runtime_settings`
+- order 915: `model_runtime_settings_for` (function), lines 13377-13387, exports `model_runtime_settings_for`
+- order 916: `apply_model_option_runtime_fields` (function), lines 13388-13400, exports `apply_model_option_runtime_fields`
+- order 919: `load_llm_config_from_source` (function), lines 13433-13468, exports `load_llm_config_from_source`
+- order 920: `parse_llm_config_profiles` (function), lines 13469-14329, exports `parse_llm_config_profiles`
+- order 921: `looks_like_llm_config` (function), lines 14330-14419, exports `looks_like_llm_config`
+- order 925: `parse_front_matter` (function), lines 14615-14843, exports `parse_front_matter`
+- order 933: `normalize_liquid_kernel_startup_policy` (function), lines 14930-14934, exports `normalize_liquid_kernel_startup_policy`
+- order 960: `normalize_upload_rel_path` (function), lines 16781-16815, exports `normalize_upload_rel_path`
 
 ### `ide/assets.py`
 
-- order 1148: `IDE_INDEX_HTML` (constant), lines 114359-114514, exports `IDE_INDEX_HTML`
-- order 1149: `IDE_CSS` (constant), lines 114515-114556, exports `IDE_CSS`
-- order 1150: `IDE_JS` (constant), lines 114557-114750, exports `IDE_JS`
-- order 1151: `IDE_CSS` (constant), lines 114751-114771, exports `IDE_CSS`
-- order 1152: `IDE_JS` (constant), lines 114772-115035, exports `IDE_JS`
-- order 1153: `IDE_JS` (constant), lines 115036-115164, exports `IDE_JS`
-- order 1154: `IDE_JS` (constant), lines 115165-115388, exports `IDE_JS`
-- order 1155: `IDE_JS` (constant), lines 115389-115487, exports `IDE_JS`
+- order 1167: `IDE_INDEX_HTML` (constant), lines 115687-115842, exports `IDE_INDEX_HTML`
+- order 1168: `IDE_CSS` (constant), lines 115843-115884, exports `IDE_CSS`
+- order 1169: `IDE_JS` (constant), lines 115885-116078, exports `IDE_JS`
+- order 1170: `IDE_CSS` (constant), lines 116079-116099, exports `IDE_CSS`
+- order 1171: `IDE_JS` (constant), lines 116100-116363, exports `IDE_JS`
+- order 1172: `IDE_JS` (constant), lines 116364-116492, exports `IDE_JS`
+- order 1173: `IDE_JS` (constant), lines 116493-116716, exports `IDE_JS`
+- order 1174: `IDE_JS` (constant), lines 116717-116815, exports `IDE_JS`
 
 ### `ide/auth.py`
 
-- order 920: `IDEAuthError` (class), lines 14418-14425, exports `IDEAuthError`
-- order 921: `IDEAuthStore` (class), lines 14426-15149, exports `IDEAuthStore`
+- order 939: `IDEAuthError` (class), lines 15271-15278, exports `IDEAuthError`
+- order 940: `IDEAuthStore` (class), lines 15279-16002, exports `IDEAuthStore`
 
 ### `ide/errors.py`
 
-- order 922: `IDECapabilityError` (class), lines 15150-15156, exports `IDECapabilityError`
-- order 923: `IDEFileConflict` (class), lines 15157-15164, exports `IDEFileConflict`
+- order 941: `IDECapabilityError` (class), lines 16003-16009, exports `IDECapabilityError`
+- order 942: `IDEFileConflict` (class), lines 16010-16017, exports `IDEFileConflict`
 
 ### `ide/events.py`
 
-- order 811: `ide_public_operation_data` (function), lines 9247-9298, exports `ide_public_operation_data`
+- order 814: `ide_public_operation_data` (function), lines 9340-9391, exports `ide_public_operation_data`
 
 ### `ide/handler.py`
 
-- order 1185: `IdeHandler` (class), lines 132446-134101, exports `IdeHandler`
+- order 1204: `IdeHandler` (class), lines 134085-135741, exports `IdeHandler`
 
 ### `ide/preview.py`
 
-- order 940: `normalize_rel_preview_path` (function), lines 15914-15927, exports `normalize_rel_preview_path`
-- order 942: `is_code_preview_candidate` (function), lines 15963-15973, exports `is_code_preview_candidate`
-- order 947: `preview_kind_for_path` (function), lines 15980-16009, exports `preview_kind_for_path`
-- order 948: `normalize_markdown_preview_text` (function), lines 16010-16043, exports `normalize_markdown_preview_text`
-- order 949: `_preview_markdown_value_html` (function), lines 16044-16064, exports `_preview_markdown_value_html`
-- order 950: `_preview_markdown_frontmatter_html` (function), lines 16065-16080, exports `_preview_markdown_frontmatter_html`
-- order 951: `_preview_markdown_task_lists` (function), lines 16081-16094, exports `_preview_markdown_task_lists`
-- order 952: `_preview_markdown_fallback_inline` (function), lines 16095-16136, exports `_preview_markdown_fallback_inline`
-- order 953: `_preview_markdown_fallback_html` (function), lines 16137-16233, exports `_preview_markdown_fallback_html`
-- order 956: `workspace_file_revision_map` (function), lines 16274-16298, exports `workspace_file_revision_map`
-- order 957: `workspace_revision_delta` (function), lines 16299-16305, exports `workspace_revision_delta`
-- order 958: `build_code_preview_rows` (function), lines 16306-16354, exports `build_code_preview_rows`
+- order 959: `normalize_rel_preview_path` (function), lines 16767-16780, exports `normalize_rel_preview_path`
+- order 961: `is_code_preview_candidate` (function), lines 16816-16826, exports `is_code_preview_candidate`
+- order 966: `preview_kind_for_path` (function), lines 16833-16862, exports `preview_kind_for_path`
+- order 967: `normalize_markdown_preview_text` (function), lines 16863-16896, exports `normalize_markdown_preview_text`
+- order 968: `_preview_markdown_value_html` (function), lines 16897-16917, exports `_preview_markdown_value_html`
+- order 969: `_preview_markdown_frontmatter_html` (function), lines 16918-16933, exports `_preview_markdown_frontmatter_html`
+- order 970: `_preview_markdown_task_lists` (function), lines 16934-16947, exports `_preview_markdown_task_lists`
+- order 971: `_preview_markdown_fallback_inline` (function), lines 16948-16989, exports `_preview_markdown_fallback_inline`
+- order 972: `_preview_markdown_fallback_html` (function), lines 16990-17086, exports `_preview_markdown_fallback_html`
+- order 975: `workspace_file_revision_map` (function), lines 17127-17151, exports `workspace_file_revision_map`
+- order 976: `workspace_revision_delta` (function), lines 17152-17158, exports `workspace_revision_delta`
+- order 977: `build_code_preview_rows` (function), lines 17159-17207, exports `build_code_preview_rows`
 
 ### `ide/sandbox.py`
 
-- order 763: `_windows_subprocess_encodings` (function), lines 8186-8203, exports `_windows_subprocess_encodings`
-- order 1041: `_IDE_SANDBOX_BACKEND_CACHE` (assignment), lines 28614-28622, exports `_IDE_SANDBOX_BACKEND_CACHE`
-- order 1042: `_IDE_SANDBOX_BACKEND_LOCK` (assignment), lines 28623-28623, exports `_IDE_SANDBOX_BACKEND_LOCK`
-- order 1043: `WINDOWS_JOB_SANDBOX_MARKER` (constant), lines 28624-28624, exports `WINDOWS_JOB_SANDBOX_MARKER`
-- order 1044: `_WINDOWS_LOW_INTEGRITY_ROOTS` (assignment), lines 28625-28625, exports `_WINDOWS_LOW_INTEGRITY_ROOTS`
-- order 1045: `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS` (assignment), lines 28626-28626, exports `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS`
-- order 1046: `_WINDOWS_LOW_INTEGRITY_LOCK` (assignment), lines 28627-28627, exports `_WINDOWS_LOW_INTEGRITY_LOCK`
-- order 1047: `_is_windows_job_sandbox_prefix` (function), lines 28628-28634, exports `_is_windows_job_sandbox_prefix`
-- order 1048: `_windows_builtin_sandbox_probe` (function), lines 28635-28658, exports `_windows_builtin_sandbox_probe`
-- order 1049: `_windows_last_error` (function), lines 28659-28666, exports `_windows_last_error`
-- order 1050: `_windows_set_integrity_label` (function), lines 28667-28720, exports `_windows_set_integrity_label`
-- order 1051: `_windows_set_low_integrity_label` (function), lines 28721-28723, exports `_windows_set_low_integrity_label`
-- order 1052: `_windows_protect_application_snapshot` (function), lines 28724-28747, exports `_windows_protect_application_snapshot`
-- order 1053: `_windows_prepare_low_integrity_workspace` (function), lines 28748-28785, exports `_windows_prepare_low_integrity_workspace`
-- order 1054: `_windows_job_memory_limit` (function), lines 28786-28793, exports `_windows_job_memory_limit`
-- order 1055: `_windows_lower_process_integrity` (function), lines 28794-28841, exports `_windows_lower_process_integrity`
-- order 1056: `_windows_attach_sandbox_job` (function), lines 28842-28934, exports `_windows_attach_sandbox_job`
-- order 1057: `_windows_close_sandbox_job` (function), lines 28935-28951, exports `_windows_close_sandbox_job`
-- order 1058: `_popen_windows_sandboxed` (function), lines 28952-28983, exports `_popen_windows_sandboxed`
-- order 1059: `_run_windows_sandboxed_command` (function), lines 28984-29037, exports `_run_windows_sandboxed_command`
-- order 1060: `_detect_ide_sandbox_backend` (function), lines 29038-29142, exports `_detect_ide_sandbox_backend`
+- order 766: `_windows_subprocess_encodings` (function), lines 8279-8296, exports `_windows_subprocess_encodings`
+- order 1060: `_IDE_SANDBOX_BACKEND_CACHE` (assignment), lines 29482-29490, exports `_IDE_SANDBOX_BACKEND_CACHE`
+- order 1061: `_IDE_SANDBOX_BACKEND_LOCK` (assignment), lines 29491-29491, exports `_IDE_SANDBOX_BACKEND_LOCK`
+- order 1062: `WINDOWS_JOB_SANDBOX_MARKER` (constant), lines 29492-29492, exports `WINDOWS_JOB_SANDBOX_MARKER`
+- order 1063: `_WINDOWS_LOW_INTEGRITY_ROOTS` (assignment), lines 29493-29493, exports `_WINDOWS_LOW_INTEGRITY_ROOTS`
+- order 1064: `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS` (assignment), lines 29494-29494, exports `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS`
+- order 1065: `_WINDOWS_LOW_INTEGRITY_LOCK` (assignment), lines 29495-29495, exports `_WINDOWS_LOW_INTEGRITY_LOCK`
+- order 1066: `_is_windows_job_sandbox_prefix` (function), lines 29496-29502, exports `_is_windows_job_sandbox_prefix`
+- order 1067: `_windows_builtin_sandbox_probe` (function), lines 29503-29526, exports `_windows_builtin_sandbox_probe`
+- order 1068: `_windows_last_error` (function), lines 29527-29534, exports `_windows_last_error`
+- order 1069: `_windows_set_integrity_label` (function), lines 29535-29588, exports `_windows_set_integrity_label`
+- order 1070: `_windows_set_low_integrity_label` (function), lines 29589-29591, exports `_windows_set_low_integrity_label`
+- order 1071: `_windows_protect_application_snapshot` (function), lines 29592-29615, exports `_windows_protect_application_snapshot`
+- order 1072: `_windows_prepare_low_integrity_workspace` (function), lines 29616-29653, exports `_windows_prepare_low_integrity_workspace`
+- order 1073: `_windows_job_memory_limit` (function), lines 29654-29661, exports `_windows_job_memory_limit`
+- order 1074: `_windows_lower_process_integrity` (function), lines 29662-29709, exports `_windows_lower_process_integrity`
+- order 1075: `_windows_attach_sandbox_job` (function), lines 29710-29802, exports `_windows_attach_sandbox_job`
+- order 1076: `_windows_close_sandbox_job` (function), lines 29803-29819, exports `_windows_close_sandbox_job`
+- order 1077: `_popen_windows_sandboxed` (function), lines 29820-29851, exports `_popen_windows_sandboxed`
+- order 1078: `_run_windows_sandboxed_command` (function), lines 29852-29905, exports `_run_windows_sandboxed_command`
+- order 1079: `_detect_ide_sandbox_backend` (function), lines 29906-30010, exports `_detect_ide_sandbox_backend`
 
 ### `llm/client.py`
 
-- order 1026: `OllamaError` (class), lines 25362-25384, exports `OllamaError`
-- order 1027: `OllamaClient` (class), lines 25385-27887, exports `OllamaClient`
+- order 1045: `OllamaError` (class), lines 26215-26237, exports `OllamaError`
+- order 1046: `OllamaClient` (class), lines 26238-28755, exports `OllamaClient`
 
 ### `llm/constants.py`
 
-- order 122: `DEFAULT_OLLAMA_BASE_URL` (constant), lines 3822-3822, exports `DEFAULT_OLLAMA_BASE_URL`
-- order 123: `DEFAULT_OLLAMA_MODEL` (constant), lines 3823-3823, exports `DEFAULT_OLLAMA_MODEL`
-- order 875: `OPENAI_COMPAT_PROVIDER_NAMES` (constant), lines 12536-12545, exports `OPENAI_COMPAT_PROVIDER_NAMES`
-- order 876: `OPENAI_LIKE_PROVIDER_NAMES` (constant), lines 12546-12547, exports `OPENAI_LIKE_PROVIDER_NAMES`
-- order 879: `EFFORT_OFF` (constant), lines 12554-12565, exports `EFFORT_OFF`
-- order 880: `EFFORT_LOW` (constant), lines 12566-12566, exports `EFFORT_LOW`
-- order 881: `EFFORT_MEDIUM` (constant), lines 12567-12567, exports `EFFORT_MEDIUM`
-- order 882: `EFFORT_HIGH` (constant), lines 12568-12568, exports `EFFORT_HIGH`
-- order 883: `EFFORT_MAX` (constant), lines 12569-12569, exports `EFFORT_MAX`
-- order 884: `EFFORT_LEVELS` (constant), lines 12570-12570, exports `EFFORT_LEVELS`
-- order 885: `EFFORT_ORDER` (constant), lines 12571-12571, exports `EFFORT_ORDER`
-- order 886: `EFFORT_DEFAULT` (constant), lines 12572-12572, exports `EFFORT_DEFAULT`
-- order 887: `EFFORT_ANTHROPIC_BUDGET` (constant), lines 12573-12580, exports `EFFORT_ANTHROPIC_BUDGET`
-- order 888: `EFFORT_OPENAI_REASONING` (constant), lines 12581-12587, exports `EFFORT_OPENAI_REASONING`
-- order 889: `TASK_LEVEL_EFFORT` (constant), lines 12588-12597, exports `TASK_LEVEL_EFFORT`
-- order 890: `ROLE_EFFORT_FLOOR` (constant), lines 12598-12603, exports `ROLE_EFFORT_FLOOR`
-- order 891: `COORDINATION_EFFORT` (constant), lines 12604-12607, exports `COORDINATION_EFFORT`
+- order 125: `DEFAULT_OLLAMA_BASE_URL` (constant), lines 3915-3915, exports `DEFAULT_OLLAMA_BASE_URL`
+- order 126: `DEFAULT_OLLAMA_MODEL` (constant), lines 3916-3916, exports `DEFAULT_OLLAMA_MODEL`
+- order 881: `OPENAI_COMPAT_PROVIDER_NAMES` (constant), lines 12719-12728, exports `OPENAI_COMPAT_PROVIDER_NAMES`
+- order 882: `OPENAI_LIKE_PROVIDER_NAMES` (constant), lines 12729-12730, exports `OPENAI_LIKE_PROVIDER_NAMES`
+- order 885: `EFFORT_OFF` (constant), lines 12737-12748, exports `EFFORT_OFF`
+- order 886: `EFFORT_LOW` (constant), lines 12749-12749, exports `EFFORT_LOW`
+- order 887: `EFFORT_MEDIUM` (constant), lines 12750-12750, exports `EFFORT_MEDIUM`
+- order 888: `EFFORT_HIGH` (constant), lines 12751-12751, exports `EFFORT_HIGH`
+- order 889: `EFFORT_MAX` (constant), lines 12752-12752, exports `EFFORT_MAX`
+- order 890: `EFFORT_LEVELS` (constant), lines 12753-12753, exports `EFFORT_LEVELS`
+- order 891: `EFFORT_ORDER` (constant), lines 12754-12754, exports `EFFORT_ORDER`
+- order 892: `EFFORT_DEFAULT` (constant), lines 12755-12755, exports `EFFORT_DEFAULT`
+- order 893: `EFFORT_ANTHROPIC_BUDGET` (constant), lines 12756-12763, exports `EFFORT_ANTHROPIC_BUDGET`
+- order 894: `EFFORT_OPENAI_REASONING` (constant), lines 12764-12770, exports `EFFORT_OPENAI_REASONING`
+- order 895: `TASK_LEVEL_EFFORT` (constant), lines 12771-12780, exports `TASK_LEVEL_EFFORT`
+- order 896: `ROLE_EFFORT_FLOOR` (constant), lines 12781-12786, exports `ROLE_EFFORT_FLOOR`
+- order 897: `COORDINATION_EFFORT` (constant), lines 12787-12790, exports `COORDINATION_EFFORT`
 
 ### `llm/utils.py`
 
-- order 848: `probe_ollama_environment` (function), lines 12139-12153, exports `probe_ollama_environment`
-- order 849: `list_ollama_models` (function), lines 12154-12157, exports `list_ollama_models`
-- order 850: `_OLLAMA_TAG_CACHE_LOCK` (assignment), lines 12158-12159, exports `_OLLAMA_TAG_CACHE_LOCK`
-- order 851: `_OLLAMA_TAG_CACHE` (assignment), lines 12160-12160, exports `_OLLAMA_TAG_CACHE`
-- order 854: `list_ollama_models_cached` (function), lines 12169-12207, exports `list_ollama_models_cached`
-- order 857: `split_thinking_content` (function), lines 12224-12268, exports `split_thinking_content`
-- order 858: `strip_thinking_content` (function), lines 12269-12271, exports `strip_thinking_content`
-- order 859: `check_ollama_model_ready` (function), lines 12272-12297, exports `check_ollama_model_ready`
-- order 860: `list_loaded_ollama_models` (function), lines 12298-12312, exports `list_loaded_ollama_models`
-- order 861: `wake_ollama_model` (function), lines 12313-12344, exports `wake_ollama_model`
-- order 862: `try_pull_ollama_model` (function), lines 12345-12363, exports `try_pull_ollama_model`
-- order 863: `ordered_model_candidates` (function), lines 12364-12383, exports `ordered_model_candidates`
-- order 864: `pick_working_ollama_model` (function), lines 12384-12401, exports `pick_working_ollama_model`
-- order 868: `complete_chat_endpoint` (function), lines 12443-12453, exports `complete_chat_endpoint`
-- order 877: `is_openai_compat_provider` (function), lines 12548-12550, exports `is_openai_compat_provider`
-- order 878: `is_openai_like_provider` (function), lines 12551-12553, exports `is_openai_like_provider`
-- order 892: `clamp_effort` (function), lines 12608-12619, exports `clamp_effort`
-- order 893: `model_reasoning_style` (function), lines 12620-12656, exports `model_reasoning_style`
-- order 895: `openai_compat_probe_headers` (function), lines 12708-12720, exports `openai_compat_probe_headers`
-- order 896: `openai_compat_model_list_urls` (function), lines 12721-12754, exports `openai_compat_model_list_urls`
-- order 898: `_is_http_url` (function), lines 12790-12803, exports `_is_http_url`
-- order 899: `_resolve_local_path` (function), lines 12804-12821, exports `_resolve_local_path`
+- order 851: `probe_ollama_environment` (function), lines 12232-12246, exports `probe_ollama_environment`
+- order 853: `probe_ollama_model_records` (function), lines 12269-12302, exports `probe_ollama_model_records`
+- order 854: `list_ollama_models` (function), lines 12303-12307, exports `list_ollama_models`
+- order 855: `_OLLAMA_TAG_CACHE_LOCK` (assignment), lines 12308-12309, exports `_OLLAMA_TAG_CACHE_LOCK`
+- order 856: `_OLLAMA_TAG_CACHE` (assignment), lines 12310-12310, exports `_OLLAMA_TAG_CACHE`
+- order 859: `_fetch_ollama_models_cached` (function), lines 12319-12344, exports `_fetch_ollama_models_cached`
+- order 860: `list_ollama_models_cached` (function), lines 12345-12390, exports `list_ollama_models_cached`
+- order 863: `split_thinking_content` (function), lines 12407-12451, exports `split_thinking_content`
+- order 864: `strip_thinking_content` (function), lines 12452-12454, exports `strip_thinking_content`
+- order 865: `check_ollama_model_ready` (function), lines 12455-12480, exports `check_ollama_model_ready`
+- order 866: `list_loaded_ollama_models` (function), lines 12481-12495, exports `list_loaded_ollama_models`
+- order 867: `wake_ollama_model` (function), lines 12496-12527, exports `wake_ollama_model`
+- order 868: `try_pull_ollama_model` (function), lines 12528-12546, exports `try_pull_ollama_model`
+- order 869: `ordered_model_candidates` (function), lines 12547-12566, exports `ordered_model_candidates`
+- order 870: `pick_working_ollama_model` (function), lines 12567-12584, exports `pick_working_ollama_model`
+- order 874: `complete_chat_endpoint` (function), lines 12626-12636, exports `complete_chat_endpoint`
+- order 883: `is_openai_compat_provider` (function), lines 12731-12733, exports `is_openai_compat_provider`
+- order 884: `is_openai_like_provider` (function), lines 12734-12736, exports `is_openai_like_provider`
+- order 898: `clamp_effort` (function), lines 12791-12802, exports `clamp_effort`
+- order 899: `model_reasoning_style` (function), lines 12803-12845, exports `model_reasoning_style`
+- order 901: `openai_compat_probe_headers` (function), lines 12898-12916, exports `openai_compat_probe_headers`
+- order 902: `openai_compat_model_list_urls` (function), lines 12917-12950, exports `openai_compat_model_list_urls`
+- order 903: `anthropic_model_list_url` (function), lines 12951-12965, exports `anthropic_model_list_url`
+- order 906: `_PROVIDER_MODEL_CACHE_LOCK` (assignment), lines 13081-13083, exports `_PROVIDER_MODEL_CACHE_LOCK`
+- order 907: `_PROVIDER_MODEL_CACHE` (assignment), lines 13084-13084, exports `_PROVIDER_MODEL_CACHE`
+- order 908: `_fetch_provider_models_cached` (function), lines 13085-13158, exports `_fetch_provider_models_cached`
+- order 909: `probe_provider_models` (function), lines 13159-13226, exports `probe_provider_models`
+- order 917: `_is_http_url` (function), lines 13401-13414, exports `_is_http_url`
+- order 918: `_resolve_local_path` (function), lines 13415-13432, exports `_resolve_local_path`
 
 ### `mcp/constants.py`
 
-- order 176: `MCP_SERVICE_PORT_OFFSET` (constant), lines 4194-4194, exports `MCP_SERVICE_PORT_OFFSET`
-- order 1006: `MCP_PROTOCOL_VERSION` (constant), lines 23980-24009, exports `MCP_PROTOCOL_VERSION`
-- order 1007: `MCP_NAME_RE` (constant), lines 24010-24010, exports `MCP_NAME_RE`
-- order 1008: `MCP_TOOL_PREFIX` (constant), lines 24011-24011, exports `MCP_TOOL_PREFIX`
-- order 1009: `_MCP_DEFAULT_HANDSHAKE_TIMEOUT` (assignment), lines 24012-24012, exports `_MCP_DEFAULT_HANDSHAKE_TIMEOUT`
-- order 1010: `_MCP_DEFAULT_CALL_TIMEOUT` (assignment), lines 24013-24013, exports `_MCP_DEFAULT_CALL_TIMEOUT`
-- order 1011: `_MCP_MAX_RESULT_CHARS` (assignment), lines 24014-24014, exports `_MCP_MAX_RESULT_CHARS`
-- order 1012: `_MCP_TRUST_STORE_VERSION` (assignment), lines 24015-24015, exports `_MCP_TRUST_STORE_VERSION`
+- order 179: `MCP_SERVICE_PORT_OFFSET` (constant), lines 4287-4287, exports `MCP_SERVICE_PORT_OFFSET`
+- order 1025: `MCP_PROTOCOL_VERSION` (constant), lines 24833-24862, exports `MCP_PROTOCOL_VERSION`
+- order 1026: `MCP_NAME_RE` (constant), lines 24863-24863, exports `MCP_NAME_RE`
+- order 1027: `MCP_TOOL_PREFIX` (constant), lines 24864-24864, exports `MCP_TOOL_PREFIX`
+- order 1028: `_MCP_DEFAULT_HANDSHAKE_TIMEOUT` (assignment), lines 24865-24865, exports `_MCP_DEFAULT_HANDSHAKE_TIMEOUT`
+- order 1029: `_MCP_DEFAULT_CALL_TIMEOUT` (assignment), lines 24866-24866, exports `_MCP_DEFAULT_CALL_TIMEOUT`
+- order 1030: `_MCP_MAX_RESULT_CHARS` (assignment), lines 24867-24867, exports `_MCP_MAX_RESULT_CHARS`
+- order 1031: `_MCP_TRUST_STORE_VERSION` (assignment), lines 24868-24868, exports `_MCP_TRUST_STORE_VERSION`
 
 ### `mcp/driver.py`
 
-- order 1013: `mcp_normalize_name` (function), lines 24016-24025, exports `mcp_normalize_name`
-- order 1014: `mcp_normalize_server_configs` (function), lines 24026-24110, exports `mcp_normalize_server_configs`
-- order 1015: `mcp_extract_server_configs` (function), lines 24111-24130, exports `mcp_extract_server_configs`
-- order 1016: `_mcp_sha256_file` (function), lines 24131-24141, exports `_mcp_sha256_file`
-- order 1017: `_mcp_file_identity` (function), lines 24142-24159, exports `_mcp_file_identity`
-- order 1018: `mcp_workspace_identity` (function), lines 24160-24178, exports `mcp_workspace_identity`
-- order 1019: `mcp_config_file_digest` (function), lines 24179-24186, exports `mcp_config_file_digest`
-- order 1020: `mcp_default_trust_store_path` (function), lines 24187-24221, exports `mcp_default_trust_store_path`
-- order 1021: `mcp_record_definition_fingerprint` (function), lines 24222-24236, exports `mcp_record_definition_fingerprint`
-- order 1022: `_mcp_effective_spawn` (function), lines 24237-24324, exports `_mcp_effective_spawn`
-- order 1023: `MCPWorkspaceTrustStore` (class), lines 24325-24386, exports `MCPWorkspaceTrustStore`
-- order 1024: `MCPServerProcess` (class), lines 24387-24742, exports `MCPServerProcess`
-- order 1025: `MCPManager` (class), lines 24743-25361, exports `MCPManager`
+- order 1032: `mcp_normalize_name` (function), lines 24869-24878, exports `mcp_normalize_name`
+- order 1033: `mcp_normalize_server_configs` (function), lines 24879-24963, exports `mcp_normalize_server_configs`
+- order 1034: `mcp_extract_server_configs` (function), lines 24964-24983, exports `mcp_extract_server_configs`
+- order 1035: `_mcp_sha256_file` (function), lines 24984-24994, exports `_mcp_sha256_file`
+- order 1036: `_mcp_file_identity` (function), lines 24995-25012, exports `_mcp_file_identity`
+- order 1037: `mcp_workspace_identity` (function), lines 25013-25031, exports `mcp_workspace_identity`
+- order 1038: `mcp_config_file_digest` (function), lines 25032-25039, exports `mcp_config_file_digest`
+- order 1039: `mcp_default_trust_store_path` (function), lines 25040-25074, exports `mcp_default_trust_store_path`
+- order 1040: `mcp_record_definition_fingerprint` (function), lines 25075-25089, exports `mcp_record_definition_fingerprint`
+- order 1041: `_mcp_effective_spawn` (function), lines 25090-25177, exports `_mcp_effective_spawn`
+- order 1042: `MCPWorkspaceTrustStore` (class), lines 25178-25239, exports `MCPWorkspaceTrustStore`
+- order 1043: `MCPServerProcess` (class), lines 25240-25595, exports `MCPServerProcess`
+- order 1044: `MCPManager` (class), lines 25596-26214, exports `MCPManager`
 
 ### `mcp/service.py`
 
-- order 1187: `McpServiceHandler` (class), lines 134573-134790, exports `McpServiceHandler`
+- order 1206: `McpServiceHandler` (class), lines 136213-136430, exports `McpServiceHandler`
 
 ### `rag/assets.py`
 
-- order 1142: `RAG_ADMIN_INDEX_HTML` (constant), lines 111752-111984, exports `RAG_ADMIN_INDEX_HTML`
-- order 1143: `RAG_ADMIN_CSS` (constant), lines 111985-112088, exports `RAG_ADMIN_CSS`
-- order 1144: `RAG_ADMIN_JS` (constant), lines 112089-114309, exports `RAG_ADMIN_JS`
-- order 1145: `CODE_ADMIN_INDEX_HTML` (constant), lines 114310-114322, exports `CODE_ADMIN_INDEX_HTML`
-- order 1146: `CODE_ADMIN_CSS` (constant), lines 114323-114353, exports `CODE_ADMIN_CSS`
-- order 1147: `CODE_ADMIN_JS` (constant), lines 114354-114358, exports `CODE_ADMIN_JS`
+- order 1161: `RAG_ADMIN_INDEX_HTML` (constant), lines 113080-113312, exports `RAG_ADMIN_INDEX_HTML`
+- order 1162: `RAG_ADMIN_CSS` (constant), lines 113313-113416, exports `RAG_ADMIN_CSS`
+- order 1163: `RAG_ADMIN_JS` (constant), lines 113417-115637, exports `RAG_ADMIN_JS`
+- order 1164: `CODE_ADMIN_INDEX_HTML` (constant), lines 115638-115650, exports `CODE_ADMIN_INDEX_HTML`
+- order 1165: `CODE_ADMIN_CSS` (constant), lines 115651-115681, exports `CODE_ADMIN_CSS`
+- order 1166: `CODE_ADMIN_JS` (constant), lines 115682-115686, exports `CODE_ADMIN_JS`
 
 ### `rag/constants.py`
 
-- order 172: `RAG_LIBRARY_DIRNAME` (constant), lines 4190-4190, exports `RAG_LIBRARY_DIRNAME`
-- order 173: `RAG_ADMIN_PORT_OFFSET` (constant), lines 4191-4191, exports `RAG_ADMIN_PORT_OFFSET`
-- order 174: `CODE_LIBRARY_DIRNAME` (constant), lines 4192-4192, exports `CODE_LIBRARY_DIRNAME`
-- order 180: `WEB_SEARCH_INDEX_DIRNAME` (constant), lines 4201-4201, exports `WEB_SEARCH_INDEX_DIRNAME`
-- order 182: `USER_MEMORY_DIRNAME` (constant), lines 4203-4203, exports `USER_MEMORY_DIRNAME`
-- order 183: `USER_MEMORY_DB_FILENAME` (constant), lines 4204-4204, exports `USER_MEMORY_DB_FILENAME`
-- order 184: `USER_MEMORY_PROFILE_FILENAME` (constant), lines 4205-4205, exports `USER_MEMORY_PROFILE_FILENAME`
-- order 185: `USER_MEMORY_MODE_CHOICES` (constant), lines 4206-4206, exports `USER_MEMORY_MODE_CHOICES`
-- order 187: `USER_MEMORY_WEAK_CAPSULE_CHARS` (constant), lines 4208-4208, exports `USER_MEMORY_WEAK_CAPSULE_CHARS`
-- order 188: `USER_MEMORY_ON_CAPSULE_CHARS` (constant), lines 4209-4209, exports `USER_MEMORY_ON_CAPSULE_CHARS`
-- order 189: `USER_MEMORY_CAPSULE_INJECT_CHARS` (constant), lines 4210-4213, exports `USER_MEMORY_CAPSULE_INJECT_CHARS`
-- order 190: `USER_MEMORY_MAX_SUMMARY_CHARS` (constant), lines 4214-4214, exports `USER_MEMORY_MAX_SUMMARY_CHARS`
-- order 191: `USER_MEMORY_QUERY_LIMIT` (constant), lines 4215-4215, exports `USER_MEMORY_QUERY_LIMIT`
-- order 192: `USER_MEMORY_DECAY_HALFLIFE_DAYS` (constant), lines 4216-4216, exports `USER_MEMORY_DECAY_HALFLIFE_DAYS`
-- order 193: `USER_MEMORY_PROFILE_SCHEMA_VERSION` (constant), lines 4217-4217, exports `USER_MEMORY_PROFILE_SCHEMA_VERSION`
-- order 213: `WEB_SEARCH_CONTEXT_REGISTRY_MAX` (constant), lines 4239-4239, exports `WEB_SEARCH_CONTEXT_REGISTRY_MAX`
-- order 214: `WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS` (constant), lines 4240-4240, exports `WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS`
-- order 215: `WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS` (constant), lines 4241-4241, exports `WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS`
-- order 216: `WEB_SEARCH_CONTEXT_NODE_MAX` (constant), lines 4242-4242, exports `WEB_SEARCH_CONTEXT_NODE_MAX`
-- order 217: `WEB_SEARCH_CONTEXT_URL_MAX` (constant), lines 4243-4243, exports `WEB_SEARCH_CONTEXT_URL_MAX`
-- order 218: `RAG_CHUNK_CHARS` (constant), lines 4244-4244, exports `RAG_CHUNK_CHARS`
-- order 219: `RAG_CHUNK_OVERLAP` (constant), lines 4245-4245, exports `RAG_CHUNK_OVERLAP`
-- order 220: `RAG_MAX_CHUNKS_PER_DOC` (constant), lines 4246-4248, exports `RAG_MAX_CHUNKS_PER_DOC`
-- order 221: `RAG_MAX_DOCUMENT_CHARS` (constant), lines 4249-4259, exports `RAG_MAX_DOCUMENT_CHARS`
-- order 226: `RAG_MAX_QUERY_RESULTS` (constant), lines 4273-4273, exports `RAG_MAX_QUERY_RESULTS`
-- order 227: `RAG_HIGH_RECALL_POOL_MULTIPLIER` (constant), lines 4274-4274, exports `RAG_HIGH_RECALL_POOL_MULTIPLIER`
-- order 228: `RAG_HIGH_RECALL_MIN_POOL` (constant), lines 4275-4275, exports `RAG_HIGH_RECALL_MIN_POOL`
-- order 229: `RAG_RETRIEVAL_MAX_PER_DOC` (constant), lines 4276-4276, exports `RAG_RETRIEVAL_MAX_PER_DOC`
-- order 230: `RAG_BM25_K1` (constant), lines 4277-4280, exports `RAG_BM25_K1`
-- order 231: `RAG_BM25_B` (constant), lines 4281-4281, exports `RAG_BM25_B`
-- order 232: `RAG_BM25_SATURATION` (constant), lines 4282-4288, exports `RAG_BM25_SATURATION`
-- order 233: `RAG_SYMBOL_EXACT_BOOST` (constant), lines 4289-4292, exports `RAG_SYMBOL_EXACT_BOOST`
-- order 234: `RAG_INDEX_SNAPSHOT_FORMAT` (constant), lines 4293-4296, exports `RAG_INDEX_SNAPSHOT_FORMAT`
-- order 235: `RAG_GRAPH_MAX_NODES` (constant), lines 4297-4297, exports `RAG_GRAPH_MAX_NODES`
-- order 236: `RAG_TASK_HISTORY_LIMIT` (constant), lines 4298-4298, exports `RAG_TASK_HISTORY_LIMIT`
-- order 237: `RAG_MODEL_MEDIA_MAX_BYTES` (constant), lines 4299-4299, exports `RAG_MODEL_MEDIA_MAX_BYTES`
-- order 238: `RAG_MAX_IMPORT_FILES` (constant), lines 4300-4300, exports `RAG_MAX_IMPORT_FILES`
-- order 239: `RAG_MAX_IMPORT_BATCH_ITEMS` (constant), lines 4301-4301, exports `RAG_MAX_IMPORT_BATCH_ITEMS`
-- order 240: `RAG_MAX_IMPORT_BATCH_BYTES` (constant), lines 4302-4302, exports `RAG_MAX_IMPORT_BATCH_BYTES`
-- order 241: `RAG_PDF_IMAGE_LIMIT` (constant), lines 4303-4303, exports `RAG_PDF_IMAGE_LIMIT`
-- order 242: `RAG_QUERY_CONTEXT_CHARS` (constant), lines 4304-4304, exports `RAG_QUERY_CONTEXT_CHARS`
-- order 243: `RAG_MAX_GLOBAL_COMMUNITIES` (constant), lines 4305-4305, exports `RAG_MAX_GLOBAL_COMMUNITIES`
-- order 244: `RAG_MAX_COMMUNITY_MAP_SUPPORT` (constant), lines 4306-4306, exports `RAG_MAX_COMMUNITY_MAP_SUPPORT`
-- order 245: `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT` (constant), lines 4307-4307, exports `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT`
-- order 246: `RAG_DYNAMIC_NOISE_MIN_DOC_FREQ` (constant), lines 4308-4308, exports `RAG_DYNAMIC_NOISE_MIN_DOC_FREQ`
-- order 247: `RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ` (constant), lines 4309-4309, exports `RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ`
-- order 248: `RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO` (constant), lines 4310-4310, exports `RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO`
-- order 249: `RAG_DYNAMIC_NOISE_HARD_DOC_RATIO` (constant), lines 4311-4311, exports `RAG_DYNAMIC_NOISE_HARD_DOC_RATIO`
-- order 250: `RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO` (constant), lines 4312-4312, exports `RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO`
-- order 251: `RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO` (constant), lines 4313-4313, exports `RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO`
-- order 252: `RAG_MIN_SYNTHESIS_SCORE` (constant), lines 4314-4314, exports `RAG_MIN_SYNTHESIS_SCORE`
-- order 253: `RAG_NO_EVIDENCE_THRESHOLD` (constant), lines 4315-4315, exports `RAG_NO_EVIDENCE_THRESHOLD`
-- order 254: `RAG_WEAK_MATCH_SCORE_CAP` (constant), lines 4316-4316, exports `RAG_WEAK_MATCH_SCORE_CAP`
-- order 255: `RAG_SYNTHESIS_MAX_PER_DOC` (constant), lines 4317-4317, exports `RAG_SYNTHESIS_MAX_PER_DOC`
-- order 256: `RAG_WORKFLOW_ACCEPT_SCORE` (constant), lines 4318-4318, exports `RAG_WORKFLOW_ACCEPT_SCORE`
-- order 257: `RAG_NO_EVIDENCE_MESSAGE` (constant), lines 4319-4319, exports `RAG_NO_EVIDENCE_MESSAGE`
-- order 258: `RAG_CONTEXT_BUDGETS` (constant), lines 4320-4324, exports `RAG_CONTEXT_BUDGETS`
-- order 259: `RAG_WEAK_EVIDENCE_MESSAGE` (constant), lines 4325-4325, exports `RAG_WEAK_EVIDENCE_MESSAGE`
-- order 260: `RAG_EVIDENCE_SCHEMA_VERSION` (constant), lines 4326-4326, exports `RAG_EVIDENCE_SCHEMA_VERSION`
-- order 261: `RAG_EVIDENCE_BATCH_CHARS` (constant), lines 4327-4330, exports `RAG_EVIDENCE_BATCH_CHARS`
-- order 262: `RAG_EVALUATION_SUMMARY_CHARS` (constant), lines 4331-4334, exports `RAG_EVALUATION_SUMMARY_CHARS`
-- order 263: `RAG_DENSE_DEFAULT_ENABLED` (constant), lines 4335-4335, exports `RAG_DENSE_DEFAULT_ENABLED`
-- order 264: `RAG_EMBEDDING_MODE_VALUES` (constant), lines 4336-4336, exports `RAG_EMBEDDING_MODE_VALUES`
-- order 265: `RAG_IMPORT_WORKER_COUNT` (constant), lines 4337-4340, exports `RAG_IMPORT_WORKER_COUNT`
-- order 267: `RAG_PARSE_TIMEOUT_SECONDS` (constant), lines 4345-4348, exports `RAG_PARSE_TIMEOUT_SECONDS`
-- order 1074: `RAG_TERM_GROUPS` (constant), lines 98746-103379, exports `RAG_TERM_GROUPS`
-- order 1075: `RAG_RESEARCH_HINTS` (constant), lines 103380-103401, exports `RAG_RESEARCH_HINTS`
-- order 1076: `RAG_CODE_HINTS` (constant), lines 103402-103412, exports `RAG_CODE_HINTS`
-- order 1077: `RAG_SHORT_TOKEN_ALLOWLIST` (constant), lines 103413-103428, exports `RAG_SHORT_TOKEN_ALLOWLIST`
-- order 1078: `RAG_EN_STOPWORDS` (constant), lines 103429-103501, exports `RAG_EN_STOPWORDS`
-- order 1079: `RAG_ZH_STOPWORDS` (constant), lines 103502-103538, exports `RAG_ZH_STOPWORDS`
-- order 1080: `RAG_GENERIC_ENTITY_TERMS_EN` (constant), lines 103539-103617, exports `RAG_GENERIC_ENTITY_TERMS_EN`
-- order 1081: `RAG_GENERIC_ENTITY_TERMS_ZH` (constant), lines 103618-103660, exports `RAG_GENERIC_ENTITY_TERMS_ZH`
-- order 1082: `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant), lines 103661-103679, exports `RAG_STRUCTURAL_ENTITY_PATTERNS`
-- order 1114: `CODE_LIBRARY_IGNORED_DIRS` (constant), lines 104637-104646, exports `CODE_LIBRARY_IGNORED_DIRS`
-- order 1115: `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant), lines 104647-104703, exports `CODE_LIBRARY_LANGUAGE_BY_EXT`
-- order 1116: `CODE_LIBRARY_SPECIAL_FILENAMES` (constant), lines 104704-104710, exports `CODE_LIBRARY_SPECIAL_FILENAMES`
+- order 175: `RAG_LIBRARY_DIRNAME` (constant), lines 4283-4283, exports `RAG_LIBRARY_DIRNAME`
+- order 176: `RAG_ADMIN_PORT_OFFSET` (constant), lines 4284-4284, exports `RAG_ADMIN_PORT_OFFSET`
+- order 177: `CODE_LIBRARY_DIRNAME` (constant), lines 4285-4285, exports `CODE_LIBRARY_DIRNAME`
+- order 183: `WEB_SEARCH_INDEX_DIRNAME` (constant), lines 4294-4294, exports `WEB_SEARCH_INDEX_DIRNAME`
+- order 185: `USER_MEMORY_DIRNAME` (constant), lines 4296-4296, exports `USER_MEMORY_DIRNAME`
+- order 186: `USER_MEMORY_DB_FILENAME` (constant), lines 4297-4297, exports `USER_MEMORY_DB_FILENAME`
+- order 187: `USER_MEMORY_PROFILE_FILENAME` (constant), lines 4298-4298, exports `USER_MEMORY_PROFILE_FILENAME`
+- order 188: `USER_MEMORY_MODE_CHOICES` (constant), lines 4299-4299, exports `USER_MEMORY_MODE_CHOICES`
+- order 190: `USER_MEMORY_WEAK_CAPSULE_CHARS` (constant), lines 4301-4301, exports `USER_MEMORY_WEAK_CAPSULE_CHARS`
+- order 191: `USER_MEMORY_ON_CAPSULE_CHARS` (constant), lines 4302-4302, exports `USER_MEMORY_ON_CAPSULE_CHARS`
+- order 192: `USER_MEMORY_CAPSULE_INJECT_CHARS` (constant), lines 4303-4306, exports `USER_MEMORY_CAPSULE_INJECT_CHARS`
+- order 193: `USER_MEMORY_MAX_SUMMARY_CHARS` (constant), lines 4307-4307, exports `USER_MEMORY_MAX_SUMMARY_CHARS`
+- order 194: `USER_MEMORY_QUERY_LIMIT` (constant), lines 4308-4308, exports `USER_MEMORY_QUERY_LIMIT`
+- order 195: `USER_MEMORY_DECAY_HALFLIFE_DAYS` (constant), lines 4309-4309, exports `USER_MEMORY_DECAY_HALFLIFE_DAYS`
+- order 196: `USER_MEMORY_PROFILE_SCHEMA_VERSION` (constant), lines 4310-4310, exports `USER_MEMORY_PROFILE_SCHEMA_VERSION`
+- order 216: `WEB_SEARCH_CONTEXT_REGISTRY_MAX` (constant), lines 4332-4332, exports `WEB_SEARCH_CONTEXT_REGISTRY_MAX`
+- order 217: `WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS` (constant), lines 4333-4333, exports `WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS`
+- order 218: `WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS` (constant), lines 4334-4334, exports `WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS`
+- order 219: `WEB_SEARCH_CONTEXT_NODE_MAX` (constant), lines 4335-4335, exports `WEB_SEARCH_CONTEXT_NODE_MAX`
+- order 220: `WEB_SEARCH_CONTEXT_URL_MAX` (constant), lines 4336-4336, exports `WEB_SEARCH_CONTEXT_URL_MAX`
+- order 221: `RAG_CHUNK_CHARS` (constant), lines 4337-4337, exports `RAG_CHUNK_CHARS`
+- order 222: `RAG_CHUNK_OVERLAP` (constant), lines 4338-4338, exports `RAG_CHUNK_OVERLAP`
+- order 223: `RAG_MAX_CHUNKS_PER_DOC` (constant), lines 4339-4341, exports `RAG_MAX_CHUNKS_PER_DOC`
+- order 224: `RAG_MAX_DOCUMENT_CHARS` (constant), lines 4342-4352, exports `RAG_MAX_DOCUMENT_CHARS`
+- order 229: `RAG_MAX_QUERY_RESULTS` (constant), lines 4366-4366, exports `RAG_MAX_QUERY_RESULTS`
+- order 230: `RAG_HIGH_RECALL_POOL_MULTIPLIER` (constant), lines 4367-4367, exports `RAG_HIGH_RECALL_POOL_MULTIPLIER`
+- order 231: `RAG_HIGH_RECALL_MIN_POOL` (constant), lines 4368-4368, exports `RAG_HIGH_RECALL_MIN_POOL`
+- order 232: `RAG_RETRIEVAL_MAX_PER_DOC` (constant), lines 4369-4369, exports `RAG_RETRIEVAL_MAX_PER_DOC`
+- order 233: `RAG_BM25_K1` (constant), lines 4370-4373, exports `RAG_BM25_K1`
+- order 234: `RAG_BM25_B` (constant), lines 4374-4374, exports `RAG_BM25_B`
+- order 235: `RAG_BM25_SATURATION` (constant), lines 4375-4381, exports `RAG_BM25_SATURATION`
+- order 236: `RAG_SYMBOL_EXACT_BOOST` (constant), lines 4382-4385, exports `RAG_SYMBOL_EXACT_BOOST`
+- order 237: `RAG_INDEX_SNAPSHOT_FORMAT` (constant), lines 4386-4389, exports `RAG_INDEX_SNAPSHOT_FORMAT`
+- order 238: `RAG_GRAPH_MAX_NODES` (constant), lines 4390-4390, exports `RAG_GRAPH_MAX_NODES`
+- order 239: `RAG_TASK_HISTORY_LIMIT` (constant), lines 4391-4391, exports `RAG_TASK_HISTORY_LIMIT`
+- order 240: `RAG_MODEL_MEDIA_MAX_BYTES` (constant), lines 4392-4392, exports `RAG_MODEL_MEDIA_MAX_BYTES`
+- order 241: `RAG_MAX_IMPORT_FILES` (constant), lines 4393-4393, exports `RAG_MAX_IMPORT_FILES`
+- order 242: `RAG_MAX_IMPORT_BATCH_ITEMS` (constant), lines 4394-4394, exports `RAG_MAX_IMPORT_BATCH_ITEMS`
+- order 243: `RAG_MAX_IMPORT_BATCH_BYTES` (constant), lines 4395-4395, exports `RAG_MAX_IMPORT_BATCH_BYTES`
+- order 244: `RAG_PDF_IMAGE_LIMIT` (constant), lines 4396-4396, exports `RAG_PDF_IMAGE_LIMIT`
+- order 245: `RAG_QUERY_CONTEXT_CHARS` (constant), lines 4397-4397, exports `RAG_QUERY_CONTEXT_CHARS`
+- order 246: `RAG_MAX_GLOBAL_COMMUNITIES` (constant), lines 4398-4398, exports `RAG_MAX_GLOBAL_COMMUNITIES`
+- order 247: `RAG_MAX_COMMUNITY_MAP_SUPPORT` (constant), lines 4399-4399, exports `RAG_MAX_COMMUNITY_MAP_SUPPORT`
+- order 248: `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT` (constant), lines 4400-4400, exports `RAG_INCLUDE_FILENAME_ENTITIES_DEFAULT`
+- order 249: `RAG_DYNAMIC_NOISE_MIN_DOC_FREQ` (constant), lines 4401-4401, exports `RAG_DYNAMIC_NOISE_MIN_DOC_FREQ`
+- order 250: `RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ` (constant), lines 4402-4402, exports `RAG_DYNAMIC_NOISE_MIN_COMMUNITY_FREQ`
+- order 251: `RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO` (constant), lines 4403-4403, exports `RAG_DYNAMIC_NOISE_SOFT_DOC_RATIO`
+- order 252: `RAG_DYNAMIC_NOISE_HARD_DOC_RATIO` (constant), lines 4404-4404, exports `RAG_DYNAMIC_NOISE_HARD_DOC_RATIO`
+- order 253: `RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO` (constant), lines 4405-4405, exports `RAG_DYNAMIC_NOISE_SOFT_COMMUNITY_RATIO`
+- order 254: `RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO` (constant), lines 4406-4406, exports `RAG_DYNAMIC_NOISE_HARD_COMMUNITY_RATIO`
+- order 255: `RAG_MIN_SYNTHESIS_SCORE` (constant), lines 4407-4407, exports `RAG_MIN_SYNTHESIS_SCORE`
+- order 256: `RAG_NO_EVIDENCE_THRESHOLD` (constant), lines 4408-4408, exports `RAG_NO_EVIDENCE_THRESHOLD`
+- order 257: `RAG_WEAK_MATCH_SCORE_CAP` (constant), lines 4409-4409, exports `RAG_WEAK_MATCH_SCORE_CAP`
+- order 258: `RAG_SYNTHESIS_MAX_PER_DOC` (constant), lines 4410-4410, exports `RAG_SYNTHESIS_MAX_PER_DOC`
+- order 259: `RAG_WORKFLOW_ACCEPT_SCORE` (constant), lines 4411-4411, exports `RAG_WORKFLOW_ACCEPT_SCORE`
+- order 260: `RAG_NO_EVIDENCE_MESSAGE` (constant), lines 4412-4412, exports `RAG_NO_EVIDENCE_MESSAGE`
+- order 261: `RAG_CONTEXT_BUDGETS` (constant), lines 4413-4417, exports `RAG_CONTEXT_BUDGETS`
+- order 262: `RAG_WEAK_EVIDENCE_MESSAGE` (constant), lines 4418-4418, exports `RAG_WEAK_EVIDENCE_MESSAGE`
+- order 263: `RAG_EVIDENCE_SCHEMA_VERSION` (constant), lines 4419-4419, exports `RAG_EVIDENCE_SCHEMA_VERSION`
+- order 264: `RAG_EVIDENCE_BATCH_CHARS` (constant), lines 4420-4423, exports `RAG_EVIDENCE_BATCH_CHARS`
+- order 265: `RAG_EVALUATION_SUMMARY_CHARS` (constant), lines 4424-4427, exports `RAG_EVALUATION_SUMMARY_CHARS`
+- order 266: `RAG_DENSE_DEFAULT_ENABLED` (constant), lines 4428-4428, exports `RAG_DENSE_DEFAULT_ENABLED`
+- order 267: `RAG_EMBEDDING_MODE_VALUES` (constant), lines 4429-4429, exports `RAG_EMBEDDING_MODE_VALUES`
+- order 268: `RAG_IMPORT_WORKER_COUNT` (constant), lines 4430-4433, exports `RAG_IMPORT_WORKER_COUNT`
+- order 270: `RAG_PARSE_TIMEOUT_SECONDS` (constant), lines 4438-4441, exports `RAG_PARSE_TIMEOUT_SECONDS`
+- order 1093: `RAG_TERM_GROUPS` (constant), lines 100074-104707, exports `RAG_TERM_GROUPS`
+- order 1094: `RAG_RESEARCH_HINTS` (constant), lines 104708-104729, exports `RAG_RESEARCH_HINTS`
+- order 1095: `RAG_CODE_HINTS` (constant), lines 104730-104740, exports `RAG_CODE_HINTS`
+- order 1096: `RAG_SHORT_TOKEN_ALLOWLIST` (constant), lines 104741-104756, exports `RAG_SHORT_TOKEN_ALLOWLIST`
+- order 1097: `RAG_EN_STOPWORDS` (constant), lines 104757-104829, exports `RAG_EN_STOPWORDS`
+- order 1098: `RAG_ZH_STOPWORDS` (constant), lines 104830-104866, exports `RAG_ZH_STOPWORDS`
+- order 1099: `RAG_GENERIC_ENTITY_TERMS_EN` (constant), lines 104867-104945, exports `RAG_GENERIC_ENTITY_TERMS_EN`
+- order 1100: `RAG_GENERIC_ENTITY_TERMS_ZH` (constant), lines 104946-104988, exports `RAG_GENERIC_ENTITY_TERMS_ZH`
+- order 1101: `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant), lines 104989-105007, exports `RAG_STRUCTURAL_ENTITY_PATTERNS`
+- order 1133: `CODE_LIBRARY_IGNORED_DIRS` (constant), lines 105965-105974, exports `CODE_LIBRARY_IGNORED_DIRS`
+- order 1134: `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant), lines 105975-106031, exports `CODE_LIBRARY_LANGUAGE_BY_EXT`
+- order 1135: `CODE_LIBRARY_SPECIAL_FILENAMES` (constant), lines 106032-106038, exports `CODE_LIBRARY_SPECIAL_FILENAMES`
 
 ### `rag/index.py`
 
-- order 1119: `_code_module_name` (function), lines 104735-104751, exports `_code_module_name`
-- order 1120: `_code_choose_community` (function), lines 104752-104761, exports `_code_choose_community`
-- order 1121: `_code_query_terms` (function), lines 104762-104776, exports `_code_query_terms`
-- order 1130: `TFGraphIDFIndex` (class), lines 105907-107601, exports `TFGraphIDFIndex`
-- order 1139: `CodeGraphIndex` (class), lines 110884-111372, exports `CodeGraphIndex`
+- order 1138: `_code_module_name` (function), lines 106063-106079, exports `_code_module_name`
+- order 1139: `_code_choose_community` (function), lines 106080-106089, exports `_code_choose_community`
+- order 1140: `_code_query_terms` (function), lines 106090-106104, exports `_code_query_terms`
+- order 1149: `TFGraphIDFIndex` (class), lines 107235-108929, exports `TFGraphIDFIndex`
+- order 1158: `CodeGraphIndex` (class), lines 112212-112700, exports `CodeGraphIndex`
 
 ### `rag/ingestion.py`
 
-- order 1098: `_rag_trigram_set` (function), lines 104057-104064, exports `_rag_trigram_set`
-- order 1099: `_rag_jaccard_sim` (function), lines 104065-104074, exports `_rag_jaccard_sim`
-- order 1100: `_rag_mmr_select` (function), lines 104075-104124, exports `_rag_mmr_select`
-- order 1105: `_rag_embed_text` (function), lines 104259-104282, exports `_rag_embed_text`
-- order 1106: `_rag_embed_batch` (function), lines 104283-104291, exports `_rag_embed_batch`
-- order 1107: `_rag_window_for_query` (function), lines 104292-104306, exports `_rag_window_for_query`
-- order 1108: `_rag_focused_excerpt` (function), lines 104307-104349, exports `_rag_focused_excerpt`
-- order 1109: `_rag_query_variants` (function), lines 104350-104389, exports `_rag_query_variants`
-- order 1110: `_rag_parse_segments` (function), lines 104390-104452, exports `_rag_parse_segments`
-- order 1111: `_rag_boundary_split` (function), lines 104453-104510, exports `_rag_boundary_split`
-- order 1137: `_rag_parse_file_worker` (function), lines 109985-110001, exports `_rag_parse_file_worker`
-- order 1138: `RAGIngestionService` (class), lines 110002-110883, exports `RAGIngestionService`
-- order 1141: `CodeIngestionService` (class), lines 111664-111751, exports `CodeIngestionService`
+- order 1117: `_rag_trigram_set` (function), lines 105385-105392, exports `_rag_trigram_set`
+- order 1118: `_rag_jaccard_sim` (function), lines 105393-105402, exports `_rag_jaccard_sim`
+- order 1119: `_rag_mmr_select` (function), lines 105403-105452, exports `_rag_mmr_select`
+- order 1124: `_rag_embed_text` (function), lines 105587-105610, exports `_rag_embed_text`
+- order 1125: `_rag_embed_batch` (function), lines 105611-105619, exports `_rag_embed_batch`
+- order 1126: `_rag_window_for_query` (function), lines 105620-105634, exports `_rag_window_for_query`
+- order 1127: `_rag_focused_excerpt` (function), lines 105635-105677, exports `_rag_focused_excerpt`
+- order 1128: `_rag_query_variants` (function), lines 105678-105717, exports `_rag_query_variants`
+- order 1129: `_rag_parse_segments` (function), lines 105718-105780, exports `_rag_parse_segments`
+- order 1130: `_rag_boundary_split` (function), lines 105781-105838, exports `_rag_boundary_split`
+- order 1156: `_rag_parse_file_worker` (function), lines 111313-111329, exports `_rag_parse_file_worker`
+- order 1157: `RAGIngestionService` (class), lines 111330-112211, exports `RAGIngestionService`
+- order 1160: `CodeIngestionService` (class), lines 112992-113079, exports `CodeIngestionService`
 
 ### `rag/parsers.py`
 
-- order 1083: `EvidenceRecord` (class), lines 103680-103714, exports `EvidenceRecord`
-- order 1084: `_rag_float` (function), lines 103715-103721, exports `_rag_float`
-- order 1085: `_rag_evidence_source_type` (function), lines 103722-103738, exports `_rag_evidence_source_type`
-- order 1086: `_rag_normalize_evidence_record` (function), lines 103739-103794, exports `_rag_normalize_evidence_record`
-- order 1087: `_rag_validate_evidence_record` (function), lines 103795-103837, exports `_rag_validate_evidence_record`
-- order 1088: `_rag_evidence_batches` (function), lines 103838-103855, exports `_rag_evidence_batches`
-- order 1089: `_rag_safe_name` (function), lines 103856-103861, exports `_rag_safe_name`
-- order 1090: `_rag_detect_language` (function), lines 103862-103878, exports `_rag_detect_language`
-- order 1091: `_rag_cjk_ngrams` (function), lines 103879-103893, exports `_rag_cjk_ngrams`
-- order 1092: `_rag_is_noise_token` (function), lines 103894-103915, exports `_rag_is_noise_token`
-- order 1093: `_rag_entity_allowed` (function), lines 103916-103930, exports `_rag_entity_allowed`
-- order 1094: `_rag_filter_entities` (function), lines 103931-103947, exports `_rag_filter_entities`
-- order 1095: `_rag_filename_entity_aliases` (function), lines 103948-103983, exports `_rag_filename_entity_aliases`
-- order 1096: `_rag_apply_filename_entity_policy` (function), lines 103984-104016, exports `_rag_apply_filename_entity_policy`
-- order 1097: `_rag_choose_community` (function), lines 104017-104056, exports `_rag_choose_community`
-- order 1101: `_rag_tokenize` (function), lines 104125-104178, exports `_rag_tokenize`
-- order 1102: `_rag_expand_tokens` (function), lines 104179-104202, exports `_rag_expand_tokens`
-- order 1103: `_rag_extract_entities` (function), lines 104203-104221, exports `_rag_extract_entities`
-- order 1104: `_rag_classify_document` (function), lines 104222-104258, exports `_rag_classify_document`
-- order 1112: `_rag_structure_outline` (function), lines 104511-104549, exports `_rag_structure_outline`
-- order 1113: `_rag_chunk_text` (function), lines 104550-104636, exports `_rag_chunk_text`
-- order 1117: `_code_language_from_name` (function), lines 104711-104729, exports `_code_language_from_name`
-- order 1118: `_code_is_test_path` (function), lines 104730-104734, exports `_code_is_test_path`
-- order 1122: `_CallCollector` (class), lines 104777-104791, exports `_CallCollector`
-- order 1123: `_ALGO_COMPLEXITY_RE` (assignment), lines 104792-104794, exports `_ALGO_COMPLEXITY_RE`
-- order 1124: `_ALGO_STEP_RE` (assignment), lines 104795-104795, exports `_ALGO_STEP_RE`
-- order 1125: `_ALGO_MATH_VARS` (assignment), lines 104796-104796, exports `_ALGO_MATH_VARS`
-- order 1126: `_ALGO_DOC_KEYWORDS` (assignment), lines 104797-104797, exports `_ALGO_DOC_KEYWORDS`
-- order 1127: `_detect_algo_chunk` (function), lines 104798-104823, exports `_detect_algo_chunk`
-- order 1128: `CodeContentParser` (class), lines 104824-105390, exports `CodeContentParser`
-- order 1129: `RAGContentParser` (class), lines 105391-105906, exports `RAGContentParser`
+- order 1102: `EvidenceRecord` (class), lines 105008-105042, exports `EvidenceRecord`
+- order 1103: `_rag_float` (function), lines 105043-105049, exports `_rag_float`
+- order 1104: `_rag_evidence_source_type` (function), lines 105050-105066, exports `_rag_evidence_source_type`
+- order 1105: `_rag_normalize_evidence_record` (function), lines 105067-105122, exports `_rag_normalize_evidence_record`
+- order 1106: `_rag_validate_evidence_record` (function), lines 105123-105165, exports `_rag_validate_evidence_record`
+- order 1107: `_rag_evidence_batches` (function), lines 105166-105183, exports `_rag_evidence_batches`
+- order 1108: `_rag_safe_name` (function), lines 105184-105189, exports `_rag_safe_name`
+- order 1109: `_rag_detect_language` (function), lines 105190-105206, exports `_rag_detect_language`
+- order 1110: `_rag_cjk_ngrams` (function), lines 105207-105221, exports `_rag_cjk_ngrams`
+- order 1111: `_rag_is_noise_token` (function), lines 105222-105243, exports `_rag_is_noise_token`
+- order 1112: `_rag_entity_allowed` (function), lines 105244-105258, exports `_rag_entity_allowed`
+- order 1113: `_rag_filter_entities` (function), lines 105259-105275, exports `_rag_filter_entities`
+- order 1114: `_rag_filename_entity_aliases` (function), lines 105276-105311, exports `_rag_filename_entity_aliases`
+- order 1115: `_rag_apply_filename_entity_policy` (function), lines 105312-105344, exports `_rag_apply_filename_entity_policy`
+- order 1116: `_rag_choose_community` (function), lines 105345-105384, exports `_rag_choose_community`
+- order 1120: `_rag_tokenize` (function), lines 105453-105506, exports `_rag_tokenize`
+- order 1121: `_rag_expand_tokens` (function), lines 105507-105530, exports `_rag_expand_tokens`
+- order 1122: `_rag_extract_entities` (function), lines 105531-105549, exports `_rag_extract_entities`
+- order 1123: `_rag_classify_document` (function), lines 105550-105586, exports `_rag_classify_document`
+- order 1131: `_rag_structure_outline` (function), lines 105839-105877, exports `_rag_structure_outline`
+- order 1132: `_rag_chunk_text` (function), lines 105878-105964, exports `_rag_chunk_text`
+- order 1136: `_code_language_from_name` (function), lines 106039-106057, exports `_code_language_from_name`
+- order 1137: `_code_is_test_path` (function), lines 106058-106062, exports `_code_is_test_path`
+- order 1141: `_CallCollector` (class), lines 106105-106119, exports `_CallCollector`
+- order 1142: `_ALGO_COMPLEXITY_RE` (assignment), lines 106120-106122, exports `_ALGO_COMPLEXITY_RE`
+- order 1143: `_ALGO_STEP_RE` (assignment), lines 106123-106123, exports `_ALGO_STEP_RE`
+- order 1144: `_ALGO_MATH_VARS` (assignment), lines 106124-106124, exports `_ALGO_MATH_VARS`
+- order 1145: `_ALGO_DOC_KEYWORDS` (assignment), lines 106125-106125, exports `_ALGO_DOC_KEYWORDS`
+- order 1146: `_detect_algo_chunk` (function), lines 106126-106151, exports `_detect_algo_chunk`
+- order 1147: `CodeContentParser` (class), lines 106152-106718, exports `CodeContentParser`
+- order 1148: `RAGContentParser` (class), lines 106719-107234, exports `RAGContentParser`
 
 ### `rag/store.py`
 
-- order 1131: `RAGLibraryStore` (class), lines 107602-108240, exports `RAGLibraryStore`
-- order 1132: `WikiStore` (class), lines 108241-108796, exports `WikiStore`
-- order 1133: `UserMemoryStore` (class), lines 108797-109472, exports `UserMemoryStore`
-- order 1134: `UserInteractionOptimizer` (class), lines 109473-109541, exports `UserInteractionOptimizer`
-- order 1135: `UserIntentProfiler` (class), lines 109542-109583, exports `UserIntentProfiler`
-- order 1136: `WorkflowMemoryStore` (class), lines 109584-109984, exports `WorkflowMemoryStore`
-- order 1140: `CodeLibraryStore` (class), lines 111373-111663, exports `CodeLibraryStore`
+- order 1150: `RAGLibraryStore` (class), lines 108930-109568, exports `RAGLibraryStore`
+- order 1151: `WikiStore` (class), lines 109569-110124, exports `WikiStore`
+- order 1152: `UserMemoryStore` (class), lines 110125-110800, exports `UserMemoryStore`
+- order 1153: `UserInteractionOptimizer` (class), lines 110801-110869, exports `UserInteractionOptimizer`
+- order 1154: `UserIntentProfiler` (class), lines 110870-110911, exports `UserIntentProfiler`
+- order 1155: `WorkflowMemoryStore` (class), lines 110912-111312, exports `WorkflowMemoryStore`
+- order 1159: `CodeLibraryStore` (class), lines 112701-112991, exports `CodeLibraryStore`
 
 ### `rag/web_search.py`
 
-- order 814: `_agent_web_bool` (function), lines 9333-9340, exports `_agent_web_bool`
-- order 815: `_agent_web_int` (function), lines 9341-9348, exports `_agent_web_int`
-- order 816: `_agent_web_host_is_local_name` (function), lines 9349-9355, exports `_agent_web_host_is_local_name`
-- order 817: `_agent_web_ip_is_blocked` (function), lines 9356-9370, exports `_agent_web_ip_is_blocked`
-- order 818: `_agent_web_canonical_url` (function), lines 9371-9400, exports `_agent_web_canonical_url`
-- order 819: `_agent_web_domain_to_seed` (function), lines 9401-9412, exports `_agent_web_domain_to_seed`
-- order 820: `_agent_web_query_terms` (function), lines 9413-9430, exports `_agent_web_query_terms`
-- order 821: `_agent_web_query_domain_hints` (function), lines 9431-9471, exports `_agent_web_query_domain_hints`
-- order 822: `_agent_web_query_needs_fresh_network` (function), lines 9472-9494, exports `_agent_web_query_needs_fresh_network`
-- order 823: `_agent_web_extract_text_snippet` (function), lines 9495-9512, exports `_agent_web_extract_text_snippet`
-- order 824: `AgentWebHTMLParser` (class), lines 9513-9592, exports `AgentWebHTMLParser`
-- order 825: `_agent_web_decompress_bytes` (function), lines 9593-9616, exports `_agent_web_decompress_bytes`
-- order 826: `_agent_web_charset_candidates` (function), lines 9617-9675, exports `_agent_web_charset_candidates`
-- order 827: `_agent_web_decode_text_bytes` (function), lines 9676-9710, exports `_agent_web_decode_text_bytes`
-- order 828: `AgentWebSearchEngine` (class), lines 9711-11491, exports `AgentWebSearchEngine`
+- order 817: `_agent_web_bool` (function), lines 9426-9433, exports `_agent_web_bool`
+- order 818: `_agent_web_int` (function), lines 9434-9441, exports `_agent_web_int`
+- order 819: `_agent_web_host_is_local_name` (function), lines 9442-9448, exports `_agent_web_host_is_local_name`
+- order 820: `_agent_web_ip_is_blocked` (function), lines 9449-9463, exports `_agent_web_ip_is_blocked`
+- order 821: `_agent_web_canonical_url` (function), lines 9464-9493, exports `_agent_web_canonical_url`
+- order 822: `_agent_web_domain_to_seed` (function), lines 9494-9505, exports `_agent_web_domain_to_seed`
+- order 823: `_agent_web_query_terms` (function), lines 9506-9523, exports `_agent_web_query_terms`
+- order 824: `_agent_web_query_domain_hints` (function), lines 9524-9564, exports `_agent_web_query_domain_hints`
+- order 825: `_agent_web_query_needs_fresh_network` (function), lines 9565-9587, exports `_agent_web_query_needs_fresh_network`
+- order 826: `_agent_web_extract_text_snippet` (function), lines 9588-9605, exports `_agent_web_extract_text_snippet`
+- order 827: `AgentWebHTMLParser` (class), lines 9606-9685, exports `AgentWebHTMLParser`
+- order 828: `_agent_web_decompress_bytes` (function), lines 9686-9709, exports `_agent_web_decompress_bytes`
+- order 829: `_agent_web_charset_candidates` (function), lines 9710-9768, exports `_agent_web_charset_candidates`
+- order 830: `_agent_web_decode_text_bytes` (function), lines 9769-9803, exports `_agent_web_decode_text_bytes`
+- order 831: `AgentWebSearchEngine` (class), lines 9804-11584, exports `AgentWebSearchEngine`
 
 ### `server/http.py`
 
-- order 690: `admin_language_payload` (function), lines 6352-6363, exports `admin_language_payload`
-- order 803: `_UI_TRUNCATION_MARKER` (assignment), lines 8952-8954, exports `_UI_TRUNCATION_MARKER`
-- order 804: `_ui_trim_text` (function), lines 8955-8963, exports `_ui_trim_text`
-- order 805: `_bounded_ui_value` (function), lines 8964-9024, exports `_bounded_ui_value`
-- order 806: `_bounded_ui_row` (function), lines 9025-9076, exports `_bounded_ui_row`
-- order 807: `_bounded_ui_rows` (function), lines 9077-9125, exports `_bounded_ui_rows`
-- order 808: `_enforce_ui_payload_budget` (function), lines 9126-9170, exports `_enforce_ui_payload_budget`
-- order 809: `_apply_lite_snapshot_bounds` (function), lines 9171-9226, exports `_apply_lite_snapshot_bounds`
-- order 1176: `AgentHTTPServer` (class), lines 128137-128176, exports `AgentHTTPServer`
-- order 1179: `Handler` (class), lines 129363-131130, exports `Handler`
-- order 1182: `SkillsReviewHandler` (class), lines 131932-132045, exports `SkillsReviewHandler`
-- order 1186: `CollaborationHandler` (class), lines 134102-134572, exports `CollaborationHandler`
+- order 693: `admin_language_payload` (function), lines 6445-6456, exports `admin_language_payload`
+- order 806: `_UI_TRUNCATION_MARKER` (assignment), lines 9045-9047, exports `_UI_TRUNCATION_MARKER`
+- order 807: `_ui_trim_text` (function), lines 9048-9056, exports `_ui_trim_text`
+- order 808: `_bounded_ui_value` (function), lines 9057-9117, exports `_bounded_ui_value`
+- order 809: `_bounded_ui_row` (function), lines 9118-9169, exports `_bounded_ui_row`
+- order 810: `_bounded_ui_rows` (function), lines 9170-9218, exports `_bounded_ui_rows`
+- order 811: `_enforce_ui_payload_budget` (function), lines 9219-9263, exports `_enforce_ui_payload_budget`
+- order 812: `_apply_lite_snapshot_bounds` (function), lines 9264-9319, exports `_apply_lite_snapshot_bounds`
+- order 1195: `AgentHTTPServer` (class), lines 129628-129667, exports `AgentHTTPServer`
+- order 1198: `Handler` (class), lines 130854-132769, exports `Handler`
+- order 1201: `SkillsReviewHandler` (class), lines 133571-133684, exports `SkillsReviewHandler`
+- order 1205: `CollaborationHandler` (class), lines 135742-136212, exports `CollaborationHandler`
 
 ### `server/rag_admin.py`
 
-- order 1181: `_RagAdminAuthMixin` (class), lines 131774-131931, exports `_RagAdminAuthMixin`
-- order 1183: `RagAdminHandler` (class), lines 132046-132246, exports `RagAdminHandler`
-- order 1184: `CodeAdminHandler` (class), lines 132247-132445, exports `CodeAdminHandler`
+- order 1200: `_RagAdminAuthMixin` (class), lines 133413-133570, exports `_RagAdminAuthMixin`
+- order 1202: `RagAdminHandler` (class), lines 133685-133885, exports `RagAdminHandler`
+- order 1203: `CodeAdminHandler` (class), lines 133886-134084, exports `CodeAdminHandler`
 
 ### `server/skills.py`
 
-- order 1180: `SkillsHandler` (class), lines 131131-131773, exports `SkillsHandler`
+- order 1199: `SkillsHandler` (class), lines 132770-133412, exports `SkillsHandler`
 
 ### `session/manager.py`
 
-- order 725: `SessionCreationLimitExceeded` (class), lines 7512-7517, exports `SessionCreationLimitExceeded`
-- order 1062: `SessionManager` (class), lines 89605-91947, exports `SessionManager`
+- order 728: `SessionCreationLimitExceeded` (class), lines 7605-7610, exports `SessionCreationLimitExceeded`
+- order 1081: `SessionManager` (class), lines 90660-93164, exports `SessionManager`
 
 ### `session/state.py`
 
-- order 1061: `SessionState` (class), lines 29143-89604, exports `SessionState`
+- order 1080: `SessionState` (class), lines 30011-90659, exports `SessionState`
 
 ### `skills/embedded.py`
 
-- order 961: `EMBEDDED_SKILLS_ARCHIVE_B64` (constant), lines 16771-16772, exports `EMBEDDED_SKILLS_ARCHIVE_B64`
-- order 962: `EMBEDDED_SKILLS_ARCHIVE_SHA256` (constant), lines 16773-16773, exports `EMBEDDED_SKILLS_ARCHIVE_SHA256`
-- order 963: `EMBEDDED_SKILLS_ARCHIVE_FILES` (constant), lines 16774-16796, exports `EMBEDDED_SKILLS_ARCHIVE_FILES`
-- order 988: `BUILTIN_CLAWHUB_SKILLS_VERSION` (constant), lines 20032-20034, exports `BUILTIN_CLAWHUB_SKILLS_VERSION`
-- order 989: `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64` (constant), lines 20035-20280, exports `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64`
-- order 991: `MCP_BUILDER_SKILL_MD` (constant), lines 20328-20502, exports `MCP_BUILDER_SKILL_MD`
-- order 994: `SKILL_PROTOCOL_LOCAL` (constant), lines 20534-20535, exports `SKILL_PROTOCOL_LOCAL`
-- order 995: `SKILL_PROTOCOL_CLAWHUB` (constant), lines 20536-20536, exports `SKILL_PROTOCOL_CLAWHUB`
-- order 996: `SKILL_PROTOCOL_HTTP_JSON` (constant), lines 20537-20537, exports `SKILL_PROTOCOL_HTTP_JSON`
-- order 997: `SKILL_PROTOCOL_SPECS` (constant), lines 20538-20570, exports `SKILL_PROTOCOL_SPECS`
+- order 980: `EMBEDDED_SKILLS_ARCHIVE_B64` (constant), lines 17624-17625, exports `EMBEDDED_SKILLS_ARCHIVE_B64`
+- order 981: `EMBEDDED_SKILLS_ARCHIVE_SHA256` (constant), lines 17626-17626, exports `EMBEDDED_SKILLS_ARCHIVE_SHA256`
+- order 982: `EMBEDDED_SKILLS_ARCHIVE_FILES` (constant), lines 17627-17649, exports `EMBEDDED_SKILLS_ARCHIVE_FILES`
+- order 1007: `BUILTIN_CLAWHUB_SKILLS_VERSION` (constant), lines 20885-20887, exports `BUILTIN_CLAWHUB_SKILLS_VERSION`
+- order 1008: `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64` (constant), lines 20888-21133, exports `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64`
+- order 1010: `MCP_BUILDER_SKILL_MD` (constant), lines 21181-21355, exports `MCP_BUILDER_SKILL_MD`
+- order 1013: `SKILL_PROTOCOL_LOCAL` (constant), lines 21387-21388, exports `SKILL_PROTOCOL_LOCAL`
+- order 1014: `SKILL_PROTOCOL_CLAWHUB` (constant), lines 21389-21389, exports `SKILL_PROTOCOL_CLAWHUB`
+- order 1015: `SKILL_PROTOCOL_HTTP_JSON` (constant), lines 21390-21390, exports `SKILL_PROTOCOL_HTTP_JSON`
+- order 1016: `SKILL_PROTOCOL_SPECS` (constant), lines 21391-21423, exports `SKILL_PROTOCOL_SPECS`
 
 ### `skills/provisioning.py`
 
-- order 964: `ensure_embedded_skills_at_root` (function), lines 16797-16862, exports `ensure_embedded_skills_at_root`
-- order 965: `ensure_embedded_skills` (function), lines 16863-16866, exports `ensure_embedded_skills`
-- order 967: `detect_upload_parser_capabilities` (function), lines 16873-16889, exports `detect_upload_parser_capabilities`
-- order 968: `_render_cap_markdown` (function), lines 16890-16905, exports `_render_cap_markdown`
-- order 969: `_write_text_if_changed` (function), lines 16906-16912, exports `_write_text_if_changed`
-- order 970: `ensure_generated_document_skills` (function), lines 16913-17002, exports `ensure_generated_document_skills`
-- order 971: `ensure_generated_image_coding_feedback_skill` (function), lines 17003-17103, exports `ensure_generated_image_coding_feedback_skill`
-- order 972: `_skill_knowledge_files` (function), lines 17104-17124, exports `_skill_knowledge_files`
-- order 973: `analyze_skill_building_knowledge` (function), lines 17125-17180, exports `analyze_skill_building_knowledge`
-- order 974: `_sanitize_skill_slug` (function), lines 17181-17184, exports `_sanitize_skill_slug`
-- order 975: `_build_skills_gen_skill_content` (function), lines 17185-17217, exports `_build_skills_gen_skill_content`
-- order 976: `ensure_generated_skills_gen_skill` (function), lines 17218-17223, exports `ensure_generated_skills_gen_skill`
-- order 977: `ensure_generated_execution_recovery_skill` (function), lines 17224-17308, exports `ensure_generated_execution_recovery_skill`
-- order 978: `ensure_generated_systematic_debugging_skill` (function), lines 17309-17582, exports `ensure_generated_systematic_debugging_skill`
-- order 979: `ensure_generated_code_engineering_mastery_skill` (function), lines 17583-17702, exports `ensure_generated_code_engineering_mastery_skill`
-- order 980: `ensure_generated_smart_file_navigation_skill` (function), lines 17703-17819, exports `ensure_generated_smart_file_navigation_skill`
-- order 981: `ensure_generated_html_frontend_report_skills` (function), lines 17820-18028, exports `ensure_generated_html_frontend_report_skills`
-- order 982: `ensure_generated_deep_research_skills` (function), lines 18029-18298, exports `ensure_generated_deep_research_skills`
-- order 983: `ensure_generated_research_scientific_skills` (function), lines 18299-18936, exports `ensure_generated_research_scientific_skills`
-- order 984: `ensure_generated_rag_mastery_skills` (function), lines 18937-19238, exports `ensure_generated_rag_mastery_skills`
-- order 985: `ensure_generated_multimodal_comprehension_skills` (function), lines 19239-19933, exports `ensure_generated_multimodal_comprehension_skills`
-- order 986: `ensure_generated_runtime_skills_manifest` (function), lines 19934-19968, exports `ensure_generated_runtime_skills_manifest`
-- order 987: `ensure_generated_agent_web_search_skill` (function), lines 19969-20031, exports `ensure_generated_agent_web_search_skill`
-- order 990: `ensure_embedded_clawhub_skills` (function), lines 20281-20327, exports `ensure_embedded_clawhub_skills`
-- order 992: `ensure_generated_mcp_builder_skill` (function), lines 20503-20514, exports `ensure_generated_mcp_builder_skill`
-- order 993: `ensure_runtime_skills` (function), lines 20515-20533, exports `ensure_runtime_skills`
+- order 983: `ensure_embedded_skills_at_root` (function), lines 17650-17715, exports `ensure_embedded_skills_at_root`
+- order 984: `ensure_embedded_skills` (function), lines 17716-17719, exports `ensure_embedded_skills`
+- order 986: `detect_upload_parser_capabilities` (function), lines 17726-17742, exports `detect_upload_parser_capabilities`
+- order 987: `_render_cap_markdown` (function), lines 17743-17758, exports `_render_cap_markdown`
+- order 988: `_write_text_if_changed` (function), lines 17759-17765, exports `_write_text_if_changed`
+- order 989: `ensure_generated_document_skills` (function), lines 17766-17855, exports `ensure_generated_document_skills`
+- order 990: `ensure_generated_image_coding_feedback_skill` (function), lines 17856-17956, exports `ensure_generated_image_coding_feedback_skill`
+- order 991: `_skill_knowledge_files` (function), lines 17957-17977, exports `_skill_knowledge_files`
+- order 992: `analyze_skill_building_knowledge` (function), lines 17978-18033, exports `analyze_skill_building_knowledge`
+- order 993: `_sanitize_skill_slug` (function), lines 18034-18037, exports `_sanitize_skill_slug`
+- order 994: `_build_skills_gen_skill_content` (function), lines 18038-18070, exports `_build_skills_gen_skill_content`
+- order 995: `ensure_generated_skills_gen_skill` (function), lines 18071-18076, exports `ensure_generated_skills_gen_skill`
+- order 996: `ensure_generated_execution_recovery_skill` (function), lines 18077-18161, exports `ensure_generated_execution_recovery_skill`
+- order 997: `ensure_generated_systematic_debugging_skill` (function), lines 18162-18435, exports `ensure_generated_systematic_debugging_skill`
+- order 998: `ensure_generated_code_engineering_mastery_skill` (function), lines 18436-18555, exports `ensure_generated_code_engineering_mastery_skill`
+- order 999: `ensure_generated_smart_file_navigation_skill` (function), lines 18556-18672, exports `ensure_generated_smart_file_navigation_skill`
+- order 1000: `ensure_generated_html_frontend_report_skills` (function), lines 18673-18881, exports `ensure_generated_html_frontend_report_skills`
+- order 1001: `ensure_generated_deep_research_skills` (function), lines 18882-19151, exports `ensure_generated_deep_research_skills`
+- order 1002: `ensure_generated_research_scientific_skills` (function), lines 19152-19789, exports `ensure_generated_research_scientific_skills`
+- order 1003: `ensure_generated_rag_mastery_skills` (function), lines 19790-20091, exports `ensure_generated_rag_mastery_skills`
+- order 1004: `ensure_generated_multimodal_comprehension_skills` (function), lines 20092-20786, exports `ensure_generated_multimodal_comprehension_skills`
+- order 1005: `ensure_generated_runtime_skills_manifest` (function), lines 20787-20821, exports `ensure_generated_runtime_skills_manifest`
+- order 1006: `ensure_generated_agent_web_search_skill` (function), lines 20822-20884, exports `ensure_generated_agent_web_search_skill`
+- order 1009: `ensure_embedded_clawhub_skills` (function), lines 21134-21180, exports `ensure_embedded_clawhub_skills`
+- order 1011: `ensure_generated_mcp_builder_skill` (function), lines 21356-21367, exports `ensure_generated_mcp_builder_skill`
+- order 1012: `ensure_runtime_skills` (function), lines 21368-21386, exports `ensure_runtime_skills`
 
 ### `skills/store.py`
 
-- order 998: `_BUILTIN_SKILLS` (assignment), lines 20571-20679, exports `_BUILTIN_SKILLS`
-- order 999: `SkillStore` (class), lines 20680-22573, exports `SkillStore`
+- order 1017: `_BUILTIN_SKILLS` (assignment), lines 21424-21532, exports `_BUILTIN_SKILLS`
+- order 1018: `SkillStore` (class), lines 21533-23426, exports `SkillStore`
 
 ### `skills/studio.py`
 
-- order 1164: `SkillsStudioError` (class), lines 115513-115522, exports `SkillsStudioError`
-- order 1165: `_studio_slug` (function), lines 115523-115538, exports `_studio_slug`
-- order 1166: `_studio_hash` (function), lines 115539-115542, exports `_studio_hash`
-- order 1167: `_studio_cookie_value` (function), lines 115543-115552, exports `_studio_cookie_value`
-- order 1168: `SkillsStudioStore` (class), lines 115553-117410, exports `SkillsStudioStore`
+- order 1183: `SkillsStudioError` (class), lines 116841-116850, exports `SkillsStudioError`
+- order 1184: `_studio_slug` (function), lines 116851-116866, exports `_studio_slug`
+- order 1185: `_studio_hash` (function), lines 116867-116870, exports `_studio_hash`
+- order 1186: `_studio_cookie_value` (function), lines 116871-116880, exports `_studio_cookie_value`
+- order 1187: `SkillsStudioStore` (class), lines 116881-118738, exports `SkillsStudioStore`
 
 ### `utils/compress.py`
 
-- order 832: `compress_text_blob` (function), lines 11656-11662, exports `compress_text_blob`
-- order 833: `decompress_text_blob` (function), lines 11663-11672, exports `decompress_text_blob`
+- order 835: `compress_text_blob` (function), lines 11749-11755, exports `compress_text_blob`
+- order 836: `decompress_text_blob` (function), lines 11756-11765, exports `decompress_text_blob`
 
 ### `utils/crypto.py`
 
-- order 905: `CryptoBox` (class), lines 13608-13761, exports `CryptoBox`
+- order 924: `CryptoBox` (class), lines 14461-14614, exports `CryptoBox`
 
 ### `utils/errors.py`
 
-- order 852: `EmptyActionError` (class), lines 12161-12164, exports `EmptyActionError`
-- order 1001: `ProcessManagerError` (class), lines 22709-22714, exports `ProcessManagerError`
+- order 857: `EmptyActionError` (class), lines 12311-12314, exports `EmptyActionError`
+- order 1020: `ProcessManagerError` (class), lines 23562-23567, exports `ProcessManagerError`
 
 ### `utils/files.py`
 
-- order 684: `_normalize_js_lib_asset_ref` (function), lines 6222-6237, exports `_normalize_js_lib_asset_ref`
-- order 685: `_resolve_js_lib_asset_path` (function), lines 6238-6269, exports `_resolve_js_lib_asset_path`
-- order 686: `_discover_extra_js_lib_files` (function), lines 6270-6302, exports `_discover_extra_js_lib_files`
-- order 778: `safe_path` (function), lines 8365-8375, exports `safe_path`
-- order 779: `_safe_js_filename` (function), lines 8376-8384, exports `_safe_js_filename`
-- order 780: `_sha256_bytes` (function), lines 8385-8387, exports `_sha256_bytes`
-- order 781: `_sha256_file` (function), lines 8388-8397, exports `_sha256_file`
-- order 782: `_download_http_bytes` (function), lines 8398-8407, exports `_download_http_bytes`
-- order 783: `offline_js_lib_root` (function), lines 8408-8410, exports `offline_js_lib_root`
-- order 784: `_offline_js_entry_relative_path` (function), lines 8411-8416, exports `_offline_js_entry_relative_path`
-- order 785: `_archive_member_relative_path` (function), lines 8417-8427, exports `_archive_member_relative_path`
-- order 786: `_path_size_bytes` (function), lines 8428-8444, exports `_path_size_bytes`
-- order 787: `_extract_archive_to_dir` (function), lines 8445-8486, exports `_extract_archive_to_dir`
-- order 788: `_package_required_paths` (function), lines 8487-8494, exports `_package_required_paths`
-- order 789: `_package_required_globs` (function), lines 8495-8511, exports `_package_required_globs`
-- order 790: `_package_install_ready` (function), lines 8512-8534, exports `_package_install_ready`
-- order 791: `_postprocess_offline_js_package` (function), lines 8535-8571, exports `_postprocess_offline_js_package`
-- order 792: `_ensure_offline_js_package` (function), lines 8572-8616, exports `_ensure_offline_js_package`
-- order 793: `_render_offline_js_catalog_md` (function), lines 8617-8634, exports `_render_offline_js_catalog_md`
-- order 795: `ensure_offline_js_libs` (function), lines 8646-8804, exports `ensure_offline_js_libs`
-- order 796: `_offline_js_catalog_entry_for_asset` (function), lines 8805-8825, exports `_offline_js_catalog_entry_for_asset`
-- order 797: `ensure_offline_js_asset` (function), lines 8826-8883, exports `ensure_offline_js_asset`
-- order 798: `_normalize_external_js_url` (function), lines 8884-8889, exports `_normalize_external_js_url`
-- order 799: `is_external_js_src` (function), lines 8890-8893, exports `is_external_js_src`
-- order 800: `match_offline_js_catalog_by_url` (function), lines 8894-8911, exports `match_offline_js_catalog_by_url`
-- order 801: `cache_external_js_url` (function), lines 8912-8947, exports `cache_external_js_url`
-- order 908: `try_read_text` (function), lines 14005-14014, exports `try_read_text`
+- order 687: `_normalize_js_lib_asset_ref` (function), lines 6315-6330, exports `_normalize_js_lib_asset_ref`
+- order 688: `_resolve_js_lib_asset_path` (function), lines 6331-6362, exports `_resolve_js_lib_asset_path`
+- order 689: `_discover_extra_js_lib_files` (function), lines 6363-6395, exports `_discover_extra_js_lib_files`
+- order 781: `safe_path` (function), lines 8458-8468, exports `safe_path`
+- order 782: `_safe_js_filename` (function), lines 8469-8477, exports `_safe_js_filename`
+- order 783: `_sha256_bytes` (function), lines 8478-8480, exports `_sha256_bytes`
+- order 784: `_sha256_file` (function), lines 8481-8490, exports `_sha256_file`
+- order 785: `_download_http_bytes` (function), lines 8491-8500, exports `_download_http_bytes`
+- order 786: `offline_js_lib_root` (function), lines 8501-8503, exports `offline_js_lib_root`
+- order 787: `_offline_js_entry_relative_path` (function), lines 8504-8509, exports `_offline_js_entry_relative_path`
+- order 788: `_archive_member_relative_path` (function), lines 8510-8520, exports `_archive_member_relative_path`
+- order 789: `_path_size_bytes` (function), lines 8521-8537, exports `_path_size_bytes`
+- order 790: `_extract_archive_to_dir` (function), lines 8538-8579, exports `_extract_archive_to_dir`
+- order 791: `_package_required_paths` (function), lines 8580-8587, exports `_package_required_paths`
+- order 792: `_package_required_globs` (function), lines 8588-8604, exports `_package_required_globs`
+- order 793: `_package_install_ready` (function), lines 8605-8627, exports `_package_install_ready`
+- order 794: `_postprocess_offline_js_package` (function), lines 8628-8664, exports `_postprocess_offline_js_package`
+- order 795: `_ensure_offline_js_package` (function), lines 8665-8709, exports `_ensure_offline_js_package`
+- order 796: `_render_offline_js_catalog_md` (function), lines 8710-8727, exports `_render_offline_js_catalog_md`
+- order 798: `ensure_offline_js_libs` (function), lines 8739-8897, exports `ensure_offline_js_libs`
+- order 799: `_offline_js_catalog_entry_for_asset` (function), lines 8898-8918, exports `_offline_js_catalog_entry_for_asset`
+- order 800: `ensure_offline_js_asset` (function), lines 8919-8976, exports `ensure_offline_js_asset`
+- order 801: `_normalize_external_js_url` (function), lines 8977-8982, exports `_normalize_external_js_url`
+- order 802: `is_external_js_src` (function), lines 8983-8986, exports `is_external_js_src`
+- order 803: `match_offline_js_catalog_by_url` (function), lines 8987-9004, exports `match_offline_js_catalog_by_url`
+- order 804: `cache_external_js_url` (function), lines 9005-9040, exports `cache_external_js_url`
+- order 927: `try_read_text` (function), lines 14858-14867, exports `try_read_text`
 
 ### `utils/http.py`
 
-- order 119: `_URL_OPEN_ORIGINAL` (assignment), lines 3819-3819, exports `_URL_OPEN_ORIGINAL`
-- order 120: `_HTTP_SSL_CONTEXT` (assignment), lines 3820-3820, exports `_HTTP_SSL_CONTEXT`
-- order 147: `_shared_http_ssl_context` (function), lines 3884-3907, exports `_shared_http_ssl_context`
-- order 148: `urlopen` (function), lines 3908-3917, exports `urlopen`
-- order 771: `json_response_bytes` (function), lines 8310-8312, exports `json_response_bytes`
-- order 772: `read_http_json_body` (function), lines 8313-8326, exports `read_http_json_body`
-- order 773: `close_if_http_request_body_unread` (function), lines 8327-8340, exports `close_if_http_request_body_unread`
+- order 122: `_URL_OPEN_ORIGINAL` (assignment), lines 3912-3912, exports `_URL_OPEN_ORIGINAL`
+- order 123: `_HTTP_SSL_CONTEXT` (assignment), lines 3913-3913, exports `_HTTP_SSL_CONTEXT`
+- order 150: `_shared_http_ssl_context` (function), lines 3977-4000, exports `_shared_http_ssl_context`
+- order 151: `urlopen` (function), lines 4001-4010, exports `urlopen`
+- order 774: `json_response_bytes` (function), lines 8403-8405, exports `json_response_bytes`
+- order 775: `read_http_json_body` (function), lines 8406-8419, exports `read_http_json_body`
+- order 776: `close_if_http_request_body_unread` (function), lines 8420-8433, exports `close_if_http_request_body_unread`
 
 ### `utils/json_utils.py`
 
-- order 171: `JSON_FSYNC_ENABLED` (constant), lines 4189-4189, exports `JSON_FSYNC_ENABLED`
-- order 770: `json_dumps` (function), lines 8306-8309, exports `json_dumps`
-- order 842: `parse_tool_arguments` (function), lines 11966-11976, exports `parse_tool_arguments`
-- order 843: `repair_truncated_json_object` (function), lines 11977-12031, exports `repair_truncated_json_object`
-- order 844: `parse_tool_arguments_with_error` (function), lines 12032-12063, exports `parse_tool_arguments_with_error`
-- order 845: `_is_valid_json_object` (function), lines 12064-12069, exports `_is_valid_json_object`
-- order 846: `_scan_top_level_json_objects` (function), lines 12070-12093, exports `_scan_top_level_json_objects`
-- order 847: `reconstruct_streamed_tool_args` (function), lines 12094-12138, exports `reconstruct_streamed_tool_args`
-- order 865: `parse_json_object` (function), lines 12402-12408, exports `parse_json_object`
-- order 866: `extract_json_object_from_text` (function), lines 12409-12432, exports `extract_json_object_from_text`
-- order 909: `_json_default_copy` (function), lines 14015-14021, exports `_json_default_copy`
-- order 910: `_read_json_file` (function), lines 14022-14043, exports `_read_json_file`
-- order 911: `_write_json_file` (function), lines 14044-14072, exports `_write_json_file`
+- order 174: `JSON_FSYNC_ENABLED` (constant), lines 4282-4282, exports `JSON_FSYNC_ENABLED`
+- order 773: `json_dumps` (function), lines 8399-8402, exports `json_dumps`
+- order 845: `parse_tool_arguments` (function), lines 12059-12069, exports `parse_tool_arguments`
+- order 846: `repair_truncated_json_object` (function), lines 12070-12124, exports `repair_truncated_json_object`
+- order 847: `parse_tool_arguments_with_error` (function), lines 12125-12156, exports `parse_tool_arguments_with_error`
+- order 848: `_is_valid_json_object` (function), lines 12157-12162, exports `_is_valid_json_object`
+- order 849: `_scan_top_level_json_objects` (function), lines 12163-12186, exports `_scan_top_level_json_objects`
+- order 850: `reconstruct_streamed_tool_args` (function), lines 12187-12231, exports `reconstruct_streamed_tool_args`
+- order 871: `parse_json_object` (function), lines 12585-12591, exports `parse_json_object`
+- order 872: `extract_json_object_from_text` (function), lines 12592-12615, exports `extract_json_object_from_text`
+- order 928: `_json_default_copy` (function), lines 14868-14874, exports `_json_default_copy`
+- order 929: `_read_json_file` (function), lines 14875-14896, exports `_read_json_file`
+- order 930: `_write_json_file` (function), lines 14897-14925, exports `_write_json_file`
 
 ### `utils/media.py`
 
-- order 677: `_capability_probe_png_bytes` (function), lines 5860-5874, exports `_capability_probe_png_bytes`
-- order 678: `_capability_probe_audio_bytes` (function), lines 5875-5886, exports `_capability_probe_audio_bytes`
-- order 679: `_capability_probe_video_bytes` (function), lines 5887-5891, exports `_capability_probe_video_bytes`
-- order 740: `guess_mime_from_name` (function), lines 7860-7864, exports `guess_mime_from_name`
-- order 741: `_convert_image_to_safe_format` (function), lines 7865-7884, exports `_convert_image_to_safe_format`
-- order 742: `guess_ext_from_mime` (function), lines 7885-7893, exports `guess_ext_from_mime`
+- order 680: `_capability_probe_png_bytes` (function), lines 5953-5967, exports `_capability_probe_png_bytes`
+- order 681: `_capability_probe_audio_bytes` (function), lines 5968-5979, exports `_capability_probe_audio_bytes`
+- order 682: `_capability_probe_video_bytes` (function), lines 5980-5984, exports `_capability_probe_video_bytes`
+- order 743: `guess_mime_from_name` (function), lines 7953-7957, exports `guess_mime_from_name`
+- order 744: `_convert_image_to_safe_format` (function), lines 7958-7977, exports `_convert_image_to_safe_format`
+- order 745: `guess_ext_from_mime` (function), lines 7978-7986, exports `guess_ext_from_mime`
 
 ### `utils/misc.py`
 
-- order 743: `now_ts` (function), lines 7894-7896, exports `now_ts`
-- order 744: `_benign_socket_log_lock` (assignment), lines 7897-7899, exports `_benign_socket_log_lock`
-- order 745: `_benign_socket_log_state` (assignment), lines 7900-7900, exports `_benign_socket_log_state`
-- order 747: `is_benign_socket_error` (function), lines 7916-7936, exports `is_benign_socket_error`
-- order 748: `_socket_error_code` (function), lines 7937-7948, exports `_socket_error_code`
-- order 749: `_log_benign_socket_error_limited` (function), lines 7949-7985, exports `_log_benign_socket_error_limited`
-- order 750: `swallow_benign_socket_error` (function), lines 7986-7992, exports `swallow_benign_socket_error`
-- order 751: `normalize_timeout_seconds` (function), lines 7993-8008, exports `normalize_timeout_seconds`
-- order 752: `detect_local_lan_ip` (function), lines 8009-8020, exports `detect_local_lan_ip`
-- order 753: `_LOCAL_LAN_IP_CACHE` (assignment), lines 8021-8022, exports `_LOCAL_LAN_IP_CACHE`
-- order 754: `detect_local_lan_ip_cached` (function), lines 8023-8036, exports `detect_local_lan_ip_cached`
-- order 774: `make_id` (function), lines 8341-8343, exports `make_id`
-- order 775: `sanitize_profile_id` (function), lines 8344-8347, exports `sanitize_profile_id`
-- order 903: `user_id_from_ip` (function), lines 13567-13574, exports `user_id_from_ip`
-- order 907: `_meta_string_list` (function), lines 13991-14004, exports `_meta_string_list`
-- order 966: `_module_exists` (function), lines 16867-16872, exports `_module_exists`
+- order 746: `now_ts` (function), lines 7987-7989, exports `now_ts`
+- order 747: `_benign_socket_log_lock` (assignment), lines 7990-7992, exports `_benign_socket_log_lock`
+- order 748: `_benign_socket_log_state` (assignment), lines 7993-7993, exports `_benign_socket_log_state`
+- order 750: `is_benign_socket_error` (function), lines 8009-8029, exports `is_benign_socket_error`
+- order 751: `_socket_error_code` (function), lines 8030-8041, exports `_socket_error_code`
+- order 752: `_log_benign_socket_error_limited` (function), lines 8042-8078, exports `_log_benign_socket_error_limited`
+- order 753: `swallow_benign_socket_error` (function), lines 8079-8085, exports `swallow_benign_socket_error`
+- order 754: `normalize_timeout_seconds` (function), lines 8086-8101, exports `normalize_timeout_seconds`
+- order 755: `detect_local_lan_ip` (function), lines 8102-8113, exports `detect_local_lan_ip`
+- order 756: `_LOCAL_LAN_IP_CACHE` (assignment), lines 8114-8115, exports `_LOCAL_LAN_IP_CACHE`
+- order 757: `detect_local_lan_ip_cached` (function), lines 8116-8129, exports `detect_local_lan_ip_cached`
+- order 777: `make_id` (function), lines 8434-8436, exports `make_id`
+- order 778: `sanitize_profile_id` (function), lines 8437-8440, exports `sanitize_profile_id`
+- order 922: `user_id_from_ip` (function), lines 14420-14427, exports `user_id_from_ip`
+- order 926: `_meta_string_list` (function), lines 14844-14857, exports `_meta_string_list`
+- order 985: `_module_exists` (function), lines 17720-17725, exports `_module_exists`
 
 ### `utils/sqlite.py`
 
 - order 70: `_ClosingSQLiteConnection` (class), lines 74-83, exports `_ClosingSQLiteConnection`
-- order 71: `_connect_sqlite` (function), lines 84-107, exports `_connect_sqlite`
+- order 71: `_connect_sqlite` (function), lines 84-117, exports `_connect_sqlite`
+- order 1207: `sqlite_failure_diagnostics` (function), lines 136431-136515, exports `sqlite_failure_diagnostics`
 
 ### `utils/text.py`
 
-- order 159: `MAX_TOOL_OUTPUT` (constant), lines 4177-4177, exports `MAX_TOOL_OUTPUT`
-- order 498: `SOCKET_NOISE_LINE_PATTERNS` (constant), lines 4948-4953, exports `SOCKET_NOISE_LINE_PATTERNS`
-- order 746: `filter_runtime_noise_lines` (function), lines 7901-7915, exports `filter_runtime_noise_lines`
-- order 759: `safe_utf8_bytes` (function), lines 8161-8163, exports `safe_utf8_bytes`
-- order 760: `escape_invalid_utf8_text` (function), lines 8164-8166, exports `escape_invalid_utf8_text`
-- order 761: `sanitize_utf8_surrogates` (function), lines 8167-8180, exports `sanitize_utf8_surrogates`
-- order 762: `decode_utf8_replace` (function), lines 8181-8185, exports `decode_utf8_replace`
-- order 802: `trim` (function), lines 8948-8951, exports `trim`
-- order 810: `is_synthetic_public_progress` (function), lines 9227-9246, exports `is_synthetic_public_progress`
-- order 812: `display_clean` (function), lines 9299-9313, exports `display_clean`
-- order 813: `short_title_from` (function), lines 9314-9332, exports `short_title_from`
-- order 829: `_fmt_export_ts` (function), lines 11492-11502, exports `_fmt_export_ts`
-- order 830: `_html_esc` (function), lines 11503-11506, exports `_html_esc`
-- order 831: `_text_to_minimal_pdf` (function), lines 11507-11655, exports `_text_to_minimal_pdf`
-- order 834: `normalize_embedded_newlines` (function), lines 11673-11682, exports `normalize_embedded_newlines`
-- order 835: `_map_todo_status_token` (function), lines 11683-11721, exports `_map_todo_status_token`
-- order 836: `split_todo_status_text` (function), lines 11722-11781, exports `split_todo_status_text`
-- order 837: `extract_todo_rows_from_text` (function), lines 11782-11851, exports `extract_todo_rows_from_text`
-- order 838: `decode_structured_todo_container` (function), lines 11852-11870, exports `decode_structured_todo_container`
-- order 839: `infer_todo_status_from_text` (function), lines 11871-11879, exports `infer_todo_status_from_text`
-- order 840: `split_structured_todo_content` (function), lines 11880-11935, exports `split_structured_todo_content`
-- order 841: `normalize_work_text` (function), lines 11936-11965, exports `normalize_work_text`
-- order 932: `make_unified_diff` (function), lines 15629-15647, exports `make_unified_diff`
-- order 933: `_skip_row` (function), lines 15648-15653, exports `_skip_row`
-- order 934: `_row_is_hot` (function), lines 15654-15657, exports `_row_is_hot`
-- order 935: `_hotspot_index` (function), lines 15658-15681, exports `_hotspot_index`
-- order 936: `_compress_rows_keep_hotspot` (function), lines 15682-15731, exports `_compress_rows_keep_hotspot`
-- order 937: `_focused_diff_rows_from_opcodes` (function), lines 15732-15866, exports `_focused_diff_rows_from_opcodes`
-- order 938: `make_numbered_diff` (function), lines 15867-15899, exports `make_numbered_diff`
-- order 939: `render_numbered_diff_text` (function), lines 15900-15913, exports `render_numbered_diff_text`
+- order 162: `MAX_TOOL_OUTPUT` (constant), lines 4270-4270, exports `MAX_TOOL_OUTPUT`
+- order 501: `SOCKET_NOISE_LINE_PATTERNS` (constant), lines 5041-5046, exports `SOCKET_NOISE_LINE_PATTERNS`
+- order 749: `filter_runtime_noise_lines` (function), lines 7994-8008, exports `filter_runtime_noise_lines`
+- order 762: `safe_utf8_bytes` (function), lines 8254-8256, exports `safe_utf8_bytes`
+- order 763: `escape_invalid_utf8_text` (function), lines 8257-8259, exports `escape_invalid_utf8_text`
+- order 764: `sanitize_utf8_surrogates` (function), lines 8260-8273, exports `sanitize_utf8_surrogates`
+- order 765: `decode_utf8_replace` (function), lines 8274-8278, exports `decode_utf8_replace`
+- order 805: `trim` (function), lines 9041-9044, exports `trim`
+- order 813: `is_synthetic_public_progress` (function), lines 9320-9339, exports `is_synthetic_public_progress`
+- order 815: `display_clean` (function), lines 9392-9406, exports `display_clean`
+- order 816: `short_title_from` (function), lines 9407-9425, exports `short_title_from`
+- order 832: `_fmt_export_ts` (function), lines 11585-11595, exports `_fmt_export_ts`
+- order 833: `_html_esc` (function), lines 11596-11599, exports `_html_esc`
+- order 834: `_text_to_minimal_pdf` (function), lines 11600-11748, exports `_text_to_minimal_pdf`
+- order 837: `normalize_embedded_newlines` (function), lines 11766-11775, exports `normalize_embedded_newlines`
+- order 838: `_map_todo_status_token` (function), lines 11776-11814, exports `_map_todo_status_token`
+- order 839: `split_todo_status_text` (function), lines 11815-11874, exports `split_todo_status_text`
+- order 840: `extract_todo_rows_from_text` (function), lines 11875-11944, exports `extract_todo_rows_from_text`
+- order 841: `decode_structured_todo_container` (function), lines 11945-11963, exports `decode_structured_todo_container`
+- order 842: `infer_todo_status_from_text` (function), lines 11964-11972, exports `infer_todo_status_from_text`
+- order 843: `split_structured_todo_content` (function), lines 11973-12028, exports `split_structured_todo_content`
+- order 844: `normalize_work_text` (function), lines 12029-12058, exports `normalize_work_text`
+- order 951: `make_unified_diff` (function), lines 16482-16500, exports `make_unified_diff`
+- order 952: `_skip_row` (function), lines 16501-16506, exports `_skip_row`
+- order 953: `_row_is_hot` (function), lines 16507-16510, exports `_row_is_hot`
+- order 954: `_hotspot_index` (function), lines 16511-16534, exports `_hotspot_index`
+- order 955: `_compress_rows_keep_hotspot` (function), lines 16535-16584, exports `_compress_rows_keep_hotspot`
+- order 956: `_focused_diff_rows_from_opcodes` (function), lines 16585-16719, exports `_focused_diff_rows_from_opcodes`
+- order 957: `make_numbered_diff` (function), lines 16720-16752, exports `make_numbered_diff`
+- order 958: `render_numbered_diff_text` (function), lines 16753-16766, exports `render_numbered_diff_text`
 
 ### `web/admin_assets.py`
 
-- order 1071: `ADMIN_INDEX_HTML` (constant), lines 97932-98232, exports `ADMIN_INDEX_HTML`
-- order 1072: `ADMIN_CSS` (constant), lines 98233-98369, exports `ADMIN_CSS`
-- order 1073: `ADMIN_JS` (constant), lines 98370-98745, exports `ADMIN_JS`
+- order 1090: `ADMIN_INDEX_HTML` (constant), lines 99191-99498, exports `ADMIN_INDEX_HTML`
+- order 1091: `ADMIN_CSS` (constant), lines 99499-99659, exports `ADMIN_CSS`
+- order 1092: `ADMIN_JS` (constant), lines 99660-100073, exports `ADMIN_JS`
 
 ### `web/assets.py`
 
-- order 1063: `INDEX_HTML` (constant), lines 91948-92207, exports `INDEX_HTML`
-- order 1064: `APP_CSS` (constant), lines 92208-92748, exports `APP_CSS`
-- order 1065: `APP_JS` (constant), lines 92749-97472, exports `APP_JS`
-- order 1066: `APP_CSS` (constant), lines 97473-97489, exports `APP_CSS`
-- order 1067: `APP_TS` (constant), lines 97490-97529, exports `APP_TS`
+- order 1082: `INDEX_HTML` (constant), lines 93165-93426, exports `INDEX_HTML`
+- order 1083: `APP_CSS` (constant), lines 93427-93967, exports `APP_CSS`
+- order 1084: `APP_JS` (constant), lines 93968-98728, exports `APP_JS`
+- order 1085: `APP_CSS` (constant), lines 98729-98748, exports `APP_CSS`
+- order 1086: `APP_TS` (constant), lines 98749-98788, exports `APP_TS`
 
 ### `web/skills_assets.py`
 
-- order 1068: `SKILLS_INDEX_HTML` (constant), lines 97530-97685, exports `SKILLS_INDEX_HTML`
-- order 1069: `SKILLS_EXTRA_CSS` (constant), lines 97686-97785, exports `SKILLS_EXTRA_CSS`
-- order 1070: `SKILLS_APP_JS` (constant), lines 97786-97931, exports `SKILLS_APP_JS`
+- order 1087: `SKILLS_INDEX_HTML` (constant), lines 98789-98944, exports `SKILLS_INDEX_HTML`
+- order 1088: `SKILLS_EXTRA_CSS` (constant), lines 98945-99044, exports `SKILLS_EXTRA_CSS`
+- order 1089: `SKILLS_APP_JS` (constant), lines 99045-99190, exports `SKILLS_APP_JS`

@@ -149,6 +149,8 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
         "_single_no_plan_todo_setting_present", "user_memory_enabled_from_mode",
         "task_complexity_rank", "task_complexity_at_least", "max_task_complexity",
         "agent_language_preference_payload",
+        "probe_and_merge_model_profiles", "apply_model_runtime_settings",
+        "model_runtime_settings_for", "apply_model_option_runtime_fields",
     ],
 
     "web/__init__.py": [],
@@ -209,7 +211,9 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     ],
     "utils/compress.py": ["compress_text_blob", "decompress_text_blob"],
     "utils/crypto.py": ["CryptoBox"],
-    "utils/sqlite.py": ["_ClosingSQLiteConnection", "_connect_sqlite"],
+    "utils/sqlite.py": [
+        "_ClosingSQLiteConnection", "_connect_sqlite", "sqlite_failure_diagnostics",
+    ],
     "utils/misc.py": [
         "now_ts", "make_id", "sanitize_profile_id", "user_id_from_ip", "_meta_string_list",
         "_module_exists", "is_benign_socket_error", "_socket_error_code",
@@ -227,6 +231,9 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     "llm/utils.py": [
         "~^(?:probe_ollama|list_ollama|resolve_ollama|infer_thinking|split_thinking|strip_thinking|check_ollama|list_loaded_ollama|wake_ollama|try_pull_ollama|ordered_model|pick_working_ollama|extract_base_url|complete_chat_endpoint|normalize_openai|is_openai|openai_compat|extract_openai|clamp_effort|model_reasoning|resolve_reasoning|_is_http_url|_resolve_local_path)",
         "_OLLAMA_TAG_CACHE", "_OLLAMA_TAG_CACHE_LOCK",
+        "_fetch_ollama_models_cached", "anthropic_model_list_url",
+        "_PROVIDER_MODEL_CACHE_LOCK", "_PROVIDER_MODEL_CACHE",
+        "_fetch_provider_models_cached", "probe_provider_models",
     ],
 
     "agent/__init__.py": [],
@@ -329,6 +336,7 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
         "_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64", "_ensure_embedded_liquid_kernel_package",
         "_liquid_kernel_history_present", "prepare_liquid_kernel_runtime",
         "_persist_liquid_kernel_bootstrap",
+        "_ensure_liquid_kernel_sqlite_lifecycle",
     ],
     "_unclassified.py": [],
 }
