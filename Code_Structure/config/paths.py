@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-# split-source: order=127 original-lines=3918-3918 hash=bc447feb3084cf2f
+# split-source: order=127 original-lines=3919-3919 hash=bc447feb3084cf2f
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# split-source: order=152 original-lines=4012-4021 hash=6d198870996eb061
+# split-source: order=152 original-lines=4013-4022 hash=6d198870996eb061
 
 def _resolve_default_agent_workdir() -> Path:
     raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
@@ -20,13 +20,13 @@ def _resolve_default_agent_workdir() -> Path:
         return (base / "workspace").resolve()
     return SCRIPT_DIR
 
-# split-source: order=153 original-lines=4022-4025 hash=57424d297e3b5457
+# split-source: order=153 original-lines=4023-4026 hash=57424d297e3b5457
 
 def _is_installed_python_runtime(path: Path) -> bool:
     parts = {part.casefold() for part in Path(path).parts}
     return bool(parts.intersection({"site-packages", "dist-packages"}))
 
-# split-source: order=154 original-lines=4026-4032 hash=b115426f390ac524
+# split-source: order=154 original-lines=4027-4033 hash=b115426f390ac524
 
 def _runtime_storage_mode() -> str:
     if str(os.getenv("AGENT_WORKDIR", "") or "").strip():
@@ -35,7 +35,7 @@ def _runtime_storage_mode() -> str:
         return "pip-stable-workspace"
     return "script-local"
 
-# split-source: order=155 original-lines=4033-4038 hash=27b43b29779e59bb
+# split-source: order=155 original-lines=4034-4039 hash=27b43b29779e59bb
 
 def _runtime_tree_has_content(path: Path) -> bool:
     try:
@@ -43,7 +43,7 @@ def _runtime_tree_has_content(path: Path) -> bool:
     except Exception:
         return False
 
-# split-source: order=156 original-lines=4039-4109 hash=1b33ee0d8c588a79
+# split-source: order=156 original-lines=4040-4110 hash=1b33ee0d8c588a79
 
 def _copy_runtime_tree_with_crypto_migration(
     source: Path,
@@ -116,7 +116,7 @@ def _copy_runtime_tree_with_crypto_migration(
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
 
-# split-source: order=157 original-lines=4110-4175 hash=22f466bd12b905a1
+# split-source: order=157 original-lines=4111-4176 hash=22f466bd12b905a1
 
 def _merge_legacy_codes_root(source: Path, target: Path) -> dict:
     """Import missing users/sessions from a legacy Codes root without overwrites."""
@@ -184,7 +184,7 @@ def _merge_legacy_codes_root(source: Path, target: Path) -> dict:
                 )
     return result
 
-# split-source: order=158 original-lines=4176-4266 hash=122908774e0cb307
+# split-source: order=158 original-lines=4177-4267 hash=122908774e0cb307
 
 def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
     root = Path(workspace).resolve()
@@ -277,17 +277,17 @@ def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
         "errors": errors,
     }
 
-# split-source: order=159 original-lines=4267-4268 hash=ade2cecdb185f771
+# split-source: order=159 original-lines=4268-4269 hash=ade2cecdb185f771
 
 WORKDIR = _resolve_default_agent_workdir()
 
-# split-source: order=160 original-lines=4269-4269 hash=3e4d58d57d1e261b
+# split-source: order=160 original-lines=4270-4270 hash=3e4d58d57d1e261b
 CODES_ROOT = WORKDIR / "Codes"
 
-# split-source: order=161 original-lines=4270-4270 hash=29dd970e5b14e924
+# split-source: order=161 original-lines=4271-4271 hash=29dd970e5b14e924
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 
-# split-source: order=779 original-lines=8442-8456 hash=1c8289e3f7ac60a2
+# split-source: order=779 original-lines=8443-8457 hash=1c8289e3f7ac60a2
 
 def detect_repo_root(cwd: Path) -> Path | None:
     try:
@@ -304,6 +304,6 @@ def detect_repo_root(cwd: Path) -> Path | None:
     except Exception:
         return None
 
-# split-source: order=780 original-lines=8457-8458 hash=abb03f0e9fd37533
+# split-source: order=780 original-lines=8458-8459 hash=abb03f0e9fd37533
 
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -30341,7 +30342,7 @@ class SessionState:
             l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
         )
         self.runtime_requires_todos: bool | None = None
-        self._todowrite_step_counter: dict[str, int] = {}  # Fix 5: track consecutive TodoWrite per step for loop detection
+        self._todowrite_step_counter: dict[str, int] = {}  # Consecutive no-progress writes by task, step, and role.
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
         # Full, lossless source request for the active task. Derived runtime
@@ -50791,6 +50792,13 @@ body{padding:18px}
             except Exception as exc:
                 self.kernel_runtime_degraded = True
                 self._emit("status", {"summary": f"liquid kernel hook degraded: {trim(str(exc), 160)}"})
+        if tools is not None:
+            guarded_tools = self._filter_todo_progress_tools(tools, role=context_role_hint)
+            if len(guarded_tools) != len(tools):
+                system = f"{system}\n\n{self._todo_no_progress_instruction()}"
+                if canonicalize_tool_name(tool_choice) in {"TodoWrite", "TodoWriteRescue"}:
+                    tool_choice = ""
+            tools = guarded_tools
         system = self._inject_runtime_environment_context(system)
         estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
             messages,
@@ -64622,6 +64630,15 @@ body{padding:18px}
             return {}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step_id = trim(str(plan_step.get("id", "") or ""), 60)
+        # An unchanged, uniquely identified child needs no model classification.
+        # Providers often resend the whole list without parent/row IDs.
+        existing_rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if sum(
+            normalize_work_text(str(existing.get("content", "") or "")).strip().casefold()
+            == normalize_work_text(content).strip().casefold()
+            for existing in existing_rows
+        ) == 1:
+            return {}
         prompt = (
             "/no_think\n"
             "Decide the intent of one unscoped TodoWrite row inside the active execution-plan step. "
@@ -64716,6 +64733,12 @@ body{padding:18px}
             return {}
         content = trim(str(incoming.get("content", "") or "").strip(), 900)
         if not content:
+            return {}
+        exact_content = normalize_work_text(str(incoming.get("content", "") or "")).strip().casefold()
+        if sum(
+            normalize_work_text(str(row.get("content", "") or "")).strip().casefold() == exact_content
+            for row in existing_rows if isinstance(row, dict)
+        ) == 1:
             return {}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         rows_text = "\n".join(
@@ -78753,7 +78776,79 @@ body{padding:18px}
             resume=is_resume,
         )
 
+    def _todo_progress_guard_key(self, role: str = "") -> str:
+        bb = self._ensure_blackboard()
+        step = self._get_active_plan_step(bb) or {}
+        role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner(bb)
+        return json.dumps([
+            getattr(self, "run_generation", 0), bb.get("task_epoch", 0),
+            step.get("id", ""), role_key,
+        ], ensure_ascii=False)
+
+    @staticmethod
+    def _todo_material_signature(rows: list[dict]) -> str:
+        # Timestamp-only writes are not task progress. Evidence, identities,
+        # statuses and scope changes still pass through the normal audit.
+        fields = (
+            "content", "status", "owner", "parent_step_id", "key", "subtask_id",
+            "external_subtask_id", "root_group_id", "evidence", "evidence_binding", "evidence_ids",
+            "id", "full_content", "category",
+        )
+        return json.dumps(
+            [{field: row[field] for field in fields if row.get(field) not in (None, "", [])}
+             for row in rows if isinstance(row, dict)],
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
+
+    @staticmethod
+    def _todo_no_progress_instruction() -> str:
+        return (
+            "Todo state has not changed. Do not repeat TodoWrite, switch to TodoWriteRescue, "
+            "or rewrite the same list. Execute the current in_progress task using a work or "
+            "evidence-gathering tool, then update only the statuses supported by its result. "
+            "Repeated no-progress Todo writes are temporarily unavailable until a non-Todo "
+            "work action runs. Existing tasks and completion/evidence checks remain intact."
+        )
+
+    def _filter_todo_progress_tools(self, tools: list[dict], *, role: str = "") -> list[dict]:
+        counts = getattr(self, "_todowrite_step_counter", {})
+        if not counts or counts.get(self._todo_progress_guard_key(role), 0) < 2:
+            return tools
+        return [
+            tool for tool in tools
+            if canonicalize_tool_name(tool.get("function", {}).get("name", ""))
+            not in {"TodoWrite", "TodoWriteRescue"}
+        ]
+
     def _dispatch_todo_update(self, args: dict, *, role: str = "", resume: bool = False) -> str:
+        key = self._todo_progress_guard_key(role)
+        counts = getattr(self, "_todowrite_step_counter", None)
+        if not isinstance(counts, dict):
+            counts = self._todowrite_step_counter = {}
+        if counts.get(key, 0) >= 2:
+            return self._plan_control_feedback("todo_no_progress", self._todo_no_progress_instruction())
+        before = self._todo_material_signature(self.todo.snapshot())
+        plan_before = self._todo_material_signature(self._ensure_blackboard().get("project_todos", []))
+        result = self._dispatch_todo_update_inner(args, role=role, resume=resume)
+        if key != self._todo_progress_guard_key(role):
+            counts.pop(key, None)
+            return result
+        changed = before != self._todo_material_signature(self.todo.snapshot())
+        plan_changed = plan_before != self._todo_material_signature(
+            self._ensure_blackboard().get("project_todos", []),
+        )
+        if changed or plan_changed:
+            counts.pop(key, None)
+        elif self._todo_runtime_has_worker_rows(role) and not str(result).startswith("Error:"):
+            counts[key] = counts.get(key, 0) + 1
+            if len(counts) > 40:
+                counts.pop(next(iter(counts)))
+            return self._plan_control_feedback(
+                "todo_no_progress", f"{self._todo_no_progress_instruction()}\n\n{result}",
+            )
+        return result
+
+    def _dispatch_todo_update_inner(self, args: dict, *, role: str = "", resume: bool = False) -> str:
         """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
         source = args if isinstance(args, dict) else {}
         bb = self._ensure_blackboard()
@@ -78934,13 +79029,20 @@ body{padding:18px}
         txt = str(output or "").strip()
         low = txt.lower()
         has_worker_rows = self._todo_runtime_has_worker_rows()
-        changed = self._todo_progress_changed(before_rows, after_rows) if before_rows is not None else False
+        changed = (
+            self._todo_material_signature(before_rows)
+            != self._todo_material_signature(after_rows if after_rows is not None else self.todo.snapshot())
+        ) if before_rows is not None else False
         if not txt:
             return ("failed", "empty output")
         if txt.startswith("Error:"):
             return ("failed", txt[6:].strip() or "unknown error")
+        if self._tool_control_feedback_outcome(tool_name, txt) == "todo_no_progress":
+            return ("no_progress", "canonical todo state unchanged; execute the current task")
         if changed:
             return ("ok", "todo updated")
+        if before_rows is not None and has_worker_rows:
+            return ("no_progress", "canonical todo state unchanged; execute the current task")
         if txt == self.todo.no_changes_text() or "no todo changes" in low:
             if has_worker_rows:
                 return ("ok", "todo already up to date")
@@ -80564,6 +80666,13 @@ body{padding:18px}
                     f"Error: tool '{name}' is unavailable to remote Program sessions because it can access "
                     "resources outside the isolated session workspace."
                 )
+        # A real work/evidence action releases this role's Todo cooldown, also
+        # for root Todos and external MCP tools. Bookkeeping alone does not.
+        if getattr(self, "_todowrite_step_counter", {}) and canonicalize_tool_name(name) not in {
+            "TodoWrite", "TodoWriteRescue", "compress", "tool_memory", "task_list",
+            "task_get", "read_from_blackboard", "read_inbox", "route_to_next_agent",
+        }:
+            self._todowrite_step_counter.pop(self._todo_progress_guard_key(role_key), None)
         # External MCP tools (mcp__<server>__<tool>): route to the owning
         # subprocess. Handled before any built-in branch so an MCP name can
         # never be shadowed by a builtin, and so every role/mode reaches it.
@@ -80573,16 +80682,6 @@ body{padding:18px}
                 return f"Error: MCP is not available in this session for tool '{name}'"
             self._emit("status", {"summary": f"calling MCP tool {name}"})
             return mgr.call(name, args if isinstance(args, dict) else {})
-        # Fix 5d: Reset TodoWrite loop counter on non-TodoWrite tool calls
-        if name not in ("TodoWrite", "TodoWriteRescue") and hasattr(self, '_todowrite_step_counter'):
-            try:
-                _rst_step = self._get_active_plan_step()
-                if isinstance(_rst_step, dict):
-                    _rst_id = str(_rst_step.get("id", "") or "")
-                    if _rst_id:
-                        self._todowrite_step_counter.pop(_rst_id, None)
-            except Exception:
-                pass
         if name == "bash":
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
@@ -88553,6 +88652,8 @@ body{padding:18px}
                                 "status",
                                 {
                                     "summary": (
+                                        "todo unchanged; continue current task execution"
+                                        if result_item.get("control_outcome") == "todo_no_progress" else
                                         "todo control gate preserved canonical current-step subtasks; "
                                         "continue the existing in_progress item"
                                     )
@@ -94067,6 +94168,21 @@ setTimeout(()=>{
   const originalShowModelSettings=showModelSettings;showModelSettings=(anchor,option)=>{const selected=option||modelOption()||{};const popup=E('menuPopup');if(!popup)return;const caps=selected.capabilities||{};const supports=selected.reasoning_supported===true||caps.reasoning_supported===true;const effort=String(selected.effort||'');const maxEffort=String(selected.max_effort||'');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${esc(selected.label||selected.model||'Model settings')}</strong><small>${esc(selected.display_name||selected.title||selected.provider||'')}</small></div><label class="model-setting-row">Effort<select id="webModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="webModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="webModelThinking" type="checkbox" ${selected.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="webModelResponse" type="checkbox" ${selected.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="webModelBack" class="agent-model-compact" type="button">Back</button><button id="webModelSave" class="agent-model-config" type="button" title="Save model settings" aria-label="Save model settings"><span class="codicon codicon-save"></span></button></div>`;const rect=(anchor||E('modelManageBtn')||E('modelSettingsBtn')).getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-380))}px`;popup.style.top=`${rect.bottom+6}px`;popup.style.bottom='auto';E('webModelEffort').value=effort;E('webModelMaxEffort').value=maxEffort;E('webModelBack').onclick=ev=>{ev.stopPropagation();showModelManager(anchor||E('modelManageBtn'))};E('webModelSave').onclick=async ev=>{ev.stopPropagation();const settings={effort:String(E('webModelEffort').value||''),max_effort:String(E('webModelMaxEffort').value||''),thinking_stream:!!E('webModelThinking').checked,response_stream:!!E('webModelResponse').checked};try{const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const out=await api(path,{method:'POST',body:JSON.stringify({selection:selected.selection,model:selected.selection,...settings})});applyModelCatalog(out);popup.classList.add('is-hidden');showError('Model settings saved.');scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(error){showError(error.message||String(error))}}};
   const bindWebModelManager=()=>{const settingsBtn=E('modelSettingsBtn');if(settingsBtn)settingsBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelSettings(settingsBtn)};const manageBtn=E('modelManageBtn');if(manageBtn)manageBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelManager(manageBtn)};};
   bindWebModelManager();
+  const ensureModelConfigAction=()=>{
+    const popup=E('menuPopup'),actions=popup?.querySelector('.agent-model-actions');
+    if(!actions||actions.querySelector('[data-llm-config-action]'))return;
+    const button=actions.querySelector('button[title="Import LLM config"]');
+    if(button){
+      button.dataset.llmConfigAction='1';
+      button.title='Configure LLM';
+      button.setAttribute('aria-label','Configure LLM');
+      button.classList.add('agent-model-config-text');
+      button.innerHTML='<span class="codicon codicon-settings-gear"></span><span>LLM Config</span>';
+      button.style.width='auto';button.style.minWidth='104px';button.style.padding='0 8px';button.style.gap='5px';button.style.fontSize='11px';
+    }
+  };
+  const modelConfigActionObserver=new MutationObserver(ensureModelConfigAction),modelPopup=E('menuPopup');
+  if(modelPopup)modelConfigActionObserver.observe(modelPopup,{childList:true,subtree:true});
   // Safari may restore this document from bfcache after visiting the IDE;
   // rebind controls against the restored DOM so the gear remains functional.
   window.addEventListener('pageshow',bindWebModelManager);
@@ -98730,7 +98846,7 @@ window.addEventListener('DOMContentLoaded',()=>{const search=E('sessionSearch');
 
 APP_CSS += r"""
 :root{--web-scrollbar-size:8px;--web-scrollbar-thumb:rgba(98,116,142,.44);--web-scrollbar-thumb-hover:rgba(76,98,128,.7)}
-.model-picker{display:inline-flex;align-items:center;gap:6px;max-width:min(46vw,520px);height:44px}.model-picker select{box-sizing:border-box;min-width:180px;max-width:32vw;height:44px;min-height:44px;padding:0 34px 0 12px;line-height:1.2;appearance:none;-webkit-appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4l3 3 3-3M3 8l3-3 3 3' fill='none' stroke='%235e6c84' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center}.model-picker .hidden{display:none}.model-picker button{box-sizing:border-box;flex:0 0 auto;width:44px;height:44px;min-width:44px;min-height:44px;padding:0;display:inline-flex;align-items:center;justify-content:center;line-height:1}
+.model-picker{display:inline-flex;align-items:center;gap:6px;max-width:min(46vw,520px);height:44px}.model-picker select{box-sizing:border-box;min-width:180px;max-width:32vw;height:44px;min-height:44px;padding:0 34px 0 12px;line-height:1.2;appearance:none;-webkit-appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4l3 3 3-3M3 8l3-3 3 3' fill='none' stroke='%235e6c84' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center}.model-picker .hidden{display:none}.model-picker button{box-sizing:border-box;flex:0 0 auto;width:44px;height:44px;min-width:44px;min-height:44px;padding:0;display:inline-flex;align-items:center;justify-content:center;line-height:1}.model-picker #modelManageBtn{font-size:25px!important;font-weight:600;line-height:1}
 .model-setting-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;font-size:.78rem;color:var(--fg,#0f1b2d)}.model-setting-row select{min-width:130px;padding:4px 6px;border:1px solid var(--line,#d9e1ec);border-radius:6px;background:#fff}.model-setting-check{display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:.78rem}.model-setting-check input{accent-color:var(--brand,#1f6feb)}
 .menu-popup{position:fixed;z-index:10020}.menu-popup.is-hidden{display:none!important}.menu-popup:not(.is-hidden){display:block}.menu-popup.agent-model-menu{width:min(380px,calc(100vw - 8px));max-height:min(460px,72vh);overflow:auto;padding:4px;background:var(--panel,#fff);border:1px solid var(--line,#d9e1ec);border-radius:8px;box-shadow:0 10px 28px rgba(17,31,53,.22);color:var(--fg,#0f1b2d)}.agent-model-menu button{box-sizing:border-box;height:40px!important;min-height:40px!important;line-height:1.2!important;display:flex;align-items:center;color:var(--fg,#0f1b2d);border-radius:7px;padding:8px 10px!important}.agent-model-option{height:42px;padding:1px 0}.agent-model-option>button:first-child{justify-content:flex-start;text-align:left}.agent-model-option .agent-model-config{height:36px!important;min-height:36px!important;justify-content:center;padding:0!important}.agent-model-menu button:hover{background:var(--hover,#edf3fb)}.agent-model-menu button.is-active{color:var(--brand,#1f6feb);font-weight:600}.agent-model-summary{padding:8px 10px;border-bottom:1px solid var(--line,#d9e1ec);color:var(--muted,#667085);font-size:.75rem}.agent-model-summary strong,.agent-model-summary small{display:block}.agent-model-summary strong{color:var(--fg,#0f1b2d);font-size:.82rem}.agent-model-summary small{margin-top:2px}.agent-model-option{display:flex;align-items:center;gap:4px;min-width:0}.agent-model-option>button:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-config{display:inline-grid!important;place-items:center!important;width:26px!important;min-width:26px!important;height:24px!important;min-height:24px!important;padding:0!important;border:1px solid var(--line,#d9e1ec)!important;background:transparent!important;color:var(--muted,#667085)!important}.agent-model-config:hover{background:var(--hover,#edf3fb)!important;color:var(--brand,#1f6feb)!important}.agent-model-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;padding:6px 4px}.agent-model-search{display:block;width:calc(100% - 16px);margin:7px 8px;padding:6px 8px;border:1px solid var(--line,#d9e1ec);border-radius:6px;background:var(--input,#fff);color:var(--fg,#0f1b2d);box-sizing:border-box}.agent-model-list{min-height:0}.agent-model-menu .codicon:before{display:block;font:600 14px/1 sans-serif}.agent-model-menu .codicon-refresh:before{content:"\21bb"}.agent-model-menu .codicon-cloud-upload:before{content:"\2191"}.agent-model-menu .codicon-settings-gear:before{content:"\2699"}.agent-model-menu .codicon-save:before{content:"\2713"}.agent-model-menu .codicon-check:before{content:"\2713"}.agent-model-menu .codicon-hubot:before{content:"\25c7"}
 .session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
@@ -98746,6 +98862,7 @@ html,body{scrollbar-gutter:stable}
 #chat,#sessionList,.chat-tabs,.preview-body,.preview-code-scroll,.msg-md .md-code,.msg-code-shell,.msg-diff-shell,#activity,#commands,#diffs,#fileExplorer,#catalog,.popup-menu,.application-list,.application-editor-body,.application-skill-catalog,.modal,.modal-body{scrollbar-gutter:stable}
 @media(hover:none),(pointer:coarse){*:active{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}*:active::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb)!important;background-clip:padding-box!important}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.agent-model-menu button{height:34px!important;min-height:34px!important;padding:6px 9px!important;border-radius:7px!important}.agent-model-option{height:36px!important}.agent-model-option .agent-model-config{width:32px!important;min-width:32px!important;height:32px!important;min-height:32px!important}.agent-model-actions{gap:6px;padding:5px 4px}.agent-model-actions .agent-model-config{height:34px!important;min-height:34px!important}.agent-model-config-text{display:inline-flex!important;align-items:center!important;justify-content:center!important;place-items:unset!important;width:auto!important;min-width:104px!important;height:34px!important;min-height:34px!important;padding:0 8px!important;gap:5px!important;color:var(--brand,#1f6feb)!important;font-size:11px!important;line-height:1!important;white-space:nowrap!important}.agent-model-config-text .codicon{display:inline-block!important;flex:0 0 auto}
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number};
@@ -116097,6 +116214,7 @@ html,body{scrollbar-gutter:stable}
 .open-editors,.side-list,.toolchains,.collaboration-list,.editor-tabs,.artifact-stage,.artifact-markdown,.panel-content,.agent-todo-body,.agent-messages,.agent-composer,.agent-attachments,.agent-tool-output,.agent-diff,.agent-model-menu,.palette-results,.modal,.modal-body,.conflict-preview,.prompt-enhance-body,.application-list,.ide-application-fields,.ide-application-selected,.ide-application-catalog,.xterm-viewport{scrollbar-gutter:stable}
 @media(hover:none),(pointer:coarse){*:active{scrollbar-color:var(--ide-scrollbar-thumb) transparent!important}*:active::-webkit-scrollbar-thumb{background:var(--ide-scrollbar-thumb)!important;background-clip:padding-box!important}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.agent-model-menu button{color:#ddd}.agent-model-menu button:hover{color:#fff}.agent-model-config .codicon,.agent-model-config .codicon:before{font-size:18px!important}.agent-model-config{color:#d4d4d4!important}
 """
 
 IDE_JS = r"""

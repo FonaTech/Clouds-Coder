@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1080 original-lines=30012-90660 hash=9f3d64cdd58165a0
+# split-source: order=1080 original-lines=30013-90761 hash=d76b6dcde337df93
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
@@ -338,7 +338,7 @@ class SessionState:
             l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
         )
         self.runtime_requires_todos: bool | None = None
-        self._todowrite_step_counter: dict[str, int] = {}  # Fix 5: track consecutive TodoWrite per step for loop detection
+        self._todowrite_step_counter: dict[str, int] = {}  # Consecutive no-progress writes by task, step, and role.
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
         # Full, lossless source request for the active task. Derived runtime
@@ -20788,6 +20788,13 @@ body{padding:18px}
             except Exception as exc:
                 self.kernel_runtime_degraded = True
                 self._emit("status", {"summary": f"liquid kernel hook degraded: {trim(str(exc), 160)}"})
+        if tools is not None:
+            guarded_tools = self._filter_todo_progress_tools(tools, role=context_role_hint)
+            if len(guarded_tools) != len(tools):
+                system = f"{system}\n\n{self._todo_no_progress_instruction()}"
+                if canonicalize_tool_name(tool_choice) in {"TodoWrite", "TodoWriteRescue"}:
+                    tool_choice = ""
+            tools = guarded_tools
         system = self._inject_runtime_environment_context(system)
         estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
             messages,
@@ -34619,6 +34626,15 @@ body{padding:18px}
             return {}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step_id = trim(str(plan_step.get("id", "") or ""), 60)
+        # An unchanged, uniquely identified child needs no model classification.
+        # Providers often resend the whole list without parent/row IDs.
+        existing_rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if sum(
+            normalize_work_text(str(existing.get("content", "") or "")).strip().casefold()
+            == normalize_work_text(content).strip().casefold()
+            for existing in existing_rows
+        ) == 1:
+            return {}
         prompt = (
             "/no_think\n"
             "Decide the intent of one unscoped TodoWrite row inside the active execution-plan step. "
@@ -34713,6 +34729,12 @@ body{padding:18px}
             return {}
         content = trim(str(incoming.get("content", "") or "").strip(), 900)
         if not content:
+            return {}
+        exact_content = normalize_work_text(str(incoming.get("content", "") or "")).strip().casefold()
+        if sum(
+            normalize_work_text(str(row.get("content", "") or "")).strip().casefold() == exact_content
+            for row in existing_rows if isinstance(row, dict)
+        ) == 1:
             return {}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         rows_text = "\n".join(
@@ -48750,7 +48772,79 @@ body{padding:18px}
             resume=is_resume,
         )
 
+    def _todo_progress_guard_key(self, role: str = "") -> str:
+        bb = self._ensure_blackboard()
+        step = self._get_active_plan_step(bb) or {}
+        role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner(bb)
+        return json.dumps([
+            getattr(self, "run_generation", 0), bb.get("task_epoch", 0),
+            step.get("id", ""), role_key,
+        ], ensure_ascii=False)
+
+    @staticmethod
+    def _todo_material_signature(rows: list[dict]) -> str:
+        # Timestamp-only writes are not task progress. Evidence, identities,
+        # statuses and scope changes still pass through the normal audit.
+        fields = (
+            "content", "status", "owner", "parent_step_id", "key", "subtask_id",
+            "external_subtask_id", "root_group_id", "evidence", "evidence_binding", "evidence_ids",
+            "id", "full_content", "category",
+        )
+        return json.dumps(
+            [{field: row[field] for field in fields if row.get(field) not in (None, "", [])}
+             for row in rows if isinstance(row, dict)],
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
+
+    @staticmethod
+    def _todo_no_progress_instruction() -> str:
+        return (
+            "Todo state has not changed. Do not repeat TodoWrite, switch to TodoWriteRescue, "
+            "or rewrite the same list. Execute the current in_progress task using a work or "
+            "evidence-gathering tool, then update only the statuses supported by its result. "
+            "Repeated no-progress Todo writes are temporarily unavailable until a non-Todo "
+            "work action runs. Existing tasks and completion/evidence checks remain intact."
+        )
+
+    def _filter_todo_progress_tools(self, tools: list[dict], *, role: str = "") -> list[dict]:
+        counts = getattr(self, "_todowrite_step_counter", {})
+        if not counts or counts.get(self._todo_progress_guard_key(role), 0) < 2:
+            return tools
+        return [
+            tool for tool in tools
+            if canonicalize_tool_name(tool.get("function", {}).get("name", ""))
+            not in {"TodoWrite", "TodoWriteRescue"}
+        ]
+
     def _dispatch_todo_update(self, args: dict, *, role: str = "", resume: bool = False) -> str:
+        key = self._todo_progress_guard_key(role)
+        counts = getattr(self, "_todowrite_step_counter", None)
+        if not isinstance(counts, dict):
+            counts = self._todowrite_step_counter = {}
+        if counts.get(key, 0) >= 2:
+            return self._plan_control_feedback("todo_no_progress", self._todo_no_progress_instruction())
+        before = self._todo_material_signature(self.todo.snapshot())
+        plan_before = self._todo_material_signature(self._ensure_blackboard().get("project_todos", []))
+        result = self._dispatch_todo_update_inner(args, role=role, resume=resume)
+        if key != self._todo_progress_guard_key(role):
+            counts.pop(key, None)
+            return result
+        changed = before != self._todo_material_signature(self.todo.snapshot())
+        plan_changed = plan_before != self._todo_material_signature(
+            self._ensure_blackboard().get("project_todos", []),
+        )
+        if changed or plan_changed:
+            counts.pop(key, None)
+        elif self._todo_runtime_has_worker_rows(role) and not str(result).startswith("Error:"):
+            counts[key] = counts.get(key, 0) + 1
+            if len(counts) > 40:
+                counts.pop(next(iter(counts)))
+            return self._plan_control_feedback(
+                "todo_no_progress", f"{self._todo_no_progress_instruction()}\n\n{result}",
+            )
+        return result
+
+    def _dispatch_todo_update_inner(self, args: dict, *, role: str = "", resume: bool = False) -> str:
         """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
         source = args if isinstance(args, dict) else {}
         bb = self._ensure_blackboard()
@@ -48931,13 +49025,20 @@ body{padding:18px}
         txt = str(output or "").strip()
         low = txt.lower()
         has_worker_rows = self._todo_runtime_has_worker_rows()
-        changed = self._todo_progress_changed(before_rows, after_rows) if before_rows is not None else False
+        changed = (
+            self._todo_material_signature(before_rows)
+            != self._todo_material_signature(after_rows if after_rows is not None else self.todo.snapshot())
+        ) if before_rows is not None else False
         if not txt:
             return ("failed", "empty output")
         if txt.startswith("Error:"):
             return ("failed", txt[6:].strip() or "unknown error")
+        if self._tool_control_feedback_outcome(tool_name, txt) == "todo_no_progress":
+            return ("no_progress", "canonical todo state unchanged; execute the current task")
         if changed:
             return ("ok", "todo updated")
+        if before_rows is not None and has_worker_rows:
+            return ("no_progress", "canonical todo state unchanged; execute the current task")
         if txt == self.todo.no_changes_text() or "no todo changes" in low:
             if has_worker_rows:
                 return ("ok", "todo already up to date")
@@ -50561,6 +50662,13 @@ body{padding:18px}
                     f"Error: tool '{name}' is unavailable to remote Program sessions because it can access "
                     "resources outside the isolated session workspace."
                 )
+        # A real work/evidence action releases this role's Todo cooldown, also
+        # for root Todos and external MCP tools. Bookkeeping alone does not.
+        if getattr(self, "_todowrite_step_counter", {}) and canonicalize_tool_name(name) not in {
+            "TodoWrite", "TodoWriteRescue", "compress", "tool_memory", "task_list",
+            "task_get", "read_from_blackboard", "read_inbox", "route_to_next_agent",
+        }:
+            self._todowrite_step_counter.pop(self._todo_progress_guard_key(role_key), None)
         # External MCP tools (mcp__<server>__<tool>): route to the owning
         # subprocess. Handled before any built-in branch so an MCP name can
         # never be shadowed by a builtin, and so every role/mode reaches it.
@@ -50570,16 +50678,6 @@ body{padding:18px}
                 return f"Error: MCP is not available in this session for tool '{name}'"
             self._emit("status", {"summary": f"calling MCP tool {name}"})
             return mgr.call(name, args if isinstance(args, dict) else {})
-        # Fix 5d: Reset TodoWrite loop counter on non-TodoWrite tool calls
-        if name not in ("TodoWrite", "TodoWriteRescue") and hasattr(self, '_todowrite_step_counter'):
-            try:
-                _rst_step = self._get_active_plan_step()
-                if isinstance(_rst_step, dict):
-                    _rst_id = str(_rst_step.get("id", "") or "")
-                    if _rst_id:
-                        self._todowrite_step_counter.pop(_rst_id, None)
-            except Exception:
-                pass
         if name == "bash":
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
@@ -58550,6 +58648,8 @@ body{padding:18px}
                                 "status",
                                 {
                                     "summary": (
+                                        "todo unchanged; continue current task execution"
+                                        if result_item.get("control_outcome") == "todo_no_progress" else
                                         "todo control gate preserved canonical current-step subtasks; "
                                         "continue the existing in_progress item"
                                     )

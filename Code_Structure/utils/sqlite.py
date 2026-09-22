@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=70 original-lines=73-82 hash=18c6a08d7e127f5a
+# split-source: order=70 original-lines=74-83 hash=18c6a08d7e127f5a
 
 
 class _ClosingSQLiteConnection(sqlite3.Connection):
@@ -17,7 +17,7 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
         finally:
             self.close()
 
-# split-source: order=71 original-lines=83-116 hash=a424ca6d643ed008
+# split-source: order=71 original-lines=84-117 hash=a424ca6d643ed008
 
 
 def _connect_sqlite(
@@ -53,7 +53,7 @@ def _connect_sqlite(
         raise
     return conn
 
-# split-source: order=1207 original-lines=136432-136516 hash=3479ea8c39f73747
+# split-source: order=1207 original-lines=136550-136634 hash=3479ea8c39f73747
 
 
 # 第九层：进程入口与服务启动。
