@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -4463,12 +4464,12 @@ CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
     min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
 )
 LARGE_FILE_AUTO_PAGE_BYTES = max(
-    8 * 1024,
-    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(30 * 1024)) or str(30 * 1024))),
+    32 * 1024,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
 )
 LARGE_FILE_AUTO_PAGE_LINES = max(
-    400,
-    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "1000") or "1000")),
+    1000,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
 )
 LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
     1200,
@@ -4699,7 +4700,7 @@ DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 # The loader deliberately accepts older rows (and future rows with extra
 # fields), so existing sessions/RAG evidence remain readable without a
 # migration step.
-LONG_CONTENT_MEMORY_VERSION = 5
+LONG_CONTENT_MEMORY_VERSION = 4
 LONG_CONTENT_MEMORY_MAX_ITEMS = max(
     8,
     min(160, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_ITEMS", "80") or "80"))),
@@ -5266,46 +5267,6 @@ BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP = 20
 BLACKBOARD_MEMORY_LONG_MAX = 96
 BLACKBOARD_MEMORY_INDEX_MAX = 260
 SKILL_REFRESH_MIN_INTERVAL_SECONDS = 1.5
-
-# IDE toolchain discovery is an expensive filesystem operation on machines
-# with long PATHs (especially conda, nvm and cargo installations).  Keep one
-# process-wide cache so repeated /api/ide/config requests do not rescan every
-# PATH entry.  The cache key includes the inputs used by shutil.which, so a
-# changed environment is detected without platform-specific path assumptions.
-IDE_TOOLCHAIN_CACHE_TTL_SECONDS = 60.0
-_IDE_TOOLCHAIN_CACHE_LOCK = threading.RLock()
-_IDE_TOOLCHAIN_CACHE: dict[tuple[str, str, str, str], tuple[float, list[dict]]] = {}
-_IDE_TOOLCHAIN_REFRESHING: set[tuple[str, str, str, str]] = set()
-SKILL_RECALL_CACHE_TTL_SECONDS = 2.0
-SKILL_RECALL_CACHE_MAX_ENTRIES = 256
-SKILL_RECALL_GENERIC_TOKENS = frozenset(
-    {
-        "the", "and", "for", "with", "from", "this", "that", "use", "build", "create", "analyze",
-        "task", "step", "current", "plan", "phase", "direct", "objective", "execution", "run", "start",
-        "auto", "ide", "programming", "request", "workspace", "root", "writable", "path", "session",
-    }
-)
-
-
-def _skill_term_match(haystack: str, term: str) -> bool:
-    """Match a recall term without compiling a regular expression per hit."""
-    if not term:
-        return False
-    if any("\u3400" <= char <= "\u9fff" for char in term):
-        return term in haystack
-    start = 0
-    while True:
-        index = haystack.find(term, start)
-        if index < 0:
-            return False
-        left = haystack[index - 1] if index else ""
-        end = index + len(term)
-        right = haystack[end] if end < len(haystack) else ""
-        left_word = bool(left) and (left.isascii() and (left.isalnum() or left == "_"))
-        right_word = bool(right) and (right.isascii() and (right.isalnum() or right == "_"))
-        if not left_word and not right_word:
-            return True
-        start = index + max(1, len(term))
 SKILL_CATALOG_FULL_REFRESH_SECONDS = max(
     5.0,
     min(300.0, float(str(os.getenv("AGENT_SKILL_CATALOG_FULL_REFRESH_SECONDS", "30") or "30"))),
@@ -12285,7 +12246,6 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
         return True, tags, ""
     except Exception as exc:
         return False, [], str(exc)
-
 
 def extract_ollama_model_capabilities(payload: object) -> dict:
     """Translate Ollama ``/api/show`` metadata to provider-neutral hints."""
@@ -21590,10 +21550,6 @@ class SkillStore:
         self.warnings: list[str] = []
         self.fingerprint = ""
         self.last_reload_ts = 0.0
-        self._metadata_cache: dict[str, dict] = {}
-        self._metadata_match_cache: dict[str, dict] = {}
-        self._recall_cache: dict[tuple, tuple[float, list[dict]]] = {}
-        self._recall_cache_order: deque[tuple] = deque()
         adopted = False
         if snapshot is not None:
             try:
@@ -21612,46 +21568,9 @@ class SkillStore:
                 self.warnings = list(snapshot.warnings)
                 self.fingerprint = str(snapshot.fingerprint or "")
                 self.last_reload_ts = now_ts()
-                self._rebuild_metadata_cache()
                 adopted = True
         if not adopted:
             self.reload(force=True)
-
-    def _clear_metadata_cache(self) -> None:
-        self._metadata_cache = {}
-        self._metadata_match_cache = {}
-        self._recall_cache = {}
-        self._recall_cache_order = deque()
-
-    def _rebuild_metadata_cache(self) -> None:
-        """Build immutable-ish routing metadata once per skill catalog revision."""
-        self._clear_metadata_cache()
-        for key, data in self.skills.items():
-            row = self._skill_metadata_record(key, data)
-            self._metadata_cache[key] = row
-            name = str(row.get("name", "") or "").casefold()
-            description = str(row.get("description", "") or "").casefold()
-            self._metadata_match_cache[key] = {
-                "negative_triggers": tuple(str(value).casefold() for value in row.get("negative_triggers", []) if str(value).strip()),
-                "terms": tuple(
-                    (str(value or "").strip().casefold(), str(value or "").strip())
-                    for value in list(row.get("triggers", [])) + list(row.get("keywords", [])) + list(row.get("aliases", []))
-                    if str(value or "").strip()
-                ),
-                "name": name,
-                "name_tokens": frozenset(
-                    part.casefold()
-                    for part in re.findall(r"[A-Za-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}", name, flags=re.UNICODE)
-                ),
-                "description_tokens": frozenset(
-                    part.casefold()
-                    for part in re.findall(r"[A-Za-z0-9+#.]{3,}|[\u3400-\u9fff]{2,}", description, flags=re.UNICODE)
-                ),
-            }
-
-    def _ensure_metadata_cache(self) -> None:
-        if len(self._metadata_cache) != len(self.skills) or set(self._metadata_cache) != set(self.skills):
-            self._rebuild_metadata_cache()
 
     def _sanitize_provider_id(self, raw: str, fallback: str) -> str:
         pid = re.sub(r"[^A-Za-z0-9._-]+", "-", (raw or "").strip().lower()).strip("-")
@@ -21765,10 +21684,6 @@ class SkillStore:
         return out[:24]
 
     def _skill_metadata_record(self, key: str, data: dict, *, score: float | None = None) -> dict:
-        if score is None:
-            cached = self._metadata_cache.get(str(key))
-            if isinstance(cached, dict):
-                return dict(cached)
         meta = dict(data.get("meta", {}) if isinstance(data.get("meta"), dict) else {})
         selection_meta = dict(meta)
         selection_meta.setdefault("description", str(data.get("description", "") or ""))
@@ -22338,7 +22253,6 @@ class SkillStore:
         for alias in self._skill_aliases(meta):
             if alias != skill_name:
                 self._register_alias(alias, key)
-        self._clear_metadata_cache()
 
     def _load_skill_file(self, skill_file: Path, provider_id: str, protocol: str, protocol_version: str):
         raw = try_read_text(skill_file)
@@ -22753,7 +22667,6 @@ class SkillStore:
         self.ambiguous = {}
         self.providers = {}
         self.warnings = []
-        self._clear_metadata_cache()
         if not self.skills_root.exists():
             self.fingerprint = fp
             self.last_reload_ts = now
@@ -22765,7 +22678,6 @@ class SkillStore:
         self._inject_builtin_skills()
         self.fingerprint = fp
         self.last_reload_ts = now
-        self._rebuild_metadata_cache()
 
     def _load_external_skill_roots(self):
         """Discover and load skills from external directories adjacent to skills_root.
@@ -22909,8 +22821,7 @@ class SkillStore:
         return sorted(names)
 
     def list_metadata(self) -> list[dict]:
-        self._ensure_metadata_cache()
-        out = [dict(self._metadata_cache[key]) for key in sorted(self.skills) if key in self._metadata_cache]
+        out = [self._skill_metadata_record(key, data) for key, data in sorted(self.skills.items())]
         if self.ambiguous:
             out.append(
                 {
@@ -22984,8 +22895,12 @@ class SkillStore:
         limit: int = 12,
         include_infrastructure: bool = False,
     ) -> list[dict]:
-        """Recall bounded metadata candidates using precomputed skill indexes."""
+        """Recall a bounded metadata candidate set without loading skill bodies."""
         raw_query = f"{focus or ''}\n{step or ''}\n{phase or ''}"
+        # Runtime wrappers describe where the request came from, not what the
+        # user is trying to accomplish.  Letting these lines participate in
+        # recall made tokens such as ``IDE`` and ``workspace`` outrank the
+        # actual current Todo/Plan step.
         meaningful_lines: list[str] = []
         for raw_line in normalize_embedded_newlines(raw_query).splitlines():
             line = re.sub(r"\s+", " ", str(raw_line or "").strip())
@@ -22999,71 +22914,79 @@ class SkillStore:
                 continue
             meaningful_lines.append(line)
         query = re.sub(r"\s+", " ", " ".join(meaningful_lines)).strip().casefold()
+        generic_tokens = {
+            "the", "and", "for", "with", "from", "this", "that", "use", "build", "create", "analyze",
+            "task", "step", "current", "plan", "phase", "direct", "objective", "execution", "run", "start",
+            "auto", "ide", "programming", "request", "workspace", "root", "writable", "path", "session",
+        }
         tokens: list[str] = []
         seen_tokens: set[str] = set()
         for token in re.findall(r"[\w.+#-]{2,}", query, flags=re.UNICODE):
             normalized = token.strip("._+-").casefold()
-            if not normalized or normalized in SKILL_RECALL_GENERIC_TOKENS or normalized in seen_tokens:
+            if not normalized or normalized in generic_tokens or normalized in seen_tokens:
                 continue
             seen_tokens.add(normalized)
             tokens.append(normalized)
 
-        bounded_limit = max(1, min(50, int(limit or 12)))
-        cache_key = (
-            str(self.fingerprint or ""),
-            len(self.skills),
-            query,
-            str(step or "").strip().casefold(),
-            str(phase or "").strip().casefold(),
-            bounded_limit,
-            bool(include_infrastructure),
-        )
-        now = time.monotonic()
-        cached = self._recall_cache.get(cache_key)
-        if cached is not None and now - cached[0] < SKILL_RECALL_CACHE_TTL_SECONDS:
-            return [dict(row) for row in cached[1]]
+        def _ascii_term_match(haystack: str, term: str) -> bool:
+            if not term:
+                return False
+            if re.search(r"[\u3400-\u9fff]", term):
+                return term in haystack
+            return bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(term) + r"(?![A-Za-z0-9_])", haystack))
 
-        self._ensure_metadata_cache()
         scored: list[tuple[float, str, dict]] = []
-        generic_terms = SKILL_RECALL_GENERIC_TOKENS | {"skill"}
-        for key, base_meta in self._metadata_cache.items():
-            if base_meta.get("infrastructure_only") and not include_infrastructure:
+        for key, data in self.skills.items():
+            meta = self._skill_metadata_record(key, data)
+            if meta.get("infrastructure_only") and not include_infrastructure:
                 continue
-            match_meta = self._metadata_match_cache.get(key, {})
-            negatives = match_meta.get("negative_triggers", ())
-            negative_hit = next((value for value in negatives if value and value in query), "")
+            negatives = [str(x).casefold() for x in meta.get("negative_triggers", [])]
+            negative_hit = next((x for x in negatives if x and x in query), "")
             if negative_hit:
+                meta["filter_reason"] = f"negative_trigger:{negative_hit}"
                 continue
             score = 0.0
+            # Explicit trigger/keyword/name matches are strong. Description is
+            # deliberately weak so words like Build/Use/Analyze do not dominate.
             seen_terms: set[str] = set()
-            for term, raw_term in match_meta.get("terms", ()):
-                if not term or term in seen_terms or term in generic_terms:
+            for value in list(meta.get("triggers", [])) + list(meta.get("keywords", [])) + list(meta.get("aliases", [])):
+                raw_term = str(value or "").strip()
+                term = raw_term.casefold()
+                if not term or term in seen_terms or term in generic_tokens | {"skill"}:
                     continue
                 seen_terms.add(term)
-                if _skill_term_match(query, term):
-                    is_cjk = any("㐀" <= char <= "鿿" for char in term)
+                if _ascii_term_match(query, term):
+                    is_cjk = bool(re.search(r"[\u3400-\u9fff]", term))
                     is_acronym = len(raw_term) >= 2 and raw_term.isupper()
                     score += 6.0 if is_cjk or is_acronym or " " in term or len(term) >= 6 else 2.0
-            name = str(match_meta.get("name", "") or "")
-            if name and _skill_term_match(query, name):
+            name = str(meta.get("name", "") or "").casefold()
+            if name and _ascii_term_match(query, name):
                 score += 8.0
-            name_tokens = match_meta.get("name_tokens", frozenset())
-            description_tokens = match_meta.get("description_tokens", frozenset())
+            name_tokens = {
+                part.casefold()
+                for part in re.findall(r"[A-Za-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}", name, flags=re.UNICODE)
+            }
+            description = str(meta.get("description", "") or "").casefold()
+            description_tokens = {
+                part.casefold()
+                for part in re.findall(r"[A-Za-z0-9+#.]{3,}|[\u3400-\u9fff]{2,}", description, flags=re.UNICODE)
+            }
             for token in tokens:
+                # Name matching uses normalized segments.  Arbitrary substring
+                # matching made ``ide`` match the middle of ``video``.
                 if token in name_tokens:
                     score += 2.5
                 elif token in description_tokens:
                     score += 0.35
+            # Keep unscored rows available only when the caller asks for an
+            # explicit catalog; automatic focus selection should stay empty.
             if score > 0:
-                scored.append((score, str(base_meta.get("canonical_id", key)), dict(base_meta)))
+                scored.append((score, str(meta.get("canonical_id", key)), meta))
         scored.sort(key=lambda row: (-row[0], row[1].casefold()))
-        result = [dict(row[2], score=round(row[0], 4)) for row in scored[:bounded_limit]]
-        self._recall_cache[cache_key] = (now, result)
-        self._recall_cache_order.append(cache_key)
-        while len(self._recall_cache_order) > SKILL_RECALL_CACHE_MAX_ENTRIES:
-            old_key = self._recall_cache_order.popleft()
-            self._recall_cache.pop(old_key, None)
-        return [dict(row) for row in result]
+        return [
+            dict(row[2], score=round(row[0], 4))
+            for row in scored[: max(1, min(50, int(limit or 12)))]
+        ]
 
     metadata_recall = recall_metadata
 
@@ -28847,136 +28770,36 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
-
-# ``bash`` is intentionally classified by the caller, rather than only by
-# inspecting command text after the fact.  The declaration is part of the
-# provenance contract: it tells evidence/memory whether a shell call is a
-# source read, a document/media perception step, or ordinary execution.  The
-# runtime still accepts legacy calls without the field and falls back to the
-# older syntax-aware detector for compatibility.
-BASH_OPERATION_CODES = (
-    "execute",
-    "text_read",
-    "text_search",
-    "directory_inspect",
-    "document_extract",
-    "ocr",
-    "media_metadata",
-    "media_extract",
-    "custom_extract",
-    "validation",
-    "build_test",
-    "process_control",
-    "network",
-)
-BASH_OBSERVATION_OPERATION_CODES = frozenset(
-    {
-        "text_read",
-        "text_search",
-        "directory_inspect",
-        "document_extract",
-        "ocr",
-        "media_metadata",
-        "media_extract",
-        "custom_extract",
-    }
-)
-BASH_OPERATION_ALIASES = {
-    "read": "text_read",
-    "file_read": "text_read",
-    "text": "text_read",
-    "search": "text_search",
-    "file_search": "text_search",
-    "inspect": "directory_inspect",
-    "directory": "directory_inspect",
-    "pdf": "document_extract",
-    "pdf_extract": "document_extract",
-    "document": "document_extract",
-    "document_read": "document_extract",
-    "image_ocr": "ocr",
-    "vision_ocr": "ocr",
-    "metadata": "media_metadata",
-    "media_info": "media_metadata",
-    "extract": "media_extract",
-    "media": "media_extract",
-    "script_extract": "custom_extract",
-    "custom_reader": "custom_extract",
-    "test": "build_test",
-    "build": "build_test",
-    "run_test": "build_test",
-    "process": "process_control",
-    "shell": "execute",
-    "command": "execute",
-}
-
-
-def normalize_bash_operation(value: object, *, default: str = "execute") -> str:
-    """Normalize the model-provided shell operation code."""
-    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if raw.startswith("custom:") and re.fullmatch(r"custom:[a-z0-9_:.]{1,64}", raw):
-        return raw
-    raw = BASH_OPERATION_ALIASES.get(raw, raw)
-    if raw in BASH_OPERATION_CODES:
-        return raw
-    if raw and re.fullmatch(r"[a-z0-9_:.]{1,64}", raw):
-        # Preserve an agent-supplied, domain-specific marker without treating
-        # it as one of the built-in observation classes. This keeps bash open
-        # ended while still making the marker searchable in tool memory.
-        return f"custom:{raw}"
-    fallback = str(default or "execute").strip().lower().replace("-", "_").replace(" ", "_")
-    fallback = BASH_OPERATION_ALIASES.get(fallback, fallback)
-    return fallback if fallback in BASH_OPERATION_CODES else "execute"
-
-
-def bash_operation_is_observation(value: object) -> bool:
-    return normalize_bash_operation(value, default="execute") in BASH_OBSERVATION_OPERATION_CODES
-
-
-def bash_operation_is_marked_observation(value: object) -> bool:
-    operation = normalize_bash_operation(value, default="execute")
-    return operation in BASH_OBSERVATION_OPERATION_CODES or operation.startswith("custom:")
-
-
 TOOLS = [
     tool_def(
         "bash",
         (
-            "Execute a shell command for builds, tests, validation, process control, or a pipeline that truly needs a shell. "
-            "For ordinary local file reading, searching, symbols, line windows, or exact source evidence, prefer read_file. "
-            "When a call is a special read/perception task, provide operation with the caller's intent code: text_read/text_search/directory_inspect "
-            "for source reads, document_extract for PDF/document conversion, ocr for OCR, media_metadata or "
-            "media_extract for image/audio/video perception, custom_extract for a Python/Node/other reader, "
-            "validation/build_test for checks, process_control for process operations, network for HTTP, or execute "
-            "for ordinary shell work. The field is optional so bash remains fully general; a declared observation is recorded even when output is short. Bash remains a "
-            "fallback when read_file cannot express the requested extraction; its exact output gets immutable evidence "
-            "and tool-memory trace, with source alignment when possible."
+            "Run a shell command. Use shell-native readers/search pipelines when they are the most natural option; "
+            "successful output that can be verified against local source files is automatically merged into the same "
+            "source-addressable long-content memory used by read_file."
         ),
-        {
-            "command": {"type": "string"},
-            "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker. Known markers such as text_read, document_extract, ocr, media_metadata, custom_extract and validation receive specialized memory handling; arbitrary domain markers remain searchable without restricting shell use."},
-            "recognition_code": {"type": "string", "description": "Optional alias for operation when a task-specific recognition marker is clearer."},
-        },
+        {"command": {"type": "string"}},
         ["command"],
     ),
     tool_def(
         "read_file",
         (
-            "Preferred tool for reading local files and directories with structure-aware, source-addressable modes. "
+            "Read files or directories with structure-aware modes. "
             "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
             "and mode='full' when complete content is explicitly needed. Use mode='structure' or mode='segment' "
             "to resume a long-file reading pass from compact understanding cards. Reader choice is not mandatory: "
-            "read_file and source-aligned shell readers update the same long-content memory. Successful reads receive an "
-            "immutable evidence_ref and are remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
+            "read_file and source-aligned shell readers update the same long-content memory. Successful reads are "
+            "remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
             "mode": {
                 "type": "string",
-                "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "evidence", "directory"],
-                "description": "Reading strategy. Use structure/overview to inspect a source memory, segment with target/query to read one remembered section, symbol with target for a function/class; search with query for literal text/errors; evidence with query for ranked excerpts and traceable line evidence; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"],
+                "description": "Reading strategy. Use structure/overview to inspect a long source memory, segment with target/query to read one remembered section, symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
             },
             "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
             "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure', for example 's0001'."},
@@ -29191,13 +29014,10 @@ TOOLS = [
         (
             "Inspect remembered tool evidence from the current session before repeating read_file/bash/query/edit calls. "
             "Use mode='summary' for the active map, mode='search' with query/path/command terms, "
-            "or mode='trace' with an evidence id for exact output and verification. "
-            "Proactively use mode='remember' to consolidate important facts, decisions and uncertainties "
-            "with exact source references; mode='recall' returns those memories and their evidence. "
-            "Use kind='inference' for derived conclusions; do not treat a summary as verified source truth."
+            "or mode='detail' with id to load an entry and optional cached preview."
         ),
         {
-            "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail", "trace", "remember", "recall"]},
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail"]},
             "query": {"type": "string"},
             "id": {"type": "string"},
             "tool": {"type": "string"},
@@ -29205,15 +29025,7 @@ TOOLS = [
             "status": {"type": "string"},
             "limit": {"type": "integer"},
             "max_chars": {"type": "integer"},
-            "depth": {"type": "integer", "description": "Causal evidence-trace depth for mode='trace' (0-4)."},
             "include_cached": {"type": "boolean"},
-            "claim": {"type": "string", "description": "Important model-authored conclusion to retain, with exact parameter spelling."},
-            "kind": {"type": "string", "enum": ["fact", "inference", "decision", "constraint", "procedure"]},
-            "conditions": {"type": "string", "description": "Scope, units, assumptions and unresolved qualifications."},
-            "importance": {"type": "integer", "minimum": 1, "maximum": 5},
-            "references": {"type": "array", "items": {"type": "object", "properties": {"evidence_id": {"type": "string"}, "quote": {"type": "string"}}, "required": ["evidence_id", "quote"]}},
-            "supersedes": {"type": "string", "description": "Explicit prior memory id; conflicting memories are never silently merged."},
-            "offset": {"type": "integer", "description": "Character offset into exact trace output."},
         },
     ),
         tool_def(
@@ -29484,17 +29296,7 @@ TOOLS = [
     tool_def("worktree_create", "Create git worktree.", {"name": {"type": "string"}, "task_id": {"type": "integer"}, "base_ref": {"type": "string"}}, ["name"]),
     tool_def("worktree_list", "List worktrees.", {}),
     tool_def("worktree_status", "Get worktree status.", {"name": {"type": "string"}}, ["name"]),
-    tool_def(
-        "worktree_run",
-        "Run a shell command in a worktree. Set operation using the same bash provenance codes so reads and perception results enter evidence/tool-memory correctly.",
-        {
-            "name": {"type": "string"},
-            "command": {"type": "string"},
-            "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker; known markers receive specialized memory handling."},
-            "recognition_code": {"type": "string"},
-        },
-        ["name", "command"],
-    ),
+    tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
     tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
     tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
         tool_def(
@@ -30211,634 +30013,7 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
-class EvidenceRetrievalController:
-    """Session-local, rebuildable source index and immutable tool evidence.
-
-    Indexing is not reading/comprehension. Only bytes returned by a tool are
-    evidence; summaries remain hypotheses. All SQLite connections are scoped.
-    """
-
-    def __init__(self, root: Path):
-        self.path = Path(root) / "evidence" / "sources.sqlite3"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock = threading.RLock()
-        self.metrics = Counter()
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("CREATE TABLE IF NOT EXISTS sources (version TEXT PRIMARY KEY, lines INTEGER NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS blocks (id INTEGER PRIMARY KEY, version TEXT, start INTEGER, stop INTEGER, body TEXT, tokens TEXT)")
-            db.execute("CREATE INDEX IF NOT EXISTS blocks_source ON blocks(version,start)")
-            db.execute("CREATE TABLE IF NOT EXISTS evidence (id TEXT PRIMARY KEY, path TEXT, version TEXT, tool TEXT, role TEXT, args TEXT, digest TEXT, body TEXT, status TEXT, created REAL)")
-            db.execute("CREATE INDEX IF NOT EXISTS evidence_digest ON evidence(digest,path)")
-            db.execute("CREATE INDEX IF NOT EXISTS evidence_path ON evidence(path,created)")
-            db.execute("CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, claim TEXT, kind TEXT, conditions TEXT, importance INTEGER, refs TEXT, status TEXT, created REAL, accessed REAL)")
-            db.execute("CREATE TABLE IF NOT EXISTS evidence_links (source TEXT, target TEXT, relation TEXT, PRIMARY KEY(source,target,relation))")
-            # ``flow`` nodes and file heads intentionally live beside ordinary
-            # tool evidence.  This keeps one immutable id space for tool calls,
-            # UI events, loop state and file versions, while the head table gives
-            # us a cheap current-version index without rewriting old evidence.
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS file_evidence_heads ("
-                "path TEXT PRIMARY KEY, evidence_id TEXT, version TEXT, operation TEXT, "
-                "updated REAL, stale INTEGER NOT NULL DEFAULT 0, previous_evidence_id TEXT)"
-            )
-            db.execute("CREATE INDEX IF NOT EXISTS file_heads_evidence ON file_evidence_heads(evidence_id)")
-            self.fts = self.trigram = False
-            try:
-                db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS source_terms USING fts5(tokens, content='blocks', content_rowid='id')")
-                self.fts = True
-                db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS source_substrings USING fts5(body, content='blocks', content_rowid='id', tokenize='trigram')")
-                self.trigram = True
-            except sqlite3.OperationalError:
-                pass  # Exact streamed search remains available without FTS5.
-
-    @staticmethod
-    def terms(text: str) -> list[str]:
-        tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", str(text).casefold())
-        out = []
-        for token in tokens:
-            out.append(token)
-            if re.fullmatch(r"[\u4e00-\u9fff]{3,}", token):
-                out.extend(token[i:i + 2] for i in range(len(token) - 1))
-        return list(dict.fromkeys(out))
-
-    def index(self, version: str, lines: list[str]) -> None:
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            if db.execute("SELECT 1 FROM sources WHERE version=?", (version,)).fetchone():
-                self.metrics["index_hits"] += 1
-                return
-            # A transaction publishes the version only after all blocks exist.
-            for start in range(0, len(lines), 64):
-                body = "\n".join(lines[start:start + 64])
-                tokens = " ".join(self.terms(body))
-                row_id = db.execute("INSERT INTO blocks(version,start,stop,body,tokens) VALUES(?,?,?,?,?)",
-                                    (version, start + 1, min(len(lines), start + 64), body, tokens)).lastrowid
-                if self.fts:
-                    db.execute("INSERT INTO source_terms(rowid,tokens) VALUES(?,?)", (row_id, tokens))
-                if self.trigram:
-                    db.execute("INSERT INTO source_substrings(rowid,body) VALUES(?,?)", (row_id, body))
-            db.execute("INSERT INTO sources VALUES(?,?)", (version, len(lines)))
-            self.metrics["index_builds"] += 1
-            self.metrics["indexed_lines"] += len(lines)
-
-    def search(self, version: str, query: str, *, ranked: bool = False, offset: int = 0) -> dict:
-        """Literal searches are exact; ranked retrieval is explicitly partial."""
-        terms = self.terms(query)
-        matches = []
-        scanned = 0
-        truncated = False
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            if ranked and self.fts and terms:
-                expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:32])
-                rows = db.execute(
-                    "SELECT b.start,b.body FROM source_terms JOIN blocks b ON b.id=source_terms.rowid "
-                    "WHERE source_terms MATCH ? AND b.version=? AND b.stop>? ORDER BY rank LIMIT 65",
-                    (expression, version, offset))
-            elif self.trigram and len(query) >= 3 and "\n" not in query:
-                expression = '"' + query.replace('"', '""') + '"'
-                rows = db.execute(
-                    "SELECT b.start,b.body FROM source_substrings JOIN blocks b ON b.id=source_substrings.rowid "
-                    "WHERE source_substrings MATCH ? AND b.version=? AND b.stop>? ORDER BY b.start",
-                    (expression, version, offset))
-            else:
-                rows = db.execute("SELECT start,body FROM blocks WHERE version=? AND stop>? ORDER BY start", (version, offset))
-            for block_start, body in rows:
-                scanned += 1
-                if ranked and scanned > 64:
-                    truncated = True
-                    break
-                for i, line in enumerate(body.split("\n"), block_start):
-                    if i <= offset:
-                        continue
-                    low = line.casefold()
-                    exact = query.casefold() in low
-                    score = sum(1 for term in terms if term in low) if ranked else int(exact)
-                    if (ranked and score) or exact:
-                        matches.append((score + (8 if exact else 0), i))
-                    if not ranked and len(matches) > 120:
-                        truncated = True
-                        break
-                if truncated:
-                    break
-            self.metrics["queries"] += 1
-            self.metrics["scanned_blocks"] += scanned
-        if ranked:
-            matches.sort(key=lambda item: (-item[0], item[1]))
-        return {"matches": matches[:120], "partial": truncated or ranked,
-                "scanned_blocks": scanned, "method": "ranked" if ranked else "literal"}
-
-    def remember(self, path: str, version: str, tool: str, role: str, args: dict, body: str, status: str) -> str:
-        digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
-        arg_text = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
-        eid = hashlib.sha256(f"{path}\0{version}\0{tool}\0{role}\0{arg_text}\0{digest}".encode()).hexdigest()[:24]
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            db.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?)",
-                       (eid, path, version, tool, role, arg_text, digest, body, status, time.time()))
-        return eid
-
-    def recall(self, *, eid: str = "", digest: str = "", path: str = "", query: str = "", role: str = "", tool: str = "", limit: int = 8) -> list[dict]:
-        clauses, params = [], []
-        for key, value in (("id", eid), ("digest", digest), ("path", path), ("role", role), ("tool", tool)):
-            if value:
-                clauses.append(f"{key}=?")
-                params.append(value)
-        if query:
-            # Parameter names/values and command errors survive summary loss.
-            tokens = self.terms(query)[:16]
-            if tokens:
-                clauses.append("(" + " OR ".join("instr(lower(path || ' ' || args || ' ' || body),?)>0" for _ in tokens) + ")")
-                params.extend(tokens)
-        sql = "SELECT id,path,version,tool,role,args,digest,body,status,created FROM evidence"
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created DESC LIMIT ?"
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute(sql, [*params, max(1, min(200, limit))])]
-
-
-    def link(self, source: str, target: str, relation: str) -> None:
-        if source and target and source != target:
-            with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-                db.execute("INSERT OR IGNORE INTO evidence_links VALUES(?,?,?)", (source, target, relation))
-
-    def links(self, eid: str) -> list[dict]:
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            db.row_factory = sqlite3.Row
-            return [dict(r) for r in db.execute("SELECT * FROM evidence_links WHERE source=? OR target=? LIMIT 40", (eid, eid))]
-
-    def record_flow(
-        self,
-        kind: str,
-        body: object,
-        *,
-        role: str = "",
-        metadata: dict | None = None,
-        parent_ids: list[str] | None = None,
-        status: str = "ok",
-    ) -> str:
-        """Persist a compact immutable node for any agentic-flow transition."""
-        flow_id = uuid.uuid4().hex
-        payload = {
-            "kind": str(kind or "flow"),
-            "flow_id": flow_id,
-            "metadata": dict(metadata or {}),
-            "body": body,
-        }
-        encoded = json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)
-        # Flow nodes are summaries; the exact large tool output remains in the
-        # ordinary tool evidence row referenced by parent_ids.
-        encoded = encoded[:24_000]
-        eid = self.remember(
-            "",
-            f"flow:{flow_id}",
-            f"flow:{str(kind or 'event')}",
-            role or "single",
-            {"flow_id": flow_id, **dict(metadata or {})},
-            encoded,
-            status,
-        )
-        for parent_id in list(parent_ids or [])[:24]:
-            parent = str(parent_id or "").strip()
-            if parent and parent != eid:
-                self.link(eid, parent, "continues")
-        return eid
-
-    def trace(self, eid: str, *, depth: int = 2, limit: int = 80) -> dict:
-        """Return one evidence row plus its bounded causal neighborhood."""
-        root_id = str(eid or "").strip()
-        rows = self.recall(eid=root_id, limit=1)
-        if not rows:
-            return {}
-        seen = {root_id}
-        frontier = [root_id]
-        nodes = [rows[0]]
-        edges: list[dict] = []
-        for _ in range(max(0, min(5, int(depth or 0)))):
-            next_frontier: list[str] = []
-            for current in frontier:
-                for edge in self.links(current):
-                    edges.append(edge)
-                    other = str(edge.get("target", "") or "")
-                    if other == current:
-                        other = str(edge.get("source", "") or "")
-                    if not other or other in seen or len(nodes) >= max(1, min(200, int(limit or 80))):
-                        continue
-                    found = self.recall(eid=other, limit=1)
-                    if found:
-                        seen.add(other)
-                        nodes.append(found[0])
-                        next_frontier.append(other)
-            frontier = next_frontier
-            if not frontier:
-                break
-        return {"root": rows[0], "nodes": nodes, "links": edges[: max(1, min(400, int(limit or 80) * 4))]}
-
-    def file_head(self, path: str) -> dict:
-        rel = str(path or "").replace("\\", "/").strip()
-        if not rel:
-            return {}
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            db.row_factory = sqlite3.Row
-            row = db.execute("SELECT * FROM file_evidence_heads WHERE path=?", (rel,)).fetchone()
-            return dict(row) if row else {}
-
-    def update_file_head(
-        self,
-        path: str,
-        evidence_id: str,
-        version: str,
-        operation: str,
-        *,
-        previous_evidence_id: str = "",
-    ) -> dict:
-        rel = str(path or "").replace("\\", "/").strip()
-        if not rel or not evidence_id:
-            return {}
-        previous = self.file_head(rel)
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            db.execute(
-                "INSERT INTO file_evidence_heads(path,evidence_id,version,operation,updated,stale,previous_evidence_id) "
-                "VALUES(?,?,?,?,?,0,?) ON CONFLICT(path) DO UPDATE SET evidence_id=excluded.evidence_id, "
-                "version=excluded.version, operation=excluded.operation, updated=excluded.updated, stale=0, "
-                "previous_evidence_id=excluded.previous_evidence_id",
-                (rel, evidence_id, str(version or ""), str(operation or ""), time.time(), previous_evidence_id or str(previous.get("evidence_id", "") or "")),
-            )
-        return previous
-
-    def mark_file_stale_if_changed(self, path: str, version: str) -> dict:
-        rel = str(path or "").replace("\\", "/").strip()
-        if not rel or not version:
-            return {}
-        head = self.file_head(rel)
-        if head and str(head.get("version", "") or "") != str(version):
-            with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-                db.execute("UPDATE file_evidence_heads SET stale=1, updated=? WHERE path=?", (time.time(), rel))
-                if head.get("evidence_id"):
-                    db.execute("UPDATE evidence SET status='stale' WHERE id=? AND status='ok'", (str(head.get("evidence_id")),))
-            head["stale"] = 1
-        return head
-
-    def consolidate(self, claim: str, kind: str, conditions: str, importance: int, references: list[dict], supersedes: str = '') -> dict:
-        if not claim.strip() or len(claim) > 2000 or len(conditions) > 1000:
-            raise ValueError('claim is required (max 2000 chars); conditions max 1000 chars')
-        if kind not in {'fact', 'inference', 'decision', 'constraint', 'procedure'}:
-            raise ValueError('unknown memory kind')
-        if not isinstance(references, list) or not 1 <= len(references) <= 12:
-            raise ValueError('supply 1-12 references with evidence_id and an exact quote')
-        refs = []
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            for ref in references:
-                eid, quote = str(ref.get('evidence_id', '')), str(ref.get('quote', ''))
-                row = db.execute("SELECT body,digest,status FROM evidence WHERE id=?", (eid,)).fetchone()
-                if not row or not quote.strip() or len(quote) > 4000 or quote not in row[0]:
-                    raise ValueError(f'reference {eid} is unavailable or quote does not exactly match the tool result')
-                refs.append({'evidence_id': eid, 'quote': quote, 'digest': row[1], 'source_status': row[2]})
-            # Exact numerical spelling is mandatory for a factual memory.
-            # Conversions/calculations belong to inference with source refs.
-            if kind == 'fact':
-                number_re = r'(?<![\w])[-+−]?\d+(?:\.\d+)?(?:[eEdD][-+]?\d+)?'
-                available = set(re.findall(number_re, ' '.join(r['quote'] for r in refs)))
-                if not set(re.findall(number_re, claim)).issubset(available):
-                    raise ValueError('factual numerical values must occur verbatim in the cited quotes; use inference for a derived value')
-                key_match = re.match(r"\s*([A-Za-z_][\w .-]{1,96})\s*(?:=|:)\s*", claim)
-                if key_match and not supersedes:
-                    fact_key = key_match.group(1).strip().casefold()
-                    for existing_claim, existing_id in db.execute(
-                        "SELECT claim,id FROM memories WHERE status='active' AND kind='fact'"
-                    ):
-                        existing_match = re.match(
-                            r"\s*([A-Za-z_][\w .-]{1,96})\s*(?:=|:)\s*", str(existing_claim or '')
-                        )
-                        if existing_match and existing_match.group(1).strip().casefold() == fact_key and str(existing_claim).strip() != claim.strip():
-                            raise ValueError(
-                                f'conflict with active memory {existing_id}; cite the new evidence and set supersedes explicitly'
-                            )
-            packed = json.dumps(refs, sort_keys=True, ensure_ascii=False)
-            mid = 'mem_' + hashlib.sha256((claim + kind + conditions + packed).encode()).hexdigest()[:20]
-            if supersedes and not db.execute("SELECT 1 FROM memories WHERE id=?", (supersedes,)).fetchone():
-                raise ValueError('superseded memory does not exist')
-            db.execute("INSERT OR IGNORE INTO memories VALUES(?,?,?,?,?,?,?,?,?)",
-                       (mid, claim, kind, conditions, max(1, min(5, importance)), packed, 'active', time.time(), time.time()))
-            for ref in refs:
-                db.execute("INSERT OR IGNORE INTO evidence_links VALUES(?,?,?)", (mid, ref['evidence_id'], 'cites'))
-            if supersedes and supersedes != mid:
-                db.execute("UPDATE memories SET status='superseded' WHERE id=?", (supersedes,))
-                db.execute("INSERT OR IGNORE INTO evidence_links VALUES(?,?,?)", (mid, supersedes, 'supersedes'))
-        return {'id': mid, 'kind': kind, 'status': 'active', 'validation': 'exact citations checked; claim remains model-authored'}
-
-    def memories(self, query: str = '', mid: str = '', limit: int = 6) -> list[dict]:
-        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
-            db.row_factory = sqlite3.Row
-            sql = "SELECT * FROM memories WHERE status='active'"
-            params = []
-            if mid:
-                sql += ' AND id=?'
-                params.append(mid)
-            terms = self.terms(query)[:16]
-            if terms:
-                sql += ' AND (' + ' OR '.join("instr(lower(claim || ' ' || conditions),?)>0" for _ in terms) + ')'
-                params.extend(terms)
-            sql += ' ORDER BY importance DESC, accessed DESC LIMIT ?'
-            rows = [dict(r) for r in db.execute(sql, [*params, max(1, min(40, limit))])]
-            for row in rows:
-                row['references'] = json.loads(row.pop('refs'))
-                db.execute('UPDATE memories SET accessed=? WHERE id=?', (time.time(), row['id']))
-            return rows
-
-
-_EVIDENCE_CONTROLLER_INIT_LOCK = threading.Lock()
-
-
 class SessionState:
-    def _evidence_controller(self) -> EvidenceRetrievalController:
-        with _EVIDENCE_CONTROLLER_INIT_LOCK:
-            controller = getattr(self, '_evidence_retrieval_controller', None)
-            if controller is None:
-                controller = EvidenceRetrievalController(self.root)
-                self._evidence_retrieval_controller = controller
-        return controller
-
-    def _flow_context(self, role: str = "", tool_call_id: str = "") -> dict:
-        """Capture the execution coordinates attached to every evidence node."""
-        sanitize_role = getattr(self, "_sanitize_agent_role", lambda value: str(value or "").strip().lower())
-        role_key = sanitize_role(role) or sanitize_role(getattr(self, "active_agent_role", "")) or "single"
-        alignment = {}
-        try:
-            alignment = self._agent_loop_todo_alignment(role_key)
-        except Exception:
-            alignment = {}
-        plan_step = {}
-        try:
-            plan_step = self._current_plan_step_row(self._ensure_blackboard()) or {}
-        except Exception:
-            plan_step = {}
-        with getattr(self, "_flow_event_lock", threading.RLock()):
-            parent = str(getattr(self, "_flow_last_evidence_by_role", {}).get(role_key, "") or "")
-            start = str(getattr(self, "_flow_tool_start_evidence", {}).get(str(tool_call_id or ""), "") or "")
-        return {
-            "run_generation": int(getattr(self, "run_generation", 0) or 0),
-            "agent_round_index": int(getattr(self, "agent_round_index", 0) or 0),
-            "current_phase": str(getattr(self, "current_phase", "idle") or "idle"),
-            "current_tool_name": str(getattr(self, "current_tool_name", "") or ""),
-            "active_agent_role": role_key,
-            "tool_call_id": trim(str(tool_call_id or ""), 240),
-            "todo_fp": trim(str(alignment.get("todo_fp", "") or ""), 40),
-            "todo_current": trim(str(alignment.get("current_todo", "") or ""), 240),
-            "plan_step_id": trim(str(plan_step.get("id", "") or ""), 80),
-            "plan_step_index": int(plan_step.get("plan_step_index", -1) or -1),
-            "parent_evidence_id": parent,
-            "tool_start_evidence_id": start,
-        }
-
-    def _record_flow_node(
-        self,
-        kind: str,
-        body: object,
-        *,
-        role: str = "",
-        metadata: dict | None = None,
-        parent_ids: list[str] | None = None,
-    ) -> str:
-        """Best-effort bridge from runtime state to immutable evidence."""
-        sanitize_role = getattr(self, "_sanitize_agent_role", lambda value: str(value or "").strip().lower())
-        role_key = sanitize_role(role) or sanitize_role(getattr(self, "active_agent_role", "")) or "single"
-        context = self._flow_context(role_key, str((metadata or {}).get("tool_call_id", "") or ""))
-        merged = {**context, **dict(metadata or {})}
-        parents = [str(value or "") for value in (parent_ids or []) if str(value or "").strip()]
-        for key in ("parent_evidence_id", "tool_start_evidence_id"):
-            value = str(merged.get(key, "") or "").strip()
-            if value and value not in parents:
-                parents.append(value)
-        try:
-            eid = self._evidence_controller().record_flow(
-                kind,
-                body,
-                role=role_key,
-                metadata=merged,
-                parent_ids=parents,
-            )
-        except Exception:
-            return ""
-        with getattr(self, "_flow_event_lock", threading.RLock()):
-            if not isinstance(getattr(self, "_flow_last_evidence_by_role", None), dict):
-                self._flow_last_evidence_by_role = {}
-            if not isinstance(getattr(self, "_flow_tool_start_evidence", None), dict):
-                self._flow_tool_start_evidence = {}
-            self._flow_last_evidence_by_role[role_key] = eid
-            call_id = str(merged.get("tool_call_id", "") or "").strip()
-            if call_id and kind == "tool_start":
-                self._flow_tool_start_evidence[call_id] = eid
-        return eid
-
-    @staticmethod
-    def _flow_safe_args(args: object) -> dict:
-        values = args if isinstance(args, dict) else {}
-        return {str(key): value for key, value in values.items() if not str(key).startswith("_")}
-
-    def _trace_tool_result(self, name: str, args: dict, output: str, role: str = '') -> str:
-        if name in {'tool_memory', 'compress'}:
-            return output  # Memory recalls must not become new factual evidence.
-        try:
-            body = str(output or '')
-            raw_args = args if isinstance(args, dict) else {}
-            trace_context = raw_args.get('_flow_context', {}) if isinstance(raw_args.get('_flow_context', {}), dict) else {}
-            evidence_args = self._flow_safe_args(raw_args)
-            path = str(evidence_args.get('path', '') or '')
-            fingerprint = self._read_source_fingerprint(path) if path else {}
-            version = str(fingerprint.get('source_sha256', '') or '')
-            rendered_version = re.search(r'\bsource_sha256=([a-f0-9]{64})', body[:900])
-            if rendered_version:
-                version = rendered_version.group(1)
-            if not version:
-                version = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
-            status = 'ok' if self._tool_result_compat_ok(name, body) else 'error'
-            controller = self._evidence_controller()
-            eid = controller.remember(path, version, name, role or 'single', evidence_args, body, status)
-            parent_ids = evidence_args.get("trace_parent_ids", evidence_args.get("parent_evidence_ids", []))
-            if isinstance(parent_ids, str):
-                parent_ids = [parent_ids]
-            parent_ids = list(parent_ids) if isinstance(parent_ids, list) else []
-            for parent_id in (
-                trace_context.get("tool_start_evidence_id"),
-                trace_context.get("parent_evidence_id"),
-            ):
-                if parent_id and parent_id not in parent_ids:
-                    parent_ids.append(parent_id)
-            for parent_id in parent_ids[:24]:
-                controller.link(eid, str(parent_id), "derived_from")
-            # Connect source reads and mutations to the current file head. A
-            # write/edit supersedes the prior head; a read observes it. Bash
-            # source alignment uses the same path/version relation.
-            candidate_paths = []
-            if path:
-                candidate_paths.append(path)
-            changed = self._peek_tool_result_meta().get("changed_files", [])
-            if isinstance(changed, list):
-                candidate_paths.extend(str(value or "") for value in changed[:40])
-            if name in {"bash", "worktree_run", "background_run"}:
-                try:
-                    candidate_paths.extend(self._bash_file_read_targets(
-                        str(evidence_args.get("command", "") or ""),
-                        operation=str(evidence_args.get("operation", "") or ""),
-                    ))
-                except Exception:
-                    pass
-            for rel in list(dict.fromkeys(str(value or "").replace("\\", "/").strip() for value in candidate_paths))[:40]:
-                if not rel:
-                    continue
-                current_fp = self._read_source_fingerprint(rel)
-                current_version = str(current_fp.get("source_sha256", "") or "")
-                if not current_version:
-                    continue
-                head = controller.mark_file_stale_if_changed(rel, current_version)
-                if name in {"write_file", "edit_file"} and status == "ok" and rel == path:
-                    previous_id = str(head.get("evidence_id", "") or "") if head else ""
-                    previous_version = str(head.get("version", "") or "") if head else ""
-                    if previous_id and previous_id != eid:
-                        controller.link(eid, previous_id, "supersedes")
-                    if previous_version and previous_version != current_version:
-                        controller.link(eid, previous_id, "derived_from")
-                    controller.update_file_head(
-                        rel,
-                        eid,
-                        current_version,
-                        name,
-                        previous_evidence_id=previous_id,
-                    )
-                elif head and str(head.get("evidence_id", "") or "") and str(head.get("version", "") or "") == current_version:
-                    controller.link(eid, str(head.get("evidence_id")), "observes_version")
-                elif name in {"read_file", "bash", "worktree_run", "background_run", "check_background"} and status == "ok":
-                    previous_id = str(head.get("evidence_id", "") or "") if head else ""
-                    if previous_id and previous_id != eid:
-                        controller.link(eid, previous_id, "continues")
-                    controller.update_file_head(
-                        rel,
-                        eid,
-                        current_version,
-                        str(evidence_args.get("operation", "") or name),
-                        previous_evidence_id=previous_id,
-                    )
-            self._record_flow_node(
-                "tool_result",
-                {"name": name, "path": path, "status": status, "output": self._tool_result_compact_output(body, max_chars=1800)},
-                role=role,
-                metadata={**trace_context, "tool_call_id": trace_context.get("tool_call_id", "")},
-                parent_ids=[eid],
-            )
-            if canonicalize_tool_name(name) in {"TodoWrite", "TodoWriteRescue"}:
-                try:
-                    todo_rows = [
-                        dict(row) for row in self.todo.snapshot()
-                        if isinstance(row, dict)
-                    ][:80]
-                except Exception:
-                    todo_rows = []
-                self._record_flow_node(
-                    "todo_state",
-                    {"tool": name, "rows": todo_rows, "result": self._tool_result_compact_output(body, max_chars=900)},
-                    role=role,
-                    metadata={"tool_call_id": trace_context.get("tool_call_id", "")},
-                    parent_ids=[eid],
-                )
-            if canonicalize_tool_name(name) in {"ask_colleague", "send_message", "broadcast", "task", "spawn_teammate", "route_to_next_agent"}:
-                self._record_flow_node(
-                    "handoff",
-                    {"tool": name, "args": evidence_args, "result": self._tool_result_compact_output(body, max_chars=1200)},
-                    role=role,
-                    metadata={"tool_call_id": trace_context.get("tool_call_id", "")},
-                    parent_ids=[eid],
-                )
-            self._set_tool_result_meta(**{**self._peek_tool_result_meta(), 'evidence_id': eid})
-            self._bind_tool_memory_evidence_id(name, args, body, role, eid)
-            return body + f'\n[evidence_ref id={eid} tool={name}; tool_memory mode="trace" id="{eid}" returns exact evidence and verification locator]'
-        except Exception as exc:
-            return str(output or '') + f'\n[evidence storage unavailable: {type(exc).__name__}; retain this raw result for verification]'
-
-    def _bind_tool_memory_evidence_id(
-        self,
-        name: str,
-        args: dict | None,
-        output: str,
-        role: str = '',
-        evidence_id: str = '',
-    ) -> None:
-        """Attach the immutable trace id to the already-recorded tool-memory row."""
-        eid = str(evidence_id or '').strip()
-        if not eid or not isinstance(getattr(self, 'tool_memory_registry', {}), dict):
-            return
-        tool = canonicalize_tool_name(name)
-        role_key = self._sanitize_agent_role(role) or 'single'
-        body = str(output or '')
-        digest = hashlib.sha256(body.encode('utf-8', errors='replace')).hexdigest()
-        signature = self._tool_memory_signature_from_args(tool, args or {})
-        key = self._tool_memory_key(role_key, signature) if signature else ''
-        candidates: list[dict] = []
-        if key and isinstance(self.tool_memory_registry.get(key), dict):
-            candidates.append(self.tool_memory_registry[key])
-        candidates.extend(
-            row for row in self.tool_memory_registry.values()
-            if isinstance(row, dict)
-            and row not in candidates
-            and str(row.get('source_tool', '') or '') == tool
-            and str(row.get('agent_role', '') or '') == role_key
-        )
-        target = next((row for row in candidates if str(row.get('sha256', '') or '') == digest), None)
-        if target is None and candidates:
-            target = candidates[0]
-        if isinstance(target, dict):
-            target['evidence_id'] = eid
-
-    @staticmethod
-    def _evidence_body(output: str) -> str:
-        return re.sub(r'\n\[evidence_ref id=[a-f0-9]+[^\n]*\]$', '', str(output or ''))
-
-    def _source_lines(self, fp: Path, rel: str, *, fresh: bool = False) -> tuple[list[str], str, dict]:
-        if fresh:
-            getattr(self, '_long_content_source_cache', {}).pop(rel, None)
-            getattr(self, '_source_fingerprint_cache', {}).pop(rel, None)
-        text, fingerprint = self._read_text_and_fingerprint(fp, rel)
-        cache = getattr(self, '_long_content_source_cache', {}).get(rel, {})
-        lines = cache.get('lines')
-        if not isinstance(lines, list):
-            lines = text.splitlines()
-            if cache:
-                cache['lines'] = lines
-        return lines, text, fingerprint
-
-    def _render_evidence_windows(self, rel: str, lines: list[str], ranges: list[tuple[int, int]], *, label: str = 'window', max_chars: object = None, detail: str = '') -> str:
-        """Bound output before marking coverage. Omitted lines are never read."""
-        cap = self._read_file_max_chars(max_chars)
-        fp = self._read_source_fingerprint(rel)
-        header = f'[read_file {label} path={rel} source_sha256={fp.get("source_sha256", "unknown")} total_lines={len(lines)} {detail}]'
-        rows = [header]
-        used = len(header) + 1
-        delivered = set()
-        omitted = []
-        for a, b in ranges:
-            start, end = max(1, int(a)), min(len(lines), int(b))
-            local = []
-            for line_no in range(start, end + 1):
-                if line_no in delivered:
-                    continue
-                row = f'{line_no}: {lines[line_no - 1]}'
-                if used + len(row) + 120 > cap:
-                    omitted.append([line_no, end])
-                    break
-                local.append(row)
-                delivered.add(line_no)
-                used += len(row) + 1
-            if local:
-                first = int(local[0].split(':', 1)[0])
-                last = int(local[-1].split(':', 1)[0])
-                marker = f'@@ lines {first}-{last} @@'
-                rows.extend([marker, *local])
-                used += len(marker) + 1
-        if omitted:
-            rows.append('[partial evidence: omitted ranges=' + json.dumps(omitted) + '; read mode="window" at an omitted line; use mode="full" offset for an oversized single line]')
-        rows.append('[source excerpts; preserve values, signs, units, labels and conditions together. Coverage is delivery, not understanding.]')
-        return '\n'.join(rows)
-
     @staticmethod
     def _normalize_workspace_id(value: object, fallback: str) -> str:
         """Normalize persisted workspace lineage without allowing path traversal."""
@@ -31146,12 +30321,6 @@ class SessionState:
         self.agent_round_index = 0
         self.current_phase = "idle"
         self.current_tool_name = ""
-        # Runtime-only indexes that connect visible events and tool results to
-        # the durable evidence graph.  The graph itself is persisted by the
-        # session-local EvidenceRetrievalController.
-        self._flow_last_evidence_by_role: dict[str, str] = {}
-        self._flow_tool_start_evidence: dict[str, str] = {}
-        self._flow_event_lock = threading.RLock()
         self.runtime_task_level = 0
         self.user_task_level_override = 0
         self.runtime_execution_mode = ""
@@ -31228,12 +30397,6 @@ class SessionState:
         # keeping them out of persistence preserves small snapshots.
         self._long_content_source_cache: dict[str, dict] = {}
         self._long_content_structure_cache: dict[str, dict] = {}
-        # Source-version keyed inverted indexes let large-file searches jump
-        # directly to relevant lines instead of scanning the decoded source
-        # on every query.  The index is transient; durable cards and source
-        # fingerprints remain the persistence boundary.
-        self._long_content_search_index_cache: dict[str, dict] = {}
-        self._readonly_bash_cache: dict[str, dict] = {}
         # Durable, source-addressable understanding for long text/files/code.
         # ``read_context_registry`` keeps raw tool evidence; this registry keeps
         # compact structure/cards so a later turn can resume comprehension
@@ -34098,7 +33261,6 @@ class SessionState:
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state = {}
-        self._readonly_bash_cache = {}
         self.agent_loop_progress_state = {}
         self.stall_severity_score = 0
         self.stall_severity_sources = []
@@ -34643,10 +33805,6 @@ class SessionState:
         command = str(values.get("command", "") or "").strip()
         if command:
             public["command"] = trim(command, 8000)
-        if tool_name in {"bash", "worktree_run", "background_run", "check_background"}:
-            operation, declared = self._bash_operation_from_args(values)
-            if declared:
-                public["operation"] = operation
         cwd = str(values.get("cwd", "") or "").strip()
         if not cwd and tool_name in {"bash", "worktree_run", "check_background"}:
             cwd = str(self.files_root)
@@ -34657,7 +33815,7 @@ class SessionState:
             if value:
                 public[key] = trim(value, 2000)
         details = result if isinstance(result, dict) else self._peek_tool_result_meta()
-        for key in ("exit_code", "duration_ms", "evidence_id"):
+        for key in ("exit_code", "duration_ms"):
             if details.get(key) is not None:
                 public[key] = details.get(key)
         if isinstance(details.get("changed_files"), list):
@@ -34720,39 +33878,10 @@ class SessionState:
             str(kind or "").strip().lower() == "web_search"
             and not bool(payload.get("conversation_visible", True))
         )
-        event_id = make_id("evt")
-        event_seq = self._next_event_seq()
-        tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
-        event_role = str(payload.get("agent_role", payload.get("role", "")) or "")
-        flow_kind = f"event:{str(kind or 'unknown').strip().lower() or 'unknown'}"
-        flow_parent = []
-        if str(kind or "").strip().lower() == "tool_result":
-            result_eid = str(payload.get("evidence_id", "") or "").strip()
-            if result_eid:
-                flow_parent.append(result_eid)
-            if tool_call_id:
-                flow_parent.append(str(getattr(self, "_flow_tool_start_evidence", {}).get(tool_call_id, "") or ""))
-        flow_body = {
-            "event_id": event_id,
-            "type": str(kind or ""),
-            "data": self._flow_safe_event_payload(payload),
-        }
-        flow_eid = self._record_flow_node(
-            flow_kind,
-            flow_body,
-            role=event_role,
-            metadata={"event_id": event_id, "seq": event_seq, "tool_call_id": tool_call_id},
-            parent_ids=flow_parent,
-        )
-        if flow_eid:
-            payload["evidence_id"] = flow_eid
-        if tool_call_id and str(kind or "").strip().lower() == "tool_start" and flow_eid:
-            with getattr(self, "_flow_event_lock", threading.RLock()):
-                self._flow_tool_start_evidence[tool_call_id] = flow_eid
         with self.lock:
             event = {
-                "id": event_id,
-                "seq": event_seq,
+                "id": make_id("evt"),
+                "seq": self._next_event_seq(),
                 "ts": now_ts(),
                 "type": kind,
                 "session_id": self.id,
@@ -34776,21 +33905,6 @@ class SessionState:
         self._maybe_persist_after_event(kind, payload)
         self._publish_collaboration_event_heartbeat(kind, payload)
         return event
-
-    @staticmethod
-    def _flow_safe_event_payload(payload: object) -> dict:
-        """Bound event data before it is copied into the durable flow graph."""
-        values = payload if isinstance(payload, dict) else {}
-        out: dict = {}
-        for key, value in values.items():
-            if key in {"output", "result", "text", "thinking", "diff", "diff_numbered"}:
-                value = trim(str(value or ""), 1800)
-            elif isinstance(value, list):
-                value = [trim(str(item or ""), 300) if not isinstance(item, dict) else dict(item) for item in value[:24]]
-            elif isinstance(value, dict):
-                value = {str(k): trim(str(v or ""), 500) for k, v in list(value.items())[:40]}
-            out[str(key)] = value
-        return out
 
     def record_scheduler_queued_message(
         self,
@@ -36858,7 +35972,6 @@ class SessionState:
         code_ref_block = self._runtime_code_reference_prompt_block()
         knowledge_ref_block = self._runtime_knowledge_reference_prompt_block()
         long_content_memory_block = self._long_content_memory_prompt_block()
-        long_content_memory_block += "\n" + self._evidence_memory_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -36940,7 +36053,7 @@ class SessionState:
                 f"{self._public_progress_prompt_instruction()}"
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
-            "For local file or directory inspection, use read_file first: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='evidence' for ranked cited excerpts, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context. Use bash for execution, builds, tests, validation, process control, or shell pipelines that read_file cannot express. When bash is used for a special read/perception task, optionally set operation (text_read/text_search/document_extract/ocr/media_metadata/media_extract/custom_extract) so short outputs are retained under the right memory category; this marker is caller-supplied and does not restrict general shell use. Bash file reads are source-aligned on a best-effort basis and share long-content memory, but read_file is the authoritative exact-source reader. Every successful result receives an immutable evidence_ref; use tool_memory/trace instead of repeating a broad read. "
+            "Choose any local reading method that best fits the question. read_file offers mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context; shell-native grep/rg/sed/awk/head/tail or custom extractors are equally valid. Verified local-source output from every method is merged into one source-addressable long-content memory, so do not switch tools merely for memory retention. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
                 f"{web_search_instruction}"
@@ -38709,9 +37822,6 @@ class SessionState:
         elif tool in {"bash", "background_run", "worktree_run"}:
             cmd = trim(str(src.get("command", "") or ""), 500)
             parts.append(f"command={cmd}")
-            operation, declared = self._bash_operation_from_args(src)
-            if declared:
-                parts.append(f"operation={operation}")
             if tool == "worktree_run":
                 parts.append(f"worktree={trim(str(src.get('name', '') or ''), 120)}")
         elif tool in {"load_skill", "unload_skill"}:
@@ -38827,7 +37937,6 @@ class SessionState:
                 "path": target_path,
                 "target_path": target_path,
                 "command": trim(str(raw_entry.get("command", "") or ""), 500),
-                "operation": normalize_bash_operation(raw_entry.get("operation", ""), default="execute") if tool in {"bash", "worktree_run", "background_run"} and str(raw_entry.get("operation", "") or "").strip() else "",
                 "signature": signature,
                 "agent_role": role_key,
                 "status": status,
@@ -38865,16 +37974,9 @@ class SessionState:
             "edit_error": 1,
             "file_patch": 2,
             "retrieval": 3,
-            "document_extraction": 4,
-            "ocr": 4,
-            "media_perception": 4,
-            "media_extraction": 4,
-            "custom_extraction": 4,
-            "custom_observation": 4,
-            "directory_observation": 5,
             "skill_loaded": 4,
-            "command_result": 6,
-            "file_read": 7,
+            "command_result": 5,
+            "file_read": 6,
         }
         status = str(entry.get("status", "active") or "active").lower()
         kind = str(entry.get("evidence_kind", "") or "").lower()
@@ -39461,62 +38563,6 @@ class SessionState:
                 break
         return trim(" ".join(picked), READ_CONTEXT_SUMMARY_MAX_CHARS)
 
-    @staticmethod
-    def _bash_operation_from_args(args: dict | None) -> tuple[str, bool]:
-        """Return the declared shell operation and whether it was explicit.
-
-        ``operation`` is the public contract. The aliases keep persisted calls
-        and older integrations readable while making the new field the one the
-        model is instructed to emit. Missing declarations intentionally remain
-        distinguishable so compatibility inference cannot masquerade as model
-        intent in provenance records.
-        """
-        src = args if isinstance(args, dict) else {}
-        raw = ""
-        for key in (
-            "operation",
-            "operation_code",
-            "recognition_code",
-            "perception_code",
-            "read_marker",
-            "bash_type",
-            "command_type",
-            "read_kind",
-        ):
-            value = str(src.get(key, "") or "").strip()
-            if value:
-                raw = value
-                break
-        if not raw:
-            return "execute", False
-        return normalize_bash_operation(raw), True
-
-    @classmethod
-    def _bash_declared_observation(cls, args: dict | None) -> tuple[str, bool]:
-        operation, declared = cls._bash_operation_from_args(args)
-        return operation, bool(declared and bash_operation_is_marked_observation(operation))
-
-    @staticmethod
-    def _bash_operation_evidence_kind(operation: object) -> str:
-        mapping = {
-            "text_read": "file_read",
-            "text_search": "file_read",
-            "directory_inspect": "directory_observation",
-            "document_extract": "document_extraction",
-            "ocr": "ocr",
-            "media_metadata": "media_perception",
-            "media_extract": "media_extraction",
-            "custom_extract": "custom_extraction",
-            "validation": "validation",
-            "build_test": "validation",
-            "process_control": "process_control",
-            "network": "network_observation",
-        }
-        normalized = normalize_bash_operation(operation)
-        if normalized.startswith("custom:"):
-            return "custom_observation"
-        return mapping.get(normalized, "command_result")
-
     def _shell_command_units(self, command: str) -> list[list[str]]:
         """Tokenize a shell expression into command/pipeline units.
 
@@ -39577,14 +38623,7 @@ class SessionState:
         except Exception:
             return ""
 
-    def _shell_source_candidates(
-        self,
-        command: str,
-        output: str = "",
-        *,
-        likely_only: bool = False,
-        operation: object = "",
-    ) -> list[str]:
+    def _shell_source_candidates(self, command: str, output: str = "", *, likely_only: bool = False) -> list[str]:
         """Find local source candidates without assuming a document domain.
 
         Known text-processing commands provide high-confidence candidates. For
@@ -39602,15 +38641,11 @@ class SessionState:
         candidate_cwds: list[Path] = [root] if root is not None else []
         likely: list[str] = []
         broad: list[str] = []
-        declared_operation = normalize_bash_operation(operation) if str(operation or "").strip() else ""
-        declared_observation = bash_operation_is_marked_observation(declared_operation)
         readers = {
             "cat", "tac", "nl", "head", "tail", "sed", "awk", "gawk", "mawk",
             "grep", "egrep", "fgrep", "rg", "ripgrep", "cut", "paste", "join",
             "sort", "uniq", "tr", "fold", "fmt", "column", "jq", "yq", "bat",
             "less", "more", "strings", "od", "hexdump", "xxd", "wc",
-            "pdftotext", "pdftoppm", "pdftocairo", "tesseract", "ocrmypdf",
-            "identify", "exiftool", "ffprobe", "ffmpeg", "mediainfo", "whisper",
         }
 
         def add(bucket: list[str], value: str) -> None:
@@ -39628,12 +38663,7 @@ class SessionState:
             if command_name in {"bash", "sh", "zsh"}:
                 for idx, token in enumerate(tokens[1:], 1):
                     if token in {"-c", "-lc", "-ic"} and idx + 1 < len(tokens):
-                        nested = self._shell_source_candidates(
-                            tokens[idx + 1],
-                            output,
-                            likely_only=likely_only,
-                            operation=declared_operation,
-                        )
+                        nested = self._shell_source_candidates(tokens[idx + 1], output, likely_only=likely_only)
                         for value in nested:
                             add(likely, value)
                         break
@@ -39654,13 +38684,6 @@ class SessionState:
             is_reader = command_name in readers or (
                 command_name == "git" and len(tokens) > 1 and str(tokens[1]).lower() in {"grep", "show", "diff"}
             )
-            if declared_observation:
-                # For an explicitly marked observation, custom executables and
-                # wrappers are treated as reader inputs too. The later source
-                # alignment step still verifies that output actually matches
-                # the candidate, so this does not turn arbitrary output into
-                # file comprehension.
-                is_reader = True
             for token in tokens[1:]:
                 if token.startswith("-") or token.isdigit() or token in {"<", ">", ">>", "2>", "1>"}:
                     continue
@@ -39742,8 +38765,8 @@ class SessionState:
         selected = likely if likely_only else likely + [x for x in broad if x not in likely]
         return selected[:SHELL_SOURCE_CANDIDATE_MAX]
 
-    def _bash_file_read_targets(self, command: str, operation: object = "") -> list[str]:
-        targets = self._shell_source_candidates(command, likely_only=True, operation=operation)
+    def _bash_file_read_targets(self, command: str) -> list[str]:
+        targets = self._shell_source_candidates(command, likely_only=True)
         if targets:
             return targets[:SHELL_SOURCE_CANDIDATE_MAX]
         # Lightweight fallback for partially initialized/test sessions where a
@@ -39751,9 +38774,8 @@ class SessionState:
         raw = str(command or "").strip()
         if not raw:
             return []
-        readers = r"(?:cat|tac|nl|head|tail|sed|awk|gawk|mawk|grep|egrep|fgrep|rg|ripgrep|cut|paste|jq|yq|bat|less|more|strings|wc|pdftotext|pdftoppm|pdftocairo|tesseract|ocrmypdf|identify|exiftool|ffprobe|ffmpeg|mediainfo|whisper|python(?:3(?:\.13|\.14)?)?|node|nodejs|deno|bun)"
-        operation_value = normalize_bash_operation(operation) if str(operation or "").strip() else ""
-        if not operation_value and not re.search(rf"(?:^|[;&|]\s*){readers}\b", raw, re.I):
+        readers = r"(?:cat|tac|nl|head|tail|sed|awk|gawk|mawk|grep|egrep|fgrep|rg|ripgrep|cut|paste|jq|yq|bat|less|more|strings|wc)"
+        if not re.search(rf"(?:^|[;&|]\s*){readers}\b", raw, re.I):
             return []
         out: list[str] = []
         for unit in self._shell_command_units(raw):
@@ -39768,10 +38790,8 @@ class SessionState:
                         out.append(value)
         return out[:SHELL_SOURCE_CANDIDATE_MAX]
 
-    def _bash_looks_like_file_read(self, command: str, operation: object = "") -> bool:
-        if str(operation or "").strip() and bash_operation_is_marked_observation(operation):
-            return True
-        return bool(self._bash_file_read_targets(command, operation=operation))
+    def _bash_looks_like_file_read(self, command: str) -> bool:
+        return bool(self._bash_file_read_targets(command))
 
     @staticmethod
     def _source_alignment_text(value: object) -> str:
@@ -39979,23 +38999,14 @@ class SessionState:
         command = str(src_args.get("command", "") or meta.get("command", "") or "").strip()
         if not command:
             return []
-        operation, _declared = self._bash_operation_from_args(src_args)
-        likely_candidates = set(
-            self._shell_source_candidates(command, text, likely_only=True, operation=operation)
-        )
-        candidates = self._shell_source_candidates(command, text, likely_only=False, operation=operation)
+        likely_candidates = set(self._shell_source_candidates(command, text, likely_only=True))
+        candidates = self._shell_source_candidates(command, text, likely_only=False)
         if not candidates:
             return []
         observations: list[dict] = []
         for rel in candidates[:SHELL_SOURCE_CANDIDATE_MAX]:
             try:
                 fp = self._session_path(rel)
-                if operation in {"document_extract", "ocr", "media_metadata", "media_extract"}:
-                    # These outputs are semantic/format conversions whose
-                    # source is not a trustworthy line-oriented text stream.
-                    # Keep their exact command output in evidence/tool-memory,
-                    # but do not manufacture long-content line coverage.
-                    continue
                 if not fp.is_file() or fp.suffix.lower() in IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS:
                     continue
                 source_text, source_fp = self._read_text_and_fingerprint(fp, rel)
@@ -40004,13 +39015,7 @@ class SessionState:
                     rel,
                     lines,
                     text,
-                    allow_fragments=(
-                        rel in likely_candidates
-                        and (
-                            operation in {"text_read", "text_search", "custom_extract", "execute"}
-                            or operation.startswith("custom:")
-                        )
-                    ),
+                    allow_fragments=rel in likely_candidates,
                 )
                 ranges = aligned.get("ranges", []) if isinstance(aligned, dict) else []
                 if not ranges:
@@ -40023,7 +39028,6 @@ class SessionState:
                     source_tool=tool,
                     role=role,
                     locator=command,
-                    operation=operation,
                     excerpts=list(aligned.get("excerpts", []) or []),
                     matched_lines=int(aligned.get("matched_lines", 0) or 0),
                     confidence=float(aligned.get("confidence", 0.0) or 0.0),
@@ -40055,12 +39059,9 @@ class SessionState:
             return "process_observation"
         if tool == "stop_background_process":
             return "process_control"
-        if tool in {"bash", "background_run", "worktree_run"}:
+        if tool in {"bash", "worktree_run"}:
             if not ok or self._command_output_has_error_shape(output):
                 return "command_error"
-            operation, declared = self._bash_operation_from_args(args)
-            if declared:
-                return self._bash_operation_evidence_kind(operation)
             if self._bash_looks_like_file_read(command):
                 return "file_read"
             if self._command_looks_like_validation(command):
@@ -40144,7 +39145,6 @@ class SessionState:
             return trim(f"{tool}: {path} :: {head}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"bash", "background_run", "worktree_run"} and isinstance(args, dict):
             cmd = trim(str(args.get("command", "") or ""), 180)
-            operation, declared = self._bash_operation_from_args(args)
             picked = []
             for ln in lines[:12]:
                 if ln.startswith("[long_output"):
@@ -40157,8 +39157,7 @@ class SessionState:
                 if len(" ".join(picked)) >= TOOL_MEMORY_SUMMARY_MAX_CHARS:
                     break
             body = " ".join(picked) if picked else "(no output)"
-            label = f"{tool}[{operation}]" if declared else tool
-            return trim(f"{label}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
+            return trim(f"{tool}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"load_skill", "unload_skill"} and isinstance(args, dict):
             return trim(f"{tool}: {args.get('name', '')} :: {' '.join(lines[:4])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"list_background_processes", "stop_background_process"} and isinstance(args, dict):
@@ -40175,14 +39174,6 @@ class SessionState:
         command = str((args or {}).get("command", "") or "") if isinstance(args, dict) else ""
         if not command.strip():
             return False
-        operation, declared = self._bash_operation_from_args(args)
-        if declared and bash_operation_is_marked_observation(operation):
-            # Explicitly marked reads/perception are evidence even when the
-            # extractor returns only a short result (OCR line, dimensions,
-            # media duration, or a one-line document answer).
-            return True
-        if declared and operation in {"validation", "build_test", "process_control", "network"}:
-            return True
         low = command.strip().lower()
         if re.match(r"^(pwd|date|whoami|clear)\b", low) and ok and len(str(output or "")) < 400:
             return False
@@ -40198,7 +39189,7 @@ class SessionState:
             return True
         if not ok:
             return True
-        if self._bash_looks_like_file_read(command):
+        if self._bash_looks_like_file_read(command) and len(str(output or "")) >= 40:
             return True
         if re.search(r"\b(rg|grep|find|fd|ls)\b", low) and len(str(output or "")) >= 120:
             return True
@@ -40247,20 +39238,8 @@ class SessionState:
         if not isinstance(registry, dict):
             registry = {}
         old = registry.get(key, {}) if isinstance(registry.get(key, {}), dict) else {}
-        operation, operation_declared = self._bash_operation_from_args(src_args)
-        source_fp = (
-            self._read_source_fingerprint(rel_path)
-            if rel_path and (kind == "file_read" or (operation_declared and bash_operation_is_marked_observation(operation)))
-            else {}
-        )
+        source_fp = self._read_source_fingerprint(rel_path) if kind == "file_read" and rel_path else {}
         sha = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-        evidence_match = re.search(r"\[evidence_ref id=([a-f0-9]{24})\b", text)
-        result_meta = self._peek_tool_result_meta()
-        evidence_id = (
-            evidence_match.group(1)
-            if evidence_match
-            else str(result_meta.get("evidence_id", "") or old.get("evidence_id", "") or "")
-        )
         cached = str(cache_path or old.get("cache_path", "") or "")
         if len(text) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
             not cached or str(old.get("sha256", "") or "") != sha
@@ -40287,12 +39266,6 @@ class SessionState:
             "path": rel_path,
             "target_path": rel_path,
             "command": cmd,
-            "operation": (
-                operation
-                if tool in {"bash", "worktree_run", "background_run"}
-                and operation_declared
-                else str(old.get("operation", "") or "")
-            ),
             "signature": signature,
             "agent_role": role_key,
             "status": entry_status,
@@ -40300,7 +39273,6 @@ class SessionState:
             "chars": len(text),
             "lines": text.count("\n") + (1 if text else 0),
             "sha256": sha,
-            "evidence_id": evidence_id,
             "summary": trim(summary or self._tool_memory_summary_from_output(tool, src_args, text), TOOL_MEMORY_SUMMARY_MAX_CHARS),
             "cache_path": cached,
             "cache_source_complete": bool(
@@ -40959,13 +39931,10 @@ class SessionState:
             rows.append(
                 "- "
                 f"id={entry.get('key','')} status={status} role={entry.get('agent_role','')} "
-                f"tool={tool} kind={kind} result={entry.get('result_status','ok')} "
-                + (f"operation={entry.get('operation')} " if entry.get("operation") else "")
-                + f"{locator} "
+                f"tool={tool} kind={kind} result={entry.get('result_status','ok')} {locator} "
                 f"chars={int(entry.get('chars', 0) or 0)} hits={int(entry.get('hit_count', 0) or 0)} "
                 f"age={_age(entry.get('last_ts', 0.0))} "
                 f"summary={trim(str(entry.get('summary','') or ''), 300)}"
-                + (f" evidence_id={entry.get('evidence_id')}" if entry.get("evidence_id") else "")
                 + (f" cache={cache}" if cache else "")
                 + (
                     " cache_scope=source-prefix"
@@ -40985,104 +39954,8 @@ class SessionState:
         rows.append("</tool-memory-registry>")
         return trim("\n".join(rows), max_chars)
 
-    def _evidence_memory_prompt_block(self, *, max_chars: int = 2600) -> str:
-        """Inject a bounded claim index while keeping exact source outside context."""
-        try:
-            rows = self._evidence_controller().memories(limit=8)
-        except Exception:
-            return ""
-        if not rows:
-            return ""
-        parts = [
-            "CLAIM MEMORY (model-authored consolidation; summaries are not source truth):",
-            "Use the cited evidence_id and exact quote to verify every important value before acting. "
-            "Facts require verbatim source wording; derived values must be marked inference.",
-        ]
-        for row in rows:
-            refs = row.get("references", []) if isinstance(row.get("references"), list) else []
-            ref_text = ", ".join(
-                f"{str(ref.get('evidence_id', ''))[:24]}:{trim(str(ref.get('quote', '')), 120)}"
-                for ref in refs[:2] if isinstance(ref, dict)
-            )
-            parts.append(
-                f"- {row.get('id', '')} kind={row.get('kind', 'fact')} importance={row.get('importance', 1)} "
-                f"claim={trim(str(row.get('claim', '')), 420)} "
-                f"conditions={trim(str(row.get('conditions', '')), 180)} "
-                f"evidence={ref_text or 'missing'}"
-            )
-        parts.append("To inspect exact output use tool_memory mode='trace' id='<evidence_id>'; "
-                     "to save a durable claim use mode='remember' with exact references.")
-        return trim("\n".join(parts), max_chars)
-
-    def _evidence_memory_tool(self, args: dict | None, role: str = "") -> str:
-        """Handle trace/remember/recall without copying evidence into normal memory."""
-        src = args if isinstance(args, dict) else {}
-        mode = str(src.get("mode", "trace") or "trace").strip().lower()
-        controller = self._evidence_controller()
-        if mode == "trace":
-            eid = str(src.get("id", "") or src.get("evidence_id", "")).strip()
-            if not eid:
-                return json_dumps({"ok": False, "error": "trace requires evidence id"}, indent=2)
-            rows = controller.recall(eid=eid, limit=1)
-            if not rows:
-                return json_dumps({"ok": False, "error": "evidence not found", "evidence_id": eid}, indent=2)
-            row = rows[0]
-            body = str(row.get("body", "") or "")
-            cap = self._tool_max_chars(src.get("max_chars"))
-            if len(body) > cap:
-                body = body[:cap] + "\n...[trace clipped; use read_file/bash verification locator]"
-            try:
-                trace_depth = max(0, min(4, int(src.get("depth", 2) or 2)))
-            except (TypeError, ValueError):
-                trace_depth = 2
-            neighborhood = controller.trace(str(row.get("id", eid)), depth=trace_depth, limit=80)
-            return json_dumps({
-                "ok": True,
-                "mode": "trace",
-                "evidence_id": row.get("id", eid),
-                "status": row.get("status", "ok"),
-                "tool": row.get("tool", ""),
-                "path": row.get("path", ""),
-                "version": row.get("version", ""),
-                "digest": row.get("digest", ""),
-                "created": row.get("created", 0),
-                "exact_output": body,
-                "verification": {"tool": row.get("tool", ""), "path": row.get("path", ""), "args": row.get("args", "{}")},
-                "links": controller.links(str(row.get("id", eid))),
-                "causal_trace": {
-                    "nodes": neighborhood.get("nodes", []) if isinstance(neighborhood, dict) else [],
-                    "links": neighborhood.get("links", []) if isinstance(neighborhood, dict) else [],
-                },
-            }, indent=2)
-        if mode == "remember":
-            try:
-                references = src.get("references", [])
-                if not isinstance(references, list):
-                    references = []
-                result = controller.consolidate(
-                    str(src.get("claim", "")),
-                    str(src.get("kind", "fact") or "fact"),
-                    str(src.get("conditions", "")),
-                    int(src.get("importance", 3) or 3),
-                    references,
-                    str(src.get("supersedes", "")),
-                )
-                return json_dumps({"ok": True, "mode": "remember", **result}, indent=2)
-            except (TypeError, ValueError) as exc:
-                return json_dumps({"ok": False, "mode": "remember", "error": str(exc)}, indent=2)
-        if mode == "recall":
-            rows = controller.memories(
-                query=str(src.get("query", "") or ""),
-                mid=str(src.get("id", "") or ""),
-                limit=max(1, min(40, int(src.get("limit", 8) or 8))),
-            )
-            return json_dumps({"ok": True, "mode": "recall", "memories": rows}, indent=2)
-        return json_dumps({"ok": False, "error": f"unsupported evidence memory mode: {mode}"}, indent=2)
-
     def _tool_memory_tool(self, args: dict | None, role: str = "") -> str:
         src = args if isinstance(args, dict) else {}
-        if str(src.get("mode", "")) in {"remember", "recall", "trace"}:
-            return self._evidence_memory_tool(src, role)
         registry = getattr(self, "tool_memory_registry", {})
         if (not isinstance(registry, dict) or not registry) and getattr(self, "read_context_registry", {}):
             registry = self._tool_memory_from_read_context_registry(getattr(self, "read_context_registry", {}))
@@ -41217,7 +40090,6 @@ class SessionState:
                 "cache_source_complete": bool(entry.get("cache_source_complete", True)),
                 "buffer_ref": entry.get("buffer_ref", ""),
                 "full_output_path": entry.get("temp_output_path", ""),
-                "evidence_id": entry.get("evidence_id", ""),
             }
             hit = cache_hits.get(str(entry.get("key", "") or ""))
             if hit and mode in {"search", "detail"}:
@@ -41634,20 +40506,6 @@ class SessionState:
         state.pop("next_action", None)
         store[role_key] = state
         self.agent_loop_progress_state = store
-        self._record_flow_node(
-            "loop_state",
-            {
-                "round_kind": state.get("round_kind", ""),
-                "round_tools": state.get("round_tools", []),
-                "evidence_fresh": state.get("evidence_fresh", 0),
-                "evidence_reused": state.get("evidence_reused", 0),
-                "reused_streak": state.get("reused_streak", 0),
-                "stagnant_evidence_streak": state.get("stagnant_evidence_streak", 0),
-                "guidance_reason": state.get("guidance_reason", ""),
-            },
-            role=role_key,
-            metadata={"todo_fp": todo_fp, "current_phase": str(getattr(self, "current_phase", "") or "")},
-        )
         return state
 
     def _mark_agent_loop_strategy_signal(self, role: str, reason: str) -> None:
@@ -41664,12 +40522,6 @@ class SessionState:
         state["updated_at"] = now_ts()
         store[role_key] = state
         self.agent_loop_progress_state = store
-        self._record_flow_node(
-            "loop_intervention",
-            {"reason": trim(str(reason or "strategy_signal"), 240), "state": {k: state.get(k) for k in ("round_kind", "guidance_reason", "reused_streak", "stagnant_evidence_streak")}},
-            role=role_key,
-            metadata={"intervention": trim(str(reason or "strategy_signal"), 120)},
-        )
 
     def _agent_loop_progress_prompt_block(self, for_role: str = "") -> str:
         """Render observation-only multi-agent progress telemetry.
@@ -41865,7 +40717,6 @@ class SessionState:
         return True
 
     def _maybe_record_tool_memory_after_result(self, name: str, args: dict | None, output: str, role: str = "") -> None:
-        output = self._evidence_body(output)
         tool = canonicalize_tool_name(name)
         if not tool or tool == "read_file":
             return
@@ -41938,13 +40789,7 @@ class SessionState:
                 if isinstance(row, dict) and str(row.get("path", "") or "").strip()
             ]
             read_targets = list(dict.fromkeys(
-                observed_paths
-                + self._bash_file_read_targets(
-                    command_text,
-                    operation=self._bash_operation_from_args(src_args)[0]
-                    if self._bash_operation_from_args(src_args)[1]
-                    else "",
-                )
+                observed_paths + self._bash_file_read_targets(command_text)
             ))
             result_probe = {
                 "name": tool,
@@ -41966,13 +40811,9 @@ class SessionState:
                 "validation"
                 if negative_assertion
                 else (
-                    self._bash_operation_evidence_kind(self._bash_operation_from_args(src_args)[0])
-                    if self._bash_operation_from_args(src_args)[1]
-                    else (
-                        "file_read"
-                        if source_observations
-                        else self._tool_memory_evidence_kind(tool, src_args, text, ok)
-                    )
+                    "file_read"
+                    if source_observations
+                    else self._tool_memory_evidence_kind(tool, src_args, text, ok)
                 )
             )
             self._record_tool_memory(
@@ -47277,7 +46118,6 @@ body{padding:18px}
                 observations.append({
                     "id": observation_id,
                     "source_tool": trim(str(item.get("source_tool", "reader") or "reader"), 40),
-                    "operation": trim(str(item.get("operation", "") or ""), 80),
                     "agent_role": trim(str(item.get("agent_role", "single") or "single"), 40),
                     "locator": trim(str(item.get("locator", "") or ""), 500),
                     "ranges": ranges,
@@ -47322,7 +46162,6 @@ body{padding:18px}
                 "stale": bool(value.get("stale", False)),
                 "content_type": trim(str(value.get("content_type", "text") or "text"), 40),
                 "language": trim(str(value.get("language", "text") or "text"), 40),
-                "scale": trim(str(value.get("scale", "long") or "long"), 16) or "long",
                 "total_lines": max(0, int(value.get("total_lines", 0) or 0)),
                 "outline_ready": bool(value.get("outline_ready", False)),
                 "outline": trim(str(value.get("outline", "") or ""), LONG_CONTENT_STRUCTURE_MAX_CHARS),
@@ -47362,13 +46201,6 @@ body{padding:18px}
                 "objective_gaps": [trim(str(x), 260) for x in (value.get("objective_gaps", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS] if str(x).strip()],
                 "objective_covered": [trim(str(x), 260) for x in (value.get("objective_covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED] if str(x).strip()],
                 "frontier_segments": [trim(str(x), 120) for x in (value.get("frontier_segments", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
-                "retrieval_plan": {
-                    "action": trim(str((value.get("retrieval_plan", {}) or {}).get("action", "") if isinstance(value.get("retrieval_plan", {}), dict) else ""), 80),
-                    "reason": trim(str((value.get("retrieval_plan", {}) or {}).get("reason", "") if isinstance(value.get("retrieval_plan", {}), dict) else ""), 360),
-                    "information_gain": max(0.0, min(1.0, float((value.get("retrieval_plan", {}) or {}).get("information_gain", 0.0) if isinstance(value.get("retrieval_plan", {}), dict) else 0.0))),
-                    "next_segments": [trim(str(x), 120) for x in ((value.get("retrieval_plan", {}) or {}).get("next_segments", []) if isinstance(value.get("retrieval_plan", {}), dict) else [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
-                    "updated_at": float((value.get("retrieval_plan", {}) or {}).get("updated_at", 0.0) if isinstance(value.get("retrieval_plan", {}), dict) else 0.0),
-                },
                 "read_events": max(0, int(value.get("read_events", 0) or 0)),
                 "reuse_events": max(0, int(value.get("reuse_events", 0) or 0)),
                 "semantic": self._normalize_long_content_semantic(value.get("semantic", {})),
@@ -47738,38 +46570,6 @@ body{padding:18px}
         ranked.sort(key=lambda row: (-row[0], int(row[1].get("start_line", 0) or 0)))
         return [seg for _score, seg in ranked[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]]
 
-    def _update_long_content_retrieval_plan(self, memory: dict, *, information_gain: float = 0.0) -> dict:
-        """Choose the next evidence action from current gaps and coverage.
-
-        This is deliberately adaptive: a repeated read records low gain but
-        does not block it.  The controller simply recommends a more useful
-        query/window or a semantic refresh based on what is still unknown.
-        """
-        objective = self._long_content_objective()
-        frontier = self._long_content_select_frontier(memory, query=objective)
-        next_ids = [str(seg.get("id", "")) for seg in frontier if str(seg.get("id", ""))]
-        coverage = float(memory.get("coverage", 0.0) or 0.0)
-        if not next_ids and coverage < 1.0:
-            action, reason = "search", "no unread semantic frontier; search the source for the objective terms"
-        elif information_gain <= 0.001 and next_ids:
-            action, reason = "frontier_segment", "the last read added no new lines; inspect the highest-value unread segment"
-        elif next_ids:
-            action, reason = "frontier_segment", "continue with the most objective-relevant unread segment"
-        elif coverage >= 1.0:
-            action, reason = "synthesize", "all source lines are covered; synthesize the evidence or verify a precise claim"
-        else:
-            action, reason = "search", "use an indexed query to locate the remaining objective evidence"
-        plan = {
-            "action": action,
-            "reason": reason,
-            "information_gain": max(0.0, min(1.0, float(information_gain))),
-            "next_segments": next_ids[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS],
-            "updated_at": now_ts(),
-        }
-        memory["retrieval_plan"] = plan
-        memory["frontier_segments"] = next_ids[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]
-        return plan
-
     def _long_content_reuse_hint(self, rel: str, memory: dict, args: dict) -> str:
         """Return a compact cache hit instead of replaying an old window."""
         mode = str((args or {}).get("mode", "") or "auto").strip().lower()
@@ -47794,7 +46594,7 @@ body{padding:18px}
                     return (
                         f"[read_file reused path={rel} mode=full chars={offset + 1}-{end_char} "
                         f"lines={start_line}-{end_line}]\n"
-                        + source_text[offset:end_char]
+                        "Requested full page is already in long-content memory; use fresh=true for exact source verification."
                     )
             except Exception:
                 pass
@@ -47809,18 +46609,13 @@ body{padding:18px}
             if wanted in seen:
                 for seg in memory.get("segments", []) or []:
                     if isinstance(seg, dict) and str(seg.get("id", "")) == wanted:
-                        try:
-                            source_text, _ = self._read_text_and_fingerprint(self._session_path(rel), rel)
-                            source_lines = source_text.splitlines()
-                            seg_start = max(1, int(seg.get("start_line", 1) or 1) - 8)
-                            seg_end = min(len(source_lines), int(seg.get("end_line", seg_start) or seg_start) + 8)
-                            body = "\n".join(f"{idx}: {source_lines[idx - 1]}" for idx in range(seg_start, seg_end + 1))
-                            return (
-                                f"[read_file reused path={rel} segment_id={wanted} lines={seg_start}-{seg_end}]\n"
-                                + body
-                            )
-                        except Exception:
-                            return ""
+                        return (
+                            f"[read_file reused path={rel} segment_id={wanted} "
+                            f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+                            f"Card: {trim(str(seg.get('summary', '') or ''), 720)}\n"
+                            f"Evidence: {', '.join(seg.get('evidence', [])[:3])}\n"
+                            "Cached evidence reused; use fresh=true for exact source verification."
+                        )
         # Query/target reads can reuse a remembered semantic card if it
         # contains the requested terms.  Do not claim an exact match when only
         # the source card is relevant; return a navigation plan instead.
@@ -47874,11 +46669,10 @@ body{padding:18px}
         else:
             return ""
         if self._long_content_range_is_covered(memory, start, end):
-            body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
-            return self._clip_read_file_output(
-                f"[read_file reused path={rel} lines={start}-{end} coverage="
-                f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
-                self._read_file_max_chars(src.get("max_chars")),
+            return (
+                f"[read_file reused path={rel} lines={start}-{end} "
+                f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+                "Requested range is already in long-content memory; use fresh=true for exact source verification."
             )
         # Compute uncovered intervals against the union of remembered ranges.
         covered = []
@@ -47901,11 +46695,10 @@ body{padding:18px}
         if cursor <= end:
             gaps.append((cursor, end))
         if not gaps:
-            body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
-            return self._clip_read_file_output(
-                f"[read_file reused path={rel} lines={start}-{end} coverage="
-                f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
-                self._read_file_max_chars(src.get("max_chars")),
+            return (
+                f"[read_file reused path={rel} lines={start}-{end} "
+                f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+                "Requested range is already in long-content memory; use fresh=true for exact source verification."
             )
         body = "\n\n".join(
             f"@@ lines {a}-{b} @@\n" + "\n".join(
@@ -47918,42 +46711,6 @@ body{padding:18px}
             f"uncovered_lines={','.join(f'{a}-{b}' for a,b in gaps)}]\n{body}",
             self._read_file_max_chars(src.get("max_chars")),
         )
-
-    def _long_content_search_index(self, memory: dict, lines: list[str]) -> dict:
-        version = str(memory.get('source_sha256') or memory.get('content_id'))
-        controller = self._evidence_controller()
-        controller.index(version, lines)
-        cache = getattr(self, '_long_content_search_index_cache', {})
-        cache[version] = {'version': version, 'line_count': len(lines)}
-        self._long_content_search_index_cache = dict(list(cache.items())[-6:])
-        return cache[version]
-
-
-    def _render_indexed_long_content_search(self, rel: str, lines: list[str], memory: dict, *, query: object = '', context: object = None, max_chars: object = None, ranked: bool = False, offset: object = None) -> str:
-        needle = str(query or '').strip()
-        if not needle:
-            return 'Error: query is required for source search.'
-        version = self._long_content_search_index(memory, lines)['version']
-        result = self._evidence_controller().search(version, needle, ranked=ranked, offset=self._read_file_int_arg(offset, 0, 0, len(lines)))
-        ctx = self._read_file_int_arg(context, 6, 0, 80)
-        matches = result['matches']
-        if not matches:
-            return f'[read_file search path={rel} query={needle!r} matches=0 indexed=true method={result["method"]}]\nNo match in this search scope; try mode="evidence" with related terms or inspect structure. Do not infer that a parameter is absent from every source.'
-        # Preserve relevance order so a late decisive hit cannot be clipped by
-        # earlier low-scoring hits. Overlapping lines are emitted only once.
-        ranges = [(n - ctx, n + ctx) for _score, n in matches]
-        detail = f'query={needle!r} indexed=true method={result["method"]} partial={str(result["partial"]).lower()}'
-        if result['partial']:
-            detail += f' next_search_offset={matches[-1][1]}'
-        return self._render_evidence_windows(
-            rel,
-            lines,
-            ranges,
-            label='evidence' if ranked else 'search',
-            max_chars=max_chars,
-            detail=detail,
-        )
-
 
     def _maybe_enrich_long_content_semantic(
         self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None,
@@ -48189,17 +46946,16 @@ body{padding:18px}
             source_bytes = int(fp.stat().st_size or 0) if fp.is_file() else 0
         except Exception:
             source_bytes = 0
-        if not fp.is_file() or not lines:
-            return {}
-        compact_source = (
+        if not fp.is_file() or (
             len(lines) < LONG_CONTENT_TEXT_SEGMENT_LINES
             and source_bytes < LARGE_FILE_AUTO_PAGE_BYTES
-        )
+        ):
+            return {}
         content_id, source_fp = self._long_content_identity(rel, fp)
         registry = getattr(self, "long_content_memory", {})
         if not isinstance(registry, dict):
             registry = {}
-        self.long_content_memory = registry
+            self.long_content_memory = registry
         old = registry.get(content_id, {}) if isinstance(registry, dict) else {}
         if old and not force and not bool(old.get("stale", False)) and int(old.get("total_lines", 0) or 0) == len(lines):
             # Same content may be reachable through an upload alias, IDE
@@ -48242,13 +46998,11 @@ body{padding:18px}
             "source_size": int(source_fp.get("source_size", 0) or 0),
             "source_mtime_ns": int(source_fp.get("source_mtime_ns", 0) or 0),
             "content_type": kind, "language": language, "total_lines": len(lines),
-            "scale": "compact" if compact_source else "long",
             "outline": trim(outline, LONG_CONTENT_STRUCTURE_MAX_CHARS),
             "segments": segments, "cards": cards, "coverage": 0.0,
             "seen_segments": [], "observed_segments": [], "read_ranges": [],
             "observations": [], "observation_count": 0, "source_tools": [],
             "unresolved_items": [], "updated_at": now_ts(),
-            "retrieval_plan": {},
             "stale": False,
         }
         if isinstance(old, dict) and old.get("total_lines") == len(lines):
@@ -48256,11 +47010,10 @@ body{padding:18px}
             memory["observed_segments"] = list(old.get("observed_segments", old.get("seen_segments", [])) or [])
             memory["read_ranges"] = list(old.get("read_ranges", []) or [])
             memory["coverage"] = float(old.get("coverage", 0.0) or 0.0)
-            for field in ("observations", "observation_count", "source_tools", "semantic_status", "semantic_version", "semantic_updated_at", "semantic_attempts", "semantic_refreshes", "semantic_last_coverage", "semantic_last_seen_count", "semantic_last_observation_count", "semantic_started_at", "semantic_retry_at", "semantic_next_segments", "semantic_refresh_due", "semantic", "objective_signature", "objective_text", "objective_gaps", "objective_covered", "frontier_segments", "retrieval_plan", "read_events", "reuse_events"):
+            for field in ("observations", "observation_count", "source_tools", "semantic_status", "semantic_version", "semantic_updated_at", "semantic_attempts", "semantic_refreshes", "semantic_last_coverage", "semantic_last_seen_count", "semantic_last_observation_count", "semantic_started_at", "semantic_retry_at", "semantic_next_segments", "semantic_refresh_due", "semantic", "objective_signature", "objective_text", "objective_gaps", "objective_covered", "frontier_segments", "read_events", "reuse_events"):
                 if field in old:
                     memory[field] = old[field]
             memory["outline_ready"] = bool(old.get("outline_ready", False))
-            memory["scale"] = str(old.get("scale", memory.get("scale", "long")) or memory.get("scale", "long"))
             old_paths = [
                 str(x).replace("\\", "/").strip()
                 for x in ([old.get("source_path", "")] + list(old.get("source_paths", []) or []))
@@ -48281,7 +47034,6 @@ body{padding:18px}
         source_tool: str = "reader",
         role: str = "",
         locator: str = "",
-        operation: str = "",
         excerpts: list[str] | None = None,
         matched_lines: int = 0,
         confidence: float = 1.0,
@@ -48309,7 +47061,6 @@ body{padding:18px}
                 clean_ranges.append((start, end))
         if not clean_ranges:
             return memory
-        previous_coverage = float(memory.get("coverage", 0.0) or 0.0)
         existing_ranges: list[tuple[int, int]] = []
         for item in memory.get("read_ranges", []) or []:
             if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -48370,8 +47121,6 @@ body{padding:18px}
         memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
         read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
         memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
-        information_gain = max(0.0, float(memory["coverage"]) - previous_coverage)
-        self._update_long_content_retrieval_plan(memory, information_gain=information_gain)
 
         evidence = [trim(str(x), 260) for x in (excerpts or []) if str(x).strip()]
         if not evidence:
@@ -48396,7 +47145,6 @@ body{padding:18px}
         objective_sig = self._long_content_objective_signature(self._long_content_objective())
         observation_basis = json_dumps({
             "tool": tool_name,
-            "operation": trim(str(operation or ""), 80),
             "locator": trim(str(locator or ""), 500),
             "ranges": clean_ranges,
             "evidence": bounded_evidence,
@@ -48412,7 +47160,6 @@ body{padding:18px}
             observations.append({
                 "id": observation_id,
                 "source_tool": tool_name,
-                "operation": trim(str(operation or ""), 80),
                 "agent_role": role_key,
                 "locator": trim(str(locator or ""), 500),
                 "ranges": [[a, b] for a, b in clean_ranges[:LONG_CONTENT_OBSERVATION_MAX_RANGES]],
@@ -48447,49 +47194,102 @@ body{padding:18px}
         self.long_content_memory = self._normalize_long_content_memory(self.long_content_memory)
         memory = self.long_content_memory.get(memory["content_id"], memory)
         self._schedule_persist()
-        if bool(memory.get("semantic_refresh_due", False)) and str(memory.get("scale", "long")) != "compact":
+        if bool(memory.get("semantic_refresh_due", False)):
             self._start_long_content_semantic_enrichment(memory, rel, lines, touched)
         return memory
 
-    def _mark_long_content_read(self, rel: str, fp: Path, lines: list[str], args: dict, output: str, role: str = '') -> None:
-        memory = self._ensure_long_content_memory(rel, fp, lines)
-        if not memory:
+    def _mark_long_content_read(
+        self,
+        rel: str,
+        fp: Path,
+        lines: list[str],
+        args: dict,
+        output: str,
+        role: str = "",
+    ) -> None:
+        try:
+            memory = self._ensure_long_content_memory(rel, fp, lines)
+            if not memory:
+                return
+            if str(output or "").lstrip().startswith("[read_file reused"):
+                return
+            raw_mode = str((args or {}).get("mode", "") or "auto").lower()
+            mode = raw_mode
+            # ``read_file`` resolves auto to a concrete strategy before
+            # rendering. Mirror that resolution while recording evidence so
+            # default calls (line/offset/query/target) participate in range
+            # reuse instead of being mistaken for outline-only reads.
+            if mode == "auto":
+                if str((args or {}).get("segment_id", "") or "").strip():
+                    mode = "segment"
+                elif str((args or {}).get("target", "") or "").strip():
+                    mode = "symbol"
+                elif str((args or {}).get("query", "") or "").strip():
+                    mode = "search"
+                elif (
+                    (args or {}).get("line") not in (None, "")
+                    or (args or {}).get("offset") not in (None, "")
+                    or (args or {}).get("limit") not in (None, "")
+                ):
+                    mode = "window"
+                else:
+                    mode = "overview"
+            # Structure/overview establishes navigation only.  Do not treat the
+            # line ranges printed in the outline as semantically read; otherwise
+            # one cheap overview would falsely report 100% comprehension.
+            if mode in {"overview", "structure"} and not str((args or {}).get("segment_id", "") or "").strip():
+                memory["outline_ready"] = True
+                memory["updated_at"] = now_ts()
+                self.long_content_memory[memory["content_id"]] = memory
+                self._schedule_persist()
+                return
+            observed_ranges: list[tuple[int, int]] = []
+            for output_line in str(output or "").splitlines():
+                marker = output_line.strip()
+                if not (marker.startswith("[read_file") or marker.startswith("@@ lines")):
+                    continue
+                # Delta responses carry the requested span for navigation and
+                # an explicit uncovered span for coverage accounting.  Only
+                # the latter is new evidence; recording the whole requested
+                # window would falsely claim that overlapping lines were read.
+                uncovered = re.search(r"\buncovered_lines\s*=\s*([0-9]+(?:\s*-\s*[0-9]+)?(?:\s*,\s*[0-9]+(?:\s*-\s*[0-9]+)?)*)", marker, re.I)
+                if uncovered:
+                    for part in str(uncovered.group(1) or "").split(","):
+                        nums = re.findall(r"\d+", part)
+                        if nums:
+                            a, b = int(nums[0]), int(nums[-1])
+                            observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
+                    continue
+                window_marker = re.search(r"^@@\s*lines\s+(\d+)(?:\s*-\s*(\d+))?", marker, re.I)
+                if window_marker:
+                    a = int(window_marker.group(1))
+                    b = int(window_marker.group(2) or window_marker.group(1))
+                    observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
+                    continue
+                for match in re.finditer(r"(?:^|\s)(?:lines?|L)\s*=\s*(\d+)(?:\s*-\s*(\d+))?", marker, re.I):
+                    a, b = int(match.group(1)), int(match.group(2) or match.group(1))
+                    observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
+            if mode == "full" and not observed_ranges:
+                full_text = "\n".join(lines)
+                offset = self._read_file_int_arg((args or {}).get("offset", 0), 0, 0, max(0, len(full_text)))
+                cap = self._read_file_max_chars((args or {}).get("max_chars"))
+                end_char = min(len(full_text), offset + cap)
+                start_line = full_text.count("\n", 0, offset) + 1
+                end_line = full_text.count("\n", 0, end_char) + 1
+                observed_ranges.append((start_line, min(len(lines), max(start_line, end_line))))
+            if observed_ranges:
+                self._merge_long_content_observation(
+                    rel,
+                    fp,
+                    lines,
+                    observed_ranges,
+                    source_tool="read_file",
+                    role=role,
+                    locator=self._read_file_signature_from_args({**dict(args or {}), "path": rel}),
+                    confidence=1.0,
+                )
+        except Exception:
             return
-        # Verify each rendered, numbered line against the exact source. A range
-        # header, structure card or truncated row is never evidence of coverage.
-        actual = []
-        for row in self._evidence_body(output).splitlines():
-            match = re.match(r'^\s*(\d+): (.*)$', row)
-            if match:
-                n = int(match.group(1))
-                if 1 <= n <= len(lines) and match.group(2) == lines[n - 1]:
-                    actual.append(n)
-        mode = str(args.get('mode') or 'auto')
-        if mode == 'full':
-            body = self._evidence_body(output)
-            if body.startswith('[read_file full'):
-                body = body.partition('\n')[2]
-            body = body.split('\n[read_file clipped', 1)[0]
-            source = '\n'.join(lines)
-            start = self._read_file_int_arg(args.get('offset'), 0, 0, len(source))
-            end = start + len(body)
-            if source[start:end] == body:
-                cursor = 0
-                for n, value in enumerate(lines, 1):
-                    if cursor >= start and cursor + len(value) <= end:
-                        actual.append(n)
-                    cursor += len(value) + 1
-        if not actual:
-            return
-        ranges = []
-        for n in sorted(set(actual)):
-            if ranges and n == ranges[-1][1] + 1:
-                ranges[-1][1] = n
-            else:
-                ranges.append([n, n])
-        self._merge_long_content_observation(rel, fp, lines, ranges, source_tool='read_file', role=role,
-                                            locator=self._read_file_signature_from_args({**args, 'path': rel}), confidence=1.0)
-
 
     def _invalidate_long_content_memory_path(self, rel: str, reason: str = "source changed") -> int:
         """Drop cards for a changed source while keeping unrelated memories intact."""
@@ -48546,26 +47346,17 @@ body{padding:18px}
             return ""
         rows.sort(key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
         parts = [
-            "SOURCE EVIDENCE MEMORY (one source-addressable architecture for small and large files; evidence from read_file, shell pipelines, and other verified local readers is unified):"
+            "LONG-CONTENT UNDERSTANDING MEMORY (source-addressable; evidence from read_file, shell pipelines, and other verified local readers is unified):"
         ]
         for row in rows[:4]:
             source_tools = ",".join(str(x) for x in (row.get("source_tools", []) or [])[:6] if str(x).strip())
             parts.append(
-                f"- {row.get('source_path','')} scale={row.get('scale','long')} type={row.get('content_type','text')} "
+                f"- {row.get('source_path','')} type={row.get('content_type','text')} "
                 f"coverage={float(row.get('coverage', 0.0) or 0.0):.0%} "
                 f"lines={int(row.get('total_lines', 0) or 0)} "
                 f"observations={int(row.get('observation_count', 0) or 0)}"
                 + (f" readers={source_tools}" if source_tools else "")
             )
-            plan = row.get("retrieval_plan", {}) if isinstance(row.get("retrieval_plan", {}), dict) else {}
-            if plan.get("action"):
-                parts.append(
-                    f"  retrieval_plan action={plan.get('action')} gain={float(plan.get('information_gain', 0.0) or 0.0):.3f}: "
-                    f"{trim(str(plan.get('reason', '') or ''), 300)}"
-                )
-                plan_ids = [str(x) for x in (plan.get("next_segments", []) or []) if str(x).strip()]
-                if plan_ids:
-                    parts.append("  retrieval_next_segments: " + ", ".join(plan_ids[:6]))
             outline = str(row.get("outline", "") or "").splitlines()
             if outline:
                 parts.append("  outline: " + " | ".join(outline[:6]))
@@ -48589,9 +47380,7 @@ body{padding:18px}
                     trim(str(x), 150) for x in (observation.get("excerpts", []) or [])[:3] if str(x).strip()
                 )
                 parts.append(
-                    f"  verified_observation tool={observation.get('source_tool','reader')}"
-                    + (f" operation={observation.get('operation')}" if observation.get("operation") else "")
-                    + f" refs={refs}: {evidence}"
+                    f"  verified_observation tool={observation.get('source_tool','reader')} refs={refs}: {evidence}"
                 )
             semantic = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
             if str(row.get("semantic_status", "") or "").lower() == "ready" and semantic:
@@ -48620,51 +47409,86 @@ body{padding:18px}
 
     def _render_long_content_structure(self, rel: str, fp: Path, lines: list[str], *, max_chars: object = None) -> str:
         memory = self._ensure_long_content_memory(rel, fp, lines)
-        objective = self._long_content_objective()
-        segments = memory.get('segments', [])
-        frontier = self._long_content_select_frontier(memory, query=objective)
-        rows = [f'[read_file structure path={rel} content_id={memory.get("content_id")} lines={len(lines)}]',
-                'Navigation only: indexed sections are not verified facts or read coverage.']
-        if objective:
-            # Query raw indexed source rather than trusting the first card lines.
-            rows.append(self._render_indexed_long_content_search(rel, lines, memory, query=objective, ranked=True, context=3,
-                        max_chars=min(5000, self._read_file_max_chars(max_chars) // 2)))
-        rows.append('Objective-guided retrieval frontier:')
-        selected = frontier + [s for s in segments if s not in frontier]
-        for seg in selected[:24]:
-            rows.append(f'{seg["id"]} L{seg["start_line"]}-{seg["end_line"]} {seg["title"]}')
-        if len(segments) > 24:
-            rows.append(f'{len(segments) - 24} further sections remain searchable across the complete source.')
-        rows.append('Use mode="evidence" query="<question>" for ranked excerpts, search for literal values, or segment with an id.')
-        return self._clip_read_file_output('\n'.join(rows), self._read_file_max_chars(max_chars))
+        if not memory:
+            return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+        cards = memory.get("cards", []) if isinstance(memory.get("cards", []), list) else []
+        out = [
+            f"[read_file structure path={rel} content_id={memory.get('content_id','')} "
+            f"type={memory.get('content_type','text')} lines={len(lines)} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]",
+            "Structure is persisted as compact cards. Use mode='segment' with segment_id or query to continue reading one section.",
+        ]
+        outline = str(memory.get("outline", "") or "").strip()
+        if outline:
+            out.append("\nOutline:\n" + outline)
+        if cards:
+            out.append("\nCards:")
+            for card in cards[:24]:
+                if not isinstance(card, dict):
+                    continue
+                out.append(
+                    f"- {card.get('id','')} {card.get('title','')} :: "
+                    f"{trim(card.get('text',''), 220)} [{','.join(card.get('evidence', [])[:2])}]"
+                )
+        out.append(f"\nFocused read: read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
+        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
 
-
-    def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = '', query: object = '', max_chars: object = None) -> str:
+    def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = "", query: object = "", max_chars: object = None) -> str:
         memory = self._ensure_long_content_memory(rel, fp, lines)
-        wanted = str(segment_id or '').strip()
-        if query and not wanted:
-            return self._render_indexed_long_content_search(rel, lines, memory, query=query, max_chars=max_chars, ranked=True)
-        match = next((s for s in memory.get('segments', []) if s['id'] == wanted), None)
-        if not match:
-            return f'[read_file segment path={rel} matches=0]\nUse structure or mode="evidence" query="<question>".'
-        out = self._render_evidence_windows(
-            rel,
-            lines,
-            [(match['start_line'] - 8, match['end_line'] + 8)],
-            label='segment',
-            max_chars=max_chars,
-            detail=f"segment_id={wanted} title={match.get('title', '')}"
-        )
-        marker = "\n@@ lines "
-        if marker in out:
-            head, tail = out.split(marker, 1)
-            out = (
-                f"{head}\nCard: {trim(str(match.get('summary', '') or ''), 900)}\n"
-                f"Evidence window:{marker}{tail}"
+        if not memory:
+            return self._render_window_text_read(rel, lines, max_chars=max_chars)
+        wanted_id = str(segment_id or "").strip()
+        wanted_query = str(query or "").strip().lower()
+        segments = memory.get("segments", []) if isinstance(memory.get("segments", []), list) else []
+        match = None
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            if wanted_id and str(seg.get("id", "")) == wanted_id:
+                match = seg
+                break
+            if wanted_query and wanted_query in (str(seg.get("title", "")) + " " + str(seg.get("summary", ""))).lower():
+                match = seg
+                break
+        if match is None:
+            return (
+                f"[read_file segment path={rel} matches=0]\n"
+                "Use mode='structure' first, then provide segment_id (for example s0001) or a narrow query."
             )
-        self._mark_long_content_read(rel, fp, lines, {'mode': 'segment', 'segment_id': wanted}, out)
-        return out
-
+        start = max(1, int(match.get("start_line", 1) or 1))
+        end = min(len(lines), int(match.get("end_line", start) or start))
+        context = 8
+        body_start, body_end = max(1, start - context), min(len(lines), end + context)
+        body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(body_start, body_end + 1))
+        seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
+        seen.add(str(match.get("id", "")))
+        memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        ranges: list[list[int]] = []
+        for item in memory.get("read_ranges", []) or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    ranges.append([max(1, int(item[0])), min(len(lines), max(int(item[0]), int(item[1])))])
+                except Exception:
+                    continue
+        ranges.append([body_start, body_end])
+        merged: list[list[int]] = []
+        for a, b in sorted(ranges):
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        memory["read_ranges"] = merged[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        covered_lines = sum(max(0, int(b) - int(a) + 1) for a, b in merged)
+        memory["coverage"] = round(min(1.0, covered_lines / max(1, len(lines))), 4)
+        match["status"] = "read"
+        match["last_seen"] = now_ts()
+        memory["updated_at"] = now_ts()
+        self.long_content_memory[memory["content_id"]] = memory
+        return self._clip_read_file_output(
+            f"[read_file segment path={rel} segment_id={match.get('id')} title={match.get('title','')} "
+            f"lines={start}-{end} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+            f"Card: {match.get('summary','')}\nEvidence window:\n{body}",
+            self._read_file_max_chars(max_chars),
+        )
 
     def _render_text_overview(
         self,
@@ -48721,38 +47545,22 @@ body{padding:18px}
         out.append(f"- read_file path=\"{rel}\" mode=\"full\" max_chars={min(cap, READ_FILE_DEFAULT_MAX_CHARS)}")
         if not is_code:
             out.append("- For long logs or command output, start with mode=\"search\" for the error, warning, filename, or keyword.")
-        # Every text source has the same source identity, evidence ranges and
-        # search index.  Larger sources additionally expose section navigation
-        # and semantic frontier hints; size changes detail, not architecture.
-        try:
-            memory = self._ensure_long_content_memory(rel, fp, lines)
-            if memory:
-                out.append(
-                    f"\nEvidence memory: content_id={memory.get('content_id','')} "
-                    f"scale={memory.get('scale','long')} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}."
-                )
-                if memory.get("scale") == "long":
+        # Keep the legacy overview shape, but expose the durable long-content
+        # navigation whenever this is a large source.  The model can opt into
+        # structure/segment reads without paying for all source lines here.
+        if total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or size >= LARGE_FILE_AUTO_PAGE_BYTES:
+            try:
+                memory = self._ensure_long_content_memory(rel, fp, lines)
+                if memory:
                     out.append(
-                        f"segments={len(memory.get('segments', []) or [])}; "
-                        "use structure/segment for objective-guided navigation."
+                        f"\nLong-content memory: content_id={memory.get('content_id','')} "
+                        f"segments={len(memory.get('segments', []) or [])} "
+                        f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}."
                     )
-                objective = self._long_content_objective()
-                frontier = self._long_content_select_frontier(memory, query=objective)
-                if memory.get("scale") == "long" and (objective or frontier):
-                    out.append("\nObjective-guided retrieval frontier:")
-                    if objective:
-                        out.append(f"- objective: {trim(objective, 420)}")
-                    for seg in frontier[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]:
-                        out.append(
-                            f"- segment={seg.get('id')} lines={seg.get('start_line', 0)}-{seg.get('end_line', 0)} "
-                            f"title={trim(str(seg.get('title', '') or ''), 140)}"
-                        )
-                    out.append(
-                        f"- read_file path=\"{rel}\" mode=\"segment\" "
-                        f"segment_id=\"{frontier[0].get('id') if frontier else 's0001'}\""
-                    )
-        except Exception:
-            pass
+                    out.append(f"- read_file path=\"{rel}\" mode=\"structure\"")
+                    out.append(f"- read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
+            except Exception:
+                pass
         return self._clip_read_file_output("\n".join(out), cap)
 
     def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
@@ -51570,11 +50378,6 @@ body{padding:18px}
         if not goal or self._is_title_continuation_text(goal):
             return False
         goal_digest = self._auto_title_goal_digest(goal)
-        # Let the dedicated title request produce the first visible name when
-        # enabled.  A synchronous fallback before that request completes makes
-        # the UI emit two rename events for one user message.
-        if AUTO_TITLE_MODEL_REFINE:
-            return self._schedule_auto_title_model_refine(goal, goal_digest, trigger)
         quick_changed = False
         quick_old = ""
         quick_title = ""
@@ -52050,21 +50853,6 @@ body{padding:18px}
 
         for attempt in range(1, retry_budget + 2):
             try:
-                self._record_flow_node(
-                    "model_call",
-                    {
-                        "context_label": trim(str(context_label or "agent"), 120),
-                        "attempt": int(attempt),
-                        "tool_count": len(tools or []),
-                        "prompt_tokens_estimate": int(estimated_prompt_tokens or 0),
-                    },
-                    role=context_role_hint or getattr(self, "active_agent_role", ""),
-                    metadata={
-                        "attempt": int(attempt),
-                        "retry_budget": int(retry_budget),
-                        "context_label": trim(str(context_label or "agent"), 120),
-                    },
-                )
                 if visible_response_stream:
                     self._clear_live_response()
                     self._begin_live_response(
@@ -54142,14 +52930,34 @@ body{padding:18px}
             f"for the next page, keep mode=\"full\" and set offset={end}.",
         )
 
-    def _render_window_text_read(self, rel: str, lines: list[str], *, limit: int | None = None, offset: int | None = None, line: object = None, context: object = None, max_chars: int | None = None) -> str:
+    def _render_window_text_read(
+        self,
+        rel: str,
+        lines: list[str],
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        line: object = None,
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        total = len(lines)
+        if total <= 0:
+            return f"[read_file window path={rel} lines=0]\n[end_of_file]"
         ctx = self._read_file_int_arg(context, 60, 0, 2000)
-        start = max(1, int(line) - ctx) if line not in (None, '') else self._read_file_int_arg(offset, 0, 0, len(lines)) + 1
-        count = self._read_file_int_arg(limit, 2 * ctx + 1 if line not in (None, '') else LONG_OUTPUT_READ_PAGE_LINES, 1, 4000)
-        if start > len(lines):
-            return f'[read_file window path={rel} lines=0]\n[end_of_file]'
-        return self._render_evidence_windows(rel, lines, [(start, start + count - 1)], max_chars=max_chars)
-
+        default_limit = ctx * 2 + 1 if line not in (None, "") else LONG_OUTPUT_READ_PAGE_LINES
+        requested_limit = self._read_file_int_arg(limit, default_limit, 1, 4000)
+        line_val = self._read_file_int_arg(line, 0, 0, max(1, total)) if line not in (None, "") else 0
+        if line_val > 0:
+            start = max(0, line_val - ctx - 1)
+        else:
+            start = self._read_file_int_arg(offset, 0, 0, max(0, total))
+        end = min(total, start + requested_limit)
+        if start >= total:
+            return f"[read_file window path={rel} lines=0 of {total} start={start + 1}]\n[end_of_file]"
+        body = "\n".join(lines[start:end])
+        header = f"[read_file window path={rel} lines={start + 1}-{end} of {total}]\n"
+        return header + self._clip_read_file_output(body, self._read_file_max_chars(max_chars))
 
     def _render_search_text_read(
         self,
@@ -54307,7 +53115,7 @@ body{padding:18px}
             except Exception:
                 file_size = 0
             mode_text = str(mode or "auto").strip().lower() or "auto"
-            if mode_text not in {"auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "evidence", "directory"}:
+            if mode_text not in {"auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"}:
                 mode_text = "auto"
             if mode_text == "auto":
                 if str(target or "").strip():
@@ -54316,7 +53124,7 @@ body{padding:18px}
                     mode_text = "search"
                 elif line not in (None, "") or offset not in (None, "") or limit is not None:
                     mode_text = "window"
-                elif total_lines >= LARGE_FILE_AUTO_PAGE_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
+                elif total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
                     mode_text = "structure"
             if mode_text == "directory":
                 return f"Error: path is a file, not a directory: {rel}"
@@ -54355,18 +53163,6 @@ body{padding:18px}
                         self.long_content_memory[memory.get("content_id", "")] = memory
                         self._schedule_persist()
                         return delta
-            if mode_text in {"search", "evidence"} and memory and not bool(regex):
-                indexed = self._render_indexed_long_content_search(
-                    rel,
-                    lines,
-                    memory,
-                    query=query or target,
-                    context=context,
-                    max_chars=max_chars,
-                    ranked=mode_text == "evidence",
-                )
-                if indexed:
-                    return indexed
             if mode_text in {"overview", "structure"}:
                 if mode_text == "structure":
                     return self._render_long_content_structure(rel, fp, lines, max_chars=max_chars)
@@ -54375,7 +53171,7 @@ body{padding:18px}
                 return self._render_long_content_segment(rel, fp, lines, segment_id=segment_id or target, query=query, max_chars=max_chars)
             if mode_text == "full":
                 return self._render_full_text_read(rel, lines, offset=offset, max_chars=max_chars)
-            if mode_text in {"search", "evidence"}:
+            if mode_text == "search":
                 return self._render_search_text_read(
                     rel,
                     lines,
@@ -54420,11 +53216,6 @@ body{padding:18px}
             return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
-
-    def _render_compact_evidence_read(self, rel: str, lines: list[str], text: str, memory: dict) -> str:
-        return self._render_evidence_windows(rel, lines, [(1, len(lines))], label='compact',
-                                             max_chars=READ_FILE_DEFAULT_MAX_CHARS, detail='complete_source_requested=true')
-
 
     def _run_read_media(self, fp: Path, rel: str, media_type: str) -> str:
         """Read a media file and return description or inject into multimodal context."""
@@ -54778,43 +53569,32 @@ body{padding:18px}
 
     def run_subagent(self, prompt: str, agent_type: str = "Explore") -> str:
         subtools = [
-            tool_def(
-                "bash",
-                "Execute a shell command. For a special read/perception task, optionally provide operation using the bash provenance codes (text_read/text_search/document_extract/ocr/media_metadata/media_extract/custom_extract/validation/build_test/process_control/network/execute); prefer read_file for exact ordinary source reads.",
-                {
-                    "command": {"type": "string"},
-                    "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker; known markers receive specialized memory handling."},
-                    "recognition_code": {"type": "string"},
-                },
-                ["command"],
-            ),
+            tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
             tool_def(
                 "read_file",
                 (
-                    "Preferred tool for reading files or directories with structure-aware, source-addressable modes. "
+                    "Read files or directories with structure-aware modes. "
                     "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
                     "app.py line 240 -> mode='window' line=240 context=5; "
                     "run.txt E123 -> mode='search' query='E123'. "
                     "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed. "
-                    "Successful reads receive immutable evidence and are remembered in the tool-memory registry."
+                    "Successful reads are remembered in the tool-memory registry."
                 ),
                 {
                     "path": {"type": "string"},
                     "mode": {
                         "type": "string",
-                        "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "evidence", "directory"],
-                        "description": "Reading strategy. Use structure/overview for a bounded source map, segment for a remembered section, symbol with target for a function/class, search/evidence with query for text and ranked citations, and window with line/context for a line range. Avoid full for large logs when a query is known.",
+                        "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
+                        "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
                     },
                     "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
-                    "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure'."},
-                    "query": {"type": "string", "description": "Search text or regex for mode='search' or mode='evidence'; can also be used when target is unknown."},
+                    "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
                     "line": {"type": "integer", "description": "1-based center line for mode='window'."},
                     "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
                     "regex": {"type": "boolean", "description": "Treat query as a regular expression in mode='search'."},
                     "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
                     "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
                     "offset": {"type": "integer", "description": "0-based character offset for mode='full'; legacy 0-based line/entry offset for mode='window' or mode='directory'. Prefer mode='window' with line/context for line-oriented reads."},
-                    "fresh": {"type": "boolean", "description": "Force an exact source reread instead of reusing verified long-content memory."},
                 },
                 ["path"],
             ),
@@ -63235,11 +62015,7 @@ body{padding:18px}
             if name in {"read_file", "write_file", "edit_file"}:
                 _add(args.get("path", "") or args.get("file_path", ""))
             elif name in {"bash", "worktree_run"}:
-                operation, declared = self._bash_operation_from_args(args)
-                for path in self._bash_file_read_targets(
-                    str(args.get("command", "") or ""),
-                    operation=operation if declared else "",
-                )[:6]:
+                for path in self._bash_file_read_targets(str(args.get("command", "") or ""))[:6]:
                     _add(path)
         path_inference = self._plan_step_quality_path_inference(plan_step, paths)
         for path in path_inference.get("candidate_paths", []) if isinstance(path_inference, dict) else []:
@@ -63910,7 +62686,6 @@ body{padding:18px}
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state = {}
         self.agent_loop_progress_state = {}
-        self._readonly_bash_cache = {}
         self.rounds_without_todo = 0
         self.last_todo_reminder_ts = 0.0
         self.todo_reminder_count = 0
@@ -64192,20 +62967,6 @@ body{padding:18px}
             self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-transition")
         except Exception:
             pass
-        self._record_flow_node(
-            "plan_step_transition",
-            {
-                "from": previous_focus,
-                "to": new_focus,
-                "actor": trim(str(actor or ""), 40),
-                "evidence": trim(str(evidence or ""), 600),
-            },
-            role=actor,
-            metadata={
-                "from_focus_id": str(previous_focus.get("id", "") or ""),
-                "to_focus_id": str(new_focus.get("id", "") or ""),
-            },
-        )
         return True
 
     def _post_execution_plan_step_check(self, route: dict, worker_step: dict) -> bool:
@@ -77345,10 +76106,7 @@ body{padding:18px}
                 self._blackboard_set_status("CODING")
         elif name in {"bash", "worktree_run", "check_background"}:
             cmd = trim(str(args.get("command", "") or "").strip(), 180)
-            operation, operation_declared = self._bash_operation_from_args(args)
             line = f"{name} {cmd}".strip()
-            if operation_declared:
-                line = f"{line}\noperation={operation}".strip()
             if output:
                 line = f"{line}\n{output}".strip()
             if item.get("exit_code") is not None:
@@ -77383,10 +76141,7 @@ body{padding:18px}
                     command=str(args.get("command", "") or ""),
                     tier="long",
                 )
-            bash_paths = self._bash_file_read_targets(
-                str(args.get("command", "") or ""),
-                operation=operation if operation_declared else "",
-            )
+            bash_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
             if bash_paths and ok:
                 self._blackboard_append_memory(
                     "file_read",
@@ -77529,12 +76284,7 @@ body{padding:18px}
             }
             if name in {"bash", "worktree_run"}:
                 file_paths = list(dict.fromkeys(
-                    self._bash_file_read_targets(
-                        str(args.get("command", "") or ""),
-                        operation=self._bash_operation_from_args(args)[0]
-                        if self._bash_operation_from_args(args)[1]
-                        else "",
-                    )
+                    self._bash_file_read_targets(str(args.get("command", "") or ""))
                     + list(changed_paths)
                 ))
             for value in file_paths[:8]:
@@ -81580,32 +80330,20 @@ body{padding:18px}
 
     def _clear_tool_result_meta(self) -> None:
         try:
-            local = getattr(self, "_tool_result_local", None)
-            if local is None:
-                local = threading.local()
-                self._tool_result_local = local
-            local.meta = {}
+            self._tool_result_local.meta = {}
         except Exception:
             pass
 
     def _set_tool_result_meta(self, **values) -> None:
         try:
             clean = {str(key): value for key, value in values.items() if value is not None}
-            local = getattr(self, "_tool_result_local", None)
-            if local is None:
-                local = threading.local()
-                self._tool_result_local = local
-            local.meta = clean
+            self._tool_result_local.meta = clean
         except Exception:
             pass
 
     def _peek_tool_result_meta(self) -> dict:
         try:
-            local = getattr(self, "_tool_result_local", None)
-            if local is None:
-                local = threading.local()
-                self._tool_result_local = local
-            raw = getattr(local, "meta", {})
+            raw = getattr(self._tool_result_local, "meta", {})
             return dict(raw) if isinstance(raw, dict) else {}
         except Exception:
             return {}
@@ -81676,22 +80414,14 @@ body{padding:18px}
             "ok": self._tool_result_ok(tool_name, output, meta),
         }
         if tool_name in {"bash", "worktree_run", "check_background"}:
-            operation, declared = self._bash_operation_from_args(item_args)
-            if declared or meta.get("operation"):
-                item["operation"] = str(meta.get("operation", operation) or operation)
-                item["operation_declared"] = bool(meta.get("operation_declared", declared))
             exit_code = self._effective_shell_exit_code(output, meta.get("exit_code"))
             if exit_code is not None:
                 item["exit_code"] = int(exit_code)
             if meta.get("shell_exit_code") is not None:
                 item["shell_exit_code"] = int(meta.get("shell_exit_code"))
-        for key in ("duration_ms", "changed_files", "error", "evidence_id"):
+        for key in ("duration_ms", "changed_files", "error"):
             if meta.get(key) not in (None, "", []):
                 item[key] = meta.get(key)
-        if not item.get("evidence_id"):
-            match = re.search(r"\[evidence_ref id=([a-f0-9]{24})\b", str(output or ""))
-            if match:
-                item["evidence_id"] = match.group(1)
         item = self._annotate_negative_search_assertion(item)
         self._update_shell_failure_guidance(tool_name, item, meta)
         return self._annotate_tool_control_feedback(item)
@@ -81734,42 +80464,14 @@ body{padding:18px}
         if resume_alias and "resume" not in args and "continue" not in args and "resume_existing" not in args:
             args = {**args, "resume": True}
         if name == "agent_web_search" and not bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)):
-            return self._trace_tool_result(
-                name,
-                args,
-                "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable).",
-                "",
-            )
+            return "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable)."
         role_key = self._sanitize_agent_role(agent_role)
-        args = dict(args)
-        flow_context = self._flow_context(role_key, tool_call_id)
-        # Main agent loops emit a visible tool_start first. Subagent and
-        # programmatic callers may not; create the graph node only when no
-        # visible start node already exists for this call.
-        if not flow_context.get("tool_start_evidence_id"):
-            flow_context["tool_start_evidence_id"] = self._record_flow_node(
-                "tool_start",
-                {"name": name, "args": self._flow_safe_args(args)},
-                role=role_key,
-                metadata={**flow_context, "tool_call_id": tool_call_id},
-                parent_ids=[flow_context.get("parent_evidence_id", "")],
-            )
-        args["_flow_context"] = flow_context
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
-            out = self._trace_tool_result(
-                name,
-                args,
-                f"Error: tool '{name}' is not allowed for agent role '{role_key}'",
-                role_key,
-            )
-            self._maybe_record_tool_memory_after_result(name, args, out, role_key)
-            return out
+            return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
         role_guard = self._guard_role_shell_mutation(role_key, name, args)
         if role_guard:
             self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=role_guard)
-            out = self._trace_tool_result(name, args, role_guard, role_key)
-            self._maybe_record_tool_memory_after_result(name, args, out, role_key)
-            return out
+            return role_guard
         try:
             # Shell-backed tools have their own timeout/state mechanism; keep
             # them on this thread so structured outcome metadata is not lost at
@@ -81792,14 +80494,12 @@ body{padding:18px}
                 or self._is_mcp_tool_name(name)
             ):
                 out = self._dispatch_tool_inner(name, args, role_key, tool_call_id)
-                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
             if timeout <= 0:
                 out = self._dispatch_tool_inner(name, args, role_key, tool_call_id)
-                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
@@ -81807,7 +80507,6 @@ body{padding:18px}
             future = pool.submit(self._dispatch_tool_inner, name, args, role_key, tool_call_id)
             try:
                 out = future.result(timeout=timeout)
-                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 pool.shutdown(wait=True)
                 self._record_tool_telemetry(name, out, telemetry_started)
@@ -81832,7 +80531,6 @@ body{padding:18px}
                     "summary": f"tool '{name}' timed out after {timeout}s",
                 })
                 out = f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
-                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started, status="timeout")
                 return out
@@ -81846,7 +80544,6 @@ body{padding:18px}
                 "traceback": trim(tb_lines, 2000),
             })
             out = f"Error: {type(exc).__name__}: {trim(str(exc), 500)}"
-            out = self._trace_tool_result(name, args, out, role_key)
             self._maybe_record_tool_memory_after_result(name, args, out, role_key)
             self._record_tool_telemetry(name, out, telemetry_started)
             return out
@@ -81949,59 +80646,6 @@ body{padding:18px}
         except Exception:
             pass
 
-    def _readonly_bash_cache_key(self, command: str) -> str:
-        """Return a source-version key for safe, read-only shell commands."""
-        raw = re.sub(r"\s+", " ", str(command or "").strip())
-        if not raw or not self._bash_looks_like_file_read(raw):
-            return ""
-        if re.search(r"(?:^|[;&|]\s*)(?:rm|mv|cp|touch|chmod|chown|mkdir|rmdir|sed\s+-i|perl\s+-i)\b", raw, re.I):
-            return ""
-        if any(token in raw for token in (">", "$(", "`")):
-            return ""
-        targets = self._bash_file_read_targets(raw)
-        if not targets:
-            return ""
-        rows = []
-        for rel in targets[:SHELL_SOURCE_CANDIDATE_MAX]:
-            try:
-                fp = self._session_path(rel)
-                if not fp.is_file():
-                    continue
-                stat = fp.stat()
-                rows.append((str(rel), int(stat.st_size), int(getattr(stat, "st_mtime_ns", 0))))
-            except Exception:
-                continue
-        if not rows:
-            return ""
-        payload = json_dumps({"command": raw, "files": rows}, ensure_ascii=False)
-        return hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()
-
-    def _readonly_bash_cache_lookup(self, command: str) -> dict | None:
-        key = self._readonly_bash_cache_key(command)
-        if not key:
-            return None
-        row = getattr(self, "_readonly_bash_cache", {}).get(key)
-        if not isinstance(row, dict):
-            return None
-        return dict(row)
-
-    def _readonly_bash_cache_store(self, command: str, meta: dict) -> None:
-        key = self._readonly_bash_cache_key(command)
-        if not key or not isinstance(meta, dict):
-            return
-        cache = getattr(self, "_readonly_bash_cache", {})
-        if not isinstance(cache, dict):
-            cache = {}
-            self._readonly_bash_cache = cache
-        cache[key] = {
-            k: v for k, v in meta.items()
-            if k in {"command", "effective_command", "cwd", "exit_code", "duration_ms", "changed_files", "output", "error", "model_truncated", "ui_truncated", "buffer_ref", "buffer_chars", "temp_output_path", "long_output_strategy", "output_page_index", "output_page_count", "output_full_chars", "output_full_lines"}
-        }
-        if len(cache) > 64:
-            oldest = list(cache)[: len(cache) - 64]
-            for old_key in oldest:
-                cache.pop(old_key, None)
-
     def _dispatch_tool_inner(
         self,
         name: str,
@@ -82039,48 +80683,32 @@ body{padding:18px}
             self._emit("status", {"summary": f"calling MCP tool {name}"})
             return mgr.call(name, args if isinstance(args, dict) else {})
         if name == "bash":
-            operation, operation_declared = self._bash_operation_from_args(args)
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
                 self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=guard_error)
                 return guard_error
             coordinator = getattr(self, "collaboration_write_coordinator", None)
-            cached_meta = self._readonly_bash_cache_lookup(str(args.get("command", "") or ""))
-            if cached_meta is not None:
-                meta = dict(cached_meta)
-                meta["duration_ms"] = 0
-                meta["cache_hit"] = True
-                meta["output"] = (
-                    f"[bash cached command={trim(str(args.get('command', '') or ''), 180)} "
-                    "source_versions_unchanged=true]\n"
-                    + str(meta.get("output", "") or "")
-                )
-            else:
-                if coordinator is not None:
-                    with coordinator.mutation_lease():
-                        before_process = coordinator.begin_process()
-                        meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
-                        coordinated_changes = coordinator.finish_process(before_process)
-                    meta["collaboration_changes"] = coordinated_changes
-                    conflicts = [row for row in coordinated_changes if not bool(row.get("ok", False))]
-                    if conflicts:
-                        meta["output"] = str(meta.get("output", "")) + "\nCollaboration conflict: one or more process writes were frozen for review."
-                else:
+            if coordinator is not None:
+                with coordinator.mutation_lease():
+                    before_process = coordinator.begin_process()
                     meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
+                    coordinated_changes = coordinator.finish_process(before_process)
+                meta["collaboration_changes"] = coordinated_changes
+                conflicts = [row for row in coordinated_changes if not bool(row.get("ok", False))]
+                if conflicts:
+                    meta["output"] = str(meta.get("output", "")) + "\nCollaboration conflict: one or more process writes were frozen for review."
+            else:
+                meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
             effective_exit = self._effective_shell_exit_code(meta.get("output", ""), meta.get("exit_code"))
             self._set_tool_result_meta(
                 exit_code=effective_exit,
                 shell_exit_code=meta.get("exit_code"),
-                operation=operation,
-                operation_declared=operation_declared,
                 duration_ms=meta.get("duration_ms"),
                 changed_files=list(meta.get("changed_files", []) or []),
                 error=str(meta.get("error", "") or ""),
                 model_truncated=bool(meta.get("model_truncated", False)),
                 ui_truncated=bool(meta.get("ui_truncated", False)),
             )
-            if not bool(meta.get("cache_hit", False)) and effective_exit == 0 and not meta.get("changed_files"):
-                self._readonly_bash_cache_store(str(args.get("command", "") or ""), meta)
             if coordinator is not None:
                 try:
                     coordinated_rows = list(meta.get("collaboration_changes", []) or [])
@@ -82125,8 +80753,6 @@ body{padding:18px}
                 "command",
                 {
                     "name": "bash",
-                    "operation": operation,
-                    "operation_declared": operation_declared,
                     "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "command": meta["command"],
                     "effective_command": meta.get("effective_command", meta["command"]),
@@ -82138,7 +80764,6 @@ body{padding:18px}
                     "async_handoff_seconds": int(meta.get("async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                     "background_task_id": str(meta.get("background_task_id", "") or ""),
                     "duration_ms": meta["duration_ms"],
-                    "cache_hit": bool(meta.get("cache_hit", False)),
                     "changed_files": meta["changed_files"],
                     "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
                     "ui_output_pages": meta.get("ui_output_pages", []),
@@ -82825,7 +81450,6 @@ body{padding:18px}
         if name == "worktree_status":
             return self.worktrees.status(args["name"])
         if name == "worktree_run":
-            operation, operation_declared = self._bash_operation_from_args(args)
             wt_path = self.worktrees.resolve_path(args["name"])
             if wt_path is None:
                 return f"Error: unknown worktree '{args['name']}'"
@@ -82838,8 +81462,6 @@ body{padding:18px}
             self._set_tool_result_meta(
                 exit_code=effective_exit,
                 shell_exit_code=meta.get("exit_code"),
-                operation=operation,
-                operation_declared=operation_declared,
                 duration_ms=meta.get("duration_ms"),
                 changed_files=list(meta.get("changed_files", []) or []),
                 error=str(meta.get("error", "") or ""),
@@ -82850,8 +81472,6 @@ body{padding:18px}
                 "command",
                 {
                     "name": "worktree_run",
-                    "operation": operation,
-                    "operation_declared": operation_declared,
                     "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "worktree": args["name"],
                     "command": meta["command"],
@@ -95455,10 +94075,8 @@ const APP_STORE={view:'sessions',scope:'personal',personal:[],shared:[],catalog:
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
-const SNAPSHOT_DELAY_RUNNING_MS=260;
-const SNAPSHOT_DELAY_IDLE_MS=1200;
-const SNAPSHOT_DELAY_VISIBLE_MS=SNAPSHOT_DELAY_IDLE_MS;
-const SNAPSHOT_DELAY_HIDDEN_MS=3000;
+const SNAPSHOT_DELAY_VISIBLE_MS=300;
+const SNAPSHOT_DELAY_HIDDEN_MS=2400;
 const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
 const SESSION_BOOT_LIMIT=120;
@@ -95865,7 +94483,7 @@ async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
 function showError(msg){const el=E('errorBox');if(!msg){el.classList.add('hidden');el.textContent='';return}el.textContent=msg;el.classList.remove('hidden')}
 function nearBottom(el,threshold=24){const t=Math.max(0,Number(threshold)||24);return (el.scrollHeight-el.scrollTop-el.clientHeight)<=t}
-function snapshotDelayMs(){if(document.visibilityState==='hidden')return SNAPSHOT_DELAY_HIDDEN_MS;return S.snap?.running?SNAPSHOT_DELAY_RUNNING_MS:SNAPSHOT_DELAY_VISIBLE_MS}
+function snapshotDelayMs(){return document.visibilityState==='hidden'?SNAPSHOT_DELAY_HIDDEN_MS:SNAPSHOT_DELAY_VISIBLE_MS}
 function sessionPollDelayMs(){return document.visibilityState==='hidden'?SESSION_POLL_HIDDEN_MS:SESSION_POLL_VISIBLE_MS}
 function applyStaticUiClass(){document.documentElement.classList.toggle('ui-static',!!(S.staticMode&&S.frozen))}
 function shouldFreezeAfterRender(){return !!(S.staticMode&&S.bootRendered&&(document.visibilityState==='hidden'))}
@@ -118073,7 +116691,7 @@ function resetAgentSessionUI(sessionId=''){if(S.agentEventRaf){cancelAnimationFr
 function namedAgentClipboardFile(file,index=0){if(!(file instanceof File))return null;if(String(file.name||'').trim())return file;const mime=String(file.type||'').toLowerCase(),ext=({'image/png':'png','image/jpeg':'jpg','image/webp':'webp','application/pdf':'pdf','text/plain':'txt','text/markdown':'md'}[mime]||mime.split('/').pop()||'bin').replace(/[^a-z0-9]+/g,'')||'bin';try{return new File([file],`clipboard_${Date.now()}_${index+1}.${ext}`,{type:file.type||'',lastModified:Date.now()})}catch{return file}}
 function agentClipboardFiles(event){const data=event?.clipboardData;if(!data)return[];const files=[],seen=new Set(),push=(raw,index)=>{const file=namedAgentClipboardFile(raw,index);if(!file)return;const key=`${file.name}:${file.type}:${file.size}`;if(seen.has(key))return;seen.add(key);files.push(file)};[...(data.files||[])].forEach(push);[...(data.items||[])].forEach((item,index)=>{if(item?.kind==='file')push(item.getAsFile?.(),index)});return files}
 async function uploadAgentAttachments(files){const list=[...(files||[])].map(namedAgentClipboardFile).filter(Boolean);if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
-async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);const actions=document.createElement('span');actions.className='agent-model-actions';const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
+async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);const actions=document.createElement('span');actions.className='agent-model-actions';const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
 async function compactAgentContext(button){if(S.agentState?.running)return toast('Stop the active run before compacting context.','warning');if(!confirm('Compact this session context now?'))return;button.disabled=true;button.textContent='...';try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/compact`,{method:'POST',body:'{}'});S.agentState=Object.assign({},S.agentState||{},out);E('menuPopup').classList.add('is-hidden');renderAgentContextHud(S.agentState);toast('Context compacted.','success');S.agentPollRequested=true;scheduleAgentPoll(80)}finally{button.disabled=false;button.textContent='Compact'}}
 async function applyAgentModel(selection,label){const popup=E('menuPopup');popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu','prompt-budget-menu');popup.style.transform='';popup.style.bottom='auto';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify({selection})});toast(out.queued?out.note||'Model switch queued.':`Model switched to ${label||selection}.`,out.queued?'warning':'success');scheduleAgentPoll(80)}
 async function showLlmConfigModal(){
@@ -118311,34 +116929,6 @@ function bindUI(){
 function initIconFallback(){if(!document.fonts||typeof document.fonts.load!=='function')return;let settled=false;const timeout=setTimeout(()=>{settled=true},2500);document.fonts.load('12px codicon').then(fonts=>{if(settled||!fonts||!fonts.length)return;clearTimeout(timeout);document.body.classList.remove('icons-fallback')}).catch(()=>{})}
 function debounce(fn,delay){let timer;return(...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay)}}
 async function startWorkbench(){E('authGate').classList.add('is-hidden');E('ideShell').classList.remove('is-hidden');if(window.innerWidth<=820){S.primaryVisible=false;S.secondaryVisible=false;E('ideShell').classList.add('primary-hidden','secondary-hidden')}configureCommands();bindUI();setStatus('Loading sessions...');const libraryTask=Promise.all([initMonaco(),initTerminalLibrary()]),workbenchTask=api('/api/ide/v2/workbench/state').catch(error=>{logOutput(`State restore failed: ${error.message}`);return{ok:false,state:{}}});await refreshConfig({lite:true});const savedWorkbench=await workbenchTask,restoredSession=workbenchSessionFromState(savedWorkbench.state||{});if(restoredSession)S.activeSession=restoredSession;renderSessions();resetAgentSessionUI(S.activeSession);const bootSession=S.activeSession,bootSessionSeq=S.sessionSwitchSeq;updateStatusBar();updateAgentContext();connectAgentEvents();scheduleAgentPoll(40);if(S.collaborationMode){renderCollaborationSnapshot();connectCollaborationEvents();startCollaborationPresenceHeartbeat()}if(!S.capabilities.processes)toast(S.capabilities.process_denial_reason||'Process features are disabled for this connection.','warning',8000);setStatus(S.collaborationMode?'Collaboration ready':'Ready');libraryTask.then(()=>restoreWorkbenchState(savedWorkbench,{restoreSession:false,expectedSession:bootSession,expectedSeq:bootSessionSeq})).then(()=>{updateStatusBar();updateAgentContext()}).catch(error=>logOutput(`Workbench restore: ${error.message}`));scheduleIdeDeferredBootstrap();setTimeout(checkIdeKernelUpdateNotice,500)}
-function showAgentModelOptionSettings(option, anchor){const popup=E('menuPopup');if(!popup)return;const caps=option?.capabilities||{};const supports=option?.reasoning_supported===true||caps.reasoning_supported===true;popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${escapeHtml(option?.label||option?.model||'Model settings')}</strong><small>Runtime settings</small></div><label class="model-setting-row">Effort<select id="ideModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="ideModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="ideModelThinking" type="checkbox" ${option?.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="ideModelResponse" type="checkbox" ${option?.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="ideModelSettingsBack" class="agent-model-compact" type="button">Back</button><button id="ideModelSettingsSave" class="agent-model-config" type="button" title="Save model settings" aria-label="Save model settings"><span class="codicon codicon-save"></span></button></div>`;const rect=(anchor||E('agentModelBtn')).getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';const effort=E('ideModelEffort'),maxEffort=E('ideModelMaxEffort');if(effort)effort.value=String(option?.effort||'');if(maxEffort)maxEffort.value=String(option?.max_effort||'');E('ideModelSettingsBack').onclick=event=>{event.stopPropagation();showAgentModelMenu(anchor||E('agentModelBtn')).catch(showError)};E('ideModelSettingsSave').onclick=async event=>{event.stopPropagation();const payload={selection:option.selection,effort:String(effort?.value||''),max_effort:String(maxEffort?.value||''),thinking_stream:!!E('ideModelThinking')?.checked,response_stream:!!E('ideModelResponse')?.checked};try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify(payload)});S.agentModelCatalog=out;popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu');toast(out.queued?out.note||'Model settings queued.':'Model settings saved.','success');scheduleAgentPoll(80)}catch(error){showError(error.message||String(error))}}}
-showAgentModelMenu=(async function showAgentModelMenuWithSettings(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const summary=document.createElement('div');summary.className='agent-model-summary';summary.textContent=`${catalog.options?.length||0} models`;popup.appendChild(summary);for(const option of catalog.options||[]){const row=document.createElement('div');row.className='agent-model-option';const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label','Model settings');settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=event=>{event.stopPropagation();showAgentModelOptionSettings(option,anchor)};row.append(button,settings);popup.appendChild(row)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}});
-showAgentModelMenu=async function showAgentModelMenuWithSettingsAndActions(anchor){
-  const popup=E('menuPopup');
-  if(!popup||!anchor)return;
-  popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');
-  const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';
-  popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';
-  try{
-    const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;
-    popup.innerHTML='';
-    const summary=document.createElement('div');summary.className='agent-model-summary';
-    const context=document.createElement('span');context.className='agent-model-context';
-    const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';
-    const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);
-    const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);
-    const actions=document.createElement('span');actions.className='agent-model-actions';
-    const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};
-    const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);
-    const options=Array.isArray(catalog.options)?catalog.options:[];let visibleLimit=80;
-    const search=document.createElement('input');search.type='search';search.className='agent-model-search';search.placeholder='Search models';search.setAttribute('aria-label','Search models');search.autocomplete='off';popup.appendChild(search);
-    const list=document.createElement('div');list.className='agent-model-list';popup.appendChild(list);
-    const renderList=()=>{const query=String(search.value||'').trim().toLowerCase();const filtered=query?options.filter(option=>[option.label,option.model,option.provider,option.selection].join(' ').toLowerCase().includes(query)):options;list.innerHTML='';const shown=filtered.slice(0,visibleLimit);for(const option of shown){const row=document.createElement('div');row.className='agent-model-option';const button=document.createElement('button');button.type='button';button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label',`Model settings for ${option.label||option.model||option.selection}`);settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=event=>{event.stopPropagation();showAgentModelOptionSettings(option,anchor)};row.append(button,settings);list.appendChild(row)}if(!shown.length)list.innerHTML='<div class="agent-model-summary">No matching models.</div>';if(filtered.length>shown.length){const more=document.createElement('button');more.type='button';more.className='agent-model-more';more.textContent=`Show ${filtered.length-shown.length} more`;more.onclick=event=>{event.stopPropagation();visibleLimit+=80;renderList()};list.appendChild(more)}};
-    search.oninput=()=>{visibleLimit=80;renderList()};renderList();
-  }catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}
-};
-{const style=document.createElement('style');style.textContent='.agent-model-option{display:flex;align-items:center;gap:4px;min-width:0}.agent-model-option>button:first-child{flex:1;min-width:0}.model-setting-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;color:#ccc;font-size:11px}.model-setting-row select{min-width:140px;padding:3px 5px;border:1px solid #4f4f4f;background:#252525;color:#ddd}.model-setting-check{display:flex;align-items:center;gap:7px;padding:5px 10px;color:#ccc;font-size:11px}.model-setting-check input{accent-color:#3794ff}';document.head.appendChild(style)}
-{const style=document.createElement('style');style.textContent='.agent-model-search{display:block;width:calc(100% - 16px);margin:6px 8px;padding:5px 7px;border:1px solid #4f4f4f;border-radius:4px;background:#252525;color:#ddd;font-size:11px;box-sizing:border-box}.agent-model-search::placeholder{color:#888}.agent-model-list{min-height:0}.agent-model-more{width:100%;text-align:center;color:#9cdcfe!important}.agent-model-option .agent-model-config{flex:0 0 28px;width:28px;padding:4px!important}';document.head.appendChild(style)}
 window.addEventListener('pagehide',stopCollaborationPresenceHeartbeat);
 window.addEventListener('DOMContentLoaded',async()=>{initIconFallback();try{if(await authenticate())await startWorkbench()}catch(error){showError(error)}});
 """
@@ -120277,70 +118867,6 @@ ADMIN_SKILLS_REVIEW_JS = r'''const A={token:sessionStorage.getItem('cc_admin_tok
 
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.
-def _ide_toolchain_cache_key() -> tuple[str, str, str, str]:
-    """Return the portable environment inputs used by toolchain discovery."""
-    return (
-        str(sys.platform or ""),
-        str(os.environ.get("PATH", "") or ""),
-        str(os.environ.get("PATHEXT", "") or ""),
-        str(sys.executable or ""),
-    )
-
-
-def _probe_ide_toolchains() -> list[dict]:
-    """Probe local toolchains once without invoking a shell or scanning twice."""
-    specs = [
-        ("python3", ["python3", "python"], "Install Python from https://www.python.org/downloads/ or your OS package manager."),
-        ("node", ["node"], "Install Node.js LTS from https://nodejs.org/ or use your package manager."),
-        ("npm", ["npm"], "Install Node.js LTS; npm is included with standard Node.js installers."),
-        ("go", ["go"], "Install Go from https://go.dev/dl/."),
-        ("rust", ["rustc", "cargo"], "Install Rust with rustup from https://rustup.rs/."),
-        ("java", ["java", "javac"], "Install a JDK such as Temurin, Microsoft Build of OpenJDK, or Oracle JDK."),
-        ("c_cpp", ["clang", "gcc", "make"], "Install Xcode Command Line Tools, build-essential, MSYS2, or Visual Studio Build Tools."),
-        ("git", ["git"], "Install Git from https://git-scm.com/downloads."),
-    ]
-    rows: list[dict] = []
-    for name, commands, hint in specs:
-        found: dict[str, str] = {}
-        for command in commands:
-            path = shutil.which(command)
-            if path:
-                found[command] = path
-        rows.append(
-            {
-                "name": name,
-                "available": bool(found),
-                "required_commands": commands,
-                "found": found,
-                "install_hint": "" if found else hint,
-            }
-        )
-    try:
-        debugpy_spec = importlib.util.find_spec("debugpy")
-    except Exception:
-        debugpy_spec = None
-    rows.append(
-        {
-            "name": "python-debug",
-            "available": debugpy_spec is not None,
-            "required_commands": [],
-            "found": {"debugpy": str(getattr(debugpy_spec, "origin", "") or "installed")} if debugpy_spec else {},
-            "install_hint": "Optional: install debugpy for full IDE adapter support. The built-in pdb compatibility debugger remains available without it.",
-        }
-    )
-    return rows
-
-
-def _refresh_ide_toolchains_in_background(cache_key: tuple[str, str, str, str]) -> None:
-    try:
-        rows = _probe_ide_toolchains()
-        with _IDE_TOOLCHAIN_CACHE_LOCK:
-            _IDE_TOOLCHAIN_CACHE[cache_key] = (time.monotonic(), rows)
-    finally:
-        with _IDE_TOOLCHAIN_CACHE_LOCK:
-            _IDE_TOOLCHAIN_REFRESHING.discard(cache_key)
-
-
 class AppContext:
     def _llm_config_revision(self, config: dict | None) -> str:
         try:
@@ -123941,33 +122467,43 @@ document.addEventListener('DOMContentLoaded', function(){{
         }
 
     def ide_toolchains(self) -> list[dict]:
-        cache_key = _ide_toolchain_cache_key()
-        now = time.monotonic()
-        with _IDE_TOOLCHAIN_CACHE_LOCK:
-            cached = _IDE_TOOLCHAIN_CACHE.get(cache_key)
-            if cached is not None:
-                cached_at, rows = cached
-                if now - cached_at < IDE_TOOLCHAIN_CACHE_TTL_SECONDS:
-                    return copy.deepcopy(rows)
-                if cache_key not in _IDE_TOOLCHAIN_REFRESHING:
-                    _IDE_TOOLCHAIN_REFRESHING.add(cache_key)
-                    threading.Thread(
-                        target=_refresh_ide_toolchains_in_background,
-                        args=(cache_key,),
-                        name="ide-toolchain-refresh",
-                        daemon=True,
-                    ).start()
-                # Stale data is preferable to blocking the IDE config request
-                # on PATH scans. The next request observes the refreshed copy.
-                return copy.deepcopy(rows)
-
-        # There is no usable first result yet. Probe once so the initial IDE
-        # view remains truthful; all subsequent requests are served from the
-        # cross-session cache or refreshed asynchronously after expiry.
-        rows = _probe_ide_toolchains()
-        with _IDE_TOOLCHAIN_CACHE_LOCK:
-            _IDE_TOOLCHAIN_CACHE[cache_key] = (time.monotonic(), rows)
-        return copy.deepcopy(rows)
+        specs = [
+            ("python3", ["python3", "python"], "Install Python from https://www.python.org/downloads/ or your OS package manager."),
+            ("node", ["node"], "Install Node.js LTS from https://nodejs.org/ or use your package manager."),
+            ("npm", ["npm"], "Install Node.js LTS; npm is included with standard Node.js installers."),
+            ("go", ["go"], "Install Go from https://go.dev/dl/."),
+            ("rust", ["rustc", "cargo"], "Install Rust with rustup from https://rustup.rs/."),
+            ("java", ["java", "javac"], "Install a JDK such as Temurin, Microsoft Build of OpenJDK, or Oracle JDK."),
+            ("c_cpp", ["clang", "gcc", "make"], "Install Xcode Command Line Tools, build-essential, MSYS2, or Visual Studio Build Tools."),
+            ("git", ["git"], "Install Git from https://git-scm.com/downloads."),
+        ]
+        rows: list[dict] = []
+        for name, commands, hint in specs:
+            found: dict[str, str] = {}
+            for command in commands:
+                path = shutil.which(command)
+                if path:
+                    found[command] = path
+            rows.append(
+                {
+                    "name": name,
+                    "available": bool(found),
+                    "required_commands": commands,
+                    "found": found,
+                    "install_hint": "" if found else hint,
+                }
+            )
+        debugpy_spec = importlib.util.find_spec("debugpy")
+        rows.append(
+            {
+                "name": "python-debug",
+                "available": debugpy_spec is not None,
+                "required_commands": [],
+                "found": {"debugpy": str(getattr(debugpy_spec, "origin", "") or "installed")} if debugpy_spec else {},
+                "install_hint": "Optional: install debugpy for full IDE adapter support. The built-in pdb compatibility debugger remains available without it.",
+            }
+        )
+        return rows
 
     def _ide_state_path(self, user_id: str) -> Path:
         uid = str(user_id or "")
