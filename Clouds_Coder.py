@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -24,9 +25,10 @@ import math
 import mimetypes
 import multiprocessing
 import os
-import posixpath
 import platform
+import posixpath
 import queue
+import random
 import re
 import secrets
 import select
@@ -54,7 +56,8 @@ import zipfile
 import zlib
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -69,262 +72,366 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+
+class _ClosingSQLiteConnection(sqlite3.Connection):
+    """Finish the transaction and release the connection on context exit."""
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, exc_traceback)
+        finally:
+            self.close()
+
+
+def _connect_sqlite(
+    database: str,
+    *,
+    timeout: float,
+    isolation_level: str | None = "",
+    row_factory=sqlite3.Row,
+    pragmas: tuple[str, ...] = (),
+) -> sqlite3.Connection:
+    # sqlite3.Connection's own context manager does not close the connection.
+    # Polling/request handlers must not rely on cyclic GC to release DB/WAL FDs.
+    operation = "connect"
+    try:
+        conn = sqlite3.connect(
+            database, timeout=timeout, isolation_level=isolation_level,
+            factory=_ClosingSQLiteConnection,
+        )
+    except sqlite3.Error as exc:
+        exc.sqlite_database_path = database
+        exc.sqlite_operation = operation
+        raise
+    try:
+        conn.row_factory = row_factory
+        for statement in pragmas:
+            operation = statement
+            conn.execute(statement)
+    except BaseException as exc:
+        if isinstance(exc, sqlite3.Error):
+            exc.sqlite_database_path = database
+            exc.sqlite_operation = operation
+        conn.close()
+        raise
+    return conn
+
+
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
 except Exception:
     _AESGCM = None
 
 _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
-    "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"
+    "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"
-    "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"
+    "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"
 )
 
 
@@ -334,49 +441,79 @@ def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> 
         quarantine = raw_root.with_name(f"{raw_root.name}.invalid-{uuid.uuid4().hex[:12]}")
         raw_root.rename(quarantine)
     root = raw_root.resolve(strict=False)
-    required = ("__init__.py", "control.py")
-    ready = root.is_dir() and all((root / name).is_file() for name in required)
+    required = ("__init__.py", "control.py", "models.py")
+    capability = 0
+    ready = root.is_dir() and all((root / name).is_file() and not (root / name).is_symlink() for name in required)
     if ready:
         try:
-            ready = "def inject_embedded_kernel" in (root / "control.py").read_text(encoding="utf-8")
+            match = re.search(r"^EVOLUTION_MODEL_CAPABILITY_VERSION = (\d+)$", (root / "control.py").read_text(encoding="utf-8"), re.M)
+            capability = int(match.group(1)) if match else 0
+            ready = capability >= 2
         except Exception:
             ready = False
     if ready:
-        return {
-            "root": str(root),
-            "ready": True,
-            "restored": False,
-            "source": "local",
-            "required_files": list(required),
-        }
-    if root.exists():
-        quarantine = root.with_name(f"{root.name}.incomplete-{uuid.uuid4().hex[:12]}")
-        root.rename(quarantine)
+        return {"root": str(root), "ready": True, "restored": False, "source": "local",
+                "required_files": list(required), "model_capability_version": capability}
     root.mkdir(parents=True, exist_ok=True)
+    backup = None
     try:
         payload = base64.b64decode(_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64.encode("ascii"), validate=True)
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            allowed = {"__init__.py", "control.py", "README.md"}
-            for name in allowed:
-                member = archive.getinfo(name)
+            names = (*required, "README.md")
+            contents = {name: archive.read(name) for name in names}
+            # Back up package code only. Runtime records, config, signing keys
+            # and artifact/version history stay at their original paths.
+            if any((root / name).exists() for name in names):
+                backup = root / ".package-backups" / uuid.uuid4().hex
+                backup.mkdir(parents=True)
+                for name in names:
+                    old = root / name
+                    if old.is_file():
+                        shutil.copy2(old, backup / name)
+            for name, content in contents.items():
                 target = root / name
                 temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-                temporary.write_bytes(archive.read(member))
+                temporary.write_bytes(content)
                 os.replace(temporary, target)
     except Exception as exc:
-        raise RuntimeError(f"unable to restore embedded liquid_kernel package: {exc}") from exc
-    return {
-        "root": str(root),
-        "ready": True,
-        "restored": True,
-        "source": "embedded",
-        "required_files": list(required),
-    }
-
+        raise RuntimeError(f"unable to restore embedded liquid_kernel package: {type(exc).__name__}") from exc
+    return {"root": str(root), "ready": True, "restored": True, "source": "embedded",
+            "required_files": list(required), "model_capability_version": 2,
+            "backup_root": str(backup) if backup else ""}
 
 LIQUID_KERNEL_PACKAGE_STATUS = _ensure_embedded_liquid_kernel_package()
 
-from liquid_kernel import EVOLUTION_MODES, LiquidKernelControlPlane, LiquidKernelError
+from liquid_kernel import (  # noqa: E402
+    EVOLUTION_MODES,
+    LiquidKernelControlPlane,
+    LiquidKernelError,
+)
+
+
+def _ensure_liquid_kernel_sqlite_lifecycle(registry_class) -> None:
+    """Close legacy local-package connections without replacing customized files."""
+    if getattr(registry_class, "SQLITE_CONNECTIONS_CLOSE_ON_EXIT", False):
+        return
+    original_connect = registry_class._connect
+
+    @contextlib.contextmanager
+    def managed_connect(self):
+        with contextlib.closing(original_connect(self)) as conn:
+            with conn:
+                yield conn
+
+    registry_class._connect = managed_connect
+    registry_class.SQLITE_CONNECTIONS_CLOSE_ON_EXIT = True
+
+
+# A standalone main-file update can leave an older local liquid_kernel package.
+# Adapt that package in memory as well as shipping the fixed embedded archive.
+from liquid_kernel.control import (  # noqa: E402
+    LiquidKernelRegistry as _LiquidKernelRegistry,
+)
+
+_ensure_liquid_kernel_sqlite_lifecycle(_LiquidKernelRegistry)
+
 
 # BEGIN EMBEDDED COLLABORATION BACKEND
 COLLAB_DB_FILENAME = "collaboration.sqlite"
@@ -736,13 +873,15 @@ class CollaborationStore:
             not self.db_path.parent.is_dir() or not self.db_path.is_file()
         ):
             raise sqlite3.OperationalError("collaboration database storage is unavailable")
-        conn = sqlite3.connect(str(self.db_path), timeout=15.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=15000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        return _connect_sqlite(
+            str(self.db_path), timeout=15.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=15000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+                "PRAGMA foreign_keys=ON",
+            ),
+        )
 
     def storage_health(self) -> dict:
         try:
@@ -3708,6 +3847,7 @@ COLLAB_INDEX_HTML = r"""<!doctype html>
 
 COLLAB_CSS = r"""
 :root{color-scheme:dark;--bg:#121416;--panel:#1a1d20;--panel2:#202429;--line:#30363d;--text:#e7e9ec;--muted:#9aa2ac;--accent:#3fb950;--blue:#58a6ff;--danger:#f85149;--warn:#d29922;--radius:6px}
+.session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
 *{box-sizing:border-box}html,body{height:100%;margin:0}body{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);letter-spacing:0}button,input,textarea,select{font:inherit;letter-spacing:0}button{border:1px solid var(--line);border-radius:4px;background:#272c32;color:var(--text);padding:6px 10px;cursor:pointer}button:hover{background:#30363d}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#238636;border-color:#2ea043;font-weight:600}.primary:hover{background:#2ea043}.hidden{display:none!important}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border:1px solid #3fb950;background:#17351e;color:#7ee787;border-radius:6px;font-weight:800}.brand-mark.small{width:30px;height:30px;font-size:11px}.lobby-shell{min-height:100%;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,#121416 0,#171b1f 65%,#152019 100%)}.lobby-panel{width:min(480px,100%);border:1px solid var(--line);background:var(--panel);padding:28px;border-radius:8px;box-shadow:0 22px 70px rgba(0,0,0,.35)}.brand-row{display:flex;align-items:center;gap:13px;margin-bottom:24px}.brand-row h1{font-size:22px;margin:0}.brand-row p{margin:2px 0 0;color:var(--muted)}label{display:grid;gap:6px;color:#c9d1d9;margin-bottom:14px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:4px;background:#0d1117;color:var(--text);padding:8px 9px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px rgba(88,166,255,.15)}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.lobby-panel form>.primary{width:100%;min-height:38px}.warning{border-left:3px solid var(--warn);background:#2d250e;color:#e3b341;padding:10px 12px;margin-bottom:16px}.pending{border:1px solid #4d4013;background:#26210f;padding:16px;border-radius:var(--radius)}.pending p{color:#d9bd67}.error-text{min-height:20px;color:#ff7b72}.workbench{height:100%;display:grid;grid-template-rows:46px 38px minmax(0,1fr);overflow:hidden}.topbar{display:flex;align-items:center;gap:16px;padding:0 12px;border-bottom:1px solid var(--line);background:#191c20}.project-title{display:flex;align-items:center;gap:10px;min-width:0}.project-title>div{display:grid}.project-title strong,.project-title span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-title span{font-size:11px;color:var(--muted)}.connection{margin-left:auto;color:var(--muted)}.connection.online{color:#7ee787}.connection.offline{color:#ff7b72}.tabs{display:flex;gap:0;border-bottom:1px solid var(--line);background:#171a1d;padding-left:10px;overflow:auto}.tab{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted);padding:0 14px}.tab.active{border-bottom-color:var(--blue);color:var(--text)}.view{display:none;min-height:0}.view.active{display:block}.editor-view.active{display:grid;grid-template-columns:230px minmax(340px,1fr) 310px;overflow:hidden}.explorer,.agent-pane{min-width:0;min-height:0;border-right:1px solid var(--line);background:#171a1d;display:flex;flex-direction:column}.agent-pane{border-right:0;border-left:1px solid var(--line)}.pane-head,.editor-toolbar{height:38px;flex:0 0 38px;display:flex;align-items:center;gap:8px;padding:0 9px;border-bottom:1px solid var(--line);background:#1b1f23}.pane-head strong,.editor-toolbar span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pane-head button,.editor-toolbar button{margin-left:auto;padding:3px 7px;font-size:11px}.file-list{overflow:auto;padding:4px}.file-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:5px;width:100%;border:0;background:transparent;text-align:left;padding:5px 7px;color:#c9d1d9}.file-row:hover,.file-row.active{background:#262b31}.file-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-row small{color:#6e7681}.editor-column{position:relative;min-width:0;min-height:0;display:grid;grid-template-rows:38px minmax(0,1fr) 25px;background:#0f1113}.editor-host,.fallback-editor{grid-row:2;min-width:0;min-height:0}.fallback-editor{display:none;resize:none;border:0;border-radius:0;padding:12px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.fallback-mode .fallback-editor{display:block}.editor-empty{position:absolute;inset:38px 0 25px;display:grid;place-items:center;color:#6e7681;background:#111315}.presence-bar{display:flex;align-items:center;justify-content:space-between;padding:0 9px;background:#1d2227;color:var(--muted);font-size:11px}.agent-pane select{margin:7px;width:calc(100% - 14px)}.agent-feed{flex:1;overflow:auto;padding:8px}.agent-message{border-bottom:1px solid #292e34;padding:8px 3px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-message.user{color:#c9d1d9}.agent-message.assistant{color:#a5d6ff}.agent-pane form{border-top:1px solid var(--line);padding:8px}.agent-pane form button{width:100%;margin-top:6px}.data-view{overflow:auto;padding:20px max(18px,4vw)}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding-bottom:14px;border-bottom:1px solid var(--line)}.section-head h2{margin:0;font-size:18px}.section-head p{margin:4px 0 0;color:var(--muted)}.data-list,.member-grid{display:grid;gap:8px;margin-top:14px}.member-grid{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}.data-card,.member-card{border:1px solid var(--line);background:var(--panel);padding:12px;border-radius:var(--radius)}.data-card h3,.member-card h3{margin:0 0 5px;font-size:14px}.meta{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:11px}.badge{display:inline-block;border:1px solid #3b434c;border-radius:10px;padding:1px 7px;color:#b8c0ca}.badge.warn{border-color:#6e5b19;color:#e3b341}.badge.good{border-color:#286c36;color:#7ee787}.empty{color:var(--muted);padding:24px;text-align:center}.toast{position:fixed;right:16px;bottom:16px;max-width:min(420px,calc(100vw - 32px));background:#272c32;border:1px solid #49515a;border-radius:6px;padding:10px 14px;box-shadow:0 12px 32px rgba(0,0,0,.4);z-index:50}.toast.error{border-color:#9e3632;color:#ffb4ad}
 .remote-cursor{border-left:2px solid #f778ba}.remote-cursor-1{border-left-color:#d2a8ff}.remote-cursor-2{border-left-color:#ffa657}.remote-cursor-3{border-left-color:#79c0ff}.remote-cursor-4{border-left-color:#7ee787}.mobile-agent-toggle{display:none}@media(max-width:980px){.editor-view.active{grid-template-columns:190px minmax(300px,1fr)}.mobile-agent-toggle{display:block}.agent-pane{display:none;position:fixed;right:0;top:84px;bottom:0;width:min(340px,90vw);z-index:20;box-shadow:-14px 0 32px rgba(0,0,0,.3)}.agent-pane.open{display:flex}.field-grid{grid-template-columns:1fr}}@media(max-width:640px){.editor-view.active{grid-template-columns:132px minmax(260px,1fr)}.topbar{gap:7px}.project-title{max-width:43vw}.tabs{padding-left:0}.tab{padding:0 10px}.lobby-panel{padding:20px}.data-view{padding:14px}.editor-toolbar #revisionState{display:none}}
 """
@@ -4324,12 +4464,12 @@ CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
     min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
 )
 LARGE_FILE_AUTO_PAGE_BYTES = max(
-    32 * 1024,
-    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
+    8 * 1024,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(30 * 1024)) or str(30 * 1024))),
 )
 LARGE_FILE_AUTO_PAGE_LINES = max(
-    1000,
-    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
+    400,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "1000") or "1000")),
 )
 LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
     1200,
@@ -4500,7 +4640,7 @@ LLM_HTTP_RETRY_404_ON_VLLM = (
 LLM_HTTP_RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 MAX_AGENT_ROUNDS = 200
 MIN_AGENT_ROUNDS = 8
-MAX_AGENT_ROUNDS_CAP = 400
+MAX_AGENT_ROUNDS_CAP = 8_000
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 BASH_READ_LOOP_THRESHOLD = 10
 READ_FILE_LOOP_THRESHOLD = 6
@@ -4560,7 +4700,7 @@ DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 # The loader deliberately accepts older rows (and future rows with extra
 # fields), so existing sessions/RAG evidence remain readable without a
 # migration step.
-LONG_CONTENT_MEMORY_VERSION = 4
+LONG_CONTENT_MEMORY_VERSION = 5
 LONG_CONTENT_MEMORY_MAX_ITEMS = max(
     8,
     min(160, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_ITEMS", "80") or "80"))),
@@ -4652,7 +4792,7 @@ STALL_PLAN_SYNTHESIS_MAX_TOKENS = 3000
 STALL_ESCALATION_CONTEXT_MAX_CHARS = 3000
 MAX_RUN_SECONDS = 3000
 MIN_RUN_TIMEOUT_SECONDS = 600
-MAX_RUN_TIMEOUT_SECONDS = 86_400
+MAX_RUN_TIMEOUT_SECONDS = 864_000
 MIN_TIMEOUT_SECONDS = 600
 MAX_TIMEOUT_SECONDS = 86_400
 DEFAULT_TIMEOUT_SECONDS = max(
@@ -9719,9 +9859,7 @@ class AgentWebSearchEngine:
             pass
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=15)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return _connect_sqlite(str(self.db_path), timeout=15)
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -12109,6 +12247,63 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     except Exception as exc:
         return False, [], str(exc)
 
+def extract_ollama_model_capabilities(payload: object) -> dict:
+    """Translate Ollama ``/api/show`` metadata to provider-neutral hints."""
+    if not isinstance(payload, dict):
+        return {}
+    values: set[str] = set()
+    raw = payload.get("capabilities")
+    if isinstance(raw, dict):
+        values.update(str(key).strip().lower() for key, value in raw.items() if value)
+    elif isinstance(raw, (list, tuple, set)):
+        values.update(str(value).strip().lower() for value in raw)
+    elif isinstance(raw, str):
+        values.update(part.strip().lower() for part in re.split(r"[,\s]+", raw) if part.strip())
+    caps: dict[str, object] = {}
+    if any("think" in value or "reason" in value for value in values):
+        caps["reasoning_supported"] = True
+        caps["reasoning_style"] = "ollama"
+    if any("vision" in value or "image" in value for value in values):
+        caps["vision"] = True
+    if any("tool" in value or "function" in value for value in values):
+        caps["tools"] = True
+    return caps
+
+
+def probe_ollama_model_records(
+    base_url: str,
+    *,
+    timeout: float = 1.5,
+    max_models: int | None = None,
+) -> list[dict]:
+    """List Ollama models and inspect each advertised capability by default.
+
+    ``max_models`` remains available for callers that explicitly need a bound;
+    normal discovery must import the complete provider directory.
+    """
+    ok, tags, _ = probe_ollama_environment(base_url, timeout=max(0.5, float(timeout)))
+    if not ok:
+        return []
+    records = [{"id": name, "capabilities": {}} for name in tags]
+    names = tags if max_models is None else tags[: max(0, int(max_models))]
+    for index, name in enumerate(names):
+        try:
+            body = json.dumps({"name": name}).encode("utf-8")
+            req = Request(
+                f"{str(base_url or '').rstrip('/')}/api/show",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            with urlopen(req, timeout=max(0.5, float(timeout))) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            records[index]["capabilities"] = extract_ollama_model_capabilities(payload)
+            records[index]["raw"] = payload
+        except Exception:
+            continue
+    return records
+
+
 def list_ollama_models(base_url: str, timeout: int = 4) -> list[str]:
     ok, tags, _ = probe_ollama_environment(base_url, timeout=timeout)
     return tags if ok else []
@@ -12124,7 +12319,46 @@ class EmptyActionError(RuntimeError):
 class CircuitBreakerTriggered(RuntimeError):
     """Raised when fused fault counter reaches hard break threshold."""
 
-def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refresh: bool = False) -> list[str]:
+def _fetch_ollama_models_cached(key: str, base_url: str, cached_tags: list[str]) -> None:
+    """Fetch Ollama tags and publish one cache snapshot.
+
+    The caller marks the cache row as fetching before starting this worker, so
+    concurrent catalog requests can keep returning the last snapshot while the
+    network request is in flight.
+    """
+    try:
+        ok, tags, _ = probe_ollama_environment(base_url)
+    except Exception:
+        ok, tags = False, []
+    finally:
+        with _OLLAMA_TAG_CACHE_LOCK:
+            if ok:
+                _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": list(tags)}
+            else:
+                row_now = _OLLAMA_TAG_CACHE.get(key, {})
+                row_now.pop("_fetching", None)
+                if cached_tags:
+                    _OLLAMA_TAG_CACHE[key] = {
+                        "ts": time.time(),
+                        "tags": list(cached_tags),
+                    }
+                else:
+                    _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
+
+
+def list_ollama_models_cached(
+    base_url: str,
+    ttl_seconds: int = 30,
+    force_refresh: bool = False,
+    *,
+    background: bool = False,
+) -> list[str]:
+    """Return cached Ollama tags, optionally refreshing without blocking.
+
+    UI/catalog reads use ``background=True`` so an unavailable local daemon
+    cannot delay the first render. Explicit scan endpoints keep the historical
+    synchronous behaviour by leaving it false.
+    """
     key = str(base_url or "").rstrip("/")
     now = time.time()
     cached_tags: list[str] = []
@@ -12143,25 +12377,19 @@ def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refres
             row = {"ts": 0.0, "tags": []}
         row["_fetching"] = True
         _OLLAMA_TAG_CACHE[key] = row
-    try:
-        ok, tags, _ = probe_ollama_environment(base_url)
-    except Exception:
-        ok, tags = False, []
-    finally:
-        with _OLLAMA_TAG_CACHE_LOCK:
-            if ok:
-                _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": list(tags)}
-            else:
-                # Clear fetching flag, keep old cache if available
-                row_now = _OLLAMA_TAG_CACHE.get(key, {})
-                row_now.pop("_fetching", None)
-                if not cached_tags:
-                    _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
-    if ok:
-        return list(tags)
-    if cached_tags:
+    if background:
+        threading.Thread(
+            target=_fetch_ollama_models_cached,
+            args=(key, base_url, cached_tags),
+            name="ollama-model-probe",
+            daemon=True,
+        ).start()
         return list(cached_tags)
-    return []
+    _fetch_ollama_models_cached(key, base_url, cached_tags)
+    with _OLLAMA_TAG_CACHE_LOCK:
+        row = _OLLAMA_TAG_CACHE.get(key, {})
+        tags = row.get("tags", []) if isinstance(row, dict) else []
+    return list(tags) if isinstance(tags, list) else list(cached_tags)
 
 def resolve_ollama_model(base_url: str, preferred: str) -> str:
     models = list_ollama_models(base_url)
@@ -12576,39 +12804,45 @@ def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_
     return EFFORT_LEVELS[min(max(EFFORT_ORDER[e], lo), hi)]
 
 
-def model_reasoning_style(provider: str, model: str) -> str:
+def model_reasoning_style(
+    provider: str,
+    model: str,
+    capabilities: dict | None = None,
+    *,
+    capabilities_probed: bool = False,
+) -> str:
     """Return which reasoning dialect a (provider, model) pair speaks.
 
     One of: "anthropic" | "openai" | "deepseek" | "glm" | "ollama" | "none".
     Conservative: only models known to support reasoning return a non-"none"
     style, so unknown models are never sent reasoning fields.
     """
-    prov = normalize_openai_compat_provider_name(provider) if provider else ""
-    raw_prov = str(provider or "").strip().lower()
-    m = str(model or "").strip().lower()
-    if raw_prov == "anthropic":
-        # Extended thinking on Claude 3.7+ / 4.x families.
-        if any(tok in m for tok in ("claude-3-7", "claude-3.7", "claude-sonnet-4",
-                                    "claude-opus-4", "claude-haiku-4", "claude-4",
-                                    "-thinking", "claude-sonnet-5", "claude-opus-5")):
-            return "anthropic"
-        return "none"
-    if raw_prov == "ollama":
-        # Local reasoning models (qwen3, deepseek-r1, etc.) accept native think flag.
-        if any(tok in m for tok in ("r1", "qwen3", "deepseek", "thinking", "reasoner", "magistral")):
-            return "ollama"
-        return "none"
-    if prov in OPENAI_COMPAT_PROVIDER_NAMES or raw_prov == "custom_http":
-        if prov == "glm" or m.startswith("glm-") or "glm" in m:
-            # GLM 4.5/4.6/5.x + coding endpoints use {"thinking": {...}}.
-            return "glm"
-        if "deepseek" in m or m in ("deepseek-reasoner",):
-            return "deepseek"
-        # OpenAI o-series / gpt-5 reasoning, and openrouter slugs that wrap them.
-        if (m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
-                or "gpt-5" in m or "/o1" in m or "/o3" in m or "/o4" in m
-                or "reasoning" in m):
+    # Probe metadata is authoritative.  A model name is never evidence of a
+    # reasoning API: providers may alias, fine-tune, or proxy models freely.
+    if isinstance(capabilities, dict):
+        explicit_style = str(
+            capabilities.get("reasoning_style")
+            or capabilities.get("reasoning_dialect")
+            or ""
+        ).strip().lower()
+        supported = capabilities.get("reasoning_supported")
+        if explicit_style in {"anthropic", "openai", "deepseek", "glm", "ollama", "none"}:
+            return explicit_style
+        if supported is False:
+            return "none"
+        if supported is True:
+            # A provider can advertise reasoning without a dialect; use its
+            # transport dialect rather than guessing from the model name.
+            raw_provider = str(provider or "").strip().lower()
+            if raw_provider == "anthropic":
+                return "anthropic"
+            if raw_provider == "ollama":
+                return "ollama"
+            if normalize_openai_compat_provider_name(provider) == "glm":
+                return "glm"
             return "openai"
+        if supported is None and not explicit_style:
+            return "none"
         return "none"
     return "none"
 
@@ -12619,6 +12853,7 @@ def resolve_reasoning_payload(
     effort: str,
     *,
     max_tokens: int = 2000,
+    capabilities: dict | None = None,
 ) -> dict:
     """Map (provider, model, effort) -> concrete request mutations.
 
@@ -12633,7 +12868,7 @@ def resolve_reasoning_payload(
     eff = str(effort or EFFORT_OFF).strip().lower()
     if eff not in EFFORT_ORDER or eff == EFFORT_OFF:
         return {}
-    style = model_reasoning_style(provider, model)
+    style = model_reasoning_style(provider, model, capabilities)
     if style == "none":
         return {}
     if style == "anthropic":
@@ -12664,13 +12899,19 @@ def resolve_reasoning_payload(
     return {}
 
 def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, str]:
+    raw_provider = str(provider or "").strip().lower().replace("-", "_")
     normalized = normalize_openai_compat_provider_name(provider)
     headers = {
         "Accept": "application/json",
         "User-Agent": "Clouds-Coder/1.0",
     }
     if str(api_key or "").strip():
-        headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+        if raw_provider == "anthropic":
+            headers["x-api-key"] = str(api_key).strip()
+        else:
+            headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+    if raw_provider == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     if normalized == "openrouter":
         headers.setdefault("HTTP-Referer", "https://clouds-coder.local")
         headers.setdefault("X-Title", "Clouds Coder")
@@ -12710,6 +12951,21 @@ def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> 
         out.append(url)
     return out
 
+
+def anthropic_model_list_url(endpoint_or_base: str) -> str:
+    """Return the Anthropic Models API URL for an API base or Messages URL."""
+    base = str(endpoint_or_base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    low = base.lower()
+    for suffix in ("/v1/messages", "/messages"):
+        if low.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+    if base.lower().endswith("/v1"):
+        return base + "/models"
+    return base + "/v1/models"
+
 def extract_openai_compat_model_ids(payload: object) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -12744,6 +13000,406 @@ def extract_openai_compat_model_ids(payload: object) -> list[str]:
             _add(node)
     _walk(payload, 0)
     return out
+
+
+def extract_openai_compat_model_records(payload: object) -> list[dict]:
+    """Extract model ids plus conservative capability hints from /models."""
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    def capability_hints(node: dict) -> dict:
+        caps: dict = {}
+        for key in ("reasoning_supported", "supports_reasoning", "reasoning", "thinking"):
+            if key in node:
+                raw = node.get(key)
+                if isinstance(raw, bool):
+                    caps["reasoning_supported"] = raw
+                    break
+                if isinstance(raw, (list, tuple, set)):
+                    caps["reasoning_supported"] = bool(raw)
+                    break
+                if isinstance(raw, str) and raw.strip().lower() in {
+                    "true", "yes", "on", "enabled", "supported"
+                }:
+                    caps["reasoning_supported"] = True
+                    break
+        style = node.get("reasoning_style") or node.get("reasoning_dialect")
+        if isinstance(style, str) and style.strip():
+            normalized_style = style.strip().lower()
+            if normalized_style in {"reasoning_effort", "reasoning-effort", "reasoning"}:
+                normalized_style = "openai"
+            caps["reasoning_style"] = normalized_style
+            caps.setdefault("reasoning_supported", True)
+        for key in ("supported_parameters", "supported_features", "features"):
+            values = node.get(key)
+            if isinstance(values, dict):
+                values = values.keys()
+            if isinstance(values, (list, tuple, set)):
+                names = {str(value or "").strip().lower() for value in values}
+                if any(
+                    any(token in value for token in ("reasoning", "thinking"))
+                    for value in names
+                ):
+                    caps.setdefault("reasoning_supported", True)
+                    if any("reasoning_effort" in value for value in names):
+                        caps.setdefault("reasoning_style", "openai")
+                    break
+        raw_caps = node.get("capabilities")
+        if isinstance(raw_caps, dict):
+            nested = capability_hints(raw_caps)
+            caps.update(nested)
+        elif isinstance(raw_caps, (list, tuple, set)):
+            nested = capability_hints({"supported_features": raw_caps})
+            caps.update(nested)
+        return caps
+
+    def walk(node: object, depth: int = 0):
+        if depth > 5 or node is None:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        model_id = ""
+        for key in ("id", "model", "name"):
+            value = node.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                model_id = trim(str(value).strip(), 240)
+                break
+        if model_id and model_id.lower() not in {"list", "model", "models", "object", "data"}:
+            low = model_id.lower()
+            if low not in seen:
+                seen.add(low)
+                caps = capability_hints(node)
+                records.append({"id": model_id, "capabilities": caps, "raw": node})
+        for key in ("data", "models", "items", "result", "results", "value"):
+            if key in node:
+                walk(node.get(key), depth + 1)
+
+    walk(payload)
+    return records
+
+
+_PROVIDER_MODEL_CACHE_LOCK = threading.Lock()
+_PROVIDER_MODEL_CACHE: dict[str, dict] = {}
+
+
+def _fetch_provider_models_cached(
+    key: str,
+    profile: dict,
+    cached_models: list[dict],
+) -> None:
+    """Fetch provider models and publish one cache snapshot."""
+    if not isinstance(profile, dict):
+        return
+    provider = str(profile.get("provider", "") or "").strip().lower()
+    base_url = str(profile.get("base_url", "") or "").strip().rstrip("/")
+    endpoint = str(profile.get("endpoint", "") or "").strip()
+    api_key = str(profile.get("api_key", "") or "").strip()
+    custom_headers = profile.get("headers", {})
+    custom_headers = (
+        {str(k): str(v) for k, v in custom_headers.items() if str(k).strip()}
+        if isinstance(custom_headers, dict)
+        else {}
+    )
+    records: list[dict] = []
+    try:
+        if provider == "ollama" and base_url:
+            records = probe_ollama_model_records(base_url, timeout=1.5)
+        elif provider == "anthropic":
+            models_url = anthropic_model_list_url(base_url or endpoint)
+            headers = openai_compat_probe_headers(provider, api_key)
+            headers.update(custom_headers)
+            seen: set[str] = set()
+            after_id = ""
+            for _page in range(20):
+                if not models_url:
+                    break
+                separator = "&" if "?" in models_url else "?"
+                page_url = f"{models_url}{separator}limit=1000"
+                if after_id:
+                    page_url += f"&after_id={quote(after_id, safe='')}"
+                req = Request(page_url, method="GET", headers=headers)
+                with urlopen(req, timeout=3) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                page_records = extract_openai_compat_model_records(payload)
+                for record in page_records:
+                    model_id = str(record.get("id", "") or "").strip()
+                    if model_id and model_id not in seen:
+                        seen.add(model_id)
+                        records.append(record)
+                if not isinstance(payload, dict) or not bool(payload.get("has_more")):
+                    break
+                next_after = str(payload.get("last_id", "") or "").strip()
+                if not next_after or next_after == after_id:
+                    break
+                after_id = next_after
+        elif is_openai_compat_provider(provider) or provider == "custom_http":
+            headers = openai_compat_probe_headers(provider, api_key)
+            headers.update(custom_headers)
+            for url in openai_compat_model_list_urls(base_url or endpoint, provider):
+                try:
+                    req = Request(url, method="GET", headers=headers)
+                    with urlopen(req, timeout=3) as resp:
+                        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    records = extract_openai_compat_model_records(payload)
+                    if records:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        records = []
+    finally:
+        with _PROVIDER_MODEL_CACHE_LOCK:
+            previous = _PROVIDER_MODEL_CACHE.get(key, {})
+            _PROVIDER_MODEL_CACHE[key] = {
+                "ts": time.time(),
+                "models": records or previous.get("models", cached_models),
+            }
+
+
+def probe_provider_models(
+    profile: dict,
+    *,
+    force_refresh: bool = False,
+    ttl_seconds: int = 30,
+    background: bool = False,
+    cached_only: bool = False,
+) -> list[dict]:
+    """Return cached provider models and optionally refresh them in the background.
+
+    Direct callers retain synchronous probing by default. Model catalog reads
+    pass ``background=True`` so a cold network cache never blocks a UI request.
+    """
+    if not isinstance(profile, dict):
+        return []
+    provider = str(profile.get("provider", "") or "").strip().lower()
+    base_url = str(profile.get("base_url", "") or "").strip().rstrip("/")
+    endpoint = str(profile.get("endpoint", "") or "").strip()
+    api_key = str(profile.get("api_key", "") or "").strip()
+    raw_headers = profile.get("headers", {})
+    header_secret = (
+        json.dumps(
+            {str(k): str(v) for k, v in raw_headers.items()},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        if isinstance(raw_headers, dict)
+        else ""
+    )
+    auth_material = f"{api_key}\0{header_secret}"
+    key_fingerprint = (
+        hashlib.sha256(auth_material.encode("utf-8")).hexdigest()[:12]
+        if api_key or header_secret
+        else "-"
+    )
+    key = hashlib.sha256(
+        f"{provider}|{base_url}|{endpoint}|{key_fingerprint}".encode()
+    ).hexdigest()[:24]
+    now = time.time()
+    with _PROVIDER_MODEL_CACHE_LOCK:
+        cached = _PROVIDER_MODEL_CACHE.get(key, {})
+        cached_models = [
+            dict(x) for x in cached.get("models", []) if isinstance(x, dict)
+        ]
+        if cached_only:
+            return cached_models
+        if cached and not force_refresh and now - float(cached.get("ts", 0.0) or 0.0) <= ttl_seconds:
+            return cached_models
+        if cached.get("fetching"):
+            return cached_models
+        cached["fetching"] = True
+        _PROVIDER_MODEL_CACHE[key] = cached
+    profile_snapshot = dict(profile)
+    if background:
+        threading.Thread(
+            target=_fetch_provider_models_cached,
+            args=(key, profile_snapshot, cached_models),
+            name=f"model-probe-{provider or 'provider'}",
+            daemon=True,
+        ).start()
+        return cached_models
+    _fetch_provider_models_cached(key, profile_snapshot, cached_models)
+    with _PROVIDER_MODEL_CACHE_LOCK:
+        row = _PROVIDER_MODEL_CACHE.get(key, {})
+        models = row.get("models", []) if isinstance(row, dict) else []
+    return [dict(x) for x in models if isinstance(x, dict)]
+
+
+MODEL_RUNTIME_SETTING_KEYS = {
+    "effort", "max_effort", "thinking_stream", "response_stream",
+    "reasoning_supported", "reasoning_style", "temperature", "request_timeout",
+}
+
+
+def merge_probed_models_into_profile(
+    profile: dict,
+    records: object = None,
+    model_ids: object = None,
+) -> bool:
+    """Persist the provider's discovered model directory and per-model hints."""
+    if not isinstance(profile, dict):
+        return False
+    existing = [str(value).strip() for value in profile.get("models", []) if str(value).strip()]
+    ids = list(existing)
+    for raw in model_ids or []:
+        value = str(raw or "").strip()
+        if value and value not in ids:
+            ids.append(value)
+    settings = dict(profile.get("model_settings", {}) or {}) if isinstance(profile.get("model_settings"), dict) else {}
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        model_id = str(record.get("id") or record.get("model") or record.get("name") or "").strip()
+        if not model_id:
+            continue
+        if model_id not in ids:
+            ids.append(model_id)
+        caps = record.get("capabilities") if isinstance(record.get("capabilities"), dict) else {}
+        if not isinstance(caps, dict):
+            caps = {}
+        if caps.get("reasoning_style") is None and caps.get("reasoning_dialect"):
+            caps = dict(caps)
+            caps["reasoning_style"] = caps.get("reasoning_dialect")
+        normalized = normalize_model_runtime_settings(caps)
+        if normalized:
+            prior = normalize_model_runtime_settings(settings.get(model_id, {}))
+            settings[model_id] = {**prior, **normalized}
+    changed = ids != existing or settings != (profile.get("model_settings") if isinstance(profile.get("model_settings"), dict) else {})
+    if ids:
+        profile["models"] = ids
+        if not str(profile.get("model", "") or "").strip() or str(profile.get("model", "")).strip().lower() in {"auto", "custom-model"}:
+            profile["model"] = ids[0]
+        profile["selection"] = f"{profile.get('id', '')}::{profile.get('model', '')}"
+    if settings:
+        profile["model_settings"] = settings
+    return changed
+
+
+def probe_and_merge_model_profiles(
+    profiles: object,
+    *,
+    force_refresh: bool = True,
+) -> bool:
+    """Probe every configured provider and merge its complete model directory.
+
+    Import/reset paths use synchronous probing so a newly imported profile is
+    immediately usable with every model the provider exposes. Network errors
+    leave the explicitly configured models intact; the catalog can retry later.
+    """
+    if isinstance(profiles, dict):
+        rows = list(profiles.values())
+    elif isinstance(profiles, list):
+        rows = profiles
+    else:
+        return False
+    valid_rows = [profile for profile in rows if isinstance(profile, dict)]
+    if not valid_rows:
+        return False
+    records_by_index: dict[int, list[dict]] = {}
+
+    def _probe(profile: dict) -> list[dict]:
+        try:
+            return probe_provider_models(
+                profile,
+                force_refresh=bool(force_refresh),
+                background=False,
+            )
+        except Exception:
+            return []
+
+    # Providers are independent network services. Probe them concurrently so
+    # an unavailable vendor contributes one timeout instead of serially
+    # delaying every other imported profile.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, len(valid_rows)),
+        thread_name_prefix="provider-model-import",
+    ) as executor:
+        future_map = {
+            executor.submit(_probe, profile): index
+            for index, profile in enumerate(valid_rows)
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            index = future_map[future]
+            try:
+                records_by_index[index] = future.result()
+            except Exception:
+                records_by_index[index] = []
+
+    changed = False
+    for index, profile in enumerate(valid_rows):
+        changed = merge_probed_models_into_profile(
+            profile, records_by_index.get(index, [])
+        ) or changed
+    return changed
+
+
+def normalize_model_runtime_settings(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key in MODEL_RUNTIME_SETTING_KEYS:
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if key in {"thinking_stream", "response_stream", "reasoning_supported"}:
+            if key == "reasoning_supported" and value is None:
+                continue
+            out[key] = _to_bool_like(value, default=False)
+        elif key in {"effort", "max_effort", "reasoning_style"}:
+            text = str(value or "").strip().lower()
+            if key == "reasoning_style" or text in EFFORT_ORDER or not text:
+                out[key] = text
+        elif key == "temperature":
+            try:
+                out[key] = max(0.0, min(2.0, float(value)))
+            except Exception:
+                continue
+        elif key == "request_timeout":
+            out[key] = normalize_timeout_seconds(value, minimum=MIN_TIMEOUT_SECONDS, maximum=MAX_TIMEOUT_SECONDS, fallback=DEFAULT_REQUEST_TIMEOUT)
+    return out
+
+
+def apply_model_runtime_settings(profile: dict, model: str, settings: object = None) -> dict:
+    row = dict(profile or {})
+    target = str(model or row.get("model", "") or "").strip()
+    per_model = row.get("model_settings")
+    if not isinstance(per_model, dict):
+        per_model = {}
+    merged = normalize_model_runtime_settings(per_model.get(target, {}))
+    merged.update(normalize_model_runtime_settings(settings))
+    if merged:
+        per_model[target] = dict(merged)
+        row["model_settings"] = per_model
+    row["model"] = target or str(row.get("model", "") or "")
+    row["selection"] = f"{row.get('id', '')}::{row.get('model', '')}"
+    return row
+
+
+def model_runtime_settings_for(profile: dict, model: str = "") -> dict:
+    """Return the effective settings for one model without exposing secrets."""
+    row = profile if isinstance(profile, dict) else {}
+    target = str(model or row.get("model", "") or "").strip()
+    out = normalize_model_runtime_settings(row)
+    per_model = row.get("model_settings")
+    if isinstance(per_model, dict):
+        out.update(normalize_model_runtime_settings(per_model.get(target, {})))
+    return out
+
+
+def apply_model_option_runtime_fields(option: dict, profile: dict, model: str = "") -> dict:
+    """Overlay per-model runtime settings on a public catalog option."""
+    target = str(model or option.get("model", "") or "").strip()
+    settings = model_runtime_settings_for(profile, target)
+    for key in MODEL_RUNTIME_SETTING_KEYS:
+        if key in settings:
+            option[key] = settings[key]
+    if isinstance(profile, dict):
+        option.setdefault("display_name", str(profile.get("display_name", profile.get("label", "")) or ""))
+        option.setdefault("title", str(profile.get("title", profile.get("label", "")) or ""))
+    return option
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -12819,6 +13475,19 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         model_caps_map = parse_json_object(model_caps_map, {})
     if not isinstance(model_caps_map, dict):
         model_caps_map = {}
+
+    # Reasoning metadata is kept separate from multimodal capabilities.  The
+    # importer writes this map from provider model probes, and it must survive
+    # a config round-trip so model-specific effort controls remain available
+    # after restart.
+    raw_reasoning_map = config.get(
+        "model_reasoning_capabilities",
+        config.get("reasoning_capabilities", {}),
+    )
+    if isinstance(raw_reasoning_map, str):
+        raw_reasoning_map = parse_json_object(raw_reasoning_map, {})
+    if not isinstance(raw_reasoning_map, dict):
+        raw_reasoning_map = {}
 
     raw_global_caps = config.get("multimodal_capabilities", config.get("capabilities", {}))
     if isinstance(raw_global_caps, str):
@@ -12920,6 +13589,30 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 return {str(k): str(v) for k, v in parsed.items()}
         return {}
 
+    def parse_profile_model_settings(raw: object, model_ids: list[str] | None = None) -> dict:
+        """Normalize per-model runtime settings from config without secrets."""
+        if isinstance(raw, str):
+            raw = parse_json_object(raw, {})
+        if not isinstance(raw, dict):
+            return {}
+        settings: dict[str, dict] = {}
+        # A flat settings object applies to the profile's default model.
+        if any(key in MODEL_RUNTIME_SETTING_KEYS for key in raw):
+            target = str((model_ids or [""])[0] or "").strip()
+            if target:
+                normalized = normalize_model_runtime_settings(raw)
+                if normalized:
+                    settings[target] = normalized
+            return settings
+        for target, value in raw.items():
+            model_id = str(target or "").strip()
+            if not model_id or not isinstance(value, dict):
+                continue
+            normalized = normalize_model_runtime_settings(value)
+            if normalized:
+                settings[model_id] = normalized
+        return settings
+
     def add_profile(
         out: list[dict],
         *,
@@ -12927,6 +13620,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         provider: str,
         label: str,
         model: str = "",
+        models: list[str] | None = None,
+        display_name: str = "",
+        title: str = "",
         base_url: str = "",
         endpoint: str = "",
         api_key: str = "",
@@ -12941,6 +13637,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         source: str = "config",
         effort: str = "",
         max_effort: str = "",
+        reasoning_supported: bool | None = None,
+        reasoning_style: str = "",
+        model_settings: dict | None = None,
     ):
         out.append(
             {
@@ -12948,6 +13647,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "provider": provider,
                 "label": label,
                 "model": (model or "").strip(),
+                "models": [str(x).strip() for x in (models or []) if str(x).strip()],
+                "display_name": str(display_name or label or "").strip(),
+                "title": str(title or label or "").strip(),
                 "base_url": (base_url or "").strip(),
                 "endpoint": (endpoint or "").strip(),
                 "api_key": (api_key or "").strip(),
@@ -12966,12 +13668,20 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "media_endpoints": media_endpoints or {},
                 "effort": str(effort or "").strip().lower(),
                 "max_effort": str(max_effort or "").strip().lower(),
+                "reasoning_supported": reasoning_supported,
+                "reasoning_style": str(reasoning_style or "").strip().lower(),
+                "model_settings": {
+                    str(model_id).strip(): normalize_model_runtime_settings(values)
+                    for model_id, values in (model_settings or {}).items()
+                    if str(model_id).strip() and normalize_model_runtime_settings(values)
+                },
                 "source": source,
             }
         )
 
     profiles: list[dict] = []
-    provider = str(config.get("provider", "")).strip().lower()
+    config_provider = normalize_profile_provider(str(config.get("provider", "")))
+    provider = config_provider
     temp = float(config.get("temperature", 0.2) or 0.2)
     timeout = normalize_timeout_seconds(
         config.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
@@ -13055,6 +13765,12 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         ).strip()
         if not provider and (base_hint or endpoint):
             provider = "openai_compat"
+        # Arbitrary provider names are transported through the custom HTTP
+        # adapter while preserving the user supplied name for display.
+        provider_name = str(provider_hint or "").strip()
+        if provider and provider not in {"ollama", "anthropic", "custom_http"} and not is_openai_like_provider(provider) and (base_hint or endpoint):
+            provider_name = provider_name or provider
+            provider = "custom_http"
         if not provider:
             continue
         profile_id = sanitize_profile_id(
@@ -13069,9 +13785,12 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         )
         label = str(
             raw_profile.get("label")
+            or raw_profile.get("custom_name")
             or raw_profile.get("name")
             or raw_profile.get("title")
+            or raw_profile.get("custom_title")
             or raw_profile.get("display_name")
+            or provider_name
             or profile_id
         ).strip() or profile_id
         model = str(
@@ -13080,8 +13799,32 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             or raw_profile.get("default_model")
             or ""
         ).strip()
+        raw_models = raw_profile.get("models", raw_profile.get("model_ids", raw_profile.get("available_models", [])))
+        if isinstance(raw_models, str):
+            raw_models = [x.strip() for x in re.split(r"[,\n]", raw_models) if x.strip()]
+        if not isinstance(raw_models, list):
+            raw_models = []
+        model_settings: dict[str, dict] = {}
+        model_values: list[str] = []
+        for value in raw_models:
+            if isinstance(value, dict):
+                model_id = str(value.get("id") or value.get("model") or value.get("name") or "").strip()
+                if not model_id:
+                    continue
+                model_values.append(model_id)
+                inline_settings = normalize_model_runtime_settings(value)
+                if inline_settings:
+                    model_settings[model_id] = inline_settings
+            elif str(value).strip():
+                model_values.append(str(value).strip())
+        models = list(dict.fromkeys(model_values))
+        if model and model not in models:
+            models.insert(0, model)
         if not model:
-            model = default_model_for_provider(provider)
+            # A supplied model directory is already authoritative.  Do not
+            # prepend a synthetic provider default such as ``custom-model``.
+            model = models[0] if models else default_model_for_provider(provider)
+        model_settings.update(parse_profile_model_settings(raw_profile.get("model_settings"), [model] + models))
         base_url = extract_base_url(base_hint or endpoint)
         if provider == "ollama" and not base_url:
             base_url = extract_base_url(default_ollama_url)
@@ -13128,6 +13871,20 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             provider=provider,
             label=label,
             model=model,
+            models=models,
+            display_name=str(
+                raw_profile.get("display_name")
+                or raw_profile.get("provider_name")
+                or raw_profile.get("custom_name")
+                or (raw_profile.get("name") if provider == "custom_http" else "")
+                or (provider_name if provider_name and provider_name.lower() not in {"custom_http", "openai_compat"} else "")
+                or label
+            ),
+            title=str(
+                raw_profile.get("title")
+                or raw_profile.get("custom_title")
+                or label
+            ),
             base_url=base_url,
             endpoint=endpoint,
             api_key=api_key,
@@ -13154,6 +13911,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=media_endpoints,
             effort=str(raw_profile.get("effort", effort_default) or effort_default),
             max_effort=str(raw_profile.get("max_effort", max_effort_default) or max_effort_default),
+            reasoning_supported=(raw_profile.get("reasoning_supported") if isinstance(raw_profile.get("reasoning_supported"), bool) else None),
+            reasoning_style=str(raw_profile.get("reasoning_style") or raw_profile.get("reasoning_dialect") or ""),
+            model_settings=model_settings,
             source=str(raw_profile.get("source", "profiles") or "profiles"),
         )
         if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
@@ -13362,17 +14122,60 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("openrouter"),
         )
 
-    custom_url = str(config.get("custom_url", "")).strip()
+    custom_url = str(
+        config.get("custom_url")
+        or (config.get("provider_url") if config_provider == "custom_http" else "")
+        or (config.get("url") if config_provider == "custom_http" else "")
+        or ""
+    ).strip()
     custom_key = str(config.get("custom_key", "")).strip()
     custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
     custom_payload = str(config.get("custom_payload", "") or "").strip()
     if custom_url:
+        raw_custom_models = config.get(
+            "custom_models",
+            config.get(
+                "custom_model_ids",
+                config.get("models", []) if config_provider == "custom_http" else [],
+            ),
+        )
+        if isinstance(raw_custom_models, str):
+            raw_custom_models = [x.strip() for x in re.split(r"[,\n]", raw_custom_models) if x.strip()]
+        custom_models = [str(x).strip() for x in raw_custom_models] if isinstance(raw_custom_models, list) else []
+        custom_model = str(
+            config.get("custom_model", "")
+            or (config.get("model", "") if config_provider == "custom_http" else "")
+            or config.get("openai_model", "")
+        ).strip()
+        if not custom_model and custom_models:
+            custom_model = custom_models[0]
+        if not custom_model:
+            custom_model = "custom-model"
+        if custom_model and custom_model not in custom_models:
+            custom_models.insert(0, custom_model)
         add_profile(
             profiles,
             profile_id="custom",
             provider=normalize_profile_provider("custom_http"),
-            label="Custom HTTP",
-            model=str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model"),
+            label=str(
+                config.get("custom_name")
+                or (config.get("provider_name") if config_provider == "custom_http" else "")
+                or config.get("custom_title")
+                or "Custom HTTP"
+            ),
+            model=custom_model,
+            models=custom_models,
+            display_name=str(
+                config.get("custom_name")
+                or (config.get("provider_name") if config_provider == "custom_http" else "")
+                or "Custom HTTP"
+            ),
+            title=str(
+                config.get("custom_title")
+                or (config.get("provider_title") if config_provider == "custom_http" else "")
+                or config.get("custom_name")
+                or "Custom HTTP"
+            ),
             base_url=extract_base_url(custom_url),
             endpoint=custom_url,
             api_key=custom_key,
@@ -13403,6 +14206,44 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             source="default",
         )
 
+    # Legacy provider keys may carry a comma/newline separated model list.
+    # Keep the configured default first, then let the catalog append probed
+    # models without creating duplicate profiles.
+    provider_model_keys = {
+        "ollama": "ollama_models", "openai_compat": "openai_models",
+        "siliconflow": "siliconflow_models", "vllm": "vllm_models",
+        "lmstudio": "lmstudio_models", "anthropic": "anthropic_models",
+        "glm": "glm_models", "kimi": "kimi_models", "openrouter": "openrouter_models",
+        "custom_http": "custom_models",
+    }
+    for profile in profiles:
+        prov = str(profile.get("provider", "") or "").lower()
+        model_list_key = provider_model_keys.get(prov, "")
+        raw_list = (
+            config.get(
+                model_list_key,
+                config.get("models", []) if config_provider == prov else [],
+            )
+            if model_list_key
+            else []
+        )
+        if isinstance(raw_list, str):
+            raw_list = [x.strip() for x in re.split(r"[,\n]", raw_list) if x.strip()]
+        existing = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+        if not existing and isinstance(raw_list, list):
+            existing = [str(x).strip() for x in raw_list if str(x).strip()]
+        default_model = str(profile.get("model", "") or "").strip()
+        # ``auto`` is a transport placeholder for local OpenAI-compatible
+        # servers.  Once a model directory is available, make its first
+        # discovered entry the active model so importing a directory is
+        # immediately runnable and stable across restarts.
+        if existing and default_model.lower() == "auto":
+            default_model = existing[0]
+            profile["model"] = default_model
+        if default_model and default_model not in existing:
+            existing.insert(0, default_model)
+        profile["models"] = existing
+
     active_map = {
         "ollama": "ollama",
         "openai": "openai",
@@ -13423,7 +14264,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 default_profile_id = candidate
                 break
     if not default_profile_id:
-        default_profile_id = active_map.get(provider, "")
+        default_profile_id = active_map.get(config_provider or provider, "")
     if not default_profile_id or default_profile_id not in profile_ids:
         # Fallback: first non-ollama profile that was explicitly configured
         for p in profiles:
@@ -13442,6 +14283,51 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 p["effort"] = effort_default
             if max_effort_default and not str(p.get("max_effort", "") or "").strip():
                 p["max_effort"] = max_effort_default
+    raw_runtime_settings = config.get(
+        "model_settings",
+        config.get("model_runtime_settings", config.get("runtime_settings", {})),
+    )
+    if isinstance(raw_runtime_settings, str):
+        raw_runtime_settings = parse_json_object(raw_runtime_settings, {})
+    if isinstance(raw_runtime_settings, dict):
+        for profile in profiles:
+            current = dict(profile.get("model_settings", {}) or {})
+            profile_model = str(profile.get("model", "") or "").strip()
+            provider_id = str(profile.get("id", "") or "").strip()
+            provider_name = str(profile.get("provider", "") or "").strip()
+            for model_id, value in raw_reasoning_map.items():
+                normalized = normalize_model_runtime_settings(value)
+                target = str(model_id or "").strip()
+                if target and normalized:
+                    current[target] = {**current.get(target, {}), **normalized}
+            for key in (profile_model, provider_id, provider_name):
+                value = raw_runtime_settings.get(key) if key else None
+                if isinstance(value, dict) and any(k in MODEL_RUNTIME_SETTING_KEYS for k in value):
+                    normalized = normalize_model_runtime_settings(value)
+                    if profile_model and normalized:
+                        current[profile_model] = {**current.get(profile_model, {}), **normalized}
+            for model_id, value in raw_runtime_settings.items():
+                if not isinstance(value, dict):
+                    continue
+                normalized = normalize_model_runtime_settings(value)
+                if normalized:
+                    current[str(model_id).strip()] = {**current.get(str(model_id).strip(), {}), **normalized}
+                elif str(model_id) in {provider_id, provider_name}:
+                    for nested_model, nested_value in value.items():
+                        nested = normalize_model_runtime_settings(nested_value)
+                        if nested:
+                            target = str(nested_model or "").strip()
+                            current[target] = {**current.get(target, {}), **nested}
+            profile["model_settings"] = current
+    elif raw_reasoning_map:
+        for profile in profiles:
+            current = dict(profile.get("model_settings", {}) or {})
+            for model_id, value in raw_reasoning_map.items():
+                target = str(model_id or "").strip()
+                normalized = normalize_model_runtime_settings(value)
+                if target and normalized:
+                    current[target] = {**current.get(target, {}), **normalized}
+            profile["model_settings"] = current
     return {"profiles": profiles, "default_profile_id": default_profile_id}
 
 def looks_like_llm_config(config: dict) -> bool:
@@ -13483,13 +14369,23 @@ def looks_like_llm_config(config: dict) -> bool:
         "openrouter_model",
         "openrouter_key",
         "custom_url",
+        "provider_url",
+        "provider_name",
+        "provider_title",
+        "name",
+        "title",
+        "custom_name",
+        "custom_title",
         "custom_model",
+        "custom_models",
         "custom_key",
         "custom_headers",
         "custom_payload",
         "capabilities",
         "multimodal_capabilities",
         "model_capabilities",
+        "model_reasoning_capabilities",
+        "reasoning_capabilities",
         "media_endpoints",
         "ollama_capabilities",
         "openai_capabilities",
@@ -13519,6 +14415,8 @@ def looks_like_llm_config(config: dict) -> bool:
         "custom_video_endpoint",
         "temperature",
         "request_timeout",
+        "model_settings",
+        "model_runtime_settings",
     }
     return bool(keys & markers)
 
@@ -14115,12 +15013,14 @@ class AdminAuthStore:
             not self.path.parent.is_dir() or not self.path.is_file()
         ):
             raise sqlite3.OperationalError("administrator authentication storage is unavailable")
-        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=10.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=10000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+            ),
+        )
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -14405,12 +15305,14 @@ class IDEAuthStore:
             not self.path.parent.is_dir() or not self.path.is_file()
         ):
             raise sqlite3.OperationalError("IDE authentication storage is unavailable")
-        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=10.0, isolation_level=None,
+            pragmas=(
+                "PRAGMA busy_timeout=10000",
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=FULL",
+            ),
+        )
 
     def storage_health(self) -> dict:
         try:
@@ -25371,6 +26273,8 @@ class OllamaClient:
         self.thinking_stream = bool(thinking_stream)
         self.response_stream = bool(response_stream)
         self.capabilities = default_multimodal_capabilities()
+        self.reasoning_supported: bool | None = None
+        self.reasoning_style: str = ""
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
         self.telemetry_callback = None
@@ -25708,6 +26612,8 @@ class OllamaClient:
             infer_model_multimodal_capabilities(self.provider, self.model),
             declared_caps,
         )
+        self.reasoning_supported = profile.get("reasoning_supported") if isinstance(profile.get("reasoning_supported"), bool) else None
+        self.reasoning_style = str(profile.get("reasoning_style", "") or "").strip().lower()
         self.media_endpoints = parse_media_endpoints(profile.get("media_endpoints", {}))
         if "embed_model" in profile:
             self.embed_model = str(profile.get("embed_model") or "").strip()
@@ -27622,7 +28528,14 @@ class OllamaClient:
         # Resolve provider-neutral effort into native reasoning mutations once.
         # probe_mode never reasons (it is a cheap capability ping).
         reasoning = {} if probe_mode else resolve_reasoning_payload(
-            self.provider, self.model, effort, max_tokens=max_tokens,
+            self.provider,
+            self.model,
+            effort,
+            max_tokens=max_tokens,
+            capabilities={
+                "reasoning_supported": self.reasoning_supported,
+                "reasoning_style": self.reasoning_style,
+            },
         )
         if reasoning.get("max_tokens"):
             max_tokens = int(reasoning["max_tokens"])
@@ -27748,7 +28661,11 @@ class OllamaClient:
         # thinking by default when the field is omitted.  Send the explicit
         # boolean for models that advertise the native switch so a bounded
         # no-thinking compatibility turn can actually produce a tool call.
-        if model_reasoning_style(provider, self.model) == "ollama":
+        if provider == "ollama" and self.reasoning_supported is not False:
+            # Ollama accepts an explicit boolean on native chat. Unknown
+            # capability metadata stays conservative because the caller's
+            # ``think`` value defaults to false; no model-name inference is
+            # used to turn reasoning on.
             native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools
@@ -29097,6 +30014,21 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
 class SessionState:
+    @staticmethod
+    def _normalize_workspace_id(value: object, fallback: str) -> str:
+        """Normalize persisted workspace lineage without allowing path traversal."""
+        default = trim(str(fallback or "").strip(), 160)
+        candidate = trim(str(value or "").strip(), 160)
+        if (
+            not candidate
+            or candidate in {".", ".."}
+            or "/" in candidate
+            or "\\" in candidate
+            or "\x00" in candidate
+        ):
+            return default
+        return candidate
+
     def __init__(
         self,
         session_id: str,
@@ -29141,6 +30073,7 @@ class SessionState:
         knowledge_library_status_callback=None,
         mcp_manager=None,
         workspace_root: Path | None = None,
+        workspace_id: str = "",
         collaboration_context: dict | None = None,
         collaboration_context_provider=None,
         collaboration_write_coordinator=None,
@@ -29156,6 +30089,7 @@ class SessionState:
     ):
         self.id = session_id
         self.title = title
+        self.workspace_id = trim(str(workspace_id or session_id).strip(), 160) or session_id
         self.kernel_version = str(kernel_version or "")
         self.kernel_runtime = kernel_runtime
         self.title_origin = (
@@ -29408,7 +30342,7 @@ class SessionState:
             l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
         )
         self.runtime_requires_todos: bool | None = None
-        self._todowrite_step_counter: dict[str, int] = {}  # Fix 5: track consecutive TodoWrite per step for loop detection
+        self._todowrite_step_counter: dict[str, int] = {}  # Consecutive no-progress writes by task, step, and role.
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
         # Full, lossless source request for the active task. Derived runtime
@@ -29463,6 +30397,12 @@ class SessionState:
         # keeping them out of persistence preserves small snapshots.
         self._long_content_source_cache: dict[str, dict] = {}
         self._long_content_structure_cache: dict[str, dict] = {}
+        # Source-version keyed inverted indexes let large-file searches jump
+        # directly to relevant lines instead of scanning the decoded source
+        # on every query.  The index is transient; durable cards and source
+        # fingerprints remain the persistence boundary.
+        self._long_content_search_index_cache: dict[str, dict] = {}
+        self._readonly_bash_cache: dict[str, dict] = {}
         # Durable, source-addressable understanding for long text/files/code.
         # ``read_context_registry`` keeps raw tool evidence; this registry keeps
         # compact structure/cards so a later turn can resume comprehension
@@ -30341,7 +31281,14 @@ class SessionState:
         profile = self.model_profiles.get(self.active_profile_id)
         if not profile:
             return
-        row = dict(profile)
+        stored = dict(profile)
+        row = dict(stored)
+        # Restore the selected model's persisted runtime controls before the
+        # client is configured. This keeps effort/streaming identical after a
+        # restart and when a session is loaded by the IDE.
+        active_model = str(row.get("model", "") or "").strip()
+        for key, value in model_runtime_settings_for(row, active_model).items():
+            row[key] = value
         timeout_floor = max(MIN_TIMEOUT_SECONDS, int(self.max_run_seconds or 0))
         row["request_timeout"] = normalize_timeout_seconds(
             row.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
@@ -30356,9 +31303,13 @@ class SessionState:
             if cached_caps:
                 merged = merge_multimodal_capabilities(self._capabilities_from_profile(row), cached_caps)
                 row["capabilities"] = merged
-        self.model_profiles[self.active_profile_id] = row
-        profile = row
-        self.ollama.apply_profile(profile)
+                stored["capabilities"] = merged
+        stored["request_timeout"] = row["request_timeout"]
+        self.model_profiles[self.active_profile_id] = stored
+        # Keep per-model controls in ``model_settings``. Applying them to the
+        # client must not promote them to profile-level defaults, otherwise a
+        # later model switch would inherit the previous model's settings.
+        self.ollama.apply_profile(row)
         self.thinking = False
 
     def _profile_is_runnable(self, profile: dict) -> bool:
@@ -30424,6 +31375,7 @@ class SessionState:
         if force_probe:
             self._ensure_active_profile_capabilities(force_probe=True)
         opts = []
+        profiles_changed = False
         ollama_profile_id = ""
         ollama_base = self.ollama.base_url
         for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
@@ -30447,6 +31399,29 @@ class SessionState:
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model,
+                            caps,
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model,
+                            caps,
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                     "capabilities_probed": bool(cache_entry),
                     "capabilities_probed_at": float(cache_entry.get("updated_at", 0.0) or 0.0)
@@ -30463,7 +31438,24 @@ class SessionState:
             base = str(profile.get("base_url", self.ollama.base_url) or self.ollama.base_url).strip()
             if not base:
                 continue
-            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            tags = list_ollama_models_cached(
+                base,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            ollama_records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(
+                profile, ollama_records, model_ids=tags
+            ) or profiles_changed
+            ollama_record_map = {
+                str(record.get("id", "")): record
+                for record in ollama_records
+                if isinstance(record, dict) and str(record.get("id", "")).strip()
+            }
             if tags:
                 if pid == self.active_profile_id:
                     self.ollama_env_tags = list(tags)
@@ -30479,6 +31471,13 @@ class SessionState:
                 tag_cache_key = self._profile_cache_key(tag_profile, tag)
                 tag_cache_entry = self.multimodal_capability_cache.get(tag_cache_key, {})
                 tag_caps = self._capabilities_from_profile(tag_profile, model_override=tag)
+                tag_record = ollama_record_map.get(tag)
+                tag_record_caps = (
+                    tag_record.get("capabilities", {})
+                    if isinstance(tag_record, dict)
+                    else {}
+                )
+                tag_record_probed = isinstance(tag_record, dict)
                 opts.append(
                     {
                         "selection": selection,
@@ -30490,6 +31489,35 @@ class SessionState:
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
                         "response_stream": bool(profile.get("response_stream", self.ollama.response_stream)),
+                        "effort": str(profile.get("effort", "") or ""),
+                        "max_effort": str(profile.get("max_effort", "") or ""),
+                        "reasoning_supported": (
+                            profile.get("reasoning_supported")
+                            if profile.get("reasoning_supported") is not None
+                            else tag_record_caps.get("reasoning_supported")
+                            if isinstance(tag_record_caps, dict)
+                            and tag_record_caps.get("reasoning_supported") is not None
+                            else model_reasoning_style(
+                                str(profile.get("provider", "")),
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            != "none"
+                        ),
+                        "reasoning_style": str(
+                            profile.get("reasoning_style")
+                            or tag_record_caps.get("reasoning_style", "")
+                            or model_reasoning_style(
+                                str(profile.get("provider", "")),
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            or ""
+                        ),
+                        "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                        "title": str(profile.get("title", profile.get("label", pid)) or ""),
                         "capabilities": tag_caps,
                         "capabilities_probed": bool(tag_cache_entry),
                         "capabilities_probed_at": float(tag_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -30497,6 +31525,69 @@ class SessionState:
                         else 0.0,
                     }
                 )
+        # Expand every provider from configured model lists and bounded probes.
+        # The cache prevents status polling from repeatedly hitting vendors.
+        for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": self._capabilities_from_profile(dict(profile, model=model_id), model_override=model_id),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.model_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         runnable_opts = [x for x in opts if self._option_is_runnable(x)]
         if runnable_opts:
             opts = runnable_opts
@@ -30518,6 +31609,27 @@ class SessionState:
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "response_stream": bool(active.get("response_stream", False)),
+                    "effort": str(active.get("effort", "") or ""),
+                    "max_effort": str(active.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        active.get("reasoning_supported")
+                        if active.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        active.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
                     "capabilities_probed": bool(active_cache_entry),
                     "capabilities_probed_at": float(active_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -30525,11 +31637,15 @@ class SessionState:
                     else 0.0,
                 },
             )
+            apply_model_option_runtime_fields(opts[0], active, str(active.get("model", "") or ""))
             option_map.add(selected)
         if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
         active_caps = self._capabilities_from_profile(active if isinstance(active, dict) else {})
         active_cache = self.multimodal_capability_cache.get(self._profile_cache_key(active if isinstance(active, dict) else {}), {})
+        if profiles_changed:
+            self.updated_at = now_ts()
+            self._persist()
         return {
             "provider": active.get("provider", "ollama"),
             "selected": selected,
@@ -30551,6 +31667,7 @@ class SessionState:
         model_override: str | None = None,
         *,
         reset_failures: bool = True,
+        settings: dict | None = None,
     ) -> dict:
         raw = str(selection or "").strip()
         explicit_profile = "::" in raw
@@ -30581,6 +31698,11 @@ class SessionState:
             profile["model"] = str(model_override).strip()
         elif str(selected_model).strip():
             profile["model"] = str(selected_model).strip()
+        profile = apply_model_runtime_settings(profile, str(profile.get("model", "") or ""), settings)
+        for record in probe_provider_models(profile, background=True):
+            if str(record.get("id", "")) == str(profile.get("model", "")):
+                merge_probed_models_into_profile(profile, [record])
+                break
         if not self._profile_is_runnable(profile) and not explicit_profile and str(selected_model).strip():
             fallback = self._pick_runnable_selection(preferred_provider="ollama")
             if fallback:
@@ -30661,6 +31783,9 @@ class SessionState:
         if cfg_user_memory_mode is not None:
             self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
         parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
+        # A config import is also a model-directory import. Probe each provider
+        # once so all advertised models are available to both UIs immediately.
+        probe_and_merge_model_profiles(parsed.get("profiles", []), force_refresh=True)
         self.multimodal_capability_cache = {}
         OllamaClient.clear_global_probe_cache()
         self.ollama.clear_probe_cache()
@@ -30796,7 +31921,6 @@ class SessionState:
         text = str(payload.get("text", "") or "")
         if not role or not text:
             return False
-        event_ts = float(event.get("ts", 0.0) or 0.0)
         for row in reversed(list(getattr(self, "messages", [])[-8:])):
             if not isinstance(row, dict):
                 continue
@@ -30850,6 +31974,11 @@ class SessionState:
                 persisted_kernel_version = str(raw.get("kernel_version", "") or "").strip()
                 if persisted_kernel_version:
                     self.kernel_version = persisted_kernel_version
+                persisted_workspace_id = self._normalize_workspace_id(
+                    raw.get("workspace_id"), self.id
+                )
+                if persisted_workspace_id:
+                    self.workspace_id = persisted_workspace_id
                 raw_messages = raw.get("messages", [])
                 if not isinstance(raw_messages, list):
                     raw_messages = []
@@ -31266,7 +32395,7 @@ class SessionState:
                 self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
                 self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
                 self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
-                if self.current_phase == "starting:auto-title":
+                if self.current_phase == self._startup_phase("auto-title"):
                     # Remove the obsolete visible phase from sessions persisted
                     # by earlier builds. Title model refinement is background work.
                     self.current_phase = "idle"
@@ -31657,6 +32786,7 @@ class SessionState:
         scheduler_visible_inputs_snapshot = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
         data = {
             "id": self.id,
+            "workspace_id": str(getattr(self, "workspace_id", self.id) or self.id),
             "kernel_version": str(getattr(self, "kernel_version", "") or ""),
             "title": self.title,
             "title_origin": self.title_origin,
@@ -31845,10 +32975,12 @@ class SessionState:
         message_count = max(0, int(getattr(self, "ui_message_count", 0) or 0))
         summary = {
             "id": self.id,
+            "workspace_id": str(getattr(self, "workspace_id", self.id) or self.id),
             "kernel_version": str(getattr(self, "kernel_version", "") or ""),
             "title": self.title,
             "title_origin": self.title_origin,
             "title_revision": int(getattr(self, "auto_title_revision", 0) or 0),
+            "created_at": float(getattr(self, "created_at", 0.0) or 0.0),
             "updated_at": self.updated_at,
             "message_count": message_count,
             "ui_language": normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)),
@@ -32135,6 +33267,7 @@ class SessionState:
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state = {}
+        self._readonly_bash_cache = {}
         self.agent_loop_progress_state = {}
         self.stall_severity_score = 0
         self.stall_severity_sources = []
@@ -45036,6 +46169,7 @@ body{padding:18px}
                 "stale": bool(value.get("stale", False)),
                 "content_type": trim(str(value.get("content_type", "text") or "text"), 40),
                 "language": trim(str(value.get("language", "text") or "text"), 40),
+                "scale": trim(str(value.get("scale", "long") or "long"), 16) or "long",
                 "total_lines": max(0, int(value.get("total_lines", 0) or 0)),
                 "outline_ready": bool(value.get("outline_ready", False)),
                 "outline": trim(str(value.get("outline", "") or ""), LONG_CONTENT_STRUCTURE_MAX_CHARS),
@@ -45075,6 +46209,13 @@ body{padding:18px}
                 "objective_gaps": [trim(str(x), 260) for x in (value.get("objective_gaps", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS] if str(x).strip()],
                 "objective_covered": [trim(str(x), 260) for x in (value.get("objective_covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED] if str(x).strip()],
                 "frontier_segments": [trim(str(x), 120) for x in (value.get("frontier_segments", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
+                "retrieval_plan": {
+                    "action": trim(str((value.get("retrieval_plan", {}) or {}).get("action", "") if isinstance(value.get("retrieval_plan", {}), dict) else ""), 80),
+                    "reason": trim(str((value.get("retrieval_plan", {}) or {}).get("reason", "") if isinstance(value.get("retrieval_plan", {}), dict) else ""), 360),
+                    "information_gain": max(0.0, min(1.0, float((value.get("retrieval_plan", {}) or {}).get("information_gain", 0.0) if isinstance(value.get("retrieval_plan", {}), dict) else 0.0))),
+                    "next_segments": [trim(str(x), 120) for x in ((value.get("retrieval_plan", {}) or {}).get("next_segments", []) if isinstance(value.get("retrieval_plan", {}), dict) else [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
+                    "updated_at": float((value.get("retrieval_plan", {}) or {}).get("updated_at", 0.0) if isinstance(value.get("retrieval_plan", {}), dict) else 0.0),
+                },
                 "read_events": max(0, int(value.get("read_events", 0) or 0)),
                 "reuse_events": max(0, int(value.get("reuse_events", 0) or 0)),
                 "semantic": self._normalize_long_content_semantic(value.get("semantic", {})),
@@ -45444,6 +46585,33 @@ body{padding:18px}
         ranked.sort(key=lambda row: (-row[0], int(row[1].get("start_line", 0) or 0)))
         return [seg for _score, seg in ranked[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]]
 
+    def _update_long_content_retrieval_plan(self, memory: dict, *, information_gain: float = 0.0) -> dict:
+        """Choose the next evidence action from current gaps and coverage."""
+        objective = self._long_content_objective()
+        frontier = self._long_content_select_frontier(memory, query=objective)
+        next_ids = [str(seg.get("id", "")) for seg in frontier if str(seg.get("id", ""))]
+        coverage = float(memory.get("coverage", 0.0) or 0.0)
+        if not next_ids and coverage < 1.0:
+            action, reason = "search", "no unread semantic frontier; search the source for the objective terms"
+        elif information_gain <= 0.001 and next_ids:
+            action, reason = "frontier_segment", "the last read added no new lines; inspect the highest-value unread segment"
+        elif next_ids:
+            action, reason = "frontier_segment", "continue with the most objective-relevant unread segment"
+        elif coverage >= 1.0:
+            action, reason = "synthesize", "all source lines are covered; synthesize the evidence or verify a precise claim"
+        else:
+            action, reason = "search", "use an indexed query to locate the remaining objective evidence"
+        plan = {
+            "action": action,
+            "reason": reason,
+            "information_gain": max(0.0, min(1.0, float(information_gain))),
+            "next_segments": next_ids[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS],
+            "updated_at": now_ts(),
+        }
+        memory["retrieval_plan"] = plan
+        memory["frontier_segments"] = next_ids[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]
+        return plan
+
     def _long_content_reuse_hint(self, rel: str, memory: dict, args: dict) -> str:
         """Return a compact cache hit instead of replaying an old window."""
         mode = str((args or {}).get("mode", "") or "auto").strip().lower()
@@ -45468,7 +46636,7 @@ body{padding:18px}
                     return (
                         f"[read_file reused path={rel} mode=full chars={offset + 1}-{end_char} "
                         f"lines={start_line}-{end_line}]\n"
-                        "Requested full page is already in long-content memory; use fresh=true for exact source verification."
+                        + source_text[offset:end_char]
                     )
             except Exception:
                 pass
@@ -45483,13 +46651,18 @@ body{padding:18px}
             if wanted in seen:
                 for seg in memory.get("segments", []) or []:
                     if isinstance(seg, dict) and str(seg.get("id", "")) == wanted:
-                        return (
-                            f"[read_file reused path={rel} segment_id={wanted} "
-                            f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
-                            f"Card: {trim(str(seg.get('summary', '') or ''), 720)}\n"
-                            f"Evidence: {', '.join(seg.get('evidence', [])[:3])}\n"
-                            "Cached evidence reused; use fresh=true for exact source verification."
-                        )
+                        try:
+                            source_text, _ = self._read_text_and_fingerprint(self._session_path(rel), rel)
+                            source_lines = source_text.splitlines()
+                            seg_start = max(1, int(seg.get("start_line", 1) or 1) - 8)
+                            seg_end = min(len(source_lines), int(seg.get("end_line", seg_start) or seg_start) + 8)
+                            body = "\n".join(f"{idx}: {source_lines[idx - 1]}" for idx in range(seg_start, seg_end + 1))
+                            return (
+                                f"[read_file reused path={rel} segment_id={wanted} lines={seg_start}-{seg_end}]\n"
+                                + body
+                            )
+                        except Exception:
+                            return ""
         # Query/target reads can reuse a remembered semantic card if it
         # contains the requested terms.  Do not claim an exact match when only
         # the source card is relevant; return a navigation plan instead.
@@ -45543,10 +46716,11 @@ body{padding:18px}
         else:
             return ""
         if self._long_content_range_is_covered(memory, start, end):
-            return (
-                f"[read_file reused path={rel} lines={start}-{end} "
-                f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
-                "Requested range is already in long-content memory; use fresh=true for exact source verification."
+            body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
+            return self._clip_read_file_output(
+                f"[read_file reused path={rel} lines={start}-{end} coverage="
+                f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
+                self._read_file_max_chars(src.get("max_chars")),
             )
         # Compute uncovered intervals against the union of remembered ranges.
         covered = []
@@ -45569,13 +46743,16 @@ body{padding:18px}
         if cursor <= end:
             gaps.append((cursor, end))
         if not gaps:
-            return (
-                f"[read_file reused path={rel} lines={start}-{end} "
-                f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
-                "Requested range is already in long-content memory; use fresh=true for exact source verification."
+            body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
+            return self._clip_read_file_output(
+                f"[read_file reused path={rel} lines={start}-{end} coverage="
+                f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
+                self._read_file_max_chars(src.get("max_chars")),
             )
         body = "\n\n".join(
-            "@@ lines %d-%d @@\n%s" % (a, b, "\n".join(f"{i}: {lines[i - 1]}" for i in range(a, b + 1)))
+            f"@@ lines {a}-{b} @@\n" + "\n".join(
+                f"{i}: {lines[i - 1]}" for i in range(a, b + 1)
+            )
             for a, b in gaps
         )
         return self._clip_read_file_output(
@@ -45583,6 +46760,116 @@ body{padding:18px}
             f"uncovered_lines={','.join(f'{a}-{b}' for a,b in gaps)}]\n{body}",
             self._read_file_max_chars(src.get("max_chars")),
         )
+
+    def _long_content_search_index(self, memory: dict, lines: list[str]) -> dict:
+        """Build or reuse a bounded inverted index for a source version."""
+        content_id = str(memory.get("content_id", "") or "")
+        source_version = str(memory.get("source_sha256", "") or content_id)
+        cache_key = f"{content_id}:{source_version}:{len(lines)}"
+        cache = getattr(self, "_long_content_search_index_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self._long_content_search_index_cache = cache
+        elif not hasattr(self, "_long_content_search_index_cache"):
+            self._long_content_search_index_cache = cache
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict) and isinstance(cached.get("postings"), dict):
+            return cached
+        postings: dict[str, list[int]] = {}
+        max_terms = 60_000
+        max_postings = 480
+        for line_no, raw_line in enumerate(lines, 1):
+            text = str(raw_line or "").casefold()
+            if not text.strip():
+                continue
+            tokens = re.findall(
+                r"[a-z0-9_][a-z0-9_.:/-]{1,}|[\u4e00-\u9fff]{2,}",
+                text,
+                flags=re.I,
+            )
+            terms: set[str] = set(tokens)
+            for token in tokens:
+                if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 4:
+                    terms.update(token[idx : idx + 2] for idx in range(len(token) - 1))
+            for term in terms:
+                if len(term) < 2 or term.isdigit():
+                    continue
+                bucket = postings.get(term)
+                if bucket is None:
+                    if len(postings) >= max_terms:
+                        if not (term.isalpha() or "_" in term or any(ch.isalpha() for ch in term)):
+                            continue
+                    bucket = []
+                    postings[term] = bucket
+                if len(bucket) < max_postings:
+                    bucket.append(line_no)
+        result = {
+            "content_id": content_id,
+            "source_version": source_version,
+            "line_count": len(lines),
+            "postings": postings,
+            "created_at": now_ts(),
+        }
+        cache[cache_key] = result
+        if len(cache) > 6:
+            oldest = sorted(cache.items(), key=lambda item: float(item[1].get("created_at", 0.0) or 0.0))
+            for key, _value in oldest[:-6]:
+                cache.pop(key, None)
+        return result
+
+    def _render_indexed_long_content_search(
+        self,
+        rel: str,
+        lines: list[str],
+        memory: dict,
+        *,
+        query: object = "",
+        context: object = None,
+        max_chars: object = None,
+    ) -> str:
+        """Answer a plain-text search from the source-version index."""
+        needle = str(query or "").strip()
+        if not needle:
+            return ""
+        terms = self._cached_query_terms(needle.casefold())
+        if not terms:
+            return ""
+        index = self._long_content_search_index(memory, lines)
+        postings = index.get("postings", {}) if isinstance(index, dict) else {}
+        candidate_scores: Counter[int] = Counter()
+        for term in terms:
+            for line_no in postings.get(term, []) if isinstance(postings, dict) else []:
+                candidate_scores[int(line_no)] += 1
+        if not candidate_scores:
+            return f"[read_file search path={rel} query={needle!r} matches=0 indexed=true]\n(no matches)"
+        low_needle = needle.casefold()
+        ranked: list[tuple[int, int]] = []
+        for line_no, score in candidate_scores.items():
+            if 1 <= line_no <= len(lines):
+                line_low = str(lines[line_no - 1] or "").casefold()
+                ranked.append((int(score) + (3 if low_needle in line_low else 0), line_no))
+        ranked.sort(key=lambda row: (-row[0], row[1]))
+        match_lines = [line_no for _score, line_no in ranked[:READ_FILE_SEARCH_MAX_MATCHES]]
+        if not match_lines:
+            return f"[read_file search path={rel} query={needle!r} matches=0 indexed=true]\n(no matches)"
+        ctx = self._read_file_int_arg(context, 6, 0, 80)
+        ranges: list[tuple[int, int]] = []
+        for line_no in sorted(match_lines):
+            start = max(1, line_no - ctx)
+            end = min(len(lines), line_no + ctx)
+            if ranges and start <= ranges[-1][1] + 1:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+            else:
+                ranges.append((start, end))
+        out = [
+            f"[read_file search path={rel} query={needle!r} matches_returned={len(match_lines)} "
+            f"windows={len(ranges)} total_lines={len(lines)} indexed=true]"
+        ]
+        for start, end in ranges:
+            out.append(f"\n@@ lines {start}-{end} @@")
+            for line_no in range(start, end + 1):
+                out.append(f"{line_no:>6}: {lines[line_no - 1]}")
+        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
 
     def _maybe_enrich_long_content_semantic(
         self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None,
@@ -45818,11 +47105,12 @@ body{padding:18px}
             source_bytes = int(fp.stat().st_size or 0) if fp.is_file() else 0
         except Exception:
             source_bytes = 0
-        if not fp.is_file() or (
+        if not fp.is_file() or not lines:
+            return {}
+        compact_source = (
             len(lines) < LONG_CONTENT_TEXT_SEGMENT_LINES
             and source_bytes < LARGE_FILE_AUTO_PAGE_BYTES
-        ):
-            return {}
+        )
         content_id, source_fp = self._long_content_identity(rel, fp)
         registry = getattr(self, "long_content_memory", {})
         if not isinstance(registry, dict):
@@ -45870,11 +47158,13 @@ body{padding:18px}
             "source_size": int(source_fp.get("source_size", 0) or 0),
             "source_mtime_ns": int(source_fp.get("source_mtime_ns", 0) or 0),
             "content_type": kind, "language": language, "total_lines": len(lines),
+            "scale": "compact" if compact_source else "long",
             "outline": trim(outline, LONG_CONTENT_STRUCTURE_MAX_CHARS),
             "segments": segments, "cards": cards, "coverage": 0.0,
             "seen_segments": [], "observed_segments": [], "read_ranges": [],
             "observations": [], "observation_count": 0, "source_tools": [],
             "unresolved_items": [], "updated_at": now_ts(),
+            "retrieval_plan": {},
             "stale": False,
         }
         if isinstance(old, dict) and old.get("total_lines") == len(lines):
@@ -45882,10 +47172,11 @@ body{padding:18px}
             memory["observed_segments"] = list(old.get("observed_segments", old.get("seen_segments", [])) or [])
             memory["read_ranges"] = list(old.get("read_ranges", []) or [])
             memory["coverage"] = float(old.get("coverage", 0.0) or 0.0)
-            for field in ("observations", "observation_count", "source_tools", "semantic_status", "semantic_version", "semantic_updated_at", "semantic_attempts", "semantic_refreshes", "semantic_last_coverage", "semantic_last_seen_count", "semantic_last_observation_count", "semantic_started_at", "semantic_retry_at", "semantic_next_segments", "semantic_refresh_due", "semantic", "objective_signature", "objective_text", "objective_gaps", "objective_covered", "frontier_segments", "read_events", "reuse_events"):
+            for field in ("observations", "observation_count", "source_tools", "semantic_status", "semantic_version", "semantic_updated_at", "semantic_attempts", "semantic_refreshes", "semantic_last_coverage", "semantic_last_seen_count", "semantic_last_observation_count", "semantic_started_at", "semantic_retry_at", "semantic_next_segments", "semantic_refresh_due", "semantic", "objective_signature", "objective_text", "objective_gaps", "objective_covered", "frontier_segments", "retrieval_plan", "read_events", "reuse_events"):
                 if field in old:
                     memory[field] = old[field]
             memory["outline_ready"] = bool(old.get("outline_ready", False))
+            memory["scale"] = str(old.get("scale", memory.get("scale", "long")) or memory.get("scale", "long"))
             old_paths = [
                 str(x).replace("\\", "/").strip()
                 for x in ([old.get("source_path", "")] + list(old.get("source_paths", []) or []))
@@ -45933,6 +47224,7 @@ body{padding:18px}
                 clean_ranges.append((start, end))
         if not clean_ranges:
             return memory
+        previous_coverage = float(memory.get("coverage", 0.0) or 0.0)
         existing_ranges: list[tuple[int, int]] = []
         for item in memory.get("read_ranges", []) or []:
             if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -45992,8 +47284,9 @@ body{padding:18px}
         memory["observed_segments"] = list(observed)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
         memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
         read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
-        previous_coverage = float(memory.get("coverage", 0.0) or 0.0)
         memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
+        information_gain = max(0.0, float(memory["coverage"]) - previous_coverage)
+        self._update_long_content_retrieval_plan(memory, information_gain=information_gain)
 
         evidence = [trim(str(x), 260) for x in (excerpts or []) if str(x).strip()]
         if not evidence:
@@ -46067,7 +47360,7 @@ body{padding:18px}
         self.long_content_memory = self._normalize_long_content_memory(self.long_content_memory)
         memory = self.long_content_memory.get(memory["content_id"], memory)
         self._schedule_persist()
-        if bool(memory.get("semantic_refresh_due", False)):
+        if bool(memory.get("semantic_refresh_due", False)) and str(memory.get("scale", "long")) != "compact":
             self._start_long_content_semantic_enrichment(memory, rel, lines, touched)
         return memory
 
@@ -46219,17 +47512,26 @@ body{padding:18px}
             return ""
         rows.sort(key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
         parts = [
-            "LONG-CONTENT UNDERSTANDING MEMORY (source-addressable; evidence from read_file, shell pipelines, and other verified local readers is unified):"
+            "SOURCE EVIDENCE MEMORY (one source-addressable architecture for small and large files; evidence from read_file, shell pipelines, and other verified local readers is unified):"
         ]
         for row in rows[:4]:
             source_tools = ",".join(str(x) for x in (row.get("source_tools", []) or [])[:6] if str(x).strip())
             parts.append(
-                f"- {row.get('source_path','')} type={row.get('content_type','text')} "
+                f"- {row.get('source_path','')} scale={row.get('scale','long')} type={row.get('content_type','text')} "
                 f"coverage={float(row.get('coverage', 0.0) or 0.0):.0%} "
                 f"lines={int(row.get('total_lines', 0) or 0)} "
                 f"observations={int(row.get('observation_count', 0) or 0)}"
                 + (f" readers={source_tools}" if source_tools else "")
             )
+            plan = row.get("retrieval_plan", {}) if isinstance(row.get("retrieval_plan", {}), dict) else {}
+            if plan.get("action"):
+                parts.append(
+                    f"  retrieval_plan action={plan.get('action')} gain={float(plan.get('information_gain', 0.0) or 0.0):.3f}: "
+                    f"{trim(str(plan.get('reason', '') or ''), 300)}"
+                )
+                plan_ids = [str(x) for x in (plan.get("next_segments", []) or []) if str(x).strip()]
+                if plan_ids:
+                    parts.append("  retrieval_next_segments: " + ", ".join(plan_ids[:6]))
             outline = str(row.get("outline", "") or "").splitlines()
             if outline:
                 parts.append("  outline: " + " | ".join(outline[:6]))
@@ -46302,7 +47604,7 @@ body{padding:18px}
                     f"- {card.get('id','')} {card.get('title','')} :: "
                     f"{trim(card.get('text',''), 220)} [{','.join(card.get('evidence', [])[:2])}]"
                 )
-        out.append("\nFocused read: read_file path=\"%s\" mode=\"segment\" segment_id=\"s0001\"" % rel)
+        out.append(f"\nFocused read: read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
         return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
 
     def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = "", query: object = "", max_chars: object = None) -> str:
@@ -46418,22 +47720,36 @@ body{padding:18px}
         out.append(f"- read_file path=\"{rel}\" mode=\"full\" max_chars={min(cap, READ_FILE_DEFAULT_MAX_CHARS)}")
         if not is_code:
             out.append("- For long logs or command output, start with mode=\"search\" for the error, warning, filename, or keyword.")
-        # Keep the legacy overview shape, but expose the durable long-content
-        # navigation whenever this is a large source.  The model can opt into
-        # structure/segment reads without paying for all source lines here.
-        if total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or size >= LARGE_FILE_AUTO_PAGE_BYTES:
-            try:
-                memory = self._ensure_long_content_memory(rel, fp, lines)
-                if memory:
+        # Every text source has the same source identity, evidence ranges and
+        # search index. Larger sources additionally expose section navigation.
+        try:
+            memory = self._ensure_long_content_memory(rel, fp, lines)
+            if memory:
+                out.append(
+                    f"\nEvidence memory: content_id={memory.get('content_id','')} "
+                    f"scale={memory.get('scale','long')} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}."
+                )
+                if memory.get("scale") == "long":
                     out.append(
-                        f"\nLong-content memory: content_id={memory.get('content_id','')} "
-                        f"segments={len(memory.get('segments', []) or [])} "
-                        f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}."
+                        f"segments={len(memory.get('segments', []) or [])}; use structure/segment for navigation."
                     )
-                    out.append(f"- read_file path=\"{rel}\" mode=\"structure\"")
-                    out.append(f"- read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
-            except Exception:
-                pass
+                    objective = self._long_content_objective()
+                    frontier = self._long_content_select_frontier(memory, query=objective)
+                    if objective or frontier:
+                        out.append("\nObjective-guided retrieval frontier:")
+                        if objective:
+                            out.append(f"- objective: {trim(objective, 420)}")
+                        for seg in frontier[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]:
+                            out.append(
+                                f"- segment={seg.get('id')} lines={seg.get('start_line', 0)}-{seg.get('end_line', 0)} "
+                                f"title={trim(str(seg.get('title', '') or ''), 140)}"
+                            )
+                        out.append(
+                            f"- read_file path=\"{rel}\" mode=\"segment\" "
+                            f"segment_id=\"{frontier[0].get('id') if frontier else 's0001'}\""
+                        )
+        except Exception:
+            pass
         return self._clip_read_file_output("\n".join(out), cap)
 
     def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
@@ -49085,19 +50401,36 @@ body{padding:18px}
         return client
 
     def _emit_auto_title_change(self, old_title: str, final_title: str, trigger: str, source: str) -> None:
-        self._emit(
-            "status",
-            {
-                "summary": (
-                    f"session auto-renamed ({trigger or 'progress'}): "
-                    f"'{trim(old_title, 36)}' -> '{final_title}'"
-                ),
-                "session_title": final_title,
-                "title_origin": "auto",
-                "title_revision": int(getattr(self, "auto_title_revision", 0) or 0),
-                "title_source": source,
-            },
-        )
+        payload = {
+            "summary": (
+                f"session auto-renamed ({trigger or 'progress'}): "
+                f"'{trim(old_title, 36)}' -> '{final_title}'"
+            ),
+            "session_title": final_title,
+            "title_origin": str(getattr(self, "title_origin", "auto") or "auto"),
+            "title_revision": int(getattr(self, "auto_title_revision", 0) or 0),
+            "title_source": source,
+        }
+        metadata_callback = getattr(self, "workspace_metadata_callback", None)
+        if callable(metadata_callback):
+            try:
+                metadata = metadata_callback(self.id)
+                if isinstance(metadata, dict):
+                    payload.update(
+                        {
+                            key: metadata[key]
+                            for key in (
+                                "workspace_id",
+                                "workspace_name",
+                                "workspace_created_at",
+                                "workspace_label",
+                            )
+                            if key in metadata
+                        }
+                    )
+            except Exception:
+                pass
+        self._emit("status", payload)
 
     def _schedule_auto_title_model_refine(self, goal: str, goal_digest: str, trigger: str) -> bool:
         refine_lock = getattr(self, "auto_title_refine_lock", None)
@@ -49109,7 +50442,13 @@ body{padding:18px}
                 origin = str(getattr(self, "title_origin", "") or "").strip().lower()
                 source = str(getattr(self, "last_auto_title_source", "") or "").strip().lower()
                 current_title = str(self.title or "").strip()
-                if not self._title_is_replaceable(current_title, origin):
+                fallback_in_progress = (
+                    origin == "auto"
+                    and source == "fallback"
+                    and str(getattr(self, "auto_title_last_goal_digest", "") or "")
+                    in {"", goal_digest}
+                )
+                if not self._title_is_replaceable(current_title, origin) and not fallback_in_progress:
                     return False
                 if source == "model" and str(getattr(self, "auto_title_last_goal_digest", "") or "") == goal_digest:
                     return False
@@ -49191,7 +50530,13 @@ body{padding:18px}
                     return
                 old_title = str(self.title or "").strip()
                 origin = str(getattr(self, "title_origin", "") or "").strip().lower()
-                if not self._title_is_replaceable(old_title, origin):
+                fallback_in_progress = (
+                    origin == "auto"
+                    and str(getattr(self, "last_auto_title_source", "") or "").strip().lower() == "fallback"
+                    and str(getattr(self, "auto_title_last_goal_digest", "") or "")
+                    in {"", goal_digest}
+                )
+                if not self._title_is_replaceable(old_title, origin) and not fallback_in_progress:
                     return
                 if str(getattr(self, "auto_title_last_goal_digest", "") or "") not in {"", goal_digest}:
                     return
@@ -49222,7 +50567,30 @@ body{padding:18px}
         if not goal or self._is_title_continuation_text(goal):
             return False
         goal_digest = self._auto_title_goal_digest(goal)
-        return self._schedule_auto_title_model_refine(goal, goal_digest, trigger)
+        quick_changed = False
+        quick_old = ""
+        quick_title = ""
+        with self.lock:
+            origin = str(getattr(self, "title_origin", "") or "").strip().lower()
+            current = str(self.title or "").strip()
+            if self._title_is_replaceable(current, origin):
+                candidate = self._fallback_auto_title(compact=FAST_START_LOCAL_TITLE)
+                if candidate:
+                    final = self._application_title(candidate)
+                    if final and final != current:
+                        quick_old = current
+                        quick_title = final
+                        self.title = final
+                        self.title_origin = "auto"
+                        self.last_auto_title_source = "fallback"
+                        self.last_auto_title_ts = now_ts()
+                        self.auto_title_revision = int(getattr(self, "auto_title_revision", 0) or 0) + 1
+                        self.updated_at = now_ts()
+                        self._persist()
+                        quick_changed = True
+        if quick_changed and callable(getattr(self, "summary_update_callback", None)):
+            self._emit_auto_title_change(quick_old, quick_title, trigger, "fallback")
+        return self._schedule_auto_title_model_refine(goal, goal_digest, trigger) or quick_changed
 
     def _ensure_runtime_model_ready(self):
         active_profile = dict(self.model_profiles.get(self.active_profile_id, {}))
@@ -49362,6 +50730,7 @@ body{padding:18px}
                     self.set_runtime_selection(
                         selection,
                         model_override if isinstance(model_override, str) else None,
+                        settings=normalize_model_runtime_settings(payload.get("settings", payload)),
                     )
                     applied_notes.append(f"deferred model switch applied: {trim(selection, 120)}")
                     sync_needed = True
@@ -49496,8 +50865,9 @@ body{padding:18px}
             prof = {}
         if not isinstance(prof, dict):
             prof = {}
-        default = str(prof.get("effort", "") or "").strip().lower()
-        ceiling = str(prof.get("max_effort", "") or "").strip().lower()
+        effective = model_runtime_settings_for(prof, str(prof.get("model", "") or ""))
+        default = str(effective.get("effort", "") or "").strip().lower()
+        ceiling = str(effective.get("max_effort", "") or "").strip().lower()
         if ceiling not in EFFORT_ORDER:
             ceiling = EFFORT_MAX
         if default not in EFFORT_ORDER:
@@ -49611,6 +50981,13 @@ body{padding:18px}
             except Exception as exc:
                 self.kernel_runtime_degraded = True
                 self._emit("status", {"summary": f"liquid kernel hook degraded: {trim(str(exc), 160)}"})
+        if tools is not None:
+            guarded_tools = self._filter_todo_progress_tools(tools, role=context_role_hint)
+            if len(guarded_tools) != len(tools):
+                system = f"{system}\n\n{self._todo_no_progress_instruction()}"
+                if canonicalize_tool_name(tool_choice) in {"TodoWrite", "TodoWriteRescue"}:
+                    tool_choice = ""
+            tools = guarded_tools
         system = self._inject_runtime_environment_context(system)
         estimated_prompt_tokens = self._estimate_model_call_prompt_tokens(
             messages,
@@ -51936,7 +53313,7 @@ body{padding:18px}
                     mode_text = "search"
                 elif line not in (None, "") or offset not in (None, "") or limit is not None:
                     mode_text = "window"
-                elif total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
+                elif total_lines >= LARGE_FILE_AUTO_PAGE_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
                     mode_text = "structure"
             if mode_text == "directory":
                 return f"Error: path is a file, not a directory: {rel}"
@@ -51975,6 +53352,17 @@ body{padding:18px}
                         self.long_content_memory[memory.get("content_id", "")] = memory
                         self._schedule_persist()
                         return delta
+            if mode_text == "search" and memory and not bool(regex):
+                indexed = self._render_indexed_long_content_search(
+                    rel,
+                    lines,
+                    memory,
+                    query=query or target,
+                    context=context,
+                    max_chars=max_chars,
+                )
+                if indexed:
+                    return indexed
             if mode_text in {"overview", "structure"}:
                 if mode_text == "structure":
                     return self._render_long_content_structure(rel, fp, lines, max_chars=max_chars)
@@ -52028,6 +53416,22 @@ body{padding:18px}
             return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
+
+    def _render_compact_evidence_read(self, rel: str, lines: list[str], text: str, memory: dict) -> str:
+        """Keep small-file reads complete while exposing the shared evidence state."""
+        plan = memory.get("retrieval_plan", {}) if isinstance(memory.get("retrieval_plan", {}), dict) else {}
+        header = (
+            f"[read_file compact path={rel} content_id={memory.get('content_id', '')} "
+            f"scale={memory.get('scale', 'compact')} lines=1-{len(lines)} indexed=true "
+            f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]"
+        )
+        guidance = (
+            "Evidence memory updated; full content is included. "
+            "Use mode='search', mode='window', mode='symbol', or tool_memory for a narrower follow-up."
+        )
+        if plan.get("action"):
+            guidance += f" Next retrieval action: {plan.get('action')} ({trim(str(plan.get('reason', '') or ''), 180)})."
+        return f"{header}\n{guidance}\n{text}"
 
     def _run_read_media(self, fp: Path, rel: str, media_type: str) -> str:
         """Read a media file and return description or inject into multimodal context."""
@@ -61498,6 +62902,7 @@ body{padding:18px}
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state = {}
         self.agent_loop_progress_state = {}
+        self._readonly_bash_cache = {}
         self.rounds_without_todo = 0
         self.last_todo_reminder_ts = 0.0
         self.todo_reminder_count = 0
@@ -63216,7 +64621,6 @@ body{padding:18px}
         changed_ids: list[str] = []
         rejected_targets: list[str] = []
         remove_ids: set[str] = set()
-        mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
         for update in rows:
             target_ref = trim(str(
                 update.get("step_id", update.get("id", update.get("key", ""))) or ""
@@ -63443,6 +64847,15 @@ body{padding:18px}
             return {}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step_id = trim(str(plan_step.get("id", "") or ""), 60)
+        # An unchanged, uniquely identified child needs no model classification.
+        # Providers often resend the whole list without parent/row IDs.
+        existing_rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if sum(
+            normalize_work_text(str(existing.get("content", "") or "")).strip().casefold()
+            == normalize_work_text(content).strip().casefold()
+            for existing in existing_rows
+        ) == 1:
+            return {}
         prompt = (
             "/no_think\n"
             "Decide the intent of one unscoped TodoWrite row inside the active execution-plan step. "
@@ -63537,6 +64950,12 @@ body{padding:18px}
             return {}
         content = trim(str(incoming.get("content", "") or "").strip(), 900)
         if not content:
+            return {}
+        exact_content = normalize_work_text(str(incoming.get("content", "") or "")).strip().casefold()
+        if sum(
+            normalize_work_text(str(row.get("content", "") or "")).strip().casefold() == exact_content
+            for row in existing_rows if isinstance(row, dict)
+        ) == 1:
             return {}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         rows_text = "\n".join(
@@ -77574,7 +78993,79 @@ body{padding:18px}
             resume=is_resume,
         )
 
+    def _todo_progress_guard_key(self, role: str = "") -> str:
+        bb = self._ensure_blackboard()
+        step = self._get_active_plan_step(bb) or {}
+        role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner(bb)
+        return json.dumps([
+            getattr(self, "run_generation", 0), bb.get("task_epoch", 0),
+            step.get("id", ""), role_key,
+        ], ensure_ascii=False)
+
+    @staticmethod
+    def _todo_material_signature(rows: list[dict]) -> str:
+        # Timestamp-only writes are not task progress. Evidence, identities,
+        # statuses and scope changes still pass through the normal audit.
+        fields = (
+            "content", "status", "owner", "parent_step_id", "key", "subtask_id",
+            "external_subtask_id", "root_group_id", "evidence", "evidence_binding", "evidence_ids",
+            "id", "full_content", "category",
+        )
+        return json.dumps(
+            [{field: row[field] for field in fields if row.get(field) not in (None, "", [])}
+             for row in rows if isinstance(row, dict)],
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
+
+    @staticmethod
+    def _todo_no_progress_instruction() -> str:
+        return (
+            "Todo state has not changed. Do not repeat TodoWrite, switch to TodoWriteRescue, "
+            "or rewrite the same list. Execute the current in_progress task using a work or "
+            "evidence-gathering tool, then update only the statuses supported by its result. "
+            "Repeated no-progress Todo writes are temporarily unavailable until a non-Todo "
+            "work action runs. Existing tasks and completion/evidence checks remain intact."
+        )
+
+    def _filter_todo_progress_tools(self, tools: list[dict], *, role: str = "") -> list[dict]:
+        counts = getattr(self, "_todowrite_step_counter", {})
+        if not counts or counts.get(self._todo_progress_guard_key(role), 0) < 2:
+            return tools
+        return [
+            tool for tool in tools
+            if canonicalize_tool_name(tool.get("function", {}).get("name", ""))
+            not in {"TodoWrite", "TodoWriteRescue"}
+        ]
+
     def _dispatch_todo_update(self, args: dict, *, role: str = "", resume: bool = False) -> str:
+        key = self._todo_progress_guard_key(role)
+        counts = getattr(self, "_todowrite_step_counter", None)
+        if not isinstance(counts, dict):
+            counts = self._todowrite_step_counter = {}
+        if counts.get(key, 0) >= 2:
+            return self._plan_control_feedback("todo_no_progress", self._todo_no_progress_instruction())
+        before = self._todo_material_signature(self.todo.snapshot())
+        plan_before = self._todo_material_signature(self._ensure_blackboard().get("project_todos", []))
+        result = self._dispatch_todo_update_inner(args, role=role, resume=resume)
+        if key != self._todo_progress_guard_key(role):
+            counts.pop(key, None)
+            return result
+        changed = before != self._todo_material_signature(self.todo.snapshot())
+        plan_changed = plan_before != self._todo_material_signature(
+            self._ensure_blackboard().get("project_todos", []),
+        )
+        if changed or plan_changed:
+            counts.pop(key, None)
+        elif self._todo_runtime_has_worker_rows(role) and not str(result).startswith("Error:"):
+            counts[key] = counts.get(key, 0) + 1
+            if len(counts) > 40:
+                counts.pop(next(iter(counts)))
+            return self._plan_control_feedback(
+                "todo_no_progress", f"{self._todo_no_progress_instruction()}\n\n{result}",
+            )
+        return result
+
+    def _dispatch_todo_update_inner(self, args: dict, *, role: str = "", resume: bool = False) -> str:
         """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
         source = args if isinstance(args, dict) else {}
         bb = self._ensure_blackboard()
@@ -77755,13 +79246,20 @@ body{padding:18px}
         txt = str(output or "").strip()
         low = txt.lower()
         has_worker_rows = self._todo_runtime_has_worker_rows()
-        changed = self._todo_progress_changed(before_rows, after_rows) if before_rows is not None else False
+        changed = (
+            self._todo_material_signature(before_rows)
+            != self._todo_material_signature(after_rows if after_rows is not None else self.todo.snapshot())
+        ) if before_rows is not None else False
         if not txt:
             return ("failed", "empty output")
         if txt.startswith("Error:"):
             return ("failed", txt[6:].strip() or "unknown error")
+        if self._tool_control_feedback_outcome(tool_name, txt) == "todo_no_progress":
+            return ("no_progress", "canonical todo state unchanged; execute the current task")
         if changed:
             return ("ok", "todo updated")
+        if before_rows is not None and has_worker_rows:
+            return ("no_progress", "canonical todo state unchanged; execute the current task")
         if txt == self.todo.no_changes_text() or "no todo changes" in low:
             if has_worker_rows:
                 return ("ok", "todo already up to date")
@@ -79365,6 +80863,59 @@ body{padding:18px}
         except Exception:
             pass
 
+    def _readonly_bash_cache_key(self, command: str) -> str:
+        """Return a source-version key for safe, read-only shell commands."""
+        raw = re.sub(r"\s+", " ", str(command or "").strip())
+        if not raw or not self._bash_looks_like_file_read(raw):
+            return ""
+        if re.search(r"(?:^|[;&|]\s*)(?:rm|mv|cp|touch|chmod|chown|mkdir|rmdir|sed\s+-i|perl\s+-i)\b", raw, re.I):
+            return ""
+        if any(token in raw for token in (">", "$(", "`")):
+            return ""
+        targets = self._bash_file_read_targets(raw)
+        if not targets:
+            return ""
+        rows = []
+        for rel in targets[:SHELL_SOURCE_CANDIDATE_MAX]:
+            try:
+                fp = self._session_path(rel)
+                if not fp.is_file():
+                    continue
+                stat = fp.stat()
+                rows.append((str(rel), int(stat.st_size), int(getattr(stat, "st_mtime_ns", 0))))
+            except Exception:
+                continue
+        if not rows:
+            return ""
+        payload = json_dumps({"command": raw, "files": rows}, ensure_ascii=False)
+        return hashlib.sha1(payload.encode("utf-8", errors="replace")).hexdigest()
+
+    def _readonly_bash_cache_lookup(self, command: str) -> dict | None:
+        key = self._readonly_bash_cache_key(command)
+        if not key:
+            return None
+        row = getattr(self, "_readonly_bash_cache", {}).get(key)
+        if not isinstance(row, dict):
+            return None
+        return dict(row)
+
+    def _readonly_bash_cache_store(self, command: str, meta: dict) -> None:
+        key = self._readonly_bash_cache_key(command)
+        if not key or not isinstance(meta, dict):
+            return
+        cache = getattr(self, "_readonly_bash_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self._readonly_bash_cache = cache
+        cache[key] = {
+            k: v for k, v in meta.items()
+            if k in {"command", "effective_command", "cwd", "exit_code", "duration_ms", "changed_files", "output", "error", "model_truncated", "ui_truncated", "buffer_ref", "buffer_chars", "temp_output_path", "long_output_strategy", "output_page_index", "output_page_count", "output_full_chars", "output_full_lines"}
+        }
+        if len(cache) > 64:
+            oldest = list(cache)[: len(cache) - 64]
+            for old_key in oldest:
+                cache.pop(old_key, None)
+
     def _dispatch_tool_inner(
         self,
         name: str,
@@ -79385,6 +80936,13 @@ body{padding:18px}
                     f"Error: tool '{name}' is unavailable to remote Program sessions because it can access "
                     "resources outside the isolated session workspace."
                 )
+        # A real work/evidence action releases this role's Todo cooldown, also
+        # for root Todos and external MCP tools. Bookkeeping alone does not.
+        if getattr(self, "_todowrite_step_counter", {}) and canonicalize_tool_name(name) not in {
+            "TodoWrite", "TodoWriteRescue", "compress", "tool_memory", "task_list",
+            "task_get", "read_from_blackboard", "read_inbox", "route_to_next_agent",
+        }:
+            self._todowrite_step_counter.pop(self._todo_progress_guard_key(role_key), None)
         # External MCP tools (mcp__<server>__<tool>): route to the owning
         # subprocess. Handled before any built-in branch so an MCP name can
         # never be shadowed by a builtin, and so every role/mode reaches it.
@@ -79394,33 +80952,34 @@ body{padding:18px}
                 return f"Error: MCP is not available in this session for tool '{name}'"
             self._emit("status", {"summary": f"calling MCP tool {name}"})
             return mgr.call(name, args if isinstance(args, dict) else {})
-        # Fix 5d: Reset TodoWrite loop counter on non-TodoWrite tool calls
-        if name not in ("TodoWrite", "TodoWriteRescue") and hasattr(self, '_todowrite_step_counter'):
-            try:
-                _rst_step = self._get_active_plan_step()
-                if isinstance(_rst_step, dict):
-                    _rst_id = str(_rst_step.get("id", "") or "")
-                    if _rst_id:
-                        self._todowrite_step_counter.pop(_rst_id, None)
-            except Exception:
-                pass
         if name == "bash":
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
                 self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=guard_error)
                 return guard_error
             coordinator = getattr(self, "collaboration_write_coordinator", None)
-            if coordinator is not None:
-                with coordinator.mutation_lease():
-                    before_process = coordinator.begin_process()
-                    meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
-                    coordinated_changes = coordinator.finish_process(before_process)
-                meta["collaboration_changes"] = coordinated_changes
-                conflicts = [row for row in coordinated_changes if not bool(row.get("ok", False))]
-                if conflicts:
-                    meta["output"] = str(meta.get("output", "")) + "\nCollaboration conflict: one or more process writes were frozen for review."
+            cached_meta = self._readonly_bash_cache_lookup(str(args.get("command", "") or ""))
+            if cached_meta is not None:
+                meta = dict(cached_meta)
+                meta["duration_ms"] = 0
+                meta["cache_hit"] = True
+                meta["output"] = (
+                    f"[bash cached command={trim(str(args.get('command', '') or ''), 180)} "
+                    "source_versions_unchanged=true]\n"
+                    + str(meta.get("output", "") or "")
+                )
             else:
-                meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
+                if coordinator is not None:
+                    with coordinator.mutation_lease():
+                        before_process = coordinator.begin_process()
+                        meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
+                        coordinated_changes = coordinator.finish_process(before_process)
+                    meta["collaboration_changes"] = coordinated_changes
+                    conflicts = [row for row in coordinated_changes if not bool(row.get("ok", False))]
+                    if conflicts:
+                        meta["output"] = str(meta.get("output", "")) + "\nCollaboration conflict: one or more process writes were frozen for review."
+                else:
+                    meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
             effective_exit = self._effective_shell_exit_code(meta.get("output", ""), meta.get("exit_code"))
             self._set_tool_result_meta(
                 exit_code=effective_exit,
@@ -79431,6 +80990,8 @@ body{padding:18px}
                 model_truncated=bool(meta.get("model_truncated", False)),
                 ui_truncated=bool(meta.get("ui_truncated", False)),
             )
+            if not bool(meta.get("cache_hit", False)) and effective_exit == 0 and not meta.get("changed_files"):
+                self._readonly_bash_cache_store(str(args.get("command", "") or ""), meta)
             if coordinator is not None:
                 try:
                     coordinated_rows = list(meta.get("collaboration_changes", []) or [])
@@ -79486,6 +81047,7 @@ body{padding:18px}
                     "async_handoff_seconds": int(meta.get("async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                     "background_task_id": str(meta.get("background_task_id", "") or ""),
                     "duration_ms": meta["duration_ms"],
+                    "cache_hit": bool(meta.get("cache_hit", False)),
                     "changed_files": meta["changed_files"],
                     "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
                     "ui_output_pages": meta.get("ui_output_pages", []),
@@ -86271,12 +87833,6 @@ body{padding:18px}
                     if reason == "oversized_raw_toolcall":
                         self._inject_toolcall_overflow_hint("")
                 output_tokens = self._estimate_output_tokens(text, thinking_text, tool_calls)
-                budget_forced = self._is_thinking_budget_exhausted(
-                    text=text,
-                    thinking_text=thinking_text,
-                    tool_calls=tool_calls,
-                    output_tokens=output_tokens,
-                )
                 empty_action = self._is_empty_action_turn(text, thinking_text, tool_calls)
                 recovery_applied = False
                 # A writer-only Todo bootstrap is a protocol turn, not an
@@ -87380,6 +88936,8 @@ body{padding:18px}
                                 "status",
                                 {
                                     "summary": (
+                                        "todo unchanged; continue current task execution"
+                                        if result_item.get("control_outcome") == "todo_no_progress" else
                                         "todo control gate preserved canonical current-step subtasks; "
                                         "continue the existing in_progress item"
                                     )
@@ -88908,6 +90466,7 @@ body{padding:18px}
             }
             snapshot_payload = {
                 "id": self.id,
+                "workspace_id": str(getattr(self, "workspace_id", self.id) or self.id),
                 "kernel_version": str(getattr(self, "kernel_version", "") or ""),
                 "title": self.title,
                 "title_origin": str(getattr(self, "title_origin", "") or ""),
@@ -90175,12 +91734,44 @@ class SessionManager:
         self._persist_user_prefs()
         return {"ok": True, "user_memory_mode": self.user_memory_mode}
 
+    @staticmethod
+    def _normalize_workspace_id(value: object, fallback: str) -> str:
+        default = trim(str(fallback or "").strip(), 160)
+        candidate = trim(str(value or "").strip(), 160)
+        if (
+            not candidate
+            or candidate in {".", ".."}
+            or "/" in candidate
+            or "\\" in candidate
+            or "\x00" in candidate
+        ):
+            return default
+        return candidate
+
+    def _session_workspace_spec(self, session_id: str, workspace_id: object) -> tuple[str, Path | None]:
+        sid = str(session_id or "").strip()
+        wid = self._normalize_workspace_id(workspace_id, sid)
+        if self.workspace_root is not None:
+            return wid, self.workspace_root
+        if wid == sid:
+            return wid, None
+        owner = self.root / wid
+        try:
+            owner.resolve(strict=False).relative_to(self.root.resolve(strict=False))
+        except (OSError, ValueError):
+            return sid, None
+        if not owner.is_dir() or owner.is_symlink():
+            return sid, None
+        return wid, owner / "files"
+
     def _session_summary_from_disk(self, path: Path) -> dict:
         sid = str(path.name or "").strip()
         title = sid
+        workspace_id = sid
         title_origin = ""
         title_revision = 0
         updated_at = 0.0
+        created_at = 0.0
         message_count = 0
         ui_language = self.user_language
         kernel_version = ""
@@ -90190,8 +91781,10 @@ class SessionManager:
                 raw = self.crypto.read_json(meta, {})
                 if isinstance(raw, dict):
                     title = str(raw.get("title", sid) or sid)
+                    workspace_id = self._normalize_workspace_id(raw.get("workspace_id"), sid)
                     title_origin = str(raw.get("title_origin", "") or "")
                     title_revision = max(0, int(raw.get("title_revision", 0) or 0))
+                    created_at = float(raw.get("created_at", 0.0) or 0.0)
                     updated_at = float(raw.get("updated_at", 0.0) or 0.0)
                     message_count = max(0, int(raw.get("message_count", 0) or 0))
                     ui_language = normalize_ui_language(raw.get("ui_language", ui_language))
@@ -90204,11 +91797,24 @@ class SessionManager:
                 updated_at = float((state if state.exists() else path).stat().st_mtime)
             except Exception:
                 updated_at = 0.0
+        if created_at <= 0:
+            try:
+                state = path / "state.json"
+                if state.exists():
+                    raw_state = self.crypto.read_json(state, {})
+                    if isinstance(raw_state, dict):
+                        created_at = float(raw_state.get("created_at", 0.0) or 0.0)
+            except Exception:
+                created_at = 0.0
+        if created_at <= 0:
+            created_at = float(updated_at or 0.0)
         return {
             "id": sid,
+            "workspace_id": workspace_id,
             "title": title,
             "title_origin": title_origin,
             "title_revision": title_revision,
+            "created_at": float(created_at or 0.0),
             "running": False,
             "degraded": False,
             "recovered_at": 0.0,
@@ -90220,13 +91826,16 @@ class SessionManager:
             "loaded": False,
         }
 
-    def _make_session_state(self, sid: str, title: str) -> SessionState:
+    def _make_session_state(self, sid: str, title: str, workspace_id: str = "") -> SessionState:
         kernel_version = ""
         if self.kernel_registry is not None:
             try:
                 kernel_version = self.kernel_registry.choose_version(self.user_id, sid)
             except Exception:
                 kernel_version = ""
+        resolved_workspace_id, session_workspace_root = self._session_workspace_spec(
+            sid, workspace_id
+        )
         sess = SessionState(
                 session_id=sid,
                 title=title,
@@ -90269,7 +91878,8 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
-                workspace_root=self.workspace_root,
+                workspace_root=session_workspace_root,
+                workspace_id=resolved_workspace_id,
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
@@ -90282,6 +91892,7 @@ class SessionManager:
                 kernel_runtime=self.kernel_runtime,
                 skills_snapshot=self.skills_snapshot,
             )
+        sess.workspace_metadata_callback = self._workspace_metadata_for_session
         sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
@@ -90356,8 +91967,8 @@ class SessionManager:
 
     def _session_index_summary_payload(self, summary: dict) -> dict:
         allowed = {
-            "id", "title", "title_origin", "title_revision", "running", "degraded", "recovered_at",
-            "recovered_reason", "ui_language", "updated_at", "message_count", "kernel_version",
+            "id", "workspace_id", "title", "title_origin", "title_revision", "running", "degraded", "recovered_at",
+            "recovered_reason", "ui_language", "created_at", "updated_at", "message_count", "kernel_version",
         }
         return {key: value for key, value in dict(summary or {}).items() if key in allowed}
 
@@ -90589,6 +92200,112 @@ class SessionManager:
             daemon=True,
         ).start()
 
+    def _sync_workspace_metadata_locked(self, workspace_id: str) -> dict:
+        metadata = {}
+        for row_id, raw in self.session_index.items():
+            if not isinstance(raw, dict):
+                continue
+            if self._normalize_workspace_id(raw.get("workspace_id"), row_id) != str(workspace_id or ""):
+                continue
+            loaded = self.sessions.get(row_id)
+            created = float(
+                (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                or raw.get("created_at", 0.0)
+                or raw.get("updated_at", 0.0)
+                or 0.0
+            )
+            title = str(
+                getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+            ).strip() or row_id
+            prior = metadata.get("_first_created", 0.0)
+            if "workspace_name" not in metadata or (created > 0 and (not prior or created < prior)):
+                metadata.update(
+                    {
+                        "workspace_name": title,
+                        "workspace_created_at": created,
+                        "_first_created": created,
+                    }
+                )
+        metadata.pop("_first_created", None)
+        metadata["workspace_id"] = str(workspace_id or "")
+        metadata["workspace_label"] = str(metadata.get("workspace_name", "") or workspace_id or "")
+        for row_id, peer in self.session_index.items():
+            if not isinstance(peer, dict) or self._normalize_workspace_id(peer.get("workspace_id"), row_id) != str(workspace_id or ""):
+                continue
+            peer.update(metadata)
+        return metadata
+
+    def _workspace_metadata_for_session(self, session_id: str) -> dict:
+        """Return the stable display metadata shared by sessions in a workspace."""
+        sid = str(session_id or "").strip()
+        with self.lock:
+            source = self.sessions.get(sid)
+            source_row = self.session_index.get(sid, {})
+            workspace_id = self._normalize_workspace_id(
+                getattr(source, "workspace_id", "") if source is not None else source_row.get("workspace_id"),
+                sid,
+            )
+            first_title = ""
+            first_created = 0.0
+            for row_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                row_workspace = self._normalize_workspace_id(raw.get("workspace_id"), row_id)
+                if row_workspace != workspace_id:
+                    continue
+                loaded = self.sessions.get(row_id)
+                created = float(
+                    (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("created_at", 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ).strip() or row_id
+                if (
+                    not first_title
+                    or (created > 0 and (first_created <= 0 or created < first_created))
+                ):
+                    first_title, first_created = title, created
+            name = first_title or str(getattr(source, "title", "") if source is not None else source_row.get("title", "") or sid)
+            workspace_names: dict[str, str] = {}
+            workspace_created: dict[str, float] = {}
+            for row_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                wid = self._normalize_workspace_id(raw.get("workspace_id"), row_id)
+                loaded = self.sessions.get(row_id)
+                created = float(
+                    (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("created_at", 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ).strip() or row_id
+                prior_created = workspace_created.get(wid, 0.0)
+                if wid not in workspace_names or (created > 0 and (prior_created <= 0 or created < prior_created)):
+                    workspace_names[wid] = title
+                    workspace_created[wid] = created
+            duplicate_count: dict[str, int] = {}
+            for workspace_name in workspace_names.values():
+                key = workspace_name.casefold()
+                duplicate_count[key] = duplicate_count.get(key, 0) + 1
+            label = name
+            if duplicate_count.get(name.casefold(), 0) > 1 and first_created > 0:
+                try:
+                    label = f"{name} · {datetime.fromtimestamp(first_created).strftime('%Y-%m-%d')}"
+                except Exception:
+                    label = name
+            return {
+                "workspace_id": workspace_id,
+                "workspace_name": name,
+                "workspace_created_at": first_created,
+                "workspace_label": label,
+            }
+
     def _on_session_summary(self, summary: dict) -> None:
         if not isinstance(summary, dict):
             return
@@ -90602,9 +92319,13 @@ class SessionManager:
             row = {
                 **previous,
                 "id": session_id,
+                "workspace_id": self._normalize_workspace_id(
+                    summary.get("workspace_id", previous.get("workspace_id")), session_id
+                ),
                 "title": str(summary.get("title", previous.get("title", session_id)) or session_id),
                 "title_origin": str(summary.get("title_origin", previous.get("title_origin", "")) or ""),
                 "title_revision": max(0, int(summary.get("title_revision", previous.get("title_revision", 0)) or 0)),
+                "created_at": float(summary.get("created_at", previous.get("created_at", 0.0)) or 0.0),
                 "running": bool(summary.get("running", previous.get("running", False))),
                 "degraded": False,
                 "recovered_at": float(summary.get("recovered_at", previous.get("recovered_at", 0.0)) or 0.0),
@@ -90616,14 +92337,16 @@ class SessionManager:
                 "loaded": True,
             }
             comparable_keys = (
-                "title", "title_origin", "title_revision", "running", "recovered_at", "recovered_reason",
-                "ui_language", "updated_at", "message_count",
+                "workspace_id", "title", "title_origin", "title_revision", "running", "recovered_at", "recovered_reason",
+                "ui_language", "created_at", "updated_at", "message_count",
                 "kernel_version",
             )
             if all(previous.get(key) == row.get(key) for key in comparable_keys):
                 self.session_index[session_id] = row
+                self._sync_workspace_metadata_locked(row["workspace_id"])
                 return
             self.session_index[session_id] = row
+            self._sync_workspace_metadata_locked(row["workspace_id"])
             self._session_catalog_changed_locked(session_id)
             self._queue_session_index_change_locked(session_id)
 
@@ -90642,7 +92365,7 @@ class SessionManager:
                         if not sid:
                             continue
                         self.session_index[sid] = {
-                            "id": sid,
+                            "workspace_id": sid,
                             "title": sid,
                             "running": False,
                             "degraded": False,
@@ -90650,6 +92373,7 @@ class SessionManager:
                             "recovered_reason": "",
                             "ui_language": self.user_language,
                             "updated_at": 0.0,
+                            "created_at": 0.0,
                             "message_count": 0,
                             **dict(raw),
                             "id": sid,
@@ -90663,7 +92387,7 @@ class SessionManager:
                 loaded_index = False
         if not loaded_index:
             for path in sorted(self.root.glob("*")):
-                if not path.is_dir():
+                if not path.is_dir() or (path / ".workspace_retained").exists():
                     continue
                 sid = str(path.name or "").strip()
                 if not sid:
@@ -90686,7 +92410,7 @@ class SessionManager:
                 if not isinstance(summary, dict):
                     continue
                 self.session_index[sid] = {
-                    "id": sid,
+                    "workspace_id": sid,
                     "title": sid,
                     "running": False,
                     "degraded": False,
@@ -90694,6 +92418,7 @@ class SessionManager:
                     "recovered_reason": "",
                     "ui_language": self.user_language,
                     "updated_at": 0.0,
+                    "created_at": 0.0,
                     "message_count": 0,
                     **dict(summary),
                     "id": sid,
@@ -90768,17 +92493,27 @@ class SessionManager:
         if existing:
             return existing
         session_dir = self.root / sid
-        if not session_dir.exists() or not session_dir.is_dir():
+        if (
+            not session_dir.exists()
+            or not session_dir.is_dir()
+            or (session_dir / ".workspace_retained").exists()
+        ):
             return None
         summary = self.session_index.get(sid) or self._session_summary_from_disk(session_dir)
         title = str(summary.get("title", sid) or sid)
-        sess = self._make_session_state(sid, title)
+        sess = self._make_session_state(
+            sid,
+            title,
+            self._normalize_workspace_id(summary.get("workspace_id"), sid),
+        )
         self.sessions[sid] = sess
         self.session_index[sid] = {
             **summary,
+            "workspace_id": str(getattr(sess, "workspace_id", sid) or sid),
             "title": str(getattr(sess, "title", title) or title),
             "title_origin": str(getattr(sess, "title_origin", summary.get("title_origin", "")) or ""),
             "title_revision": int(getattr(sess, "auto_title_revision", summary.get("title_revision", 0)) or 0),
+            "created_at": float(getattr(sess, "created_at", summary.get("created_at", 0.0)) or 0.0),
             "running": bool(getattr(sess, "running", False)),
             "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
             "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
@@ -90799,10 +92534,33 @@ class SessionManager:
         except Exception:
             return 0
 
-    def create(self, title: str | None = None, *, title_origin: str | None = None) -> SessionState:
+    def create(
+        self,
+        title: str | None = None,
+        *,
+        title_origin: str | None = None,
+        workspace_session_id: str = "",
+    ) -> SessionState:
         with self.lock:
             sid = make_id("sess")
             name = title.strip() if title else sid
+            source_id = str(workspace_session_id or "").strip()
+            source = self._load_session_locked(source_id) if source_id else None
+            if source_id and source is None:
+                raise KeyError(source_id)
+            workspace_id = (
+                self._normalize_workspace_id(getattr(source, "workspace_id", ""), source.id)
+                if source is not None
+                else self._normalize_workspace_id(
+                    self.collaboration_context.get("project_id") if self.workspace_root is not None else "",
+                    sid,
+                )
+            )
+            session_workspace_root = (
+                self.workspace_root
+                if self.workspace_root is not None
+                else (source.files_root if source is not None else None)
+            )
             kernel_version = ""
             if self.kernel_registry is not None:
                 try:
@@ -90851,7 +92609,8 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
-                workspace_root=self.workspace_root,
+                workspace_root=session_workspace_root,
+                workspace_id=workspace_id,
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
@@ -90865,6 +92624,7 @@ class SessionManager:
                 skills_snapshot=self.skills_snapshot,
                 defer_initial_persist=True,
             )
+            sess.workspace_metadata_callback = self._workspace_metadata_for_session
             requested_origin = str(title_origin or "").strip().lower()
             if requested_origin in {"default", "auto", "application", "manual", "legacy"}:
                 sess.title_origin = requested_origin
@@ -90876,9 +92636,11 @@ class SessionManager:
             self.sessions[sid] = sess
             self.session_index[sid] = {
                 "id": sid,
+                "workspace_id": str(getattr(sess, "workspace_id", sid) or sid),
                 "title": str(getattr(sess, "title", name) or name),
                 "title_origin": str(getattr(sess, "title_origin", "") or ""),
                 "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+                "created_at": float(getattr(sess, "created_at", 0.0) or 0.0),
                 "running": bool(getattr(sess, "running", False)),
                 "degraded": False,
                 "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
@@ -90928,6 +92690,35 @@ class SessionManager:
             self.session_index[sess.id] = row
             self._session_catalog_changed_locked(sess.id)
             self._persist_session_index_change_now_locked(sess.id)
+            emit = getattr(sess, "_emit", None)
+            if callable(emit):
+                payload = {
+                    "summary": f"session renamed: '{trim(title, 36)}'",
+                    "session_title": sess.title,
+                    "title_origin": "manual",
+                    "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+                    "title_source": "manual",
+                }
+                metadata_callback = getattr(sess, "workspace_metadata_callback", None)
+                if callable(metadata_callback):
+                    try:
+                        metadata = metadata_callback(sess.id)
+                        if isinstance(metadata, dict):
+                            payload.update(
+                                {
+                                    key: metadata[key]
+                                    for key in (
+                                        "workspace_id",
+                                        "workspace_name",
+                                        "workspace_created_at",
+                                        "workspace_label",
+                                    )
+                                    if key in metadata
+                                }
+                            )
+                    except Exception:
+                        pass
+                emit("status", payload)
             return sess
 
     def delete(self, session_id: str) -> bool:
@@ -90936,7 +92727,22 @@ class SessionManager:
             return False
         with self.lock:
             sess = self.sessions.pop(sid, None)
+            summary = dict(self.session_index.get(sid, {}))
             existed = bool(sess or sid in self.session_index or (self.root / sid).exists())
+            workspace_id = self._normalize_workspace_id(
+                getattr(sess, "workspace_id", "") if sess is not None else summary.get("workspace_id"),
+                sid,
+            )
+            workspace_peers = [
+                row_id
+                for row_id, row in self.session_index.items()
+                if row_id != sid
+                and isinstance(row, dict)
+                and self._normalize_workspace_id(row.get("workspace_id"), row_id) == workspace_id
+            ]
+            retain_workspace = bool(
+                self.workspace_root is None and workspace_id == sid and workspace_peers
+            )
             self.session_index.pop(sid, None)
             if existed:
                 self._session_catalog_changed_locked(sid, deleted=True)
@@ -90947,9 +92753,35 @@ class SessionManager:
             # Note: sess.mcp is the SHARED global manager — never shut it down on
             # per-session delete (that would kill MCP for all other sessions).
             sess.interrupt()
-            shutil.rmtree(sess.root, ignore_errors=True)
+        session_root = sess.root if sess is not None else self.root / sid
+        if retain_workspace:
+            session_root.mkdir(parents=True, exist_ok=True)
+            for child in list(session_root.iterdir()):
+                if child.name in {"files", ".workspace_retained"}:
+                    continue
+                try:
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                (session_root / ".workspace_retained").write_text(workspace_id, encoding="utf-8")
+            except OSError:
+                pass
         else:
-            shutil.rmtree(self.root / sid, ignore_errors=True)
+            shutil.rmtree(session_root, ignore_errors=True)
+        if self.workspace_root is None:
+            with self.lock:
+                workspace_still_used = any(
+                    isinstance(row, dict)
+                    and self._normalize_workspace_id(row.get("workspace_id"), row_id) == workspace_id
+                    for row_id, row in self.session_index.items()
+                )
+            retained_root = self.root / workspace_id
+            if not workspace_still_used and (retained_root / ".workspace_retained").exists():
+                shutil.rmtree(retained_root, ignore_errors=True)
         return True
 
     def _user_profile_is_runnable(self, profile: dict) -> bool:
@@ -91059,6 +92891,7 @@ class SessionManager:
             except Exception:
                 pass
         opts = []
+        profiles_changed = False
         ollama_profile_id = ""
         ollama_base = self.ollama_base
         for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
@@ -91081,6 +92914,23 @@ class SessionManager:
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model, caps
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(str(profile.get("provider", "")), model, caps)
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                 }
             )
@@ -91093,7 +92943,24 @@ class SessionManager:
             base = str(profile.get("base_url", self.ollama_base) or self.ollama_base).strip()
             if not base:
                 continue
-            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            tags = list_ollama_models_cached(
+                base,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            ollama_records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(
+                profile, ollama_records, model_ids=tags
+            ) or profiles_changed
+            ollama_record_map = {
+                str(record.get("id", "")): record
+                for record in ollama_records
+                if isinstance(record, dict) and str(record.get("id", "")).strip()
+            }
             if tags:
                 if pid == self.user_active_profile_id:
                     self.ollama_env_tags = list(tags)
@@ -91108,6 +92975,13 @@ class SessionManager:
                     infer_model_multimodal_capabilities("ollama", tag),
                     parse_capability_overrides(profile.get("capabilities", {})),
                 )
+                tag_record = ollama_record_map.get(tag)
+                tag_record_caps = (
+                    tag_record.get("capabilities", {})
+                    if isinstance(tag_record, dict)
+                    else {}
+                )
+                tag_record_probed = isinstance(tag_record, dict)
                 opts.append(
                     {
                         "selection": selection,
@@ -91119,9 +92993,99 @@ class SessionManager:
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", False)),
                         "response_stream": bool(profile.get("response_stream", False)),
+                        "effort": str(profile.get("effort", "") or ""),
+                        "max_effort": str(profile.get("max_effort", "") or ""),
+                        "reasoning_supported": (
+                            profile.get("reasoning_supported")
+                            if profile.get("reasoning_supported") is not None
+                            else tag_record_caps.get("reasoning_supported")
+                            if isinstance(tag_record_caps, dict)
+                            and tag_record_caps.get("reasoning_supported") is not None
+                            else model_reasoning_style(
+                                "ollama",
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            != "none"
+                        ),
+                        "reasoning_style": str(
+                            profile.get("reasoning_style")
+                            or tag_record_caps.get("reasoning_style", "")
+                            or model_reasoning_style(
+                                "ollama",
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            or ""
+                        ),
+                        "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                        "title": str(profile.get("title", profile.get("label", pid)) or ""),
                         "capabilities": tag_caps,
                     }
                 )
+        for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": merge_multimodal_capabilities(infer_model_multimodal_capabilities(str(profile.get("provider", "")), model_id), parse_capability_overrides(profile.get("capabilities", {}))),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.user_model_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         runnable_opts = [x for x in opts if self._option_is_runnable(x)]
         if runnable_opts:
             opts = runnable_opts
@@ -91145,9 +93109,31 @@ class SessionManager:
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "response_stream": bool(active.get("response_stream", False)),
+                    "effort": str(active.get("effort", "") or ""),
+                    "max_effort": str(active.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        active.get("reasoning_supported")
+                        if active.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        active.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": active_caps,
                 },
             )
+            apply_model_option_runtime_fields(opts[0], active, str(active.get("model", "") or ""))
             option_map.add(selected)
         if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
@@ -91155,6 +93141,8 @@ class SessionManager:
             infer_model_multimodal_capabilities(str(active.get("provider", "")), str(active.get("model", ""))),
             parse_capability_overrides(active.get("capabilities", {})),
         )
+        if profiles_changed:
+            self._persist_user_prefs()
         return {
             "provider": active.get("provider", "ollama"),
             "models": [x["selection"] for x in opts] or [self.model],
@@ -91166,7 +93154,7 @@ class SessionManager:
             "active_capabilities": active_caps,
         }
 
-    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+    def set_runtime_model(self, model: str, thinking: bool | None = None, settings: dict | None = None) -> dict:
         raw = str(model or "").strip()
         if not raw:
             raise ValueError("model required")
@@ -91194,6 +93182,11 @@ class SessionManager:
                     raise ValueError(f"profile not found: {pid}")
             if selected_model.strip():
                 profile["model"] = selected_model.strip()
+            profile = apply_model_runtime_settings(profile, str(profile.get("model", "") or ""), settings)
+            for record in probe_provider_models(profile, background=True):
+                if str(record.get("id", "")) == str(profile.get("model", "")):
+                    merge_probed_models_into_profile(profile, [record])
+                    break
             if str(profile.get("provider", "")).lower() == "ollama" and selected_model.strip():
                 profile["capabilities"] = infer_model_multimodal_capabilities("ollama", selected_model.strip())
             if not self._user_profile_is_runnable(profile) and not explicit_profile and selected_model.strip():
@@ -91253,6 +93246,7 @@ class SessionManager:
         cfg = dict(config or {})
         OllamaClient.clear_global_probe_cache()
         profiles, active = self._profiles_from_config(cfg)
+        probe_and_merge_model_profiles(profiles, force_refresh=True)
         with self.lock:
             normalized: dict[str, dict] = {}
             for pid, row in profiles.items():
@@ -91347,7 +93341,9 @@ class SessionManager:
             title = str(raw.get("title", "") or sid)
             return {
                 "id": sid,
+                "workspace_id": self._normalize_workspace_id(raw.get("workspace_id"), sid),
                 "title": title,
+                "created_at": float(raw.get("created_at", 0.0) or 0.0),
                 "running": bool(raw.get("running", False)),
                 "degraded": bool(raw.get("degraded", False)),
                 "recovered_at": float(raw.get("recovered_at", 0.0) or 0.0),
@@ -91402,23 +93398,154 @@ class SessionManager:
                 continue
             row.update(
                 {
+                    "workspace_id": str(getattr(sess, "workspace_id", row.get("workspace_id", sess.id)) or sess.id),
                     "title": str(getattr(sess, "title", row.get("title", "")) or row.get("title", "")),
                     "running": bool(getattr(sess, "running", False) or getattr(sess, "scheduler_starting", False)),
                     "degraded": False,
                     "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
                     "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
                     "ui_language": normalize_ui_language(getattr(sess, "ui_language", row.get("ui_language", self.user_language))),
+                    "created_at": float(getattr(sess, "created_at", row.get("created_at", 0.0)) or 0.0),
                     "updated_at": float(getattr(sess, "updated_at", row.get("updated_at", 0.0)) or 0.0),
                     "message_count": int(row.get("message_count", 0) or 0),
                     "kernel_version": str(getattr(sess, "kernel_version", row.get("kernel_version", "")) or ""),
                 }
             )
+        with self.lock:
+            workspace_counts: dict[str, int] = {}
+            workspace_meta: dict[str, dict] = {}
+            for session_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                wid = self._normalize_workspace_id(raw.get("workspace_id"), session_id)
+                workspace_counts[wid] = workspace_counts.get(wid, 0) + 1
+                created = float(raw.get("created_at", 0.0) or 0.0)
+                if created <= 0:
+                    created = float(raw.get("updated_at", 0.0) or 0.0)
+                title = str(raw.get("title", "") or session_id).strip() or session_id
+                prior = workspace_meta.get(wid)
+                if prior is None or created < float(prior.get("created_at", 0.0) or 0.0):
+                    workspace_meta[wid] = {
+                        "name": title,
+                        "created_at": created,
+                    }
+            duplicate_names: dict[str, int] = {}
+            for meta in workspace_meta.values():
+                key = str(meta.get("name", "") or "").casefold()
+                duplicate_names[key] = duplicate_names.get(key, 0) + 1
+            workspace_labels: dict[str, str] = {}
+            for wid, meta in workspace_meta.items():
+                name = str(meta.get("name", "") or wid)
+                created = float(meta.get("created_at", 0.0) or 0.0)
+                label = name
+                if duplicate_names.get(name.casefold(), 0) > 1 and created > 0:
+                    try:
+                        label = f"{name} · {datetime.fromtimestamp(created).strftime('%Y-%m-%d')}"
+                    except Exception:
+                        label = name
+                workspace_labels[wid] = label
+        for row in page_rows:
+            wid = self._normalize_workspace_id(row.get("workspace_id"), str(row.get("id", "") or ""))
+            meta = workspace_meta.get(wid, {})
+            workspace_name = str(meta.get("name", "") or row.get("title", "") or row.get("id", ""))
+            row["workspace_session_count"] = int(workspace_counts.get(wid, 1))
+            row["workspace_name"] = workspace_name
+            row["workspace_created_at"] = float(meta.get("created_at", row.get("created_at", 0.0)) or 0.0)
+            row["workspace_label"] = workspace_labels.get(wid, workspace_name)
         return {
             "sessions": page_rows,
             "total": total,
             "offset": off,
             "limit": lim,
             "has_more": off + len(page_rows) < total,
+            "catalog_revision": catalog_revision,
+        }
+
+    def workspace_history(self, session_id: str, *, limit: int = 60) -> dict:
+        sid = str(session_id or "").strip()
+        lim = max(0, min(120, int(limit or 0)))
+        with self.lock:
+            active = self.sessions.get(sid)
+            source = self.session_index.get(sid)
+            if active is None and not isinstance(source, dict):
+                raise KeyError(sid)
+            workspace_id = self._normalize_workspace_id(
+                getattr(active, "workspace_id", "") if active is not None else source.get("workspace_id"),
+                sid,
+            )
+            matches: list[dict] = []
+            workspace_first: dict | None = None
+            for raw in self.session_index.values():
+                if not isinstance(raw, dict):
+                    continue
+                row_id = str(raw.get("id", "") or "").strip()
+                if not row_id:
+                    continue
+                loaded = self.sessions.get(row_id)
+                row_workspace_id = self._normalize_workspace_id(
+                    getattr(loaded, "workspace_id", "") if loaded is not None else raw.get("workspace_id"),
+                    row_id,
+                )
+                if row_workspace_id != workspace_id:
+                    continue
+                row_created_at = float(
+                    raw.get("created_at", 0.0)
+                    or (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                row_title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ) or row_id
+                first_created_at = float((workspace_first or {}).get("created_at", 0.0) or 0.0)
+                if (
+                    workspace_first is None
+                    or (row_created_at > 0 and (first_created_at <= 0 or row_created_at < first_created_at))
+                ):
+                    workspace_first = {"title": row_title, "created_at": row_created_at}
+                row = {
+                    "id": row_id,
+                    "workspace_id": row_workspace_id,
+                    "title": str(
+                        getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                    )
+                    or row_id,
+                    "running": bool(
+                        (getattr(loaded, "running", False) or getattr(loaded, "scheduler_starting", False))
+                        if loaded is not None
+                        else raw.get("running", False)
+                    ),
+                    "updated_at": float(
+                        getattr(loaded, "updated_at", 0.0) if loaded is not None else raw.get("updated_at", 0.0)
+                    ),
+                    "created_at": row_created_at,
+                    "workspace_name": str((workspace_first or {}).get("title", "") or row_title),
+                    "workspace_created_at": float((workspace_first or {}).get("created_at", 0.0) or 0.0),
+                    "message_count": max(0, int(raw.get("message_count", 0) or 0)),
+                    "current": row_id == sid,
+                }
+                matches.append(row)
+            matches.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+            catalog_revision = int(getattr(self, "catalog_revision", 0) or 0)
+            workspace_name = str((workspace_first or {}).get("title", "") or sid)
+            workspace_created_at = float((workspace_first or {}).get("created_at", 0.0) or 0.0)
+            for row in matches:
+                row["workspace_name"] = workspace_name
+                row["workspace_created_at"] = workspace_created_at
+        total = len(matches)
+        for row in matches:
+            row["workspace_session_count"] = total
+            row["workspace_label"] = workspace_name
+        return {
+            "ok": True,
+            "session_id": sid,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "workspace_created_at": workspace_created_at,
+            "sessions": matches[:lim] if lim else [],
+            "total": total,
+            "has_history": total > 1,
+            "truncated": bool(lim and total > lim),
             "catalog_revision": catalog_revision,
         }
 
@@ -91453,9 +93580,10 @@ window.MathJax={
   </div>
   <div class="actions">
     <select id="langSelect"></select>
-    <select id="modelSelect"></select>
-    <button id="applyModelBtn" class="subtle">Apply Model</button>
-    <button id="llmConfigBtn" class="subtle">Fill LLM Config</button>
+    <div id="modelPicker" class="model-picker" role="group" aria-label="Model selection">
+      <select id="modelSelect"></select>
+      <button id="modelManageBtn" class="subtle" type="button" title="Manage models" aria-label="Manage models">&#9881;</button>
+    </div>
     <button id="programBtn" class="subtle" type="button">Program</button>
     <input id="configInput" type="file" accept=".json,application/json" tabindex="-1" aria-hidden="true" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;opacity:0;pointer-events:none">
     <a id="downloadBtn" href="#">Open Skills Studio</a>
@@ -91648,6 +93776,7 @@ window.MathJax={
   </aside>
 </main>
 </div>
+<div id="menuPopup" class="menu-popup is-hidden" role="dialog" aria-label="Model management"></div>
 <div id="applicationEditor" class="application-modal" hidden>
   <div class="application-dialog" role="dialog" aria-modal="true" aria-labelledby="applicationEditorTitle">
     <div class="application-dialog-head">
@@ -92285,18 +94414,63 @@ const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case',
 S.staticMode=STATIC_UI;
 async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){setTextIfChanged(btn,t('btn_level')+': '+t('level_auto'))}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};setTextIfChanged(btn,t('btn_level')+': '+(labels[level]||t('level_auto')))}}
-const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
-function modelReasoningStyle(provider,model){const p=String(provider||'').trim().toLowerCase();const m=String(model||'').trim().toLowerCase();if(p==='anthropic'){return ['claude-3-7','claude-3.7','claude-sonnet-4','claude-opus-4','claude-haiku-4','claude-4','-thinking','claude-sonnet-5','claude-opus-5'].some(x=>m.includes(x))?'anthropic':'none'}if(p==='ollama'){return ['r1','qwen3','deepseek','thinking','reasoner','magistral'].some(x=>m.includes(x))?'ollama':'none'}const compat=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(compat.has(p)){if(p==='glm'||m.startsWith('glm-')||m.includes('glm'))return 'glm';if(m.includes('deepseek'))return 'deepseek';if(m.startsWith('o1')||m.startsWith('o3')||m.startsWith('o4')||m.includes('gpt-5')||m.includes('/o1')||m.includes('/o3')||m.includes('/o4')||m.includes('reasoning'))return 'openai';return 'none'}return 'none'}
+const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_name',label:'Provider Name',type:'text',placeholder:'My Provider',hint:'Name shown in model menus'},{key:'custom_title',label:'Provider Title',type:'text',placeholder:'Custom HTTP',hint:'Title used for display and session labels'},{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
+function modelReasoningStyle(provider,model,capabilities){const p=String(provider||'').trim().toLowerCase();const caps=capabilities&&typeof capabilities==='object'?capabilities:{};const explicit=String(caps.reasoning_style||caps.reasoning_dialect||'').trim().toLowerCase();if(['anthropic','openai','deepseek','glm','ollama','none'].includes(explicit))return explicit;if(caps.reasoning_supported===false)return 'none';if(caps.reasoning_supported===true){if(p==='anthropic')return 'anthropic';if(p==='ollama')return 'ollama';if(p==='glm')return 'glm';return 'openai'}return 'none'}
+function detectedModelCapabilities(provider,model){const key=String(provider||'').trim().toLowerCase();const target=String(model||'').trim().toLowerCase();const rows=S.llmDetectedModelRecords?.[key];if(Array.isArray(rows)){const row=rows.find(item=>String(item?.id||item?.model||'').trim().toLowerCase()===target);return row?.capabilities&&typeof row.capabilities==='object'?row.capabilities:{}}if(rows&&typeof rows==='object'){const row=rows[model]||rows[target];if(row&&typeof row==='object')return row.capabilities&&typeof row.capabilities==='object'?row.capabilities:row}return {}}
 function effortModelFieldId(provider){if(provider==='ollama')return 'llmF_ollama_model';const fields=LLM_PROVIDER_FIELDS[provider]||[];const mf=fields.find(f=>f.key&&f.key.endsWith('_model'));return mf?('llmF_'+mf.key):''}
 function effortCurrentModel(provider){const id=effortModelFieldId(provider);if(!id)return '';const el=E(id);return el?String(el.value||'').trim():''}
-function refreshEffortAvailability(){const provider=E('llmProvider')?.value||'ollama';const eff=E('llmF_effort');const mx=E('llmF_max_effort');const hint=E('llmEffortHint');if(!eff||!mx)return;const model=effortCurrentModel(provider);const style=modelReasoningStyle(provider,model);const supported=style!=='none';eff.disabled=!supported;mx.disabled=!supported;const wrap=E('llmEffortField');const wrap2=E('llmMaxEffortField');for(const w of [wrap,wrap2]){if(w)w.style.opacity=supported?'1':'0.55'}if(hint){if(!model){hint.textContent=t('llm_effort_need_model')}else if(supported){hint.textContent=t('llm_effort_supported').replace('{style}',style)}else{hint.textContent=t('llm_effort_unsupported')}}}
+function refreshEffortAvailability(){const provider=E('llmProvider')?.value||'ollama';const eff=E('llmF_effort');const mx=E('llmF_max_effort');const hint=E('llmEffortHint');if(!eff||!mx)return;const model=effortCurrentModel(provider);const style=modelReasoningStyle(provider,model,detectedModelCapabilities(provider,model));const supported=style!=='none';eff.disabled=!supported;mx.disabled=!supported;const wrap=E('llmEffortField');const wrap2=E('llmMaxEffortField');for(const w of [wrap,wrap2]){if(w)w.style.opacity=supported?'1':'0.55'}if(hint){if(!model){hint.textContent=t('llm_effort_need_model')}else if(supported){hint.textContent=t('llm_effort_supported').replace('{style}',style)}else{hint.textContent=t('llm_effort_unsupported')}}}
 function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select></div>';html+='<div class=\"llm-field\"><label>'+esc(t('llm_response_stream'))+'</label><select id=\"llmF_response_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select><div class=\"llm-hint\">'+esc(t('llm_response_stream_hint'))+'</div></div>';html+='<div class=\"llm-field\" id=\"llmEffortField\"><label>'+esc(t('llm_effort'))+'</label><select id=\"llmF_effort\"><option value=\"\" selected>'+esc(t('llm_effort_auto'))+'</option><option value=\"off\">'+esc(t('llm_effort_off'))+'</option><option value=\"low\">'+esc(t('llm_effort_low'))+'</option><option value=\"medium\">'+esc(t('llm_effort_medium'))+'</option><option value=\"high\">'+esc(t('llm_effort_high'))+'</option><option value=\"max\">'+esc(t('llm_effort_max'))+'</option></select></div>';html+='<div class=\"llm-field\" id=\"llmMaxEffortField\"><label>'+esc(t('llm_max_effort'))+'</label><select id=\"llmF_max_effort\"><option value=\"\">'+esc(t('llm_effort_no_ceiling'))+'</option><option value=\"low\">'+esc(t('llm_effort_low'))+'</option><option value=\"medium\">'+esc(t('llm_effort_medium'))+'</option><option value=\"high\">'+esc(t('llm_effort_high'))+'</option><option value=\"max\" selected>'+esc(t('llm_effort_max'))+'</option></select><div class=\"llm-hint\" id=\"llmEffortHint\"></div></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}const _mfid=effortModelFieldId(provider);if(_mfid){const _mfe=E(_mfid);if(_mfe){_mfe.addEventListener('input',refreshEffortAvailability);_mfe.addEventListener('change',refreshEffortAvailability)}}refreshEffortAvailability()}
-async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];try{refreshEffortAvailability()}catch(e){}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}S.llmDetectedModels=S.llmDetectedModels||{};S.llmDetectedModelRecords=S.llmDetectedModelRecords||{};S.llmDetectedModels.ollama=data.models.slice();S.llmDetectedModelRecords.ollama=Array.isArray(data.model_records)?data.model_records.slice():data.models.map(id=>({id,capabilities:{}}));if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length));refreshEffortAvailability()}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},anthropic:{urlKey:'anthropic_url',modelKey:'anthropic_model',keyKey:'anthropic_key',defaultUrl:'https://api.anthropic.com'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];const records=Array.isArray(data.model_records)?data.model_records.filter(item=>item&&String(item.id||item.model||'').trim()):models.map(id=>({id,capabilities:{}}));if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){S.llmDetectedModels=S.llmDetectedModels||{};S.llmDetectedModelRecords=S.llmDetectedModelRecords||{};S.llmDetectedModels[normalizedProvider]=models.slice();S.llmDetectedModelRecords[normalizedProvider]=records.slice();if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];try{refreshEffortAvailability()}catch(e){}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';config.response_stream=E('llmF_response_stream')?.value==='true';const _eff=E('llmF_effort');if(_eff&&!_eff.disabled){const _ev=String(_eff.value||'').trim();if(_ev)config.effort=_ev}const _mx=E('llmF_max_effort');if(_mx&&!_mx.disabled){const _mv=String(_mx.value||'').trim();if(_mv)config.max_effort=_mv}return config}
 async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
+async function scanAnthropicModels(){const baseUrl=(E('llmF_anthropic_url')?.value||'').trim()||'https://api.anthropic.com';const apiKey=(E('llmF_anthropic_key')?.value||'').trim();const modelEl=E('llmF_anthropic_model');const hint=E('localScanHint');if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider=anthropic&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];const records=Array.isArray(data.model_records)?data.model_records:models.map(id=>({id,capabilities:{}}));if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}S.llmDetectedModels.anthropic=models.slice();S.llmDetectedModelRecords.anthropic=records.slice();if(modelEl&&models.length&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=models.length?t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', '):t('llm_scan_reachable_manual');refreshEffortAvailability()}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
+S.llmDetectedModels=S.llmDetectedModels||{};
+S.llmDetectedModelRecords=S.llmDetectedModelRecords||{};
+setTimeout(()=>{
+  const originalScanOpenAI=scanOpenAICompatModels;
+  const originalScanOllama=scanOllamaModels;
+  const originalCollect=collectLlmConfig;
+  const originalRenderLlmFields=renderLlmFields;
+  renderLlmFields=provider=>{originalRenderLlmFields(provider);if(provider!=='anthropic')return;const container=E('llmFieldsContainer');if(!container||E('localScanBtn'))return;const field=document.createElement('div');field.className='llm-field';field.innerHTML='<div style="display:flex;gap:8px;align-items:center"><button type="button" id="localScanBtn" class="llm-modal-btn-secondary" style="flex:none;padding:6px 12px">'+esc(t('llm_scan'))+'</button></div><div class="llm-hint" id="localScanHint">'+esc(t('llm_scan_hint'))+'</div>';const effortField=E('llmEffortField');container.insertBefore(field,effortField||null);E('localScanBtn').onclick=()=>scanOpenAICompatModels('anthropic')};
+  scanOpenAICompatModels=async provider=>{
+    const key=String(provider||'openai_compat');
+    if(key==='anthropic')await scanAnthropicModels();else await originalScanOpenAI(provider);
+    const modelKey={openai_compat:'openai_model',siliconflow:'siliconflow_model',vllm:'vllm_model',lmstudio:'lmstudio_model',anthropic:'anthropic_model',glm:'glm_model',kimi:'kimi_model',openrouter:'openrouter_model',custom_http:'custom_model'}[key];
+    const current=modelKey?String(E('llmF_'+modelKey)?.value||'').trim():'';
+    if(current){const existing=Array.isArray(S.llmDetectedModels[key])?S.llmDetectedModels[key]:[];if(!existing.includes(current))existing.unshift(current);S.llmDetectedModels[key]=existing;const records=Array.isArray(S.llmDetectedModelRecords[key])?S.llmDetectedModelRecords[key]:[];if(!records.some(item=>String(item?.id||item?.model||'').trim()===current))records.unshift({id:current,capabilities:{}});S.llmDetectedModelRecords[key]=records}
+  };
+  scanOllamaModels=async()=>{await originalScanOllama();const sel=E('llmF_ollama_model');const values=[...(sel?.options||[])].map(x=>String(x.value||'').trim()).filter(Boolean);if(values.length)S.llmDetectedModels.ollama=values;if(values.length&&!Array.isArray(S.llmDetectedModelRecords.ollama))S.llmDetectedModelRecords.ollama=values.map(id=>({id,capabilities:{}}))};
+  collectLlmConfig=()=>{const config=originalCollect();const provider=String(config.provider||'');const detected=Array.isArray(S.llmDetectedModels[provider])?S.llmDetectedModels[provider].filter(Boolean):[];const records=Array.isArray(S.llmDetectedModelRecords[provider])?S.llmDetectedModelRecords[provider]:[];if(detected.length){config.models=detected;const modelListKeys={ollama:'ollama_models',openai_compat:'openai_models',siliconflow:'siliconflow_models',vllm:'vllm_models',lmstudio:'lmstudio_models',glm:'glm_models',kimi:'kimi_models',openrouter:'openrouter_models',custom_http:'custom_models',anthropic:'anthropic_models'};const listKey=modelListKeys[provider];if(listKey)config[listKey]=detected;if(provider==='custom_http')config.custom_models=detected}if(records.length){const reasoning={};const settings=(config.model_settings&&typeof config.model_settings==='object')?{...config.model_settings}:{};for(const record of records){const id=String(record?.id||record?.model||'').trim();const caps=record?.capabilities&&typeof record.capabilities==='object'?record.capabilities:{};if(!id)continue;const clean={};for(const key of ['reasoning_supported','reasoning_style','reasoning_dialect'])if(key in caps)clean[key]=caps[key];if(!Object.keys(clean).length)continue;reasoning[id]=clean;settings[id]={...(settings[id]&&typeof settings[id]==='object'?settings[id]:{}),...clean}}if(Object.keys(reasoning).length){config.model_reasoning_capabilities=reasoning;config.model_settings=settings}}return config};
+  const modelOption=()=>{const selected=String(S.config?.model||'');return (S.modelOptions||[]).find(x=>String(x.selection||'')===selected)||null};
+  let showModelSettings=anchor=>{const popup=E('menuPopup');if(!popup)return;const option=modelOption()||{};const caps=option.capabilities||{};const supports=option.reasoning_supported===true||caps.reasoning_supported===true;const effort=String(option.effort||'');const maxEffort=String(option.max_effort||'');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${esc(option.label||option.model||S.config?.model||'Model settings')}</strong><small>Runtime settings</small></div><label class="model-setting-row">Effort<select id="webModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="webModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="webModelThinking" type="checkbox" ${option.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="webModelResponse" type="checkbox" ${option.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="webModelSave" class="agent-model-config">Save</button></div>`;const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-300))}px`;popup.style.top=`${rect.bottom+6}px`;const eff=E('webModelEffort'),mx=E('webModelMaxEffort');if(eff)eff.value=effort;if(mx)mx.value=maxEffort;E('webModelSave').onclick=async ev=>{ev.stopPropagation();const settings={effort:String(eff?.value||''),max_effort:String(mx?.value||''),thinking_stream:!!E('webModelThinking')?.checked,response_stream:!!E('webModelResponse')?.checked};try{const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const out=await api(path,{method:'POST',body:JSON.stringify({selection:S.config?.model,model:S.config?.model,...settings})});applyModelCatalog(out);popup.classList.add('is-hidden')}catch(err){showError(err.message||String(err))}}};
+  const showModelManager=async anchor=>{const popup=E('menuPopup');if(!popup||!anchor)return;popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.style.bottom='auto';popup.style.transform='';const place=()=>{const rect=anchor.getBoundingClientRect();const width=Math.min(380,window.innerWidth-8);popup.style.width=`${width}px`;popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-width-4))}px`;popup.style.top=`${Math.min(window.innerHeight-8,rect.bottom+6)}px`};place();popup.innerHTML='<div class="agent-model-summary"><strong>Loading models...</strong><small>Reading provider model catalog</small></div>';try{const cat=await loadModelCatalog(false);if(!cat||typeof cat!=='object')throw new Error('Model catalog unavailable');applyModelCatalog(cat);const options=Array.isArray(cat.options)?cat.options:[];popup.innerHTML='';const head=document.createElement('div');head.className='agent-model-summary';head.innerHTML='<strong>Model management</strong><small>Select a model or open its settings</small>';popup.appendChild(head);const actions=document.createElement('div');actions.className='agent-model-actions';const refresh=document.createElement('button');refresh.type='button';refresh.className='agent-model-config';refresh.title='Refresh provider models';refresh.setAttribute('aria-label','Refresh provider models');refresh.innerHTML='<span class="codicon codicon-refresh"></span>';refresh.onclick=async ev=>{ev.preventDefault();ev.stopPropagation();refresh.disabled=true;try{const next=await loadModelCatalog(true);applyModelCatalog(next);await showModelManager(anchor)}catch(error){showError(error.message||String(error))}finally{refresh.disabled=false}};const importBtn=document.createElement('button');importBtn.type='button';importBtn.className='agent-model-config';importBtn.title='Import LLM config';importBtn.setAttribute('aria-label','Import LLM config');importBtn.innerHTML='<span class="codicon codicon-cloud-upload"></span>';importBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();popup.classList.add('is-hidden');openLlmConfigModal()};actions.append(refresh,importBtn);popup.appendChild(actions);const search=document.createElement('input');search.type='search';search.className='agent-model-search';search.placeholder='Search models';search.setAttribute('aria-label','Search models');popup.appendChild(search);const list=document.createElement('div');list.className='agent-model-list';popup.appendChild(list);const render=()=>{const q=String(search.value||'').trim().toLowerCase();list.innerHTML='';const shown=options.filter(o=>!q||[o.label,o.model,o.provider,o.display_name,o.title].join(' ').toLowerCase().includes(q));for(const option of shown){const row=document.createElement('div');row.className='agent-model-option';const select=document.createElement('button');select.type='button';select.classList.toggle('is-active',String(option.selection||'')===String(cat.selected||''));select.innerHTML=`<span class="codicon codicon-${String(option.selection||'')===String(cat.selected||'')?'check':'hubot'}"></span><span>${esc(option.label||option.selection)}</span>`;select.onclick=ev=>{ev.preventDefault();ev.stopPropagation();applyModelSelection(option.selection,anchor).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label',`Settings for ${option.label||option.model||option.selection}`);settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelSettings(anchor,option)};row.append(select,settings);list.appendChild(row)}if(!shown.length)list.innerHTML='<div class="agent-model-summary">No matching models.</div>'};search.oninput=render;render();place();setTimeout(()=>{try{search.focus()}catch(_){ }},0)}catch(error){popup.innerHTML=`<div class="agent-model-summary"><strong>Model management failed</strong><small>${esc(error.message||String(error))}</small></div>`;place()}};
+  const applyModelSelection=async(selection,anchor)=>{const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const out=await api(path,{method:'POST',body:JSON.stringify({selection,model:selection})});applyModelCatalog(out);E('menuPopup').classList.add('is-hidden');showError(out?.queued?(out.note||'Model switch queued.'):'Model switched.');scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})};
+  const originalShowModelSettings=showModelSettings;showModelSettings=(anchor,option)=>{const selected=option||modelOption()||{};const popup=E('menuPopup');if(!popup)return;const caps=selected.capabilities||{};const supports=selected.reasoning_supported===true||caps.reasoning_supported===true;const effort=String(selected.effort||'');const maxEffort=String(selected.max_effort||'');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${esc(selected.label||selected.model||'Model settings')}</strong><small>${esc(selected.display_name||selected.title||selected.provider||'')}</small></div><label class="model-setting-row">Effort<select id="webModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="webModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="webModelThinking" type="checkbox" ${selected.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="webModelResponse" type="checkbox" ${selected.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="webModelBack" class="agent-model-compact" type="button">Back</button><button id="webModelSave" class="agent-model-config" type="button" title="Save model settings" aria-label="Save model settings"><span class="codicon codicon-save"></span></button></div>`;const rect=(anchor||E('modelManageBtn')||E('modelSettingsBtn')).getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-380))}px`;popup.style.top=`${rect.bottom+6}px`;popup.style.bottom='auto';E('webModelEffort').value=effort;E('webModelMaxEffort').value=maxEffort;E('webModelBack').onclick=ev=>{ev.stopPropagation();showModelManager(anchor||E('modelManageBtn'))};E('webModelSave').onclick=async ev=>{ev.stopPropagation();const settings={effort:String(E('webModelEffort').value||''),max_effort:String(E('webModelMaxEffort').value||''),thinking_stream:!!E('webModelThinking').checked,response_stream:!!E('webModelResponse').checked};try{const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const out=await api(path,{method:'POST',body:JSON.stringify({selection:selected.selection,model:selected.selection,...settings})});applyModelCatalog(out);popup.classList.add('is-hidden');showError('Model settings saved.');scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(error){showError(error.message||String(error))}}};
+  const bindWebModelManager=()=>{const settingsBtn=E('modelSettingsBtn');if(settingsBtn)settingsBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelSettings(settingsBtn)};const manageBtn=E('modelManageBtn');if(manageBtn)manageBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelManager(manageBtn)};};
+  bindWebModelManager();
+  const ensureModelConfigAction=()=>{
+    const popup=E('menuPopup'),actions=popup?.querySelector('.agent-model-actions');
+    if(!actions||actions.querySelector('[data-llm-config-action]'))return;
+    const button=actions.querySelector('button[title="Import LLM config"]');
+    if(button){
+      button.dataset.llmConfigAction='1';
+      button.title='Configure LLM';
+      button.setAttribute('aria-label','Configure LLM');
+      button.classList.add('agent-model-config-text');
+      button.innerHTML='<span class="codicon codicon-settings-gear"></span><span>LLM Config</span>';
+      button.style.width='auto';button.style.minWidth='104px';button.style.padding='0 8px';button.style.gap='5px';button.style.fontSize='11px';
+    }
+  };
+  const modelConfigActionObserver=new MutationObserver(ensureModelConfigAction),modelPopup=E('menuPopup');
+  if(modelPopup)modelConfigActionObserver.observe(modelPopup,{childList:true,subtree:true});
+  // Safari may restore this document from bfcache after visiting the IDE;
+  // rebind controls against the restored DOM so the gear remains functional.
+  window.addEventListener('pageshow',bindWebModelManager);
+},0);
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
 const E=id=>document.getElementById(id);
 const PREVIEW_TOKENS=new Map();
@@ -92719,9 +94893,11 @@ function setTextIfChanged(el,text){
 }
 function closePopups(except=''){
   const keep=String(except||'');
-  for(const menu of document.querySelectorAll('.popup-menu')){
+  for(const menu of document.querySelectorAll('.popup-menu,.menu-popup')){
     if(menu.id&&menu.id===keep)continue;
     menu.style.display='none';
+    menu.classList.add('is-hidden');
+    menu.setAttribute('aria-hidden','true');
   }
   S.openPopup=keep;
 }
@@ -92732,9 +94908,13 @@ function setPopupOpen(menuId,open){
   if(open){
     closePopups(id);
     menu.style.display='block';
+    menu.classList.remove('is-hidden');
+    menu.setAttribute('aria-hidden','false');
     S.openPopup=id;
   }else{
     menu.style.display='none';
+    menu.classList.add('is-hidden');
+    menu.setAttribute('aria-hidden','true');
     if(S.openPopup===id)S.openPopup='';
   }
 }
@@ -92941,12 +95121,26 @@ function _deltaConsumeSeq(evt){
   if(S.snap&&typeof S.snap==='object')S.snap.event_seq=seq;
   return{ok:true,stale:false,gap:false};
 }
+function _applySessionTitleEvent(data,evt={}){
+  const payload=(data&&typeof data==='object')?data:{},sid=String(payload.session_id||evt.session_id||'').trim();
+  if(!sid)return false;
+  const rev=Number(payload.title_revision||0),title=String(payload.session_title||'').trim(),rows=Array.isArray(S.sessions)?S.sessions:[];
+  let changed=false,workspaceId=String(payload.workspace_id||'').trim();
+  const target=S.sessionById?.get(sid)||rows.find(row=>String(row?.id||'')===sid);
+  if(target){workspaceId=workspaceId||String(target.workspace_id||'').trim();if(title&&rev>=Number(target.title_revision||0)&&(target.title!==title||target.title_origin!==payload.title_origin)){target.title=title;target.title_origin=payload.title_origin||target.title_origin;target.title_revision=rev;changed=true}}
+  if(workspaceId){
+    const peers=rows.filter(row=>String(row?.workspace_id||'').trim()===workspaceId),first=peers.slice().sort((a,b)=>Number(a?.created_at||a?.updated_at||0)-Number(b?.created_at||b?.updated_at||0))[0],name=String(payload.workspace_name||first?.title||'').trim();
+    for(const row of peers){if(name&&row.workspace_name!==name){row.workspace_name=name;changed=true}if(payload.workspace_created_at!=null&&Number(row.workspace_created_at||0)!==Number(payload.workspace_created_at||0)){row.workspace_created_at=Number(payload.workspace_created_at||0);changed=true}if(payload.workspace_label&&row.workspace_label!==payload.workspace_label){row.workspace_label=String(payload.workspace_label);changed=true}}
+  }
+  if(changed){S.lastSessionsSig='';_deltaScheduleRender({sessions:true});}
+  return changed;
+}
 function _deltaApplyRuntimeEvent(evt){
   if(!_deltaEnsureSnapshot())return{handled:false,needsSnapshot:true};
   const typ=String(evt?.type||'').trim();
   const data=(evt&&typeof evt.data==='object')?evt.data:{};
   _deltaAdoptAgentRole(data);
-  if(data.session_title){const sid=String(data.session_id||evt.session_id||S.activeSession||'');const row=S.sessionById&&S.sessionById.get(sid);const rev=Number(data.title_revision||0);if(row&&rev>=Number(row.title_revision||0)){row.title=String(data.session_title);row.title_origin=data.title_origin||row.title_origin;row.title_revision=rev;_deltaScheduleRender({sessions:true});}}
+  if(data.session_title)_applySessionTitleEvent(data,evt);
   const ts=Number(evt?.ts||Date.now()/1000);
   if(Number.isFinite(ts)&&ts>0){
     const prevTs=Number(S.snap.updated_at||0);
@@ -96924,6 +99118,7 @@ async function refreshAll(forceProbe=false){
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
 window.addEventListener('DOMContentLoaded',()=>bindClick('programBtn',openProgram));
+window.addEventListener('DOMContentLoaded',()=>{const select=E('modelSelect');if(select)select.onchange=()=>applyModel();const popup=E('menuPopup');if(popup)popup.addEventListener('click',event=>event.stopPropagation())});
 window.addEventListener('DOMContentLoaded',()=>{bindClick('refreshUserProcessesBtn',()=>refreshUserProcesses(true).catch(err=>showError(err.message)));USER_PROCESS_STATE.timer=setInterval(()=>{if(document.visibilityState!=='hidden')refreshUserProcesses(false).catch(()=>{})},5000)});
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 function kernelNoticeDeviceId(){let value=localStorage.getItem('clouds_kernel_notice_device')||'';if(value.length<24){const bytes=new Uint8Array(18);crypto.getRandomValues(bytes);value='web_'+Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');localStorage.setItem('clouds_kernel_notice_device',value)}return value}
@@ -96935,6 +99130,10 @@ window.addEventListener('DOMContentLoaded',()=>{const search=E('sessionSearch');
 
 APP_CSS += r"""
 :root{--web-scrollbar-size:8px;--web-scrollbar-thumb:rgba(98,116,142,.44);--web-scrollbar-thumb-hover:rgba(76,98,128,.7)}
+.model-picker{display:inline-flex;align-items:center;gap:6px;max-width:min(46vw,520px);height:44px}.model-picker select{box-sizing:border-box;min-width:180px;max-width:32vw;height:44px;min-height:44px;padding:0 34px 0 12px;line-height:1.2;appearance:none;-webkit-appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4l3 3 3-3M3 8l3-3 3 3' fill='none' stroke='%235e6c84' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center}.model-picker .hidden{display:none}.model-picker button{box-sizing:border-box;flex:0 0 auto;width:44px;height:44px;min-width:44px;min-height:44px;padding:0;display:inline-flex;align-items:center;justify-content:center;line-height:1}.model-picker #modelManageBtn{font-size:25px!important;font-weight:600;line-height:1}
+.model-setting-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;font-size:.78rem;color:var(--fg,#0f1b2d)}.model-setting-row select{min-width:130px;padding:4px 6px;border:1px solid var(--line,#d9e1ec);border-radius:6px;background:#fff}.model-setting-check{display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:.78rem}.model-setting-check input{accent-color:var(--brand,#1f6feb)}
+.menu-popup{position:fixed;z-index:10020}.menu-popup.is-hidden{display:none!important}.menu-popup:not(.is-hidden){display:block}.menu-popup.agent-model-menu{width:min(380px,calc(100vw - 8px));max-height:min(460px,72vh);overflow:auto;padding:4px;background:var(--panel,#fff);border:1px solid var(--line,#d9e1ec);border-radius:8px;box-shadow:0 10px 28px rgba(17,31,53,.22);color:var(--fg,#0f1b2d)}.agent-model-menu button{box-sizing:border-box;height:40px!important;min-height:40px!important;line-height:1.2!important;display:flex;align-items:center;color:var(--fg,#0f1b2d);border-radius:7px;padding:8px 10px!important}.agent-model-option{height:42px;padding:1px 0}.agent-model-option>button:first-child{justify-content:flex-start;text-align:left}.agent-model-option .agent-model-config{height:36px!important;min-height:36px!important;justify-content:center;padding:0!important}.agent-model-menu button:hover{background:var(--hover,#edf3fb)}.agent-model-menu button.is-active{color:var(--brand,#1f6feb);font-weight:600}.agent-model-summary{padding:8px 10px;border-bottom:1px solid var(--line,#d9e1ec);color:var(--muted,#667085);font-size:.75rem}.agent-model-summary strong,.agent-model-summary small{display:block}.agent-model-summary strong{color:var(--fg,#0f1b2d);font-size:.82rem}.agent-model-summary small{margin-top:2px}.agent-model-option{display:flex;align-items:center;gap:4px;min-width:0}.agent-model-option>button:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-config{display:inline-grid!important;place-items:center!important;width:26px!important;min-width:26px!important;height:24px!important;min-height:24px!important;padding:0!important;border:1px solid var(--line,#d9e1ec)!important;background:transparent!important;color:var(--muted,#667085)!important}.agent-model-config:hover{background:var(--hover,#edf3fb)!important;color:var(--brand,#1f6feb)!important}.agent-model-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;padding:6px 4px}.agent-model-search{display:block;width:calc(100% - 16px);margin:7px 8px;padding:6px 8px;border:1px solid var(--line,#d9e1ec);border-radius:6px;background:var(--input,#fff);color:var(--fg,#0f1b2d);box-sizing:border-box}.agent-model-list{min-height:0}.agent-model-menu .codicon:before{display:block;font:600 14px/1 sans-serif}.agent-model-menu .codicon-refresh:before{content:"\21bb"}.agent-model-menu .codicon-cloud-upload:before{content:"\2191"}.agent-model-menu .codicon-settings-gear:before{content:"\2699"}.agent-model-menu .codicon-save:before{content:"\2713"}.agent-model-menu .codicon-check:before{content:"\2713"}.agent-model-menu .codicon-hubot:before{content:"\25c7"}
+.session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
 html,body{scrollbar-gutter:stable}
 *{scrollbar-width:thin;scrollbar-color:transparent transparent!important}
 *:hover,*:focus,*:focus-within{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}
@@ -96947,6 +99146,7 @@ html,body{scrollbar-gutter:stable}
 #chat,#sessionList,.chat-tabs,.preview-body,.preview-code-scroll,.msg-md .md-code,.msg-code-shell,.msg-diff-shell,#activity,#commands,#diffs,#fileExplorer,#catalog,.popup-menu,.application-list,.application-editor-body,.application-skill-catalog,.modal,.modal-body{scrollbar-gutter:stable}
 @media(hover:none),(pointer:coarse){*:active{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}*:active::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb)!important;background-clip:padding-box!important}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.agent-model-menu button{height:34px!important;min-height:34px!important;padding:6px 9px!important;border-radius:7px!important}.agent-model-option{height:36px!important}.agent-model-option .agent-model-config{width:32px!important;min-width:32px!important;height:32px!important;min-height:32px!important}.agent-model-actions{gap:6px;padding:5px 4px}.agent-model-actions .agent-model-config{height:34px!important;min-height:34px!important}.agent-model-config-text{display:inline-flex!important;align-items:center!important;justify-content:center!important;place-items:unset!important;width:auto!important;min-width:104px!important;height:34px!important;min-height:34px!important;padding:0 8px!important;gap:5px!important;color:var(--brand,#1f6feb)!important;font-size:11px!important;line-height:1!important;white-space:nowrap!important}.agent-model-config-text .codicon{display:inline-block!important;flex:0 0 auto}
 """
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number};
@@ -97540,14 +99740,21 @@ ADMIN_INDEX_HTML = """<!doctype html>
             <label>History versions<input id="evolutionHistoryDepth" type="number" min="0" max="12" value="2"></label>
             <label>Start date<input id="evolutionStartDate" type="date"></label>
             <label>End date<input id="evolutionEndDate" type="date"></label>
-            <label>Generator profile<input id="evolutionGeneratorProfile" placeholder="global profile id"></label>
-            <label>Judge profile<input id="evolutionJudgeProfile" placeholder="independent profile id"></label>
+            <label>生成模型<select id="evolutionGeneratorProfile" data-admin-no-i18n></select></label>
+            <label>评审模型<select id="evolutionJudgeProfile" data-admin-no-i18n></select></label>
+            <div class="evolution-model-info evolution-span">
+              <div id="evolutionModelSources" class="evolution-model-sources" aria-live="polite"></div>
+              <p id="evolutionModelResolved" class="evolution-model-resolved" data-admin-no-i18n></p>
+            </div>
             <label class="evolution-span">User scope<input id="evolutionUserScope" placeholder="* or comma-separated user ids"></label>
             <label class="evolution-span">Session scope<input id="evolutionSessionScope" placeholder="* or comma-separated session ids"></label>
             <label class="switch-row evolution-span"><input id="evolutionEventTriggers" type="checkbox">Enable metric/event triggers</label>
           </div>
-          <div class="inline-actions evolution-actions"><button id="saveEvolutionBtn" type="button">Save Policy</button><button id="runEvolutionBtn" class="secondary" type="button">Run Now</button><button id="killEvolutionBtn" class="danger" type="button">Emergency Off</button></div>
-          <div id="evolutionPolicyNote" class="notice hidden"></div>
+          <div id="evolutionPolicyNote" class="notice hidden" role="status" aria-live="polite"></div>
+          <div class="evolution-toolbar">
+            <div class="evolution-actions"><button id="saveEvolutionBtn" type="button">Save Policy</button><button id="runEvolutionBtn" class="secondary" type="button">Run Now</button><button id="killEvolutionBtn" class="danger" type="button">Emergency Off</button></div>
+            <div class="evolution-secondary-actions"><button id="refreshEvolutionModelsBtn" class="ghost" type="button">刷新模型列表</button><button id="reloadEvolutionConfigBtn" class="ghost" type="button">重新载入配置</button></div>
+          </div>
           <div id="evolutionBootstrap" class="notice">Restart source is configured in Startup Parameters: <code>inherit</code> keeps existing kernel history; <code>inject</code> adds the embedded kernel without deleting old versions.</div>
         </article>
         <article class="card evolution-current">
@@ -97812,6 +100019,30 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 .process-bulk-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;margin-bottom:12px;background:#fff;border:1px solid var(--line);border-radius:10px}.process-select-all{display:flex;flex-direction:row;align-items:center;gap:7px}.process-select-all input,.process-row-check{width:16px;height:16px;margin:0}.process-bulk-bar span{color:var(--muted);font-size:.78rem;margin-right:auto}
 .process-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,360px);gap:12px;align-items:start}.process-table{min-height:250px}.process-table table{min-width:980px}.process-table td{vertical-align:top}.process-command{display:block;max-width:360px;white-space:normal;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.72rem}.process-cell-meta{display:block;color:var(--muted);font-size:.68rem;margin-top:3px}.process-row-actions{display:flex;gap:5px}.process-row-actions button{padding:5px 8px;font-size:.7rem}.process-detail{position:sticky;top:76px;padding:14px;min-height:250px}.process-detail h3{margin:0 0 8px}.process-detail-grid{display:grid;grid-template-columns:100px 1fr;gap:6px 9px;font-size:.76rem}.process-detail-grid dt{color:var(--muted)}.process-detail-grid dd{margin:0;overflow-wrap:anywhere}.process-output{margin:12px 0 0;max-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5edf8;border-radius:8px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
 .evolution-grid{display:grid;grid-template-columns:minmax(360px,1.15fr) minmax(320px,.85fr);gap:14px;margin-bottom:14px}.evolution-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.evolution-span{grid-column:1/-1}.evolution-actions{margin-top:14px}.evolution-current-body{padding:12px;border:1px solid var(--line);border-radius:10px;background:#f8fafc;margin-bottom:14px;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}.evolution-current h4{margin:8px 0}.evolution-pipeline{display:flex;flex-wrap:wrap;gap:7px}.evolution-step{padding:7px 9px;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--muted);font-size:.72rem}.evolution-step.active{border-color:#8cb2f7;background:#eaf1ff;color:#1849a9}.evolution-step.done{border-color:#a6e0c6;background:#ecfdf3;color:#067647}.evolution-lineage{display:flex;gap:10px;overflow:auto;padding:8px 2px 14px}.evolution-node{min-width:210px;padding:12px;border:1px solid var(--line);border-top:4px solid #98a2b3;border-radius:11px;background:#fff;box-shadow:0 7px 18px rgba(27,39,71,.05)}.evolution-node.active{border-top-color:#12b76a}.evolution-node.canary{border-top-color:#f79009}.evolution-node.rolled_back{border-top-color:#f04438}.evolution-node strong,.evolution-node small{display:block;overflow-wrap:anywhere}.evolution-node small{margin-top:5px;color:var(--muted)}.evolution-detail pre{max-height:620px;overflow:auto;padding:12px;border-radius:9px;background:#101828;color:#e4e7ec;white-space:pre-wrap;overflow-wrap:anywhere}.evolution-score{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}.evolution-score div{padding:9px;border:1px solid var(--line);border-radius:9px;background:#f8fafc}.evolution-score strong{display:block;font-size:1.05rem}.evolution-tables table{min-width:720px}
+.evolution-grid{align-items:start}
+.evolution-grid>.card,.evolution-tables>.card{min-width:0}
+.evolution-form-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.evolution-form-grid>label{min-width:0;line-height:1.5}
+.evolution-form-grid input:not([type="checkbox"]),.evolution-form-grid select{min-width:0;max-width:100%;min-height:42px}
+.evolution-form-grid select{text-overflow:ellipsis}
+.evolution-form-grid .switch-row{flex-direction:row;justify-content:flex-start;align-items:center;gap:9px;text-align:left}
+.evolution-form-grid .switch-row input{flex:0 0 18px}
+.evolution-model-info{min-width:0;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface2)}
+.evolution-model-sources{display:flex;flex-wrap:wrap;align-items:center;gap:7px}
+.evolution-model-sources .badge{max-width:100%;white-space:normal;overflow-wrap:anywhere;font-size:.72rem;font-weight:600}
+.evolution-model-resolved{margin:9px 0 0;font-size:.75rem;line-height:1.6;color:var(--muted);white-space:pre-line;overflow-wrap:anywhere}
+.evolution-toolbar{display:grid;gap:10px;margin:14px 0}
+.evolution-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0;align-items:stretch}
+.evolution-secondary-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-items:stretch}
+.evolution-toolbar button{display:flex;align-items:center;justify-content:center;min-width:0;min-height:42px;margin:0;padding:9px 10px;font-size:.84rem;line-height:1.4;white-space:normal}
+.evolution-settings .card-head{flex-wrap:wrap}
+.evolution-settings .notice{font-size:.8rem;line-height:1.6;overflow-wrap:anywhere}
+#evolutionPolicyNote{margin:12px 0 0}
+#evolutionBootstrap{margin-bottom:0}
+.evolution-current-body{white-space:pre-line}
+.evolution-tables{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:720px){.evolution-tables{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:480px){.evolution-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.evolution-actions .danger{grid-column:1/-1}}
 .login-overlay{position:fixed;inset:0;background:rgba(10,18,34,.66);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(8px);padding:18px}
 .login-overlay.hidden{display:none}
 .login-card{width:min(440px,100%);background:#fff;border-radius:18px;padding:25px;box-shadow:0 28px 80px rgba(0,0,0,.28);display:flex;flex-direction:column;gap:14px}
@@ -97826,7 +100057,7 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 .toast.error{background:#912018}
 .collab-service-bar{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:12px 0;margin-bottom:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.collab-service-copy>div{display:flex;align-items:center;gap:9px}.collab-service-copy strong{font-size:.92rem}.collab-service-copy p{margin:5px 0 0;color:var(--muted);font-size:.78rem}.collab-service-actions{justify-content:flex-end}.collab-service-bar+.notice{margin:0 0 12px}.collab-admin-layout{display:grid;grid-template-columns:minmax(310px,390px) minmax(0,1fr);gap:14px;align-items:start}.collab-project-column{display:flex;flex-direction:column;gap:10px}.collab-create-form{display:flex;flex-direction:column;gap:9px}.collab-create-form label{margin:0}.collab-filter-row,.collab-member-filter{display:grid;grid-template-columns:minmax(0,1fr) 130px;gap:8px}.collab-project-list,.collab-member-list,.collab-conflict-list{display:flex;flex-direction:column;gap:8px}.collab-project-row,.collab-member-row,.collab-conflict-row{background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px}.collab-project-row{cursor:pointer}.collab-project-row.active{border-color:#8cb2f7;background:#f1f6ff}.collab-project-row h3,.collab-member-row h4,.collab-conflict-row h4,.collab-detail-head h3{margin:0}.collab-project-row p,.collab-member-row p,.collab-conflict-row p{margin:5px 0;color:var(--muted);font-size:.76rem}.collab-detail-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:10px}.collab-member-filter{margin-bottom:10px}.collab-member-row-head,.collab-conflict-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.collab-device-list{margin-top:8px;border-top:1px solid var(--line);padding-top:7px}.collab-device-row{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:.75rem}.collab-device-row span:first-child{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.collab-device-row .inline-actions{margin-left:auto}.collab-conflict-row{border-color:#f3d39d;background:#fffaf0}.collab-conflict-row .conflict-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.collab-conflict-row .conflict-meta span{font-size:.69rem;background:#fff;border:1px solid #f3d39d;border-radius:999px;padding:3px 6px;color:#7a2e0e}.section-head.compact{margin-top:18px;padding-bottom:8px}.section-head.compact h3{margin:0}.section-head.compact p{font-size:.76rem}.collab-detail-column>.empty{margin:0}.collab-member-row .inline-actions button,.collab-conflict-row button,.collab-detail-head .inline-actions button{padding:5px 8px;font-size:.72rem}
 @media(max-width:1100px){.metric-grid{grid-template-columns:repeat(3,1fr)}.config-grid{grid-template-columns:repeat(2,minmax(220px,1fr))}.apps-layout,.collab-admin-layout,.process-layout,.evolution-grid{grid-template-columns:1fr}.process-detail{position:static}.process-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}.app-builder{position:static}.focus-user-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head,.collab-detail-head,.collab-service-bar{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid,.process-toolbar,.evolution-form-grid{grid-template-columns:1fr}.evolution-span{grid-column:auto}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}.collab-filter-row,.collab-member-filter{grid-template-columns:1fr}.collab-service-actions{justify-content:flex-start}.collab-service-actions>*{flex:1 1 180px;text-align:center}}
+@media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head,.collab-detail-head,.collab-service-bar{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid,.process-toolbar,.evolution-form-grid{grid-template-columns:1fr}.evolution-span{grid-column:auto}.admin-nav{overflow:auto}.admin-nav .nav-tab{flex:0 0 auto;white-space:nowrap}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}.collab-filter-row,.collab-member-filter{grid-template-columns:1fr}.collab-service-actions{justify-content:flex-start}.collab-service-actions>*{flex:1 1 180px;text-align:center}}
 """
 
 ADMIN_JS = r"""
@@ -97892,6 +100123,20 @@ const ADMIN_I18N_ROWS=[
 ['导出 JSON','导出 JSON','匯出 JSON','JSON をエクスポート','Export JSON'],
 ['Liquid Kernel Evolution','液态内核演进','液態核心演進','Liquid Kernel 進化','Liquid Kernel Evolution'],
 ['版本化 Agent 内核、自主评估、随机盲评、Canary 与可回滚升级链路。','版本化 Agent 内核、自主评估、随机盲评、Canary 与可回滚升级链路。','版本化 Agent 核心、自主評估、隨機盲評、Canary 與可回復升級鏈路。','バージョン管理された Agent カーネル、自律評価、ランダム盲検、Canary、ロールバック可能な更新フロー。','Versioned agent kernel with autonomous evaluation, randomized blind judging, canary rollout, and rollback.'],
+['Use global default','沿用全局默认','沿用全域預設','グローバル既定を使用','Use global default'],
+['Global models','全局模型','全域模型','グローバルモデル','Global models'],
+['Agent chat models','Agent 聊天模型','Agent 聊天模型','Agent チャットモデル','Agent chat models'],
+['IDE account models','IDE 账号模型','IDE 帳號模型','IDE アカウントモデル','IDE account models'],
+['available models','个可选模型','個可選模型','利用可能なモデル','available models'],
+['Sign in to IDE to use this source.','未登录 IDE，此来源暂不可用','未登入 IDE，此來源暫不可用','IDE にログインすると利用できます','Sign in to IDE to use this source.'],
+['private model configuration no longer exists','未找到该来源的私有模型配置','未找到此來源的私有模型設定','このソースの個人モデル設定がありません','private model configuration no longer exists'],
+['Saved generator','已保存的生成模型','已儲存的生成模型','保存済み生成モデル','Saved generator'],
+['Saved judge','已保存的评审模型','已儲存的評審模型','保存済み評価モデル','Saved judge'],
+['Model directory unavailable','模型目录暂不可用','模型目錄暫不可用','モデル一覧を利用できません','Model directory unavailable'],
+['Loading models','正在读取模型','正在讀取模型','モデルを読込中','Loading models'],
+['selected model configuration is disabled','模型配置已停用','模型設定已停用','モデル設定は無効です','selected model configuration is disabled'],
+['selected model has no service address','模型未配置服务地址','模型未設定服務位址','モデルのサービス URL がありません','selected model has no service address'],
+['No model configured.','尚未配置具体模型','尚未設定具體模型','モデルが未設定です','No model configured.'],
 ['Evolution Policy','演进策略','演進策略','進化ポリシー','Evolution Policy'],
 ['Schedule','计划周期','排程週期','スケジュール','Schedule'],
 ['Timezone','时区','時區','タイムゾーン','Timezone'],
@@ -98076,7 +100321,7 @@ const ADMIN_I18N_ALL=[...ADMIN_I18N_ROWS,...ADMIN_CONFIG_I18N_ROWS,...ADMIN_DYNA
 const ADMIN_I18N_EXACT=new Map(ADMIN_I18N_ALL.map(row=>[row[0],row]));
 const ADMIN_I18N_FRAGMENTS=[...ADMIN_I18N_ALL].filter(row=>String(row[0]||'').length>1).sort((a,b)=>b[0].length-a[0].length);
 const ADMIN_TRADITIONAL_CHARS={'后':'後','发':'發','复':'復','务':'務','进':'進','启':'啟','关':'關','闭':'閉','应':'應','用':'用','网':'網','项':'項','选':'選','择':'擇','读':'讀','写':'寫','数':'數','据':'據','认':'認','证':'證','录':'錄','审':'審','计':'計','时':'時','间':'間','过':'過','滤':'濾','错':'錯','误':'誤','输':'輸','访':'訪','问':'問','标':'標','识':'識','获':'獲','显':'顯','详':'詳','页':'頁','签':'簽','态':'態','动':'動','实':'實','现':'現','历':'歷','辖':'轄','围':'圍','并':'並','与':'與','开':'開','创':'創','删':'刪','库':'庫','设':'設','置':'置','户':'戶','类':'類','总':'總','长':'長','径':'徑','轮':'輪','调':'調','整':'整','级':'級','备':'備','份':'份','从':'從','将':'將','为':'為','这':'這','个':'個','没':'沒','无':'無','对':'對','话':'話','体':'體','内':'內','链':'鏈','滚':'滾','线':'線','异':'異','步':'步','结':'結','构':'構','继':'繼','续':'續','档':'檔','归':'歸','离':'離','冻':'凍','检':'檢','测':'測','满':'滿','压':'壓','缩':'縮','较':'較','评':'評','毁':'毀','拥':'擁','护':'護','载':'載','节':'節','点':'點','弹':'彈','窗':'窗','语':'語','简':'簡','统':'統','协':'協','区':'區','称':'稱','码':'碼','险':'險','丢':'丟','仅':'僅','侧':'側','准':'準','击':'擊','叠':'疊','号':'號','听':'聽','员':'員','处':'處','尔':'爾','弃':'棄','当':'當','报':'報','换':'換','断':'斷','暂':'暫','机':'機','权':'權','来':'來','紧':'緊','约':'約','细':'細','终':'終','绑':'綁','绝':'絕','状':'狀','监':'監','盖':'蓋','确':'確','范':'範','许':'許','试':'試','说':'說','请':'請','账':'帳','跃':'躍','运':'運','远':'遠','采':'採','钟':'鐘','销':'銷','队':'隊','际':'際','验':'驗','黄':'黃','联':'聯','筛':'篩'};
-const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:'',collabProjects:[],collabProject:null,collabMembers:[],collabConflicts:[],collabAudit:[],processPayload:null,selectedProcesses:[],processDetailId:'',evolution:null,evolutionTimer:0,language:'zh-CN',languageSource:'webui_user_preference',languageObserver:null,languageSyncBusy:false};
+const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:'',collabProjects:[],collabProject:null,collabMembers:[],collabConflicts:[],collabAudit:[],processPayload:null,selectedProcesses:[],processDetailId:'',evolution:null,evolutionTimer:0,evolutionDraft:null,evolutionDirty:false,evolutionBusy:false,evolutionModels:null,evolutionError:'',evolutionLoading:null,language:'zh-CN',languageSource:'webui_user_preference',languageObserver:null,languageSyncBusy:false};
 const E=id=>document.getElementById(id);
 function normalizeAdminLanguage(value){const raw=String(value||'').trim();if(ADMIN_LANGUAGE_CODES.includes(raw))return raw;const low=raw.toLowerCase();if(['zh','zh-cn','cn'].includes(low))return'zh-CN';if(['zh-tw','zh-hk','tc'].includes(low))return'zh-TW';if(['ja-jp','jp'].includes(low))return'ja';if(['en-us','en-gb'].includes(low))return'en';return'zh-CN'}
 function adminTraditional(value){return Array.from(String(value||''),ch=>ADMIN_TRADITIONAL_CHARS[ch]||ch).join('')}
@@ -98088,7 +100333,7 @@ function translateAdminAttributes(element,capture=false){if(!element||element.no
 function applyAdminI18n(root=document){const target=root?.nodeType?root:document;if(target.nodeType===3){translateAdminTextNode(target);return}if(target.nodeType===1)translateAdminAttributes(target);const walker=document.createTreeWalker(target,NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT);let current;while((current=walker.nextNode())){if(current.nodeType===3)translateAdminTextNode(current);else translateAdminAttributes(current)}document.documentElement.lang=A.language;document.title=adminTranslate('Clouds Coder Admin');renderAdminLanguageControl()}
 function observeAdminI18n(){if(A.languageObserver)A.languageObserver.disconnect();A.languageObserver=new MutationObserver(records=>{for(const record of records){if(record.type==='characterData'){if(ADMIN_INTERNAL_TEXT.has(record.target)){ADMIN_INTERNAL_TEXT.delete(record.target);continue}translateAdminTextNode(record.target,true);continue}for(const added of record.addedNodes||[])applyAdminI18n(added)}});A.languageObserver.observe(document.body,{subtree:true,childList:true,characterData:true})}
 function renderAdminLanguageControl(){const selects=[E('adminLanguageSelect'),E('adminLoginLanguageSelect')].filter(Boolean),labels=[E('adminLanguageLabel'),E('adminLoginLanguageLabel')].filter(Boolean),source=E('adminLanguageSource'),labelText={'zh-CN':'界面语言','zh-TW':'介面語言','ja':'表示言語','en':'Language'}[A.language],sourceText={'zh-CN':'与 WebUI 用户语言同步','zh-TW':'與 WebUI 使用者語言同步','ja':'WebUI のユーザー言語と同期','en':'Synced with WebUI language'}[A.language];for(const select of selects){if(select.value!==A.language)select.value=A.language;select.setAttribute('aria-label',labelText)}for(const label of labels)label.textContent=labelText;if(source)source.textContent=sourceText}
-function applyAdminLanguage(language){A.language=normalizeAdminLanguage(language);try{localStorage.setItem('clouds_coder_admin_language',A.language)}catch(_){}applyAdminI18n(document)}
+function applyAdminLanguage(language){A.language=normalizeAdminLanguage(language);try{localStorage.setItem('clouds_coder_admin_language',A.language)}catch(_){}applyAdminI18n(document);if(A.evolutionModels&&A.evolutionDraft){A.evolutionDraft=collectEvolutionConfig();renderEvolutionModels()}}
 async function loadAdminLanguage(quiet=false){if(A.languageSyncBusy)return;A.languageSyncBusy=true;try{const out=await request('/api/admin/language');A.languageSource=String(out.source||'webui_user_preference');applyAdminLanguage(out.language)}catch(err){if(!quiet)console.warn('admin language sync failed',err)}finally{A.languageSyncBusy=false}}
 async function saveAdminLanguage(language){const previous=A.language;applyAdminLanguage(language);try{const out=await request('/api/admin/language',{method:'POST',body:JSON.stringify({language:A.language})});A.languageSource=String(out.source||'webui_user_preference');applyAdminLanguage(out.language)}catch(err){applyAdminLanguage(previous);toast(err.message,true)}}
 const ADMIN_NATIVE_CONFIRM=window.confirm.bind(window),ADMIN_NATIVE_PROMPT=window.prompt.bind(window);window.confirm=message=>ADMIN_NATIVE_CONFIRM(adminTranslate(message));window.prompt=(message,defaultValue)=>ADMIN_NATIVE_PROMPT(adminTranslate(message),defaultValue);
@@ -98097,7 +100342,7 @@ function toast(message,error=false){const el=E('toast');el.textContent=adminTran
 function setAuthenticated(ok){E('loginOverlay').classList.toggle('hidden',!!ok);E('connectionBadge').textContent=ok?'已认证':'未认证';E('connectionBadge').className='badge '+(ok?'good':'muted')}
 async function request(path,opt={}){const headers={...(opt.headers||{})};if(opt.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';const r=await fetch(path,{...opt,headers});const raw=await r.text();let body={};try{body=raw?JSON.parse(raw):{}}catch(_){body={error:raw||'请求失败'}}if(!r.ok){const details=Array.isArray(body.errors)?body.errors:[];const msg=[body.error||'请求失败',...details.map(x=>String(x.key||'参数')+': '+String(x.error||'无效'))].filter(Boolean).join('\n');const err=new Error(msg);err.status=r.status;err.code=String(body.code||'');err.details=details;err.body=body;throw err}return body}
 async function api(path,opt={}){const headers={...(opt.headers||{})};if(A.token)headers.Authorization='Bearer '+A.token;try{return await request(path,{...opt,headers})}catch(err){if(err.status===401){clearSession();setAuthenticated(false);E('loginError').textContent='登录会话已过期，请重新登录';loadAuthStatus().catch(()=>{});}throw err}}
-function clearSession(){sessionStorage.removeItem('clouds_coder_admin_token');A.token='';A.config=null;A.metrics=null;A.apps=[];A.skills=[];A.collabProjects=[];A.collabProject=null;A.collabMembers=[];A.collabConflicts=[];A.collabAudit=[];A.processPayload=null;A.selectedProcesses=[];A.processDetailId=''}
+function clearSession(){A.evolutionDraft=null;A.evolutionModels=null;A.evolutionDirty=false;sessionStorage.removeItem('clouds_coder_admin_token');A.token='';A.config=null;A.metrics=null;A.apps=[];A.skills=[];A.collabProjects=[];A.collabProject=null;A.collabMembers=[];A.collabConflicts=[];A.collabAudit=[];A.processPayload=null;A.selectedProcesses=[];A.processDetailId=''}
 function setAuthBusy(form,busy){const btn=form?.querySelector('button[type="submit"]');if(btn)btn.disabled=!!busy}
 function authError(err){const retry=Number(err?.body?.retry_after||0);E('loginError').textContent=retry?String(err.message)+'（约 '+retry+' 秒后重试）':String(err?.message||err||'认证失败')}
 function renderAuthState(status){const setup=!!status?.setup_required;E('retryAuthBtn').classList.add('hidden');E('setupForm').classList.toggle('hidden',!setup);E('passwordLoginForm').classList.toggle('hidden',setup);E('tokenLoginDetails').classList.toggle('hidden',!status?.token_login_enabled);E('tokenLoginBtn').textContent=setup?'用此 Token 创建管理员':'使用 Token 进入';E('tokenLoginHelp').textContent=setup?'远程首次初始化：输入现有 Admin Token，然后在上方填写账号密码并点击“创建管理员”。本机首次运行无需填写 Token。':'验证后只保存换取的短期会话，不保存原始 Admin Token。';E('authTitle').textContent=setup?'创建管理员账号':'管理员登录';if(setup){E('authDescription').textContent=status?.local_setup_allowed?'这是首次运行。请创建唯一管理员账号，密码只以强哈希形式保存在本机。':'首次创建仅允许在本机完成；远程初始化请展开高级入口并使用 Admin Token。';setTimeout(()=>E('setupUsername').focus(),0)}else{E('authDescription').textContent='使用管理员账号和密码登录。登录成功后本标签页只保存短期会话。';setTimeout(()=>E('loginUsername').focus(),0)}}
@@ -98108,7 +100353,7 @@ async function loginWithPassword(){const form=E('passwordLoginForm');setAuthBusy
 async function loginWithToken(){if(!E('setupForm').classList.contains('hidden')){await registerAdmin();return}const form=E('tokenLoginForm'),candidate=E('tokenInput').value.trim();if(!candidate){E('loginError').textContent='请输入 Admin Token';return}setAuthBusy(form,true);E('loginError').textContent='';try{const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+candidate},body:'{}'});await acceptSession(out.access_token)}catch(err){authError(err);E('tokenInput').value='';E('tokenInput').focus()}finally{setAuthBusy(form,false)}}
 async function logoutAdmin(){const token=A.token;try{if(token)await request('/api/admin/auth/logout',{method:'POST',headers:{Authorization:'Bearer '+token},body:'{}'})}catch(_){}finally{clearSession();setAuthenticated(false);await loadAuthStatus().catch(err=>authError(err))}}
 async function bootstrapAuth(){setAuthenticated(false);if(A.token){try{const state=await request('/api/admin/auth/session',{headers:{Authorization:'Bearer '+A.token}});if(state.auth_kind==='token'){const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+A.token},body:'{}'});await acceptSession(out.access_token)}else await acceptSession(A.token);return}catch(err){if(err.status===401)clearSession();else{E('authTitle').textContent='认证服务不可用';E('authDescription').textContent='暂时无法验证已保存的会话，请重试。';authError(err);E('retryAuthBtn').classList.remove('hidden');return}}}await loadAuthStatus()}
-function node(tag,attrs={},text=''){const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs||{})){if(k==='class')el.className=v;else if(k==='dataset')Object.assign(el.dataset,v);else if(k==='type')el.type=v;else el.setAttribute(k,String(v))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
+function node(tag,attrs={},text=''){const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs||{})){if(k==='class')el.className=v;else if(k==='dataset')Object.assign(el.dataset,v);else if(k==='type')el.type=v;else if(typeof v==='boolean'&&typeof el[k]==='boolean')el[k]=v;else el.setAttribute(k,String(v))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
 function switchView(name){document.querySelectorAll('.nav-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===name));document.querySelectorAll('.admin-view').forEach(x=>x.classList.toggle('active',x.id===name+'View'));if(name==='metrics')loadMetrics().catch(err=>toast(err.message,true));if(name==='processes')loadProcesses().catch(err=>toast(err.message,true));if(name==='config'&&!A.config)loadConfig().catch(err=>toast(err.message,true));if(name==='evolution')loadEvolution().catch(err=>toast(err.message,true));if(name==='apps')loadApps().catch(err=>toast(err.message,true));if(name==='collaboration')loadCollaboration().catch(err=>toast(err.message,true))}
 function table(headers,rows){if(!rows.length)return node('div',{class:'empty'},'暂无数据');const t=node('table');const thead=node('thead'),tr=node('tr');headers.forEach(h=>tr.appendChild(node('th',{},h[0])));thead.appendChild(tr);t.appendChild(thead);const tb=node('tbody');rows.forEach(row=>{const r=node('tr');headers.forEach(h=>r.appendChild(node('td',{},h[1](row))));tb.appendChild(r)});t.appendChild(tb);return t}
 const SVG_NS='http://www.w3.org/2000/svg',METRIC_COLORS=['series-1','series-2','series-3','series-4','series-danger','series-muted'];
@@ -98175,23 +100420,47 @@ async function stopProcessIds(ids,label){const unique=[...new Set((ids||[]).filt
 async function stopSelectedProcesses(){await stopProcessIds(A.selectedProcesses,'所选')}
 async function stopFilteredProcesses(){const rows=Array.isArray(A.processPayload?.processes)?A.processPayload.processes:[];await stopProcessIds(rows.filter(row=>row.can_stop).map(row=>row.id),'当前筛选结果中')}
 function bindProcesses(){E('refreshProcessesBtn').onclick=()=>loadProcesses().catch(err=>toast(err.message,true));E('filterProcessesBtn').onclick=()=>loadProcesses().catch(err=>toast(err.message,true));E('processSearch').onkeydown=ev=>{if(ev.key==='Enter')loadProcesses().catch(err=>toast(err.message,true))};E('processStatus').onchange=()=>loadProcesses().catch(err=>toast(err.message,true));E('selectAllProcesses').onchange=()=>{const rows=Array.isArray(A.processPayload?.processes)?A.processPayload.processes:[];A.selectedProcesses=E('selectAllProcesses').checked?rows.filter(row=>row.can_stop).map(row=>String(row.id)):[];renderProcesses()};E('stopSelectedProcessesBtn').onclick=()=>stopSelectedProcesses().catch(err=>toast(err.message,true));E('stopFilteredProcessesBtn').onclick=()=>stopFilteredProcesses().catch(err=>toast(err.message,true))}
-const EVOLUTION_PIPELINE=['queued','collecting','assessing','proposal_ready','validating_patch','benchmarking','awaiting_approval','canary','promoted'];
+const EVOLUTION_PIPELINE=['queued','collecting','assessing','generating','proposal_ready','validating_patch','benchmarking','judging','awaiting_approval','canary','promoted'];
 function evolutionTime(value){const ts=Number(value||0);return ts?new Date(ts*1000).toLocaleString(A.language):'-'}
 function evolutionScopes(value){return String(value||'').split(',').map(x=>x.trim()).filter(Boolean).slice(0,500)}
-function renderEvolution(){const data=A.evolution||{},cfg=data.config||{},active=data.active||{},bootstrap=data.bootstrap||{},runs=Array.isArray(data.runs?.runs)?data.runs.runs:[],versions=Array.isArray(data.versions?.versions)?data.versions.versions:[];E('evolutionMode').value=cfg.mode||'Off';E('evolutionSchedule').value=cfg.schedule||'off';E('evolutionTimezone').value=cfg.timezone||'Asia/Shanghai';E('evolutionHistoryDepth').value=Number(cfg.history_version_depth??2);E('evolutionStartDate').value=cfg.history_start_date||'';E('evolutionEndDate').value=cfg.history_end_date||'';E('evolutionGeneratorProfile').value=cfg.generator_profile||'';E('evolutionJudgeProfile').value=cfg.judge_profile||'';E('evolutionUserScope').value=(cfg.user_scope||['*']).join(', ');E('evolutionSessionScope').value=(cfg.session_scope||['*']).join(', ');E('evolutionEventTriggers').checked=!!cfg.event_triggers;E('evolutionRevision').textContent='rev '+String(cfg.revision||1);E('evolutionActiveBadge').textContent=cfg.mode||'Off';E('evolutionActiveBadge').className='badge '+(cfg.mode==='Off'?'muted':cfg.mode==='Aggressive'?'bad':'good');const canary=active.canary||null;E('evolutionCanaryBadge').textContent=canary?`canary ${Number(canary.percent||0)}%`:'stable';E('evolutionCanaryBadge').className='badge '+(canary?'warn':'good');E('evolutionBootstrap').textContent=`startup policy=${data.startup_policy||'inherit'} · request=${bootstrap.requested_policy||'inherit'} · ${bootstrap.history_action||'history status unavailable'}${bootstrap.injected_version?' · injected='+bootstrap.injected_version:''}`;E('runEvolutionBtn').disabled=cfg.mode==='Off'||!!data.active_run_id;E('evolutionCurrent').textContent=`active=${active.version||'-'}\ncanary=${canary?canary.version+' @ '+canary.percent+'%':'none'}\nmutable_surface=${cfg.mutable_surface||'none'}\nweights=hard 30% / LLM blind judge 70%\nminimum_gain=${Number(cfg.minimum_gain||0).toFixed(1)}\nhistory=current + ${Number(cfg.history_version_depth||0)} previous versions\nimmutable=${(data.immutable_control_components||[]).join(', ')}`;
+function renderEvolution(){const data=A.evolution||{},cfg=data.config||{},active=data.active||{},bootstrap=data.bootstrap||{},runs=Array.isArray(data.runs?.runs)?data.runs.runs:[],versions=Array.isArray(data.versions?.versions)?data.versions.versions:[];evolutionControls();E('evolutionActiveBadge').textContent=cfg.mode||'Off';E('evolutionActiveBadge').className='badge '+(cfg.mode==='Off'?'muted':cfg.mode==='Aggressive'?'bad':'good');const canary=active.canary||null;E('evolutionCanaryBadge').textContent=canary?`canary ${Number(canary.percent||0)}%`:'stable';E('evolutionCanaryBadge').className='badge '+(canary?'warn':'good');E('evolutionBootstrap').textContent=`startup policy=${data.startup_policy||'inherit'} · request=${bootstrap.requested_policy||'inherit'} · ${bootstrap.history_action||'history status unavailable'}${bootstrap.injected_version?' · injected='+bootstrap.injected_version:''}`;E('evolutionCurrent').textContent=`active=${active.version||'-'}\ncanary=${canary?canary.version+' @ '+canary.percent+'%':'none'}\nmutable_surface=${cfg.mutable_surface||'none'}\nweights=hard 30% / LLM blind judge 70%\nminimum_gain=${Number(cfg.minimum_gain||0).toFixed(1)}\nhistory=current + ${Number(cfg.history_version_depth||0)} previous versions\nimmutable=${(data.immutable_control_components||[]).join(', ')}`;
   const currentRun=runs.find(row=>!['no_change','rejected','failed','cancelled','promoted'].includes(String(row.status||'')))||runs[0]||{};const pipeline=E('evolutionPipeline');pipeline.innerHTML='';const currentIndex=EVOLUTION_PIPELINE.indexOf(String(currentRun.status||''));for(const [index,status] of EVOLUTION_PIPELINE.entries()){pipeline.appendChild(node('span',{class:'evolution-step '+(index<currentIndex?'done':index===currentIndex?'active':'')},status))}
   const lineage=E('evolutionLineage');lineage.innerHTML='';for(const row of [...versions].reverse()){const card=node('button',{type:'button',class:'evolution-node '+String(row.status||'')});card.append(node('strong',{},row.version||'-'),node('small',{},'parent '+(row.parent_version||'baseline')),node('small',{},String(row.status||'')+' · score '+Number(row.mixed_score||0).toFixed(1)),node('small',{},evolutionTime(row.promoted_at||row.created_at)));card.onclick=()=>showEvolutionVersion(row.version);lineage.appendChild(card)}if(!versions.length)lineage.appendChild(node('div',{class:'empty'},'No kernel versions'));
   const runHost=E('evolutionRuns');runHost.innerHTML='';if(!runs.length)runHost.appendChild(node('div',{class:'empty'},'No evolution runs'));else{const table=node('table'),head=node('tr');for(const label of ['Run','Mode','Status','Candidate','Created','Actions'])head.appendChild(node('th',{},label));table.appendChild(head);for(const row of runs){const tr=node('tr'),actions=node('td');const view=node('button',{type:'button',class:'ghost'},'View');view.onclick=()=>showEvolutionRun(row.run_id);actions.appendChild(view);if(row.status==='awaiting_approval'){const approve=node('button',{type:'button'},'Approve'),reject=node('button',{type:'button',class:'danger'},'Reject');approve.onclick=()=>evolutionRunAction(row.run_id,'approve');reject.onclick=()=>evolutionRunAction(row.run_id,'reject');actions.append(approve,reject)}else if(!['no_change','rejected','failed','cancelled','promoted','rolled_back'].includes(row.status)){const cancel=node('button',{type:'button',class:'danger'},'Cancel');cancel.onclick=()=>evolutionRunAction(row.run_id,'cancel');actions.appendChild(cancel)}for(const value of [row.run_id,row.mode,row.status,row.candidate_version||'-',evolutionTime(row.created_at)])tr.appendChild(node('td',{},value));tr.appendChild(actions);table.appendChild(tr)}runHost.appendChild(table)}
   const versionHost=E('evolutionVersions');versionHost.innerHTML='';if(!versions.length)versionHost.appendChild(node('div',{class:'empty'},'No versions'));else{const table=node('table'),head=node('tr');for(const label of ['Version','Status','Hard','LLM','Mixed','Actions'])head.appendChild(node('th',{},label));table.appendChild(head);for(const row of versions){const tr=node('tr'),actions=node('td'),view=node('button',{type:'button',class:'ghost'},'Diff');view.onclick=()=>showEvolutionVersion(row.version,true);actions.appendChild(view);if(row.status==='canary'&&String(active.canary?.version||'')===String(row.version||'')&&Number(active.canary?.percent||0)>=100){const promote=node('button',{type:'button'},'Promote');promote.onclick=()=>evolutionVersionAction(row.version,'promote');actions.appendChild(promote)}if(row.parent_version){const rollback=node('button',{type:'button',class:'danger'},'Rollback');rollback.onclick=()=>evolutionVersionAction(row.parent_version,'rollback');actions.appendChild(rollback)}for(const value of [row.version,row.status,Number(row.hard_score||0).toFixed(1),Number(row.soft_score||0).toFixed(1),Number(row.mixed_score||0).toFixed(1)])tr.appendChild(node('td',{},value));tr.appendChild(actions);table.appendChild(tr)}versionHost.appendChild(table)}
 }
-async function loadEvolution(){clearTimeout(A.evolutionTimer);A.evolution=await api('/api/admin/evolution');renderEvolution();if(E('evolutionView').classList.contains('active')){const live=!!A.evolution.active_run_id||!!A.evolution.active?.canary;A.evolutionTimer=setTimeout(()=>loadEvolution().catch(err=>toast(err.message,true)),live?2500:15000)}return A.evolution}
-function collectEvolutionConfig(){const current=A.evolution?.config||{};return{...current,mode:E('evolutionMode').value,schedule:E('evolutionSchedule').value,timezone:E('evolutionTimezone').value.trim(),history_version_depth:Number(E('evolutionHistoryDepth').value||2),history_start_date:E('evolutionStartDate').value,history_end_date:E('evolutionEndDate').value,user_scope:evolutionScopes(E('evolutionUserScope').value),session_scope:evolutionScopes(E('evolutionSessionScope').value),generator_profile:E('evolutionGeneratorProfile').value.trim(),judge_profile:E('evolutionJudgeProfile').value.trim(),event_triggers:E('evolutionEventTriggers').checked}}
-async function saveEvolution(){const cfg=collectEvolutionConfig(),out=await api('/api/admin/evolution/config',{method:'POST',body:JSON.stringify({revision:Number(A.evolution?.config?.revision||0),values:cfg})});A.evolution.config=out.config;renderEvolution();toast('Evolution policy saved')}
-async function runEvolution(){if(!confirm('Start a new liquid-kernel evolution run?'))return;const out=await api('/api/admin/evolution/runs',{method:'POST',body:JSON.stringify({trigger:'manual'})});toast('Evolution run queued: '+out.run_id);await loadEvolution()}
+const EVOLUTION_FIELDS=['Mode','Schedule','Timezone','HistoryDepth','StartDate','EndDate','GeneratorProfile','JudgeProfile','UserScope','SessionScope','EventTriggers'];
+function evolutionRefKey(ref){return ref?JSON.stringify([ref.source,ref.owner,ref.profile_id,ref.model,ref.fingerprint||'']):''}
+function renderEvolutionModels(){const catalog=A.evolutionModels||{},cfg=A.evolutionDraft||{};
+  for(const role of ['generator','judge']){const el=E(role==='generator'?'evolutionGeneratorProfile':'evolutionJudgeProfile'),ref=cfg[role+'_model_ref'],legacy=cfg[role+'_profile']||'';el.innerHTML='';el.appendChild(node('option',{value:''},adminTranslate('Use global default')));
+    let selected='';for(const [index,row] of (catalog.options||[]).entries()){const value=String(index);el.appendChild(node('option',{value,disabled:!row.available},row.label+(row.reason?' · '+adminTranslate(row.reason):'')));if(ref&&(row.aliases||[row.ref]).some(alias=>evolutionRefKey(alias)===evolutionRefKey(ref)))selected=value}
+    if(ref&&selected===''){selected='saved';el.appendChild(node('option',{value:selected},`[${ref.source}] ${ref.model} · ${ref.profile_id} (已保存)`))}
+    else if(!ref&&legacy){selected='legacy';el.appendChild(node('option',{value:selected},'旧配置 · '+legacy))}
+    el.value=selected;el.title=el.selectedOptions[0]?.textContent||'';
+  }
+  const sourceNames={global:'Global models',agent:'Agent chat models',ide:'IDE account models'},sourceHost=E('evolutionModelSources');sourceHost.replaceChildren();
+  for(const row of catalog.sources||[]){const count=(catalog.options||[]).filter(option=>option.available&&(option.sources||[]).includes(row.source)).length;const label=adminTranslate(sourceNames[row.source]||row.source)+' · '+(row.available?count+' '+adminTranslate('available models'):adminTranslate(row.reason));sourceHost.appendChild(node('span',{class:'badge '+(row.available&&count?'good':'muted'),'data-admin-no-i18n':''},label))}
+  E('evolutionModelResolved').textContent=['generator','judge'].map(role=>{const row=catalog.resolved?.[role];return adminTranslate(role==='generator'?'Saved generator':'Saved judge')+': '+(row?.available?`[${row.ref.source}] ${row.ref.model} · ${row.ref.profile_id}`:adminTranslate(row?.reason||'Loading models'))}).join('\n');
+}
+function fillEvolutionForm(cfg){A.evolutionDraft=structuredClone(cfg);A.evolutionDirty=false;A.evolutionError='';E('evolutionMode').value=cfg.mode||'Off';E('evolutionSchedule').value=cfg.schedule||'off';E('evolutionTimezone').value=cfg.timezone||'Asia/Shanghai';E('evolutionHistoryDepth').value=Number(cfg.history_version_depth??2);E('evolutionStartDate').value=cfg.history_start_date||'';E('evolutionEndDate').value=cfg.history_end_date||'';E('evolutionUserScope').value=(cfg.user_scope||['*']).join(', ');E('evolutionSessionScope').value=(cfg.session_scope||['*']).join(', ');E('evolutionEventTriggers').checked=!!cfg.event_triggers;renderEvolutionModels()}
+function evolutionControls(){const cfg=A.evolutionDraft||{},server=A.evolution?.config||{},conflict=!!cfg.revision&&cfg.revision!==server.revision;
+  E('evolutionRevision').textContent='rev '+(cfg.revision||'-')+(A.evolutionDirty?' · 未保存':'')+(conflict?' · 服务端已更新':'');
+  E('runEvolutionBtn').disabled=!cfg.revision||A.evolutionDirty||A.evolutionBusy||conflict||server.mode==='Off'||!!A.evolution?.active_run_id;
+  E('saveEvolutionBtn').disabled=!cfg.revision||!!A.evolutionBusy||conflict;
+  for(const field of EVOLUTION_FIELDS)E('evolution'+field).disabled=!!A.evolutionBusy;
+  const note=A.evolutionError||(conflict?'配置已被其他页面修改。点击“重新载入配置”后再保存。':A.evolutionDirty?'有未保存的更改，请先保存策略，再启动。':A.evolution?.last_trigger_error?.error|| (server.mode==='Off'?'当前为 Off，请选择运行模式并保存。':'策略已保存，可启动。'));
+  E('evolutionPolicyNote').textContent=note;E('evolutionPolicyNote').classList.remove('hidden');
+}
+async function loadEvolutionModels(){const catalog=await api('/api/admin/evolution/models'),draft=A.evolutionDraft?collectEvolutionConfig():null;A.evolutionModels=catalog;if(draft)A.evolutionDraft=draft;renderEvolutionModels()}
+async function loadEvolution(){clearTimeout(A.evolutionTimer);if(A.evolutionLoading)return A.evolutionLoading;A.evolutionLoading=(async()=>{try{const data=await api('/api/admin/evolution');if(data.config.revision<(A.evolution?.config?.revision||0))return A.evolution;A.evolution=data;if(!A.evolutionDraft||(!A.evolutionDirty&&!A.evolutionBusy&&A.evolutionDraft.revision!==data.config.revision))fillEvolutionForm(data.config);renderEvolution();if(!A.evolutionModels)await loadEvolutionModels();return data}finally{A.evolutionLoading=null;if(E('evolutionView').classList.contains('active')){const live=!!A.evolution?.active_run_id||!!A.evolution?.active?.canary;A.evolutionTimer=setTimeout(()=>loadEvolution().catch(err=>toast(err.message,true)),live?2500:15000)}}})();return A.evolutionLoading}
+function collectEvolutionConfig(){const current=A.evolutionDraft||{},out={...current,mode:E('evolutionMode').value,schedule:E('evolutionSchedule').value,timezone:E('evolutionTimezone').value.trim(),history_version_depth:Number(E('evolutionHistoryDepth').value),history_start_date:E('evolutionStartDate').value,history_end_date:E('evolutionEndDate').value,user_scope:evolutionScopes(E('evolutionUserScope').value),session_scope:evolutionScopes(E('evolutionSessionScope').value),event_triggers:E('evolutionEventTriggers').checked};for(const role of ['generator','judge']){const value=E(role==='generator'?'evolutionGeneratorProfile':'evolutionJudgeProfile').value;if(value==='saved'||value==='legacy')continue;out[role+'_model_ref']=value===''?null:A.evolutionModels.options[Number(value)].ref;out[role+'_profile']=''}return out}
+async function saveEvolution(){if(A.evolutionBusy)return;const cfg=collectEvolutionConfig();A.evolutionBusy=true;A.evolutionError='';evolutionControls();try{const out=await api('/api/admin/evolution/config',{method:'POST',body:JSON.stringify({revision:cfg.revision,values:cfg})});A.evolution.config=out.config;fillEvolutionForm(out.config);toast('Evolution policy saved');await loadEvolutionModels()}catch(err){A.evolutionError=err.message;if(err.status===409)await loadEvolution();throw err}finally{A.evolutionBusy=false;evolutionControls()}}
+async function runEvolution(){if(A.evolutionBusy||E('runEvolutionBtn').disabled)return;A.evolutionBusy=true;A.evolutionError='';evolutionControls();try{const out=await api('/api/admin/evolution/runs',{method:'POST',body:JSON.stringify({revision:A.evolutionDraft.revision})});toast('任务已启动: '+out.run_id+' · '+(out.models?.generator?.model||'')+' / '+(out.models?.judge?.model||''));await loadEvolution()}catch(err){A.evolutionError=err.message;await loadEvolution();throw err}finally{A.evolutionBusy=false;evolutionControls()}}
+function bindEvolutionForm(){for(const field of EVOLUTION_FIELDS)E('evolution'+field).addEventListener('input',()=>{A.evolutionDirty=true;A.evolutionError='';for(const id of ['evolutionGeneratorProfile','evolutionJudgeProfile'])E(id).title=E(id).selectedOptions[0]?.textContent||'';evolutionControls()});E('reloadEvolutionConfigBtn').onclick=async()=>{if(A.evolutionDirty&&!confirm('放弃未保存的 Evolution 更改并重新载入？'))return;try{await loadEvolution();fillEvolutionForm(A.evolution.config);await loadEvolutionModels();evolutionControls()}catch(err){toast(err.message,true)}};E('refreshEvolutionModelsBtn').onclick=()=>loadEvolutionModels().catch(err=>toast(err.message,true))}
 async function emergencyEvolutionOff(){if(!confirm('Set evolution to Off, cancel the active run, and abort any Canary?'))return;await api('/api/admin/evolution/emergency-off',{method:'POST',body:'{}'});await loadEvolution();toast('Liquid kernel evolution is Off')}
 async function evolutionRunAction(runId,action){if(!confirm(action+' evolution run '+runId+'?'))return;await api('/api/admin/evolution/runs/'+encodeURIComponent(runId)+'/'+action,{method:'POST',body:JSON.stringify({reason:'Admin '+action})});await loadEvolution();toast('Run '+action+' accepted')}
 async function evolutionVersionAction(version,action){if(!confirm(action+' kernel '+version+'?'))return;await api('/api/admin/evolution/versions/'+encodeURIComponent(version)+'/'+action,{method:'POST',body:JSON.stringify({reason:'Admin '+action})});await loadEvolution();toast('Kernel '+action+' accepted')}
-async function showEvolutionRun(runId){const detail=await api('/api/admin/evolution/runs/'+encodeURIComponent(runId));E('evolutionDetailCard').classList.remove('hidden');E('evolutionDetailTitle').textContent='Run '+runId;E('evolutionDetail').innerHTML='';const result=detail.result||{},scores=node('div',{class:'evolution-score'});for(const [label,value] of [['Hard',result.candidate?.hard],['LLM',result.candidate?.soft],['Mixed',result.candidate?.mixed]])scores.appendChild(node('div',{},`${label}\n${Number(value||0).toFixed(1)}`));E('evolutionDetail').append(scores,node('pre',{},JSON.stringify(detail,null,2)));E('evolutionDetailCard').scrollIntoView({behavior:'smooth'})}
+async function showEvolutionRun(runId){const detail=await api('/api/admin/evolution/runs/'+encodeURIComponent(runId));E('evolutionDetailCard').classList.remove('hidden');E('evolutionDetailTitle').textContent='Run '+runId;E('evolutionDetail').innerHTML='';const result=detail.result||{},scores=node('div',{class:'evolution-score'});for(const [label,value] of [['Hard',result.candidate?.hard],['LLM',result.candidate?.soft],['Mixed',result.candidate?.mixed]])scores.appendChild(node('div',{},`${label}\n${Number(value||0).toFixed(1)}`));const refs=detail.config||{};E('evolutionDetail').append(node('p',{},'状态: '+detail.status+' · 生成: '+(refs.generator_model_ref?.model||refs.generator_profile||'全局默认')+' · 评审: '+(refs.judge_model_ref?.model||refs.judge_profile||'全局默认')+(detail.error?' · '+detail.error:'')),scores,node('pre',{},JSON.stringify(detail,null,2)));E('evolutionDetailCard').scrollIntoView({behavior:'smooth'})}
 async function showEvolutionVersion(version,diffOnly=false){const path='/api/admin/evolution/versions/'+encodeURIComponent(version)+(diffOnly?'/diff':'');const detail=await api(path);E('evolutionDetailCard').classList.remove('hidden');E('evolutionDetailTitle').textContent=(diffOnly?'Diff ':'Version ')+version;E('evolutionDetail').innerHTML='';E('evolutionDetail').appendChild(node('pre',{},diffOnly?detail.diff||'No diff':JSON.stringify(detail,null,2)));E('evolutionDetailCard').scrollIntoView({behavior:'smooth'})}
 async function loadApps(){const [apps,skills]=await Promise.all([api('/api/admin/apps'),api('/api/apps/skills')]);A.apps=Array.isArray(apps)?apps:[];A.skills=Array.isArray(skills)?skills:[];renderSkillCatalog();renderAdminApps()}
 function renderSkillCatalog(){const q=String(E('adminSkillSearch').value||'').trim().toLowerCase(),host=E('adminSkillCatalog');host.innerHTML='';const selected=new Set(A.selectedSkills);const rows=A.skills.filter(s=>!q||[s.id,s.name,s.description].join(' ').toLowerCase().includes(q));if(!rows.length){host.appendChild(node('div',{class:'empty'},'没有匹配的 Skill'));return}rows.forEach(s=>{const label=node('label',{class:'skill-option'+(selected.has(s.id)?' selected':'')}),check=node('input',{type:'checkbox'});check.checked=selected.has(s.id);check.addEventListener('change',()=>toggleAdminSkill(s.id));const text=node('div');text.append(node('strong',{},s.name||s.id),node('span',{},s.id),node('span',{},s.description||''));label.append(check,text);host.appendChild(label)});renderSelectedSkills()}
@@ -98201,7 +100470,7 @@ async function createSharedApp(){const payload={name:E('adminAppName').value.tri
 function renderAdminApps(){const host=E('adminAppList');host.innerHTML='';document.querySelectorAll('.review-tab').forEach(x=>x.classList.toggle('active',x.dataset.status===A.reviewStatus));const rows=A.apps.filter(x=>x.status===A.reviewStatus);if(!rows.length){host.appendChild(node('div',{class:'card empty'},'此分类暂无应用'));return}rows.sort((a,b)=>(b.updated_at||0)-(a.updated_at||0)).forEach(app=>{const card=node('article',{class:'admin-app-card'}),title=node('div',{class:'admin-app-title'}),left=node('div'),h=node('h3',{},(app.icon?app.icon+' ':'')+(app.name||'未命名应用'));left.appendChild(h);title.append(left,node('span',{class:'badge '+(app.status==='published'?'good':app.status==='rejected'?'muted':'warn')},app.status));card.append(title,node('p',{},app.description||'暂无说明'));const meta=node('div',{class:'app-meta'});meta.append(node('span',{},'revision '+(app.submitted_revision||app.revision||1)),node('span',{},'owner '+(app.owner_hash||'admin')));card.appendChild(meta);const skills=node('div',{class:'app-skills'});(app.skills||[]).sort((a,b)=>(a.order||0)-(b.order||0)).forEach(s=>skills.appendChild(node('span',{},s.name||s.id)));card.appendChild(skills);if(app.review?.note)card.appendChild(node('p',{},'审核备注：'+app.review.note));const history=Array.isArray(app.lifecycle_history)?app.lifecycle_history:[];if(history.length){const lifecycle=node('div',{class:'app-lifecycle'});lifecycle.appendChild(node('strong',{},'治理历史'));[...history].reverse().forEach(item=>{const at=item.at?new Date(Number(item.at)*1000).toLocaleString('zh-CN'):'-';const text=at+' · '+String(item.action||'')+' · '+String(item.from||'')+' -> '+String(item.to||'')+' · revision '+String(item.revision||'')+(item.note?' · '+String(item.note):'');lifecycle.appendChild(node('div',{},text))});card.appendChild(lifecycle)}if(app.status==='pending'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'审核备注（可选）',maxlength:'1000'}),approve=node('button',{type:'button'},'通过并发布'),reject=node('button',{type:'button',class:'danger'},'拒绝');approve.onclick=()=>reviewApp(app,true,note.value).catch(err=>toast(err.message,true));reject.onclick=()=>reviewApp(app,false,note.value).catch(err=>toast(err.message,true));actions.append(note,approve,reject);card.appendChild(actions)}else if(app.status==='published'||app.status==='unpublished'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'治理备注（可选）',maxlength:'1000'}),publish=app.status==='unpublished',action=node('button',{type:'button',class:publish?'':'danger'},publish?'重新上架':'下架');action.onclick=()=>changePublication(app,publish,note.value).catch(err=>toast(err.message,true));actions.append(note,action);card.appendChild(actions)}host.appendChild(card)})}
 async function reviewApp(app,approve,note){await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(approve?'approve':'reject'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision})});await loadApps();toast(approve?'应用已发布':'应用已拒绝')}
 async function changePublication(app,publish,note){const label=publish?'重新上架':'下架';if(!confirm('确定'+label+'此共享应用吗？'))return;await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(publish?'republish':'unpublish'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision,lifecycle_revision:app.lifecycle_revision||0})});await loadApps();toast('应用已'+label)}
-function bind(){document.querySelectorAll('.nav-tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));document.querySelectorAll('.review-tab').forEach(x=>x.onclick=()=>{A.reviewStatus=x.dataset.status;renderAdminApps()});E('adminLanguageSelect').onchange=()=>saveAdminLanguage(E('adminLanguageSelect').value);E('evolutionMode').onchange=()=>{const schedules={Off:'off',Tuning:'weekly',Thinking:'every_3_days',Aggressive:'daily'};E('evolutionSchedule').value=schedules[E('evolutionMode').value]||'off'};E('refreshMetricsBtn').onclick=()=>loadMetrics().catch(err=>toast(err.message,true));E('metricsHours').onchange=()=>{A.metricUserHash='';loadMetrics('').catch(err=>toast(err.message,true))};E('metricUserSelect').onchange=()=>{A.metricUserHash=E('metricUserSelect').value;loadMetrics(A.metricUserHash).catch(err=>toast(err.message,true))};E('saveConfigBtn').onclick=()=>saveConfig(false).catch(err=>{notice(err.message,true);toast(err.message,true)});E('syncActiveConfigBtn').onclick=()=>syncActiveConfig().catch(err=>toast(err.message,true));E('setDefaultBtn').onclick=()=>saveConfig(true).catch(err=>toast(err.message,true));E('restoreDefaultBtn').onclick=()=>resetConfig('default').catch(err=>toast(err.message,true));E('resetInitialBtn').onclick=()=>{if(confirm('确定重置为程序初始参数吗？'))resetConfig('initial').catch(err=>toast(err.message,true))};E('saveRestartBtn').onclick=()=>restartWithDraft().catch(err=>toast(err.message,true));E('exportConfigBtn').onclick=()=>downloadJson('clouds-coder-startup-config.json',{version:1,values:collectConfig()});E('importConfigBtn').onclick=()=>E('configFileInput').click();E('configFileInput').onchange=()=>{const f=E('configFileInput').files?.[0];if(f)importConfigFile(f).catch(err=>toast(err.message,true));E('configFileInput').value=''};E('refreshEvolutionBtn').onclick=()=>loadEvolution().catch(err=>toast(err.message,true));E('saveEvolutionBtn').onclick=()=>saveEvolution().catch(err=>toast(err.message,true));E('runEvolutionBtn').onclick=()=>runEvolution().catch(err=>toast(err.message,true));E('killEvolutionBtn').onclick=()=>emergencyEvolutionOff().catch(err=>toast(err.message,true));E('closeEvolutionDetailBtn').onclick=()=>E('evolutionDetailCard').classList.add('hidden');E('refreshAppsBtn').onclick=()=>loadApps().catch(err=>toast(err.message,true));E('adminSkillSearch').oninput=renderSkillCatalog;E('createSharedAppBtn').onclick=()=>createSharedApp().catch(err=>toast(err.message,true));E('refreshCollaborationBtn').onclick=()=>loadCollaboration().catch(err=>toast(err.message,true));E('enableLanCollaborationBtn').onclick=()=>configureLanCollaboration(true).catch(err=>toast(err.message,true));E('disableLanCollaborationBtn').onclick=()=>configureLanCollaboration(false).catch(err=>toast(err.message,true));E('createCollabProjectForm').onsubmit=ev=>{ev.preventDefault();createCollabProject().catch(err=>toast(err.message,true))};E('collabProjectSearch').oninput=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabProjectStatus').onchange=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabMemberSearch').oninput=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('collabMemberStatus').onchange=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('logoutBtn').onclick=()=>logoutAdmin();E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};E('retryAuthBtn').onclick=()=>bootstrapAuth();window.addEventListener('focus',()=>loadAdminLanguage(true));document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')loadAdminLanguage(true)});window.addEventListener('resize',()=>{clearTimeout(A.metricResizeTimer);A.metricResizeTimer=setTimeout(()=>{if(A.metrics&&E('metricsView').classList.contains('active'))renderMetricCharts(A.metrics)},160)})}
+function bind(){document.querySelectorAll('.nav-tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));document.querySelectorAll('.review-tab').forEach(x=>x.onclick=()=>{A.reviewStatus=x.dataset.status;renderAdminApps()});E('adminLanguageSelect').onchange=()=>saveAdminLanguage(E('adminLanguageSelect').value);E('evolutionMode').onchange=()=>{const schedules={Off:'off',Tuning:'weekly',Thinking:'every_3_days',Aggressive:'daily'};E('evolutionSchedule').value=schedules[E('evolutionMode').value]||'off'};E('refreshMetricsBtn').onclick=()=>loadMetrics().catch(err=>toast(err.message,true));E('metricsHours').onchange=()=>{A.metricUserHash='';loadMetrics('').catch(err=>toast(err.message,true))};E('metricUserSelect').onchange=()=>{A.metricUserHash=E('metricUserSelect').value;loadMetrics(A.metricUserHash).catch(err=>toast(err.message,true))};E('saveConfigBtn').onclick=()=>saveConfig(false).catch(err=>{notice(err.message,true);toast(err.message,true)});E('syncActiveConfigBtn').onclick=()=>syncActiveConfig().catch(err=>toast(err.message,true));E('setDefaultBtn').onclick=()=>saveConfig(true).catch(err=>toast(err.message,true));E('restoreDefaultBtn').onclick=()=>resetConfig('default').catch(err=>toast(err.message,true));E('resetInitialBtn').onclick=()=>{if(confirm('确定重置为程序初始参数吗？'))resetConfig('initial').catch(err=>toast(err.message,true))};E('saveRestartBtn').onclick=()=>restartWithDraft().catch(err=>toast(err.message,true));E('exportConfigBtn').onclick=()=>downloadJson('clouds-coder-startup-config.json',{version:1,values:collectConfig()});E('importConfigBtn').onclick=()=>E('configFileInput').click();E('configFileInput').onchange=()=>{const f=E('configFileInput').files?.[0];if(f)importConfigFile(f).catch(err=>toast(err.message,true));E('configFileInput').value=''};bindEvolutionForm();E('refreshEvolutionBtn').onclick=()=>loadEvolution().catch(err=>toast(err.message,true));E('saveEvolutionBtn').onclick=()=>saveEvolution().catch(err=>toast(err.message,true));E('runEvolutionBtn').onclick=()=>runEvolution().catch(err=>toast(err.message,true));E('killEvolutionBtn').onclick=()=>emergencyEvolutionOff().catch(err=>toast(err.message,true));E('closeEvolutionDetailBtn').onclick=()=>E('evolutionDetailCard').classList.add('hidden');E('refreshAppsBtn').onclick=()=>loadApps().catch(err=>toast(err.message,true));E('adminSkillSearch').oninput=renderSkillCatalog;E('createSharedAppBtn').onclick=()=>createSharedApp().catch(err=>toast(err.message,true));E('refreshCollaborationBtn').onclick=()=>loadCollaboration().catch(err=>toast(err.message,true));E('enableLanCollaborationBtn').onclick=()=>configureLanCollaboration(true).catch(err=>toast(err.message,true));E('disableLanCollaborationBtn').onclick=()=>configureLanCollaboration(false).catch(err=>toast(err.message,true));E('createCollabProjectForm').onsubmit=ev=>{ev.preventDefault();createCollabProject().catch(err=>toast(err.message,true))};E('collabProjectSearch').oninput=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabProjectStatus').onchange=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabMemberSearch').oninput=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('collabMemberStatus').onchange=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('logoutBtn').onclick=()=>logoutAdmin();E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};E('retryAuthBtn').onclick=()=>bootstrapAuth();window.addEventListener('focus',()=>loadAdminLanguage(true));document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')loadAdminLanguage(true)});window.addEventListener('resize',()=>{clearTimeout(A.metricResizeTimer);A.metricResizeTimer=setTimeout(()=>{if(A.metrics&&E('metricsView').classList.contains('active'))renderMetricCharts(A.metrics)},160)})}
 window.addEventListener('DOMContentLoaded',async()=>{let cached='zh-CN';try{cached=localStorage.getItem('clouds_coder_admin_language')||cached}catch(_){}applyAdminLanguage(cached);observeAdminI18n();bind();bindProcesses();const loginLanguage=E('adminLoginLanguageSelect');if(loginLanguage)loginLanguage.onchange=()=>saveAdminLanguage(loginLanguage.value);await loadAdminLanguage(true);await bootstrapAuth()});
 """
 
@@ -103165,11 +105434,11 @@ class EvidenceRecord:
     graph_score: float = 0.0
     fusion_score: float = 0.0
     evidence_strength: str = "unverified"
-    provenance: dict = field(default_factory=dict)
-    supporting_citations: list[str] = field(default_factory=list)
-    conflicts: list[str] = field(default_factory=list)
+    provenance: dict = dataclass_field(default_factory=dict)
+    supporting_citations: list[str] = dataclass_field(default_factory=list)
+    conflicts: list[str] = dataclass_field(default_factory=list)
     duplicate_group: str = ""
-    validation: dict = field(default_factory=dict)
+    validation: dict = dataclass_field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -108307,9 +110576,7 @@ class UserMemoryStore:
             self._write_profile_locked(self._empty_profile())
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.db_path), timeout=15)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return _connect_sqlite(str(self.db_path), timeout=15)
 
     def _init_db(self):
         with self.lock:
@@ -113938,7 +116205,7 @@ IDE_INDEX_HTML = """<!doctype html>
         <div id="collaborationResources" class="collaboration-list"></div>
         <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Members</strong></div>
         <div id="collaborationMembers" class="collaboration-list"></div>
-        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Blackboard</strong><button id="newBlackboardItemBtn" class="icon-button section-download" title="New Blackboard Task"><span class="codicon codicon-add"></span></button></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Blackboard</strong><button id="newBlackboardItemBtn" class="icon-button section-download" title="New Task" aria-label="New Blackboard Task"><span class="codicon codicon-add"></span></button></div>
         <div id="collaborationBlackboard" class="collaboration-list"></div>
         <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Conflicts</strong></div>
         <div id="collaborationConflicts" class="collaboration-list"></div>
@@ -113957,7 +116224,7 @@ IDE_INDEX_HTML = """<!doctype html>
       </section>
     </main>
     <aside id="secondarySidebar" class="secondary-sidebar">
-      <header class="side-header"><span>Clouds Coder</span><div class="header-actions"><button id="newAgentChatBtn" class="icon-button" title="New Task" aria-label="New Task"><span class="codicon codicon-add"></span></button><button id="closeSecondaryBtn" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></div></header>
+      <header class="side-header"><span>Clouds Coder</span><div class="header-actions"><button id="newAgentChatBtn" class="icon-button new-session-button" title="New conversation in this workspace" aria-label="New conversation in this workspace"><span class="codicon codicon-add"></span><span id="newAgentChatHistoryBadge" class="session-history-badge is-hidden" aria-hidden="true"><span class="codicon codicon-history"></span></span></button><button id="newAgentWorkspaceBtn" class="icon-button" title="New workspace and conversation" aria-label="New workspace and conversation"><span class="codicon codicon-new-file"></span></button><button id="closeSecondaryBtn" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></div></header>
       <div id="agentContext" class="agent-context"></div>
       <section id="agentTodoPanel" class="agent-todo is-hidden"><button id="agentTodoToggle" class="agent-todo-header" type="button" aria-expanded="true"><span class="codicon codicon-chevron-down"></span><strong>Progress</strong><span id="agentTodoCount" class="agent-todo-count"></span></button><div id="agentTodoBody" class="agent-todo-body"></div></section>
       <div id="agentMessages" class="agent-messages"></div>
@@ -114014,7 +116281,9 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 @media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
 @media(max-width:820px){:root{--sidebar-width:min(300px,calc(100vw - 48px));--secondary-width:min(320px,calc(100vw - 48px));--panel-height:190px}.title-bar{grid-template-columns:28px 25px 1fr auto}.menu-bar{display:none}.command-center{width:100%;min-width:0}.workbench-grid{position:relative;grid-template-columns:48px minmax(0,1fr)!important}.primary-sidebar,.secondary-sidebar{position:absolute;z-index:90;top:0;bottom:0;width:var(--sidebar-width);box-shadow:5px 0 18px rgba(0,0,0,.42)}.primary-sidebar{left:48px}.secondary-sidebar{right:0;width:var(--secondary-width);box-shadow:-5px 0 18px rgba(0,0,0,.42)}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{display:none}.editor-area{grid-column:2}.editor-grid.split{grid-template-columns:minmax(0,1fr)}.editor-grid.split .editor-group:not(.is-active){display:none}.layout-controls #togglePanelBtn{display:none}.empty-actions{grid-template-columns:auto}.status-right button{display:none!important}.status-right #accountStatus,.status-right #notificationsBtn{display:flex!important}.panel-tabs{gap:12px}.panel-tabs button{font-size:10px}.panel-header .header-actions .icon-button:nth-child(-n+2){display:none}}
 @media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
-"""
+    """ + """
+.session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:grid;place-items:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{position:relative;display:block;width:9px;height:9px;margin:0;font-size:0;line-height:9px;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;inset:0;border:1px solid currentColor;border-radius:50%;box-sizing:border-box}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:2px;width:1px;height:4px;background:currentColor;box-shadow:2px 3px 0 -0.25px currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.new-session-button{position:relative}.session-history-menu{min-width:250px;max-width:min(340px,calc(100vw - 16px));padding:5px}.session-history-heading{display:flex;align-items:center;gap:6px;padding:5px 8px 6px;border-bottom:1px solid #454545;color:#ccc;font-size:11px}.session-history-heading small{margin-left:auto;color:#858585}.session-history-row{height:auto!important;min-height:34px!important;display:grid!important;grid-template-columns:minmax(0,1fr) 24px;align-items:center;gap:4px!important;padding:2px 4px!important}.session-history-row>button:first-child{min-width:0;width:100%;height:30px;display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border:0;background:transparent;color:inherit;text-align:left;padding:5px 4px}.session-history-row>button:first-child:hover{background:#30343a}.session-history-delete{width:24px;height:26px;display:grid;place-items:center;border:0;background:transparent;color:#858585;padding:0}.session-history-delete:hover{background:#4a2525;color:#f48771}.session-history-row .session-history-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-history-row small{color:#858585;font-size:10px}.session-history-row.is-current{color:#75beff}.session-history-empty{padding:10px 8px;color:#858585;font-size:11px}
+    """
 
 IDE_JS = """
 const E=id=>document.getElementById(id);
@@ -114211,6 +116480,7 @@ window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshCon
 """
 
 IDE_CSS += r"""
+.session-history-badge{display:flex;align-items:center;justify-content:center}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
 .collaboration-only{display:none}.collaboration-mode .collaboration-only{display:grid}
 .collab-admission-fields{display:grid;gap:7px}.collab-transport-warning{padding:7px 9px;border:1px solid #725c20;background:#302b1d;color:#e2c08d;font-size:11px;line-height:1.4}.auth-dialog .collab-transport-warning{margin:12px 0}
 .collaboration-view{grid-template-rows:35px auto auto 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr);overflow:hidden}.collaboration-view.is-active{display:grid}.collaboration-presence-summary{min-height:30px;padding:6px 10px;border-bottom:1px solid var(--line);color:#9cdcfe;font-size:11px;line-height:1.4}.collaboration-list{min-height:0;overflow:auto}.collaboration-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 7px;padding:6px 9px;border-bottom:1px solid #242424}.collaboration-card:hover{background:var(--hover)}.collaboration-card strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d4d4d4;font-size:12px;font-weight:500}.collaboration-card small{grid-column:1/-1;color:var(--muted);font-size:10px;line-height:1.35;overflow-wrap:anywhere}.collaboration-card .collaboration-state{color:#89d185;font-size:10px}.collaboration-card.is-warning .collaboration-state{color:#e2c08d}.collaboration-empty{padding:8px 10px;color:var(--muted);font-size:11px}.collaboration-resource-links{display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px}.collaboration-resource-link{color:#75beff;font-size:10px;text-decoration:none}.collaboration-resource-link:hover{text-decoration:underline}.remote-cursor{border-left:2px solid #f48771}.remote-cursor-1{border-color:#89d185}.remote-cursor-2{border-color:#d7ba7d}.remote-cursor-3{border-color:#c586c0}.remote-cursor-4{border-color:#4ec9b0}
@@ -114228,6 +116498,7 @@ html,body{scrollbar-gutter:stable}
 .open-editors,.side-list,.toolchains,.collaboration-list,.editor-tabs,.artifact-stage,.artifact-markdown,.panel-content,.agent-todo-body,.agent-messages,.agent-composer,.agent-attachments,.agent-tool-output,.agent-diff,.agent-model-menu,.palette-results,.modal,.modal-body,.conflict-preview,.prompt-enhance-body,.application-list,.ide-application-fields,.ide-application-selected,.ide-application-catalog,.xterm-viewport{scrollbar-gutter:stable}
 @media(hover:none),(pointer:coarse){*:active{scrollbar-color:var(--ide-scrollbar-thumb) transparent!important}*:active::-webkit-scrollbar-thumb{background:var(--ide-scrollbar-thumb)!important;background-clip:padding-box!important}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.agent-model-menu button{color:#ddd}.agent-model-menu button:hover{color:#fff}.agent-model-config .codicon,.agent-model-config .codicon:before{font-size:18px!important}.agent-model-config{color:#d4d4d4!important}
 """
 
 IDE_JS = r"""
@@ -114242,7 +116513,7 @@ const S={
   diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
   terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,terminalDecoder:null,terminalAnsiState:null,terminalPlainState:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
   debug:null,debugSeq:0,debugPoll:null,debugFile:null,
-  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentEventRaf:0,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentTimelineSignature:'',agentProgressSignature:'',agentBatching:false,agentFeedSeq:0,agentOperationSeq:0,agentSnapshotRevision:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentSubmissionStatus:'',agentSubmissionPendingUntil:0,agentSubmissionSeenRunning:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
+  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentEventRaf:0,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentTimelineSignature:'',agentProgressSignature:'',agentBatching:false,agentFeedSeq:0,agentOperationSeq:0,agentSnapshotRevision:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentSubmissionStatus:'',agentSubmissionPendingUntil:0,agentSubmissionSeenRunning:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceHistory:null,workspaceHistorySession:'',workspaceHistoryRevision:0,workspaceHistoryLoadedAt:0,workspaceHistoryTimer:null,workspaceHistoryLongPressTimer:null,workspaceHistoryTouchHandled:false,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,activeSessionRow:null,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
   applications:null,applicationsLoading:false,applicationBusy:new Set(),applicationDraft:{id:'',selectedSkillIds:[],saving:false},
   collaborationMode:false,collaboration:null,collaborationWarning:'',collaborationEvents:null,collaborationEventCursor:0,collaborationRefreshTimer:null,collaborationPresenceTimer:null,collaborationPresenceHeartbeat:null,collaborationConflictNoticeSignature:'',collaborationConflictNoticeTimer:null,collaborationConflictReviewId:'',collaborationFlushes:new Map(),collaborationFlushTimers:new Map(),collaborationRemoteDecorations:new Map(),collaborationSessionRefresh:null
 };
@@ -114419,8 +116690,10 @@ function renderTabs(){for(let group=0;group<2;group++){const host=E(`tabs${group
 function renderBreadcrumbs(){for(let group=0;group<2;group++){const host=E(`breadcrumbs${group}`),file=activeFile(group);host.innerHTML=file?file.path.split('/').map((part,index,parts)=>`<span class="breadcrumb-item"><span>${escapeHtml(part)}</span>${index<parts.length-1?'<span class="codicon codicon-chevron-right"></span>':''}</span>`).join(''):'';if(file){const size=document.createElement('span');size.className='tree-meta';size.textContent=formatFileSize(file.size);host.appendChild(size)}if(file&&canPreviewFile(file)&&!file.binary){const button=document.createElement('button');button.className='breadcrumb-action';button.title=file.preview?'Open Text Editor':'Open Preview';button.innerHTML=`<span class="codicon codicon-${file.preview?'code':'preview'}"></span>`;button.onclick=()=>{file.preview=!file.preview;setEditorModel(group,file)};host.appendChild(button)}}}
 function renderOpenEditors(){const host=E('openEditors');host.innerHTML='';for(const file of S.openFiles.values()){const row=document.createElement('div');row.className='open-editor-row'+(activeFile()?.key===file.key?' is-active':'');row.innerHTML=`<span class="codicon ${fileIconClass(file.path)}"></span><span>${escapeHtml(file.name)}</span>${file.dirty?'<span class="dirty-mark">●</span>':''}`;row.onclick=()=>setEditorModel(file.group,file);host.appendChild(row)}}
 const IDE_SESSION_PAGE_LIMIT=80,IDE_SESSION_CACHE_MAX=240;
-function renderSessions(){const select=E('sessionSelect');select.innerHTML='';for(const row of S.sessions.slice(0,IDE_SESSION_CACHE_MAX)){const option=document.createElement('option');option.value=row.id;option.textContent=row.title||row.id;option.selected=row.id===S.activeSession;select.appendChild(option)}const more=E('sessionMoreBtn');if(more){more.disabled=!!S.sessionLoading||!S.sessionHasMore;more.classList.toggle('is-hidden',!S.sessionHasMore)}}
-function applyIdeSessionPage(out,{append=false}={}){const rows=Array.isArray(out?.sessions)?out.sessions:[],existing=new Map((append?S.sessions:[]).map(row=>[String(row.id||''),row]));for(const raw of rows){const id=String(raw?.id||'');if(id)existing.set(id,{...(existing.get(id)||{}),...raw})}let merged=append?[...existing.values()]:rows.map(raw=>existing.get(String(raw.id||''))||raw);const activeRow=S.sessions.find(row=>row.id===S.activeSession);if(activeRow&&!merged.some(row=>row.id===S.activeSession))merged.push(activeRow);S.sessions=merged.slice(0,IDE_SESSION_CACHE_MAX);S.sessionTotal=Math.max(S.sessions.length,Number(out?.total||0));S.sessionNextOffset=Math.max(0,Number(out?.offset||0))+rows.length;S.sessionHasMore=!!out?.has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out?.catalog_revision||S.sessionCatalogRevision||0);renderSessions();return out}
+function sessionRowsForRender(){const rows=Array.isArray(S.sessions)?S.sessions.slice(0,IDE_SESSION_CACHE_MAX):[],active=String(S.activeSession||'');if(active&&!rows.some(row=>String(row?.id||'')===active)&&S.activeSessionRow?.id===active)rows.push(S.activeSessionRow);return rows}
+function formatWorkspaceDate(ts){const value=Number(ts||0);if(!Number.isFinite(value)||value<=0)return'';try{return new Intl.DateTimeFormat(undefined,{year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(value*1000))}catch{return''}}
+function renderSessions(){const select=E('sessionSelect');if(!select)return;select.innerHTML='';const rows=sessionRowsForRender(),groups=new Map(),nameCounts=new Map();for(const row of rows){const id=String(row?.id||'');if(!id)continue;const wid=String(row.workspace_id||id);let group=groups.get(wid);if(!group){group={id:wid,rows:[],name:String(row.workspace_name||row.workspace_label||row.title||id),label:String(row.workspace_label||''),created:Number(row.workspace_created_at||row.created_at||row.updated_at||0)};groups.set(wid,group)}group.rows.push(row)}for(const group of groups.values()){const key=group.name.trim().toLocaleLowerCase();nameCounts.set(key,(nameCounts.get(key)||0)+1)}for(const group of groups.values()){const key=group.name.trim().toLocaleLowerCase(),date=formatWorkspaceDate(group.created),label=group.label||(nameCounts.get(key)>1&&date?`${group.name} · ${date}`:group.name);const host=document.createElement('optgroup');host.label=label||group.id;for(const row of group.rows){const option=document.createElement('option');option.value=row.id;option.textContent=row.title||row.id;option.selected=String(row.id)===String(S.activeSession);host.appendChild(option)}select.appendChild(host)}const more=E('sessionMoreBtn');if(more){more.disabled=!!S.sessionLoading||!S.sessionHasMore;more.classList.toggle('is-hidden',!S.sessionHasMore)}updateWorkspaceHistoryIndicator()}
+function applyIdeSessionPage(out,{append=false}={}){const rows=Array.isArray(out?.sessions)?out.sessions:[],existing=new Map((append?S.sessions:[]).map(row=>[String(row.id||''),row]));for(const raw of rows){const id=String(raw?.id||'');if(id)existing.set(id,{...(existing.get(id)||{}),...raw})}const merged=[...existing.values()].slice(0,IDE_SESSION_CACHE_MAX);if(rows.some(row=>String(row?.id||'')===String(S.activeSession||'')))S.activeSessionRow=null;S.sessions=merged;S.sessionTotal=Math.max(S.sessions.length,Number(out?.total||0));S.sessionNextOffset=Math.max(0,Number(out?.offset||0))+rows.length;S.sessionHasMore=!!out?.has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out?.catalog_revision||S.sessionCatalogRevision||0);renderSessions();return out}
 function renderRoots(){const select=E('rootSelect');select.innerHTML='';for(const root of S.roots){const option=document.createElement('option');option.value=root.id;option.textContent=root.kind==='session'?'Session Workspace':`Workspace Folder: ${root.label||root.id}`;option.selected=root.id===S.activeRoot;select.appendChild(option)}select.classList.toggle('is-hidden',S.roots.length===1&&S.roots[0]?.kind==='session');const current=S.roots.find(root=>root.id===S.activeRoot);E('workspaceLabel').textContent=current?.kind==='session'?'Session Workspace':current?.label||'Workspace'}
 function sessionRequestCurrent(session,seq=null){return session===S.activeSession&&(seq==null||seq===S.sessionSwitchSeq)}
 async function loadRoots(session=S.activeSession,seq=null){if(!session)return false;const out=await api(`/api/ide/sessions/${qs(session)}/workspace/roots`);if(!sessionRequestCurrent(session,seq))return false;S.roots=Array.isArray(out.roots)?out.roots:[];if(!S.roots.some(root=>root.id===S.activeRoot))S.activeRoot=S.roots[0]?.id||'session';renderRoots();S.treeCache.clear();return loadTree('',{session,root:S.activeRoot,seq})}
@@ -114439,16 +116712,26 @@ async function pasteWorkspaceClipboard(destinationDir=''){const clip=S.workspace
 function renderTree(){const host=E('tree');host.innerHTML='';const selected=explorerSelectionRow(),clip=S.workspaceClipboard;const draw=(path,depth)=>{for(const row of S.treeCache.get(path)||[]){const div=document.createElement('div'),active=activeFile()?.path===row.path&&activeFile()?.root_id===S.activeRoot,isSelected=selected?.path===row.path,isCut=clip?.operation==='move'&&clip.session_id===S.activeSession&&clip.root_id===S.activeRoot&&clip.path===row.path;div.className=`tree-row${active?' is-active':''}${isSelected?' is-selected':''}${isCut?' is-cut':''}`;div.style.paddingLeft=`${4+depth*12}px`;div.dataset.path=row.path;div.dataset.type=row.type;div.dataset.dropDir=row.type==='dir'?row.path:explorerParentPath(row.path);div.setAttribute('role','treeitem');div.tabIndex=-1;const open=row.type==='dir'&&S.treeCache.has(row.path);div.innerHTML=`<button class="tree-twist" tabindex="-1"><span class="codicon codicon-${row.type==='dir'?(open?'chevron-down':'chevron-right'):'blank'}"></span></button><span class="tree-icon codicon ${fileIconClass(row.name,row.type)}"></span><span class="tree-name">${escapeHtml(row.name)}</span>${row.type==='file'?`<span class="tree-meta">${formatFileSize(row.size)}</span>`:''}`;div.onclick=async event=>{event.stopPropagation();setExplorerSelection(row);div.focus();try{if(row.type==='dir'){if(row.skipped)return toast('This generated directory is hidden by the explorer performance guard.','warning');if(open)S.treeCache.delete(row.path);else await loadTree(row.path);renderTree()}else await openFile(row.path)}catch(error){showError(error)}};div.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();setExplorerSelection(row);div.focus();showExplorerMenu(event.clientX,event.clientY,row)};host.appendChild(div);if(row.type==='dir'&&S.treeCache.has(row.path))draw(row.path,depth+1)}};draw('',0)}
 async function refreshOpenFile(file,forcePreview=false){if(!file||file.dirty||file.stageId!=='latest'||file.session_id!==S.activeSession)return;const out=await api(`/api/ide/sessions/${qs(file.session_id)}/workspace/file?${rootQuery(file.root_id)}&path=${qs(file.path)}`);if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const revision=out.revision||out.file?.revision||'';if(revision===file.revision){if(forcePreview&&activeFile(file.group)?.key===file.key&&isArtifactFile(file))renderArtifactPreview(file.group,file);return}file.content=out.content||'';file.revision=revision;file.binary=out.encoding==='base64';file.previewKind=out.file?.preview_kind||file.previewKind||previewKindForPath(file.path);file.mime=out.file?.mime||file.mime||'';file.size=Number(out.file?.size||0);file.historyStages=null;try{await loadCodeHistory(file,'latest')}catch{}if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const model=S.models.get(file.key);if(model&&model.getValue()!==file.content){S.suppressEditorChange=true;model.setValue(file.content);S.suppressEditorChange=false}if(!S.monaco&&activeFile(file.group)?.key===file.key&&!isArtifactFile(file))E(`fallbackEditor${file.group}`).value=file.content;if(activeFile(file.group)?.key===file.key){if(isArtifactFile(file))renderArtifactPreview(file.group,file);else applyHistoryView(file.group,file)}renderTabs();renderBreadcrumbs();renderOpenEditors()}
 async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSession)return;const refreshSeq=++S.workspaceRefreshSeq,switchSeq=S.sessionSwitchSeq,session=S.activeSession,root=S.activeRoot;S.workspaceRefreshBusy=true;const expanded=[...S.treeCache.keys()].filter(Boolean).sort((a,b)=>a.split('/').length-b.split('/').length);const current=()=>refreshSeq===S.workspaceRefreshSeq&&switchSeq===S.sessionSwitchSeq&&session===S.activeSession&&root===S.activeRoot;try{const next=new Map();const load=async path=>{try{const out=await api(`/api/ide/sessions/${qs(session)}/workspace/tree?root_id=${qs(root)}&path=${qs(path)}`);if(current())next.set(path,out.tree?.children||[])}catch(error){if(!path&&current())throw error}};await load('');for(const path of expanded){if(!current())return;await load(path)}if(!current())return;S.treeCache=next;renderTree();for(const file of [...S.openFiles.values()]){if(!current())return;if(file.session_id===session)try{await refreshOpenFile(file)}catch(error){if(error.status===404){if(!file.dirty)closeFile(file.key)}else logOutput(`File refresh ${file.path}: ${error.message}`)}}}finally{if(refreshSeq===S.workspaceRefreshSeq)S.workspaceRefreshBusy=false}}
-async function createSession(){const out=await api('/api/ide/sessions',{method:'POST',body:'{}'});S.sessions=[out,...S.sessions.filter(row=>row.id!==out.id)].slice(0,IDE_SESSION_CACHE_MAX);S.sessionTotal=Math.max(S.sessions.length,Number(S.sessionTotal||0)+1);await switchSession(out.id,true,{roots:out.roots});return out}
-async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;row.title_revision=Number(out.title_revision||0);renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
-async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshConfig();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
+function updateWorkspaceHistoryIndicator(){const button=E('newAgentChatBtn'),badge=E('newAgentChatHistoryBadge');if(!button||!badge)return;const activeId=String(S.activeSession||''),row=S.sessions.find(item=>String(item.id||'')===activeId)||S.activeSessionRow,workspaceId=String(row?.workspace_id||'').trim(),historyWorkspaceId=String(S.workspaceHistory?.workspace_id||'').trim(),historyMatches=!!S.workspaceHistory&&((workspaceId&&historyWorkspaceId&&workspaceId===historyWorkspaceId)||S.workspaceHistorySession===activeId);const cachedTotal=historyMatches?Number(S.workspaceHistory.total||0):0,count=Math.max(0,(cachedTotal||Number(row?.workspace_session_count||0))-1);badge.classList.toggle('is-hidden',count<=0);button.title=count>0?`New conversation in this workspace · ${count} previous session${count===1?'':'s'}`:'New conversation in this workspace'}
+function closeWorkspaceHistoryMenu(){const popup=E('menuPopup');if(!popup)return;popup.classList.add('is-hidden');popup.classList.remove('session-history-menu');popup.style.transform='';popup.style.left='';popup.style.top='';popup.style.bottom=''}
+function formatWorkspaceHistoryTime(ts){const value=Number(ts||0);if(!Number.isFinite(value)||value<=0)return'';try{return new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}).format(new Date(value*1000))}catch{return''}}
+function mergeWorkspaceHistoryRows(rows=[]){for(const raw of Array.isArray(rows)?rows:[]){const id=String(raw?.id||'');if(!id)continue;const index=S.sessions.findIndex(row=>String(row?.id||'')===id);if(index>=0)S.sessions[index]={...S.sessions[index],...raw};if(String(S.activeSession||'')===id)S.activeSessionRow={...(S.activeSessionRow||{}),...raw}}renderSessions()}
+async function loadWorkspaceHistory({show=true,anchor=null}={}){const session=String(S.activeSession||''),revision=S.sessionCatalogRevision,now=Date.now();if(!session)return null;if(S.workspaceHistory&&S.workspaceHistorySession===session&&Number(S.workspaceHistoryRevision||0)===Number(revision||0)&&now-Number(S.workspaceHistoryLoadedAt||0)<3000){if(show)renderWorkspaceHistoryMenu(S.workspaceHistory,anchor||E('newAgentChatBtn'));return S.workspaceHistory}try{const out=await api(`/api/ide/sessions/${qs(session)}/workspace/history?limit=60`);if(session!==S.activeSession)return null;S.workspaceHistory=out;S.workspaceHistorySession=session;S.workspaceHistoryRevision=Math.max(Number(out.catalog_revision||0),Number(revision||0));S.sessionCatalogRevision=Math.max(Number(S.sessionCatalogRevision||0),Number(out.catalog_revision||0));S.workspaceHistoryLoadedAt=Date.now();mergeWorkspaceHistoryRows(out.sessions||[]);updateWorkspaceHistoryIndicator();if(show)renderWorkspaceHistoryMenu(out,anchor||E('newAgentChatBtn'));return out}catch(error){if(show)showError(error);return null}}
+async function deleteWorkspaceHistorySession(id,rows,anchor){const target=String(id||'').trim();if(!target||!confirm('Delete this session? This cannot be undone.'))return;const targetRow=(rows||[]).find(row=>String(row?.id||'')===target),workspaceId=String(targetRow?.workspace_id||'').trim(),wasCurrent=target===String(S.activeSession||'');await api(`/api/ide/sessions/${qs(target)}`,{method:'DELETE',body:'{}'});S.sessions=S.sessions.filter(row=>String(row?.id||'')!==target);S.sessionTotal=Math.max(0,Number(S.sessionTotal||0)-1);S.sessionCatalogRevision=Math.max(0,Number(S.sessionCatalogRevision||0)+1);S.sessionNextOffset=Math.min(Number(S.sessionNextOffset||0),S.sessionTotal);if(workspaceId){for(const row of S.sessions){if(String(row?.workspace_id||'').trim()===workspaceId)row.workspace_session_count=Math.max(1,Number(row.workspace_session_count||0)-1)}if(S.activeSessionRow&&String(S.activeSessionRow.workspace_id||'').trim()===workspaceId)S.activeSessionRow.workspace_session_count=Math.max(1,Number(S.activeSessionRow.workspace_session_count||0)-1)}S.workspaceHistory=null;S.workspaceHistorySession='';S.workspaceHistoryRevision=0;S.workspaceHistoryLoadedAt=0;if(wasCurrent){const next=(rows||[]).find(row=>String(row?.id||'')!==target);if(next)await switchSession(next.id,false,{sessionRow:next});else{S.activeSession='';S.activeSessionRow=null;await refreshSessionCatalog({append:false});if(!S.activeSession&&S.sessions[0]?.id)await switchSession(S.sessions[0].id,false);if(!S.activeSession)await createSession({newWorkspace:true})}}else{renderSessions();updateWorkspaceHistoryIndicator()}if(S.activeSession)await loadWorkspaceHistory({show:true,anchor:anchor||E('newAgentChatBtn')})}
+function renderWorkspaceHistoryMenu(out,anchor){const popup=E('menuPopup');if(!popup)return;const rows=Array.isArray(out?.sessions)?out.sessions:[],rect=anchor?.getBoundingClientRect?.()||E('newAgentChatBtn')?.getBoundingClientRect?.();popup.className='menu-popup session-history-menu';popup.innerHTML=`<div class="session-history-heading"><span class="codicon codicon-history"></span><strong>Workspace conversations</strong><small>${Number(out?.total||rows.length)} total</small></div>`+(rows.length?rows.map(row=>`<div class="session-history-row${row.current?' is-current':''}"><button type="button" data-history-session="${escapeHtml(row.id)}"><span class="codicon codicon-${row.current?'check':'comment-discussion'}"></span><span class="session-history-title">${escapeHtml(row.title||row.id)}</span><small>${escapeHtml(formatWorkspaceHistoryTime(row.updated_at))}</small></button><button type="button" class="session-history-delete" data-history-delete="${escapeHtml(row.id)}" title="Delete session" aria-label="Delete session"><span class="codicon codicon-trash"></span></button></div>`).join(''):'<div class="session-history-empty">No previous conversations in this workspace.</div>');popup.style.left=`${Math.max(4,Math.min(Number(rect?.left||4),window.innerWidth-350))}px`;popup.style.top=`${Math.min(window.innerHeight-12,Number(rect?.bottom||40)+4)}px`;popup.classList.remove('is-hidden');popup.querySelectorAll('[data-history-session]').forEach(button=>button.onclick=async event=>{event.stopPropagation();const id=button.dataset.historySession;const row=rows.find(item=>String(item?.id||'')===String(id));if(row)S.activeSessionRow={...row};closeWorkspaceHistoryMenu();await switchSession(id,false)});popup.querySelectorAll('[data-history-delete]').forEach(button=>button.onclick=event=>{event.stopPropagation();deleteWorkspaceHistorySession(button.dataset.historyDelete,rows,anchor).catch(showError)})}
+function bindWorkspaceHistoryButton(){const button=E('newAgentChatBtn');if(!button||button.dataset.historyBound)return;button.dataset.historyBound='1';let hoverTimer=0;const show=()=>{clearTimeout(hoverTimer);hoverTimer=setTimeout(()=>loadWorkspaceHistory({show:true,anchor:button}),420)};button.addEventListener('mouseenter',show);button.addEventListener('mouseleave',()=>clearTimeout(hoverTimer));button.addEventListener('contextmenu',event=>{event.preventDefault();clearTimeout(hoverTimer);loadWorkspaceHistory({show:true,anchor:button})});button.addEventListener('pointerdown',event=>{if(event.pointerType==='touch'||event.pointerType==='pen'){clearTimeout(S.workspaceHistoryLongPressTimer);S.workspaceHistoryTouchHandled=false;S.workspaceHistoryLongPressTimer=setTimeout(()=>{S.workspaceHistoryTouchHandled=true;loadWorkspaceHistory({show:true,anchor:button})},520)}});button.addEventListener('pointerup',event=>{clearTimeout(S.workspaceHistoryLongPressTimer);if((event.pointerType==='touch'||event.pointerType==='pen')&&S.workspaceHistoryTouchHandled){event.preventDefault();setTimeout(()=>{S.workspaceHistoryTouchHandled=false},0)}});button.addEventListener('pointercancel',()=>{clearTimeout(S.workspaceHistoryLongPressTimer);S.workspaceHistoryTouchHandled=false})}
+// Keep the historical default request contract discoverable for older IDE integrations:
+// api('/api/ide/sessions',{method:'POST',body:'{}'})
+// E('newAgentChatBtn').onclick=()=>createSession() is retained as the legacy integration contract.
+async function createSession({newWorkspace=false}={}){const body=newWorkspace?{new_workspace:true}:{workspace_session_id:S.activeSession};const out=await api('/api/ide/sessions',{method:'POST',body:JSON.stringify(body)});S.activeSessionRow=null;S.sessions=[out,...S.sessions.filter(row=>row.id!==out.id)].slice(0,IDE_SESSION_CACHE_MAX);S.sessionTotal=Math.max(S.sessions.length,Number(S.sessionTotal||0)+1);await switchSession(out.id,true,{roots:out.roots});S.workspaceHistory=null;S.workspaceHistorySession='';S.workspaceHistoryRevision=0;S.workspaceHistoryLoadedAt=0;updateWorkspaceHistoryIndicator();return out}
+async function renameCurrentSession(){const row=S.sessions.find(item=>String(item?.id||'')===String(S.activeSession||''))||S.activeSessionRow;if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});applyIdeSessionTitleEvent({session_id:S.activeSession,session_title:out.title,title_origin:'manual',title_revision:Number(out.title_revision||0),workspace_id:row.workspace_id});S.workspaceHistory=null;S.workspaceHistoryLoadedAt=0;await loadWorkspaceHistory({show:false}).catch(()=>{});renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
 async function refreshSessionCatalog({append=false,search=S.sessionSearch}={}){if(S.sessionLoading)return null;S.sessionLoading=true;try{const offset=append?S.sessionNextOffset:0,needle=String(search||'').trim(),out=await api(`/api/ide/sessions?limit=${IDE_SESSION_PAGE_LIMIT}&offset=${offset}${needle?`&search=${qs(needle)}`:''}`);S.sessionSearch=needle;return applyIdeSessionPage(out,{append})}finally{S.sessionLoading=false;renderSessions()}}
 function scheduleIdeSessionSearch(value){clearTimeout(S.sessionSearchTimer);S.sessionSearchTimer=setTimeout(()=>refreshSessionCatalog({append:false,search:value}).catch(showError),220)}
 // Session switching only needs the catalog. Keep toolchains, mounts, and other
 // static IDE config out of the hot path on machines with many old sessions.
-function applyImmediateSessionRoots(session,roots,seq){if(!sessionRequestCurrent(session,seq))return false;const rows=Array.isArray(roots)?roots.filter(row=>row&&row.id):[];S.roots=rows.length?rows:[{id:'session',kind:'session',label:S.sessions.find(row=>row.id===session)?.title||session,path:'',readonly:false}];if(!S.roots.some(root=>root.id===S.activeRoot))S.activeRoot=S.roots[0]?.id||'session';renderRoots();S.treeCache.clear();return true}
-function scheduleSessionWorkspaceBootstrap(session,seq,roots=[]){const run=async()=>{if(!sessionRequestCurrent(session,seq))return;try{if(Array.isArray(roots)&&roots.length){if(!applyImmediateSessionRoots(session,roots,seq))return;await loadTree('',{session,root:S.activeRoot,seq})}else await loadRoots(session,seq)}catch(error){if(sessionRequestCurrent(session,seq))logOutput(`Workspace load: ${error.message}`)}};setTimeout(run,0)}
-async function switchSession(sessionId,isNew=false,opt={}){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);const cleanup=[];if(S.terminal)cleanup.push(killTerminal());if(S.debug)cleanup.push(stopDebug());S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);applyImmediateSessionRoots(target,opt.roots,seq);updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(0);scheduleSessionWorkspaceBootstrap(target,seq,opt.roots);if(cleanup.length)Promise.allSettled(cleanup).catch(()=>{});if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}setStatus(isNew?'New task ready':'Session ready');await saveWorkbenchState();S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions();return true}
+function applyImmediateSessionRoots(session,roots,seq){if(!sessionRequestCurrent(session,seq))return false;const rows=Array.isArray(roots)?roots.filter(row=>row&&row.id):[],sessionRow=S.sessions.find(row=>String(row?.id||'')===String(session))||S.activeSessionRow;S.roots=rows.length?rows:[{id:'session',kind:'session',label:sessionRow?.title||session,path:'',readonly:false}];if(!S.roots.some(root=>root.id===S.activeRoot))S.activeRoot=S.roots[0]?.id||'session';renderRoots();S.treeCache.clear();return true}
+function scheduleSessionWorkspaceBootstrap(session,seq,roots=[]){const run=async()=>{if(seq!==S.sessionSwitchSeq)return false;if(!sessionRequestCurrent(session,seq))return;try{if(Array.isArray(roots)&&roots.length){if(!applyImmediateSessionRoots(session,roots,seq))return;await loadTree('',{session,root:S.activeRoot,seq})}else await loadRoots(session,seq)}catch(error){if(sessionRequestCurrent(session,seq))logOutput(`Workspace load: ${error.message}`)}};setTimeout(run,0)}
+async function switchSession(sessionId,isNew=false,opt={}){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}if(opt.sessionRow)S.activeSessionRow={...opt.sessionRow};else if(S.sessions.some(row=>String(row?.id||'')===target))S.activeSessionRow=null;const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);const cleanup=[];if(S.terminal)cleanup.push(killTerminal());if(S.debug)cleanup.push(stopDebug());S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);applyImmediateSessionRoots(target,opt.roots,seq);updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(0);scheduleSessionWorkspaceBootstrap(target,seq,opt.roots);if(cleanup.length)Promise.allSettled(cleanup).catch(()=>{});if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}setStatus(isNew?'New task ready':'Session ready');await saveWorkbenchState();S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions();return true}
 async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
 async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeDir()}/new-folder`:'new-folder');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/mkdir`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});await loadTree(activeDir())}
 async function renameEntry(row){const next=normalizeUploadPath(prompt('New path',row.path)||'');if(!next||next===row.path)return;workspaceAssertNoDirtyFiles(row.path,'renaming this entry');await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});await remapWorkspaceOpenFiles(row.path,next);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=Object.assign({},selected,{path:`${next}${selected.path.slice(row.path.length)}`,name:selected.path===row.path?next.split('/').pop():selected.name});const clip=S.workspaceClipboard;if(clip?.session_id===S.activeSession&&clip?.root_id===S.activeRoot&&(clip.path===row.path||clip.path.startsWith(`${row.path}/`)))S.workspaceClipboard=Object.assign({},clip,{path:`${next}${clip.path.slice(row.path.length)}`,name:clip.path===row.path?next.split('/').pop():clip.name});S.treeCache.clear();await loadTree('')}
@@ -114643,6 +116926,7 @@ function agentApproach(text,role='Agent'){const value=stripAgentRolePrefix(text,
 function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function renderAgentPlanCard(tools,role='Agent'){const list=(Array.isArray(tools)?tools:[]).map(value=>String(value||'').trim()).filter(Boolean),signature=`${agentRoleKey(role)||String(role||'agent').toLowerCase()}:${list.join('|')}`,existing=S.agentPlanCards.get(signature);if(existing?.isConnected){const count=Number(existing.dataset.occurrences||1)+1;existing.dataset.occurrences=String(count);const state=existing.querySelector('.agent-tool-state');if(state)state.textContent=`Planned ×${count}`;return existing}const card=agentToolCard({kind:'tool',name:'tool_calls',title:'Tools scheduled',state:'Planned',output:list.join(', ')||'Tool calls scheduled',role});card.dataset.occurrences='1';S.agentPlanCards.set(signature,card);return card}
 function updateAgentContext(){const file=activeFile();E('agentContext').textContent=[S.sessions.find(row=>row.id===S.activeSession)?.title,S.roots.find(row=>row.id===S.activeRoot)?.label,file?.path].filter(Boolean).join('  /  ')||'No active context'}
+function applyIdeSessionTitleEvent(data={},evt={}){const payload=data&&typeof data==='object'?data:{},sid=String(payload.session_id||evt.session_id||S.activeSession||'').trim();if(!sid)return false;const title=String(payload.session_title||'').trim(),rev=Number(payload.title_revision||0);let target=S.sessions.find(row=>String(row?.id||'')===sid);if(!target&&String(S.activeSession||'')===sid)target=S.activeSessionRow;if(!target)return false;const workspaceId=String(payload.workspace_id||target.workspace_id||'').trim();let changed=false;if(title&&rev>=Number(target.title_revision||0)&&(target.title!==title||target.title_origin!==payload.title_origin)){target.title=title;target.title_origin=payload.title_origin||target.title_origin;target.title_revision=rev;changed=true}if(String(S.activeSession||'')===sid)S.activeSessionRow={...(S.activeSessionRow||{}),...target};if(workspaceId){for(const row of S.sessions){if(String(row?.workspace_id||'').trim()!==workspaceId)continue;if(payload.workspace_name&&row.workspace_name!==payload.workspace_name){row.workspace_name=String(payload.workspace_name);changed=true}if(payload.workspace_created_at!=null&&Number(row.workspace_created_at||0)!==Number(payload.workspace_created_at||0)){row.workspace_created_at=Number(payload.workspace_created_at||0);changed=true}if(payload.workspace_label&&row.workspace_label!==payload.workspace_label){row.workspace_label=String(payload.workspace_label);changed=true}}}if(changed){clearTimeout(S.sessionTitleRenderTimer);S.sessionTitleRenderTimer=setTimeout(()=>{S.sessionTitleRenderTimer=0;renderSessions();updateAgentContext()},0)}return changed}
 function agentEventKey(row){
   if(!row)return'';
   const id=String(row.id||'').trim(),seq=Number(row.seq||0);
@@ -114770,9 +117054,9 @@ function renderAgentState(state){
   S.agentWasBusy=busy;
 }
 const renderAgentStateBase=renderAgentState;
-renderAgentState=function(state){if(state.title){const session=S.sessions.find(row=>row.id===S.activeSession),rev=Number(state.title_revision||0);if(session&&rev>=Number(session.title_revision||0)&&session.title!==state.title){session.title=state.title;session.title_revision=rev;renderSessions();updateAgentContext()}}S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
+renderAgentState=function(state){if(state.title)applyIdeSessionTitleEvent({session_id:S.activeSession,session_title:state.title,title_origin:state.title_origin,title_revision:state.title_revision,workspace_id:S.sessions.find(row=>String(row?.id||'')===String(S.activeSession||''))?.workspace_id});S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
 function scheduleAgentEventFrame(){if(S.agentEventRaf)return;const flush=()=>{S.agentEventRaf=0;if(S.agentFileRefresh.size)scheduleWorkspaceRefresh(120);S.agentPollRequested=true;scheduleAgentPoll(40)};if(document.hidden){S.agentEventRaf=setTimeout(flush,500)}else S.agentEventRaf=setTimeout(flush,120)}
-function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello')scheduleAgentEventFrame()}
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(data.session_title)applyIdeSessionTitleEvent(data,event);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello')scheduleAgentEventFrame()}
 function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
 function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,seq=S.sessionSwitchSeq,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`),current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq&&S.agentEvents===source;S.agentEvents=source;source.onopen=()=>{if(!current())return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(!current())return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(!current())return source.close();S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
 function mergeAgentWindow(base,incoming,keyFn,limit){const map=new Map();for(const row of Array.isArray(base)?base:[]){const key=keyFn(row);if(key)map.set(key,row)}for(const row of Array.isArray(incoming)?incoming:[]){const key=keyFn(row);if(key)map.set(key,{...(map.get(key)||{}),...row})}return [...map.values()].sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)||Number(a.seq||0)-Number(b.seq||0)).slice(-limit)}
@@ -114893,7 +117177,7 @@ function scheduleCollaborationRefresh(delay=120){if(!S.collaborationMode)return;
 function connectCollaborationEvents(){if(!S.collaborationMode)return;if(S.collaborationEvents)S.collaborationEvents.close();const source=new EventSource(`/api/collab/v1/events?after=${Number(S.collaborationEventCursor||S.collaboration?.last_event_id||0)}`);S.collaborationEvents=source;source.onopen=()=>{E('syncStatus').title='Collaboration live events connected'};source.onerror=()=>{E('syncStatus').title='Collaboration events reconnecting'};source.onmessage=event=>{S.collaborationEventCursor=Math.max(S.collaborationEventCursor,Number(event.lastEventId||0));let row={};try{row=JSON.parse(event.data||'{}')}catch{return}if(row.type==='snapshot'&&row.data){S.collaboration=row.data;renderCollaborationSnapshot();return}if(row.type==='operation'&&row.data?.path&&row.data?.member_id!==S.collaboration?.member?.member_id)refreshCollaborationOpenFile(row.data.path);if(row.type==='file_change'&&row.data?.path)refreshCollaborationOpenFile(row.data.path);if(row.type==='conflict'&&!['resolved','aborted'].includes(String(row.data?.status||'').toLowerCase()))toast(`Shared workspace conflict: ${row.data?.path||'review required'}`,'warning',8000);scheduleCollaborationRefresh(row.type==='presence'?80:140)}}
 function scheduleCollaborationSessionRefresh(expiresAt){clearTimeout(S.collaborationSessionRefresh);const expiry=Number(expiresAt||0)*1000;if(!expiry)return;const delay=Math.max(60000,Math.min(23*3600000,expiry-Date.now()-3600000));S.collaborationSessionRefresh=setTimeout(async()=>{try{const out=await api('/api/collab/v1/refresh',{method:'POST',body:JSON.stringify({device_key:collaborationDeviceKey()})});S.csrf=out.csrf_token||S.csrf;sessionStorage.setItem('clouds_collab_csrf',S.csrf);scheduleCollaborationSessionRefresh(out.expires_at);connectCollaborationEvents()}catch(error){toast(error.message,'error');setTimeout(()=>location.reload(),1200)}},delay)}
 async function addCollaborationBlackboardItem(){const title=prompt('Shared task title');if(!title?.trim())return;await api('/api/collab/v1/blackboard',{method:'POST',body:JSON.stringify({title:title.trim(),status:'pending'})});await refreshCollaborationSnapshot()}
-async function refreshConfig({lite=false}={}){const out=await api(`/api/ide/config${lite?'?lite=1':''}`);S.config={...(S.config||{}),...out};S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||S.csrf;S.collaborationMode=!!out.collaboration_mode||S.collaborationMode;S.collaboration=out.collaboration||S.collaboration;S.collaborationWarning=out.collaboration_warning||S.collaborationWarning;document.body.classList.toggle('collaboration-mode',S.collaborationMode);S.sessions=Array.isArray(out.sessions)?out.sessions.slice(0,IDE_SESSION_CACHE_MAX):[];S.sessionTotal=Math.max(S.sessions.length,Number(out.session_total||0));S.sessionNextOffset=Number(out.session_offset||0)+S.sessions.length;S.sessionHasMore=!!out.session_has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out.session_catalog_revision||0);if(!S.activeSession||!S.sessions.some(row=>row.id===S.activeSession))S.activeSession=out.active_session_id||S.sessions[0]?.id||'';renderSessions();renderTools();E('accountName').textContent=S.account?.username||'';E('remoteStatus').title=S.collaborationMode?'Shared LAN project':S.capabilities.local?'Local window':'LAN workspace';E('newTerminalBtn').disabled=!S.capabilities.terminal;E('runActiveBtn').disabled=!S.capabilities.processes;E('debugActiveBtn').disabled=!S.capabilities.debug;updateAgentContext();renderCollaborationSnapshot();if(!S.activeSession)await createSession();return out}
+async function refreshConfig({lite=false}={}){const out=await api(`/api/ide/config${lite?'?lite=1':''}`);S.config={...(S.config||{}),...out};S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||S.csrf;S.collaborationMode=!!out.collaboration_mode||S.collaborationMode;S.collaboration=out.collaboration||S.collaboration;S.collaborationWarning=out.collaboration_warning||S.collaborationWarning;document.body.classList.toggle('collaboration-mode',S.collaborationMode);S.sessions=Array.isArray(out.sessions)?out.sessions.slice(0,IDE_SESSION_CACHE_MAX):[];S.sessionTotal=Math.max(S.sessions.length,Number(out.session_total||0));S.sessionNextOffset=Number(out.session_offset||0)+S.sessions.length;S.sessionHasMore=!!out.session_has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out.session_catalog_revision||0);if(S.sessions.some(row=>String(row?.id||'')===String(S.activeSession||'')))S.activeSessionRow=null;else if(!S.activeSession||(S.activeSessionRow?.id!==S.activeSession))S.activeSession=out.active_session_id||S.sessions[0]?.id||'';renderSessions();renderTools();E('accountName').textContent=S.account?.username||'';E('remoteStatus').title=S.collaborationMode?'Shared LAN project':S.capabilities.local?'Local window':'LAN workspace';E('newTerminalBtn').disabled=!S.capabilities.terminal;E('runActiveBtn').disabled=!S.capabilities.processes;E('debugActiveBtn').disabled=!S.capabilities.debug;updateAgentContext();renderCollaborationSnapshot();if(!S.activeSession)await createSession();return out}
 async function refreshDeferredIdeResources(){if(!S.config?.deferred_resources)return;try{const resources=await api('/api/ide/v2/resources');S.config={...(S.config||{}),shared_resources:resources,deferred_resources:false};renderCollaborationResources()}catch(error){logOutput(`Deferred resources: ${error.message}`)}}
 function scheduleIdeDeferredBootstrap(){const run=()=>{refreshDeferredIdeResources();refreshExtensions().then(()=>activateInstalledExtensions()).catch(error=>logOutput(`Extensions: ${error.message}`))};if(typeof requestIdleCallback==='function')requestIdleCallback(run,{timeout:1200});else setTimeout(run,120)}
 function showPasswordChangeGate(){E('authTitle').textContent='Change Temporary Password';E('authSubtitle').textContent='A new password is required before Program can open.';E('authUsername').value=S.account?.username||'';E('authUsername').disabled=true;E('authPassword').value='';E('authPassword').placeholder='Temporary password';E('authConfirmLabel').hidden=false;E('authConfirmLabel').textContent='New password';E('authConfirm').hidden=false;E('authConfirm').required=true;E('authConfirm').value='';E('authSubmit').textContent='Change Password';E('authForm').onsubmit=async event=>{event.preventDefault();E('authSubmit').disabled=true;try{await api('/api/ide/v2/auth/password',{method:'POST',body:JSON.stringify({old_password:E('authPassword').value,new_password:E('authConfirm').value})});E('authMessage').textContent='Password changed. Sign in with the new password.';setTimeout(()=>location.reload(),800)}catch(error){E('authMessage').textContent=error.message;E('authSubmit').disabled=false}}}
@@ -114919,12 +117203,12 @@ function bindUI(){
   E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.uploadFolder','file.downloadWorkspace','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('ideSessionSearch').oninput=()=>scheduleIdeSessionSearch(E('ideSessionSearch').value);E('sessionMoreBtn').onclick=()=>refreshSessionCatalog({append:true}).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};const workspaceLabel=E('workspaceSectionLabel'),tree=E('tree');workspaceLabel.onclick=event=>{if(event.target.closest('#downloadWorkspaceBtn'))return;setExplorerSelection(null);workspaceLabel.focus()};workspaceLabel.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();const rect=workspaceLabel.getBoundingClientRect();showWorkspaceMenu(rect.left+8,rect.bottom)}};workspaceLabel.oncontextmenu=event=>{event.preventDefault();setExplorerSelection(null);workspaceLabel.focus();showWorkspaceMenu(event.clientX,event.clientY)};tree.onclick=event=>{if(event.target!==tree)return;setExplorerSelection(null);tree.focus()};tree.oncontextmenu=event=>{if(event.target.closest('.tree-row'))return;event.preventDefault();setExplorerSelection(null);tree.focus();showWorkspaceMenu(event.clientX,event.clientY)};bindWorkspaceDropZone(tree);bindWorkspaceDropZone(workspaceLabel,{rootOnly:true});window.addEventListener('dragover',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault()});window.addEventListener('drop',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault();clearWorkspaceDropState()});window.addEventListener('dragend',clearWorkspaceDropState);E('downloadWorkspaceBtn').onclick=event=>{event.preventDefault();event.stopPropagation();downloadWorkspacePath('')};
   E('fileInput').onchange=()=>{const input=E('fileInput'),files=[...(input.files||[])],dest=S.pendingUploadDest,openAfter=S.pendingOpenUpload,firstPath=files[0]?normalizeUploadPath(dest?`${dest}/${files[0].name}`:files[0].name):'';S.pendingUploadDest='';S.pendingOpenUpload=false;uploadFiles(files,dest).then(()=>openAfter&&firstPath?openFile(firstPath):null).catch(showError).finally(()=>{input.value=''})};E('folderInput').onchange=()=>{const input=E('folderInput'),dest=S.pendingFolderUploadDest,legacy=[...(input.webkitEntries||[])];S.pendingFolderUploadDest='';const task=legacy.length?scanLegacyDirectoryEntries(legacy).then(scanned=>uploadEntries(scanned.entries,scanned.directories,dest)):uploadFiles(input.files,dest);task.catch(showError).finally(()=>{input.value=''})};E('searchInput').oninput=debounce(()=>runSearch().catch(showError),300);E('includeInput').onchange=()=>runSearch().catch(showError);E('excludeInput').onchange=()=>runSearch().catch(showError);E('matchCaseBtn').onclick=()=>{E('matchCaseBtn').classList.toggle('is-active');runSearch().catch(showError)};E('regexBtn').onclick=()=>{E('regexBtn').classList.toggle('is-active');runSearch().catch(showError)};E('clearSearchBtn').onclick=()=>{E('searchInput').value='';S.searchResults=[];E('searchSummary').textContent='';renderSearch()};
   E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);E('newIdeApplicationBtn').onclick=()=>openIdeApplicationEditor();E('refreshApplicationsBtn').onclick=()=>refreshApplications().catch(showError);
-  E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('stopAgentBtn').onclick=()=>stopAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('promptEnhanceBtn').onclick=togglePromptEnhancement;E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);const agentComposer=E('agentComposer'),agentPrompt=E('agentPrompt'),dropHint=E('agentDropHint');let agentDragDepth=0;for(const type of ['dragenter','dragover'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragenter')agentDragDepth++;agentComposer.classList.add('is-dragover');dropHint.classList.remove('is-hidden')});for(const type of ['dragleave','dragend'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragleave')agentDragDepth--;if(agentDragDepth<=0){agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden')}});agentComposer.addEventListener('drop',event=>{event.preventDefault();agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden');const files=event.dataTransfer?.files;if(files?.length)uploadAgentAttachments(files).catch(showError)});agentPrompt.addEventListener('paste',event=>{const files=agentClipboardFiles(event);if(!files.length)return;event.preventDefault();uploadAgentAttachments(files).catch(showError)});E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=()=>createSession().catch(showError);E('promptEnhanceClose').onclick=()=>closePromptEnhanceReview();E('promptUseOriginal').onclick=()=>usePromptReview(true).catch(showError);E('promptRegenerate').onclick=()=>regeneratePromptReview().catch(showError);E('promptUseEnhanced').onclick=()=>usePromptReview(false).catch(showError);E('promptEnhanceEditor').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();usePromptReview(false).catch(showError)}};E('promptEnhanceOverlay').onclick=event=>{if(event.target===E('promptEnhanceOverlay'))closePromptEnhanceReview()};renderPromptEnhanceToggle();
+  E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('stopAgentBtn').onclick=()=>stopAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('promptEnhanceBtn').onclick=togglePromptEnhancement;E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);const agentComposer=E('agentComposer'),agentPrompt=E('agentPrompt'),dropHint=E('agentDropHint');let agentDragDepth=0;for(const type of ['dragenter','dragover'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragenter')agentDragDepth++;agentComposer.classList.add('is-dragover');dropHint.classList.remove('is-hidden')});for(const type of ['dragleave','dragend'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragleave')agentDragDepth--;if(agentDragDepth<=0){agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden')}});agentComposer.addEventListener('drop',event=>{event.preventDefault();agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden');const files=event.dataTransfer?.files;if(files?.length)uploadAgentAttachments(files).catch(showError)});agentPrompt.addEventListener('paste',event=>{const files=agentClipboardFiles(event);if(!files.length)return;event.preventDefault();uploadAgentAttachments(files).catch(showError)});E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=event=>{if(S.workspaceHistoryTouchHandled){event.preventDefault();event.stopPropagation();S.workspaceHistoryTouchHandled=false;return}createSession().catch(showError)};E('promptEnhanceClose').onclick=()=>closePromptEnhanceReview();E('promptUseOriginal').onclick=()=>usePromptReview(true).catch(showError);E('promptRegenerate').onclick=()=>regeneratePromptReview().catch(showError);E('promptUseEnhanced').onclick=()=>usePromptReview(false).catch(showError);E('promptEnhanceEditor').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();usePromptReview(false).catch(showError)}};E('promptEnhanceOverlay').onclick=event=>{if(event.target===E('promptEnhanceOverlay'))closePromptEnhanceReview()};renderPromptEnhanceToggle();
   bindPromptEnhanceButton();
   E('accountsBtn').onclick=()=>showAccountModal().catch(showError);E('accountStatus').onclick=()=>showAccountModal().catch(showError);E('manageBtn').onclick=event=>showMenu(event.currentTarget,['accounts.manage','file.openFolder','workbench.action.showCommands']);E('notificationsBtn').onclick=()=>toast('No new notifications.','success',2500);E('gitStatus').onclick=()=>showView('scm');E('errorStatus').onclick=()=>showPanel('problems');
   E('paletteInput').oninput=filterPalette;E('paletteInput').onkeydown=event=>{if(event.key==='ArrowDown'){event.preventDefault();S.paletteIndex=Math.min(S.paletteItems.length-1,S.paletteIndex+1);renderPalette()}else if(event.key==='ArrowUp'){event.preventDefault();S.paletteIndex=Math.max(0,S.paletteIndex-1);renderPalette()}else if(event.key==='Enter'){event.preventDefault();activatePaletteItem(S.paletteItems[S.paletteIndex])}else if(event.key==='Escape')closePalette()};E('paletteOverlay').onclick=event=>{if(event.target===E('paletteOverlay'))closePalette()};E('modalClose').onclick=closeModal;E('modalOverlay').onclick=event=>{if(event.target===E('modalOverlay'))closeModal()};
   document.addEventListener('click',event=>{if(!event.target.closest('#menuPopup')&&!event.target.closest('[data-menu]')&&!event.target.closest('#mainMenuBtn')&&!event.target.closest('#manageBtn')&&!event.target.closest('#agentModelBtn')&&!event.target.closest('#promptEnhanceBtn')){E('menuPopup').classList.add('is-hidden');E('menuPopup').classList.remove('agent-model-menu','prompt-budget-menu');E('menuPopup').style.transform='';E('menuPopup').style.bottom='auto'}});
-  window.addEventListener('keydown',event=>{const mod=event.ctrlKey||event.metaKey;const key=event.key.toLowerCase();if(explorerHasKeyboardFocus()){if(mod&&!event.shiftKey&&!event.altKey&&key==='c'){event.preventDefault();runCommandById('explorer.copy')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='x'){event.preventDefault();runCommandById('explorer.cut')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='v'){event.preventDefault();runCommandById('explorer.paste')}else if(!mod&&!event.altKey&&event.key==='F2'){event.preventDefault();if(!event.repeat)runCommandById('explorer.rename')}else if(!mod&&!event.altKey&&(event.key==='Delete'||event.key==='Backspace')){event.preventDefault();if(!event.repeat)runCommandById('explorer.delete')}}if(event.defaultPrevented)return;if(mod&&key==='s'){event.preventDefault();(event.shiftKey?saveAll():saveActive()).catch(showError)}else if(mod&&event.shiftKey&&key==='p'){event.preventDefault();openPalette('>')}else if(mod&&key==='p'){event.preventDefault();openPalette('')}else if(mod&&key==='b'){event.preventDefault();togglePrimary()}else if(mod&&key==='j'){event.preventDefault();togglePanel()}else if(mod&&event.shiftKey&&key==='e'){event.preventDefault();showView('explorer')}else if(mod&&event.shiftKey&&key==='f'){event.preventDefault();showView('search')}else if(mod&&event.shiftKey&&key==='g'){event.preventDefault();showView('scm')}else if(mod&&event.shiftKey&&key==='x'){event.preventDefault();showView('extensions')}else if(mod&&event.key==='\\'){event.preventDefault();runCommandById('workbench.action.splitEditor')}else if(event.key==='F5'&&mod){event.preventDefault();runActiveFile().catch(showError)}else if(event.key==='Escape'){closePalette();clearWorkspaceDropState();E('menuPopup').classList.add('is-hidden');if(!E('promptEnhanceOverlay').classList.contains('is-hidden'))closePromptEnhanceReview()}});window.addEventListener('beforeunload',event=>{if([...S.openFiles.values()].some(file=>file.dirty)){event.preventDefault();event.returnValue=''}});window.addEventListener('resize',()=>{if(S.terminalFit)S.terminalFit.fit()})
+  window.addEventListener('keydown',event=>{const mod=event.ctrlKey||event.metaKey;const key=event.key.toLowerCase();if(explorerHasKeyboardFocus()){if(mod&&!event.shiftKey&&!event.altKey&&key==='c'){event.preventDefault();runCommandById('explorer.copy')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='x'){event.preventDefault();runCommandById('explorer.cut')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='v'){event.preventDefault();runCommandById('explorer.paste')}else if(!mod&&!event.altKey&&event.key==='F2'){event.preventDefault();if(!event.repeat)runCommandById('explorer.rename')}else if(!mod&&!event.altKey&&(event.key==='Delete'||event.key==='Backspace')){event.preventDefault();if(!event.repeat)runCommandById('explorer.delete')}}if(event.defaultPrevented)return;if(mod&&key==='s'){event.preventDefault();(event.shiftKey?saveAll():saveActive()).catch(showError)}else if(mod&&event.shiftKey&&key==='p'){event.preventDefault();openPalette('>')}else if(mod&&key==='p'){event.preventDefault();openPalette('')}else if(mod&&key==='b'){event.preventDefault();togglePrimary()}else if(mod&&key==='j'){event.preventDefault();togglePanel()}else if(mod&&event.shiftKey&&key==='e'){event.preventDefault();showView('explorer')}else if(mod&&event.shiftKey&&key==='f'){event.preventDefault();showView('search')}else if(mod&&event.shiftKey&&key==='g'){event.preventDefault();showView('scm')}else if(mod&&event.shiftKey&&key==='x'){event.preventDefault();showView('extensions')}else if(mod&&event.key==='\\'){event.preventDefault();runCommandById('workbench.action.splitEditor')}else if(event.key==='F5'&&mod){event.preventDefault();runActiveFile().catch(showError)}else if(event.key==='Escape'){closePalette();clearWorkspaceDropState();E('menuPopup').classList.add('is-hidden');if(!E('promptEnhanceOverlay').classList.contains('is-hidden'))closePromptEnhanceReview()}});window.addEventListener('beforeunload',event=>{if([...S.openFiles.values()].some(file=>file.dirty)){event.preventDefault();event.returnValue=''}});window.addEventListener('resize',()=>{if(S.terminalFit)S.terminalFit.fit()});bindWorkspaceHistoryButton();E('newAgentWorkspaceBtn').onclick=()=>createSession({newWorkspace:true}).catch(showError)
 }
 function initIconFallback(){if(!document.fonts||typeof document.fonts.load!=='function')return;let settled=false;const timeout=setTimeout(()=>{settled=true},2500);document.fonts.load('12px codicon').then(fonts=>{if(settled||!fonts||!fonts.length)return;clearTimeout(timeout);document.body.classList.remove('icons-fallback')}).catch(()=>{})}
 function debounce(fn,delay){let timer;return(...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay)}}
@@ -115038,11 +117322,10 @@ class SkillsStudioStore:
         self._job_cancel: set[str] = set()
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.path), timeout=8.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=8000")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=8.0,
+            pragmas=("PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=8000"),
+        )
 
     def _init_db(self):
         with self.lock, self._connect() as db:
@@ -116932,25 +119215,47 @@ class AppContext:
         if base:
             self.base_url = base
 
-    def _liquid_kernel_profile(self, profile_id: str = "") -> dict:
-        requested = sanitize_profile_id(str(profile_id or ""))
-        if requested and requested in self.global_profiles:
-            return dict(self.global_profiles[requested])
-        active = dict(self.global_profiles.get(self.global_active_profile_id, {}))
-        if active:
-            return active
-        return {
-            "provider": "ollama",
-            "model": self.model,
-            "base_url": self.base_url,
-            "temperature": 0.1,
-        }
+    def _evolution_profile_source(self, source: str, owner: str) -> tuple[dict, str]:
+        if source == "global":
+            return copy.deepcopy(self.global_profiles), self.global_active_profile_id
+        if not owner or owner in {".", ".."} or "/" in owner or "\\" in owner:
+            raise LiquidKernelError("invalid_model_owner", "model owner is invalid", 403)
+        if source == "ide":
+            try:
+                with self.ide_auth._connect() as conn:
+                    account = conn.execute("SELECT disabled FROM ide_accounts WHERE user_id=?", (owner,)).fetchone()
+            except sqlite3.Error as exc:
+                raise LiquidKernelError("model_owner_unavailable", "IDE model ownership cannot be verified", 503) from exc
+            if account is None or bool(account["disabled"]):
+                raise LiquidKernelError("model_owner_disabled", "IDE model owner was deleted or disabled", 409)
+        path = self.codes_root / owner / "user_prefs.json"
+        if not path.is_file():
+            raise LiquidKernelError("model_profile_missing", "private model configuration no longer exists", 409)
+        raw = self.crypto.read_json(path, {})
+        profiles = raw.get("model_profiles", {}) if isinstance(raw, dict) else {}
+        if not isinstance(profiles, dict):
+            raise LiquidKernelError("model_profile_missing", "private model configuration cannot be read", 409)
+        return profiles, str(raw.get("active_profile_id", ""))
 
-    def _liquid_kernel_model_call(self, system: str, prompt: str, profile_id: str, max_tokens: int) -> dict:
+    def _evolution_models(self):
+        from liquid_kernel.models import EvolutionModels
+        return EvolutionModels(
+            self._evolution_profile_source,
+            lambda profile: probe_provider_models(profile, cached_only=True),
+            model_runtime_settings_for,
+            self.liquid_kernel.registry.signing_key,
+        )
+
+    def _liquid_kernel_profile(self, profile_id="") -> dict:
+        reference = profile_id if isinstance(profile_id, dict) else None
+        _, profile = self._evolution_models().resolve(reference, "" if reference else profile_id)
+        return profile
+
+    def _liquid_kernel_model_call(self, system: str, prompt: str, profile_id, max_tokens: int) -> dict:
         profile = self._liquid_kernel_profile(profile_id)
         client = OllamaClient(
-            base_url=str(profile.get("base_url", self.base_url) or self.base_url),
-            model=str(profile.get("model", self.model) or self.model),
+            base_url=str(profile.get("base_url", "") or ""),
+            model=str(profile["model"]),
             timeout=max(DEFAULT_REQUEST_TIMEOUT, min(MAX_TIMEOUT_SECONDS, 900)),
             provider=str(profile.get("provider", "ollama") or "ollama"),
             endpoint=str(profile.get("endpoint", "") or ""),
@@ -116961,27 +119266,43 @@ class AppContext:
             response_stream=False,
         )
         client.apply_profile(profile)
-        client.set_telemetry(self.telemetry.record, context_provider=lambda: {}, name="liquid_kernel_evolution")
-        response = client.chat(
-            [{"role": "user", "content": str(prompt or "")}],
-            system=str(system or ""),
-            max_tokens=max(512, min(int(max_tokens or 4096), 32_000)),
-            temperature=max(0.0, min(0.3, float(profile.get("temperature", 0.1) or 0.1))),
-            think=False,
-            response_stream=False,
-        )
+        # Custom templates may contain a literal model. Bind it to the selected
+        # model too, without changing the template in its encrypted source.
+        if client.provider == "custom_http" and client.payload_template:
+            template = client.payload_template.strip()
+            if not template.startswith("{"):
+                raise LiquidKernelError("invalid_model_template", "custom model template must be a JSON object")
+            client.payload_template = template[:-1] + ',"model":' + json.dumps(client.model) + ',"max_tokens":' + str(max(512, min(int(max_tokens or 4096), 32_000))) + '}'
+        active_run = self.liquid_kernel.active_run_id
+        try:
+            response = client.chat(
+                [{"role": "user", "content": str(prompt or "")}],
+                system=str(system or ""),
+                max_tokens=max(512, min(int(max_tokens or 4096), 32_000)),
+                temperature=max(0.0, min(0.3, float(profile.get("temperature", 0.1)))),
+                think=False,
+                response_stream=False,
+                cancel_check=lambda: bool(active_run and active_run in self.liquid_kernel.cancelled),
+            )
+        except Exception as exc:
+            if active_run in self.liquid_kernel.cancelled:
+                raise LiquidKernelError("run_cancelled", "evolution run was cancelled", 409) from exc
+            # Provider exceptions may contain credentials, URLs or request data.
+            raise LiquidKernelError("model_call_failed", "Selected model request failed (" + type(exc).__name__ + "); check its service, credentials and model availability", 502) from exc
         text = str(response.get("content", "") or "")
+        secrets = [profile.get("api_key", ""), *list((profile.get("headers") or {}).values())]
+        for secret in secrets:
+            if isinstance(secret, str) and len(secret) >= 4:
+                text = text.replace(secret, "[secret redacted]")
+        text = self._liquid_kernel_redact_text(text)
         parsed = parse_json_object(text, {})
         if not isinstance(parsed, dict) or not parsed:
-            raise LiquidKernelError(
-                "invalid_model_output",
-                "evolution model must return a JSON object",
-                details={"output": trim(text, 1200)},
-            )
+            raise LiquidKernelError("invalid_model_output", "evolution model must return a JSON object")
         return parsed
 
     def _liquid_kernel_judge_call(self, payload: dict, profile_id: str, max_tokens: int) -> dict:
-        profile = str(profile_id or "").strip()
+        from liquid_kernel.control import valid_judge_score
+        profile = profile_id
         order = ["incumbent", "candidate"]
         random.SystemRandom().shuffle(order)
         source_a = str(payload.get(f"{order[0]}_source", "") or "")
@@ -117010,8 +119331,8 @@ class AppContext:
             profile,
             max_tokens,
         )
-        score_a = max(0.0, min(100.0, float(result.get("score_a", 50) or 50)))
-        score_b = max(0.0, min(100.0, float(result.get("score_b", 50) or 50)))
+        score_a = valid_judge_score(result.get("score_a"))
+        score_b = valid_judge_score(result.get("score_b"))
         mapped = {order[0]: score_a, order[1]: score_b}
         return {
             "incumbent": mapped["incumbent"],
@@ -117437,6 +119758,8 @@ class AppContext:
             experience_provider=self._liquid_kernel_experience,
             model_callback=self._liquid_kernel_model_call,
             judge_callback=self._liquid_kernel_judge_call,
+            model_resolver=lambda config: self._evolution_models().bind_run(config),
+            config_validator=lambda config, **kwargs: self._evolution_models().validate_config(config, **kwargs),
         )
         if self.liquid_kernel_startup_policy == "inject":
             injection = self.liquid_kernel.inject_embedded_kernel()
@@ -118918,15 +121241,27 @@ class AppContext:
     def collaboration_resource_manifest(self, user_id: str) -> dict:
         return self.shared_resource_manifest(user_id, collaboration=True)
 
-    def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
+    def ide_create_session(
+        self,
+        user_id: str,
+        title: str | None = None,
+        client_ip: str = "",
+        *,
+        workspace_session_id: str = "",
+    ) -> dict:
         requested_title = str(title or "").strip()
+        source_session_id = str(workspace_session_id or "").strip()
         initial_title = requested_title or (
             "Shared workspace" if str(user_id or "").startswith("collab:") else "IDE Workspace"
         )
         title_origin = "manual" if requested_title else "default"
         if str(user_id or "").startswith("collab:"):
             mgr = self.manager_for_user(user_id)
-            sess = mgr.create(initial_title, title_origin=title_origin)
+            sess = mgr.create(
+                initial_title,
+                title_origin=title_origin,
+                workspace_session_id=source_session_id,
+            )
             sess.ide_remote_sandbox_required = True
             quota = self.ide_session_payload(user_id, client_ip=client_ip).get("session_creation_limit", {})
         else:
@@ -118935,10 +121270,21 @@ class AppContext:
                 initial_title,
                 client_ip=client_ip,
                 title_origin=title_origin,
+                workspace_session_id=source_session_id,
             )
+            mgr = self.manager_for_user(user_id)
+        history = mgr.workspace_history(sess.id, limit=0)
         return {
             "ok": True,
             "id": sess.id,
+            "workspace_id": str(getattr(sess, "workspace_id", sess.id) or sess.id),
+            "workspace_session_count": int(history.get("total", 1) or 1),
+            "workspace_name": str(history.get("workspace_name", sess.title) or sess.title),
+            "workspace_created_at": float(history.get("workspace_created_at", getattr(sess, "created_at", 0.0)) or 0.0),
+            "created_at": float(getattr(sess, "created_at", 0.0) or 0.0),
+            "workspace_inherited": bool(source_session_id),
+            "new_workspace": not bool(source_session_id),
+            "workspace_shared": bool(getattr(mgr, "workspace_root", None) is not None),
             "title": sess.title,
             "title_origin": str(getattr(sess, "title_origin", "") or ""),
             "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
@@ -118958,6 +121304,17 @@ class AppContext:
             "title": sess.title,
             "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
         }
+
+    def ide_delete_session(self, user_id: str, session_id: str) -> dict:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise ValueError("session id required")
+        manager = self.manager_for_user(user_id)
+        if manager.get(sid) is None:
+            raise KeyError(sid)
+        if not manager.delete(sid):
+            raise KeyError(sid)
+        return {"ok": True, "id": sid}
 
     def _ide_session(self, user_id: str, session_id: str) -> SessionState:
         sess = self.manager_for_user(user_id).get(str(session_id or "").strip())
@@ -118991,6 +121348,18 @@ class AppContext:
                 }
             )
         return roots
+
+    def ide_workspace_session_history(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        limit: int = 60,
+    ) -> dict:
+        mgr = self.manager_for_user(user_id)
+        if mgr.get(str(session_id or "").strip()) is None:
+            raise KeyError("session not found")
+        return mgr.workspace_history(session_id, limit=limit)
 
     def ide_resolve_workspace(self, user_id: str, session_id: str, root_id: str, rel: str = "") -> tuple[Path, Path, dict]:
         rid = str(root_id or "session").strip() or "session"
@@ -123146,6 +125515,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         selection: str,
         *,
         client_ip: str = "",
+        settings: dict | None = None,
     ) -> dict:
         collaboration = str(user_id or "").startswith("collab:")
         source_manager = None
@@ -123164,20 +125534,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "Stop active Agents in the main Web UI before changing its model."
             )
         if bool(getattr(sess, "running", False)):
-            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": ""})
+            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": "", "settings": normalize_model_runtime_settings(settings)})
             if source_manager is not None:
-                source_manager.set_runtime_model(picked, None)
+                source_manager.set_runtime_model(picked, None, settings)
             queued = sess.model_catalog()
             queued["queued"] = True
             queued["note"] = "Model switch queued until the current run finishes."
             return queued
         if source_manager is not None:
-            out = source_manager.set_runtime_model(picked, None)
+            out = source_manager.set_runtime_model(picked, None, settings)
             if target_manager is not source_manager:
                 self._sync_ordinary_ide_llm_source(user_id, client_ip, force=True)
                 out = sess.model_catalog()
             return out
-        out = sess.set_runtime_selection(picked)
+        out = sess.set_runtime_selection(picked, settings=settings)
         self.manager_for_user(user_id)._sync_from_session(sess, apply_to_all=False)
         return out
 
@@ -123946,7 +126316,6 @@ document.addEventListener('DOMContentLoaded', function(){{
             prompt = "Synthesize only from these independent evidence evaluations. Do not use conversation history or outside knowledge. Cite exact citations. Return JSON with answer, answerability, uncertainties.\n\n" + json_dumps({"query": query, "evaluations": evaluations}, indent=2)
             try:
                 response = session.ollama.chat([{"role": "user", "content": prompt}], system="/no_think\nYou are a stateless grounded answer synthesizer.", max_tokens=1200, temperature=0.0, think=False, stream_thinking=False)
-                parsed = self._rag_parse_evaluation((response or {}).get("content", ""), [])
                 raw = str((response or {}).get("content", "") or "").strip()
                 try:
                     parsed_answer = json.loads(raw)
@@ -125291,6 +127660,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         client_ip: str = "",
         *,
         title_origin: str | None = None,
+        workspace_session_id: str = "",
     ) -> tuple[SessionState, dict]:
         mgr = self.manager_for_user(user_id)
         reserved_window = ""
@@ -125307,10 +127677,19 @@ document.addEventListener('DOMContentLoaded', function(){{
             self._save_session_daily_limit_state_locked(user_id, state)
             status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
         try:
-            if title_origin is None:
+            try:
+                sess = mgr.create(
+                    title,
+                    title_origin=title_origin,
+                    workspace_session_id=workspace_session_id,
+                )
+            except TypeError as exc:
+                # Keep lightweight/legacy manager implementations usable while
+                # the production manager accepts the lineage keywords.
+                message = str(exc).lower()
+                if "unexpected keyword" not in message and "keyword argument" not in message:
+                    raise
                 sess = mgr.create(title)
-            else:
-                sess = mgr.create(title, title_origin=title_origin)
         except Exception:
             with self._lock:
                 try:
@@ -125842,7 +128221,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             mgr = self.manager_for_user(user_id)
             sess = mgr.get(session_id)
             if sess and bool(getattr(sess, "_deferred_runtime_sync_requested", False)):
-                mgr._sync_from_session(sess, apply_to_all=False)
+                # Model selection and its per-model runtime controls are user
+                # preferences. Propagate them to every existing session so the
+                # WebUI and IDE observe the same state immediately.
+                mgr._sync_from_session(sess, apply_to_all=True)
                 sess._deferred_runtime_sync_requested = False
         except Exception:
             pass
@@ -126654,6 +129036,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         cfg = dict(config or {})
         OllamaClient.clear_global_probe_cache()
         parsed = parse_llm_config_profiles(cfg, self.base_url, self.model)
+        probe_and_merge_model_profiles(parsed.get("profiles", []), force_refresh=True)
         self.default_llm_config = cfg
         revision = self._llm_config_revision(cfg)
         self.global_llm_config_revision = revision
@@ -127424,6 +129807,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
 
     def model_catalog(self) -> dict:
         opts = []
+        profiles_changed = False
         for pid, profile in self.global_profiles.items():
             model = str(profile.get("model", ""))
             caps = merge_multimodal_capabilities(
@@ -127441,9 +129825,80 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model, caps
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(str(profile.get("provider", "")), model, caps)
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                 }
             )
+        seen = {str(x.get("selection", "")) for x in opts}
+        for pid, profile in self.global_profiles.items():
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(profile, background=True)
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", ""), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")), model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": merge_multimodal_capabilities(infer_model_multimodal_capabilities(str(profile.get("provider", "")), model_id), parse_capability_overrides(profile.get("capabilities", {}))),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.global_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         selected_profile = self.global_profiles.get(self.global_active_profile_id, {})
         selected = f"{self.global_active_profile_id}::{selected_profile.get('model', self.model)}"
         option_map = {str(x.get("selection", "")) for x in opts}
@@ -127460,6 +129915,25 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "thinking_hint": bool(selected_profile.get("thinking_hint", False)),
                     "thinking_stream": bool(selected_profile.get("thinking_stream", False)),
                     "response_stream": bool(selected_profile.get("response_stream", False)),
+                    "reasoning_supported": (
+                        selected_profile.get("reasoning_supported")
+                        if selected_profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                            selected_profile.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        selected_profile.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                            selected_profile.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": merge_multimodal_capabilities(
                         infer_model_multimodal_capabilities(
                             str(selected_profile.get("provider", "")),
@@ -127469,6 +129943,13 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     ),
                 },
             )
+        selected_option = next((item for item in opts if str(item.get("selection", "")) == selected), None)
+        if selected_option is not None:
+            apply_model_option_runtime_fields(
+                selected_option,
+                selected_profile,
+                str(selected_option.get("model", "") or ""),
+            )
         active_caps = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(
                 str(selected_profile.get("provider", "")),
@@ -127476,6 +129957,21 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             ),
             parse_capability_overrides(selected_profile.get("capabilities", {})),
         )
+        if profiles_changed:
+            self.global_profiles_payload = {
+                **(self.global_profiles_payload if isinstance(self.global_profiles_payload, dict) else {}),
+                "profiles": [dict(item) for item in self.global_profiles.values()],
+            }
+            # Keep the discovered directory in the system config so a restart
+            # can render the same provider/model choices before the next probe.
+            persisted = dict(self.default_llm_config or {})
+            persisted["profiles"] = [dict(item) for item in self.global_profiles.values()]
+            persisted["default_profile_id"] = self.global_active_profile_id
+            self.default_llm_config = persisted
+            try:
+                LLM_CONFIG_PATH.write_text(json_dumps(persisted, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         return {
             "provider": selected_profile.get("provider", "ollama"),
             "models": [x["selection"] for x in opts] or [self.model],
@@ -127487,7 +129983,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             "active_capabilities": active_caps,
         }
 
-    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+    def set_runtime_model(self, model: str, thinking: bool | None = None, settings: dict | None = None) -> dict:
         raw = str(model or "").strip()
         if not raw:
             raise ValueError("model required")
@@ -127515,6 +130011,11 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                 self.global_profiles[pid]["capabilities"] = infer_model_multimodal_capabilities(
                     "ollama", selected_model.strip()
                 )
+        self.global_profiles[pid] = apply_model_runtime_settings(
+            self.global_profiles.get(pid, {}),
+            str(self.global_profiles[pid].get("model", "") or ""),
+            settings,
+        )
         self.global_active_profile_id = pid
         selected_profile = dict(self.global_profiles.get(pid, {}))
         self._sync_global_ollama_defaults(selected_profile)
@@ -127523,7 +130024,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
         with self._lock:
             for mgr in self._session_mgrs.values():
                 try:
-                    mgr.set_runtime_model(selection, self.thinking)
+                    mgr.set_runtime_model(selection, self.thinking, settings)
                 except Exception:
                     pass
         return self.model_catalog()
@@ -127602,10 +130103,10 @@ class TelemetryStore:
         return raw
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.path), timeout=8.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=8000")
-        return conn
+        return _connect_sqlite(
+            str(self.path), timeout=8.0, row_factory=None,
+            pragmas=("PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=8000"),
+        )
 
     def _init_db(self):
         with self.lock, self._connect() as conn:
@@ -128786,6 +131287,28 @@ class Handler(BaseHTTPRequestHandler):
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
 
+    def _evolution_model_context(self) -> dict:
+        # Admin Authorization is distinct from IDE identity. Verify the IDE
+        # cookie (or explicit IDE session header) using the existing auth store.
+        token = str(self.headers.get("X-Evolution-IDE-Token", "") or "").strip()
+        if not token:
+            for item in str(self.headers.get("Cookie", "") or "").split(";"):
+                key, sep, value = item.strip().partition("=")
+                if sep and key == "clouds_ide_session":
+                    token = unquote(value.strip())
+                    break
+        account = self.app.ide_auth.verify_session(token, self._client_ip()) if token else None
+        if account and (bool(account.get("must_change_password")) or (not bool(getattr(self.app, "ide_password_login_enabled", True)) and account.get("session_kind") != "local_auto")):
+            account = None
+        return {"agent": self._user_id(), "ide": str(account.get("user_id", "")) if account else ""}
+
+    @staticmethod
+    def _evolution_revision(payload: dict) -> int:
+        revision = payload.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise LiquidKernelError("config_revision_required", "load and save the evolution policy before starting; revision is required", 409)
+        return revision
+
     def _session_mgr(self) -> SessionManager:
         return self.app.manager_for_user(self._user_id())
 
@@ -129078,6 +131601,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._require_admin(query):
                 return
             return self._send_json(self.app.admin_config_payload())
+        if path == "/api/admin/evolution/models":
+            if not self._require_admin():
+                return
+            try:
+                return self._send_json(self.app._evolution_models().catalog(
+                    self._evolution_model_context(), self.app.liquid_kernel.config()))
+            except (LiquidKernelError, IDEAuthError) as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/admin/evolution":
             if not self._require_admin(query):
                 return
@@ -129383,10 +131914,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ollama/models":
             ollama_url = str((query.get("base_url", [""]) or [""])[0]).strip() or "http://127.0.0.1:11434"
             try:
-                models = list_ollama_models(ollama_url, timeout=5)
-                return self._send_json({"ok": True, "models": models, "base_url": ollama_url})
+                model_records = probe_ollama_model_records(
+                    ollama_url,
+                    timeout=1.5,
+                )
+                models = [
+                    str(record.get("id", "")).strip()
+                    for record in model_records
+                    if isinstance(record, dict) and str(record.get("id", "")).strip()
+                ]
+                return self._send_json(
+                    {
+                        "ok": True,
+                        "models": models,
+                        "model_records": model_records,
+                        "base_url": ollama_url,
+                    }
+                )
             except Exception as exc:
-                return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": ollama_url})
+                return self._send_json(
+                    {
+                        "ok": False,
+                        "models": [],
+                        "model_records": [],
+                        "error": str(exc)[:300],
+                        "base_url": ollama_url,
+                    }
+                )
         if path == "/api/openai_compat/models":
             base_url = str((query.get("base_url", [""]) or [""])[0]).strip()
             api_key = str((query.get("api_key", [""]) or [""])[0]).strip()
@@ -129403,7 +131957,60 @@ class Handler(BaseHTTPRequestHandler):
                 last_error = ""
                 notes: list[str] = []
                 probe_headers = openai_compat_probe_headers(provider, api_key)
-                for models_url in openai_compat_model_list_urls(normalized_base, provider):
+                model_urls = (
+                    [anthropic_model_list_url(normalized_base)]
+                    if provider == "anthropic"
+                    else openai_compat_model_list_urls(normalized_base, provider)
+                )
+                # Anthropic's Models API is cursor paginated. Fetch the complete
+                # catalog so importing a provider gets every available model.
+                if provider == "anthropic" and model_urls and model_urls[0]:
+                    models_url = model_urls[0]
+                    all_records: list[dict] = []
+                    seen_ids: set[str] = set()
+                    after_id = ""
+                    for _page in range(20):
+                        page_url = f"{models_url}{'&' if '?' in models_url else '?'}limit=1000"
+                        if after_id:
+                            page_url += "&after_id=" + quote(after_id, safe="")
+                        try:
+                            req = urllib.request.Request(page_url, method="GET")
+                            for hk, hv in probe_headers.items():
+                                if str(hk or "").strip() and str(hv or "").strip():
+                                    req.add_header(str(hk), str(hv))
+                            with urlopen(req, timeout=8) as resp:
+                                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                            reachable = True
+                            page_records = extract_openai_compat_model_records(payload)
+                            for record in page_records:
+                                mid = str(record.get("id", "") or "").strip()
+                                if mid and mid not in seen_ids:
+                                    seen_ids.add(mid)
+                                    all_records.append(record)
+                            if not isinstance(payload, dict) or not payload.get("has_more"):
+                                break
+                            next_after = str(payload.get("last_id", "") or "").strip()
+                            if not next_after or next_after == after_id:
+                                break
+                            after_id = next_after
+                        except urllib.error.HTTPError as exc:
+                            reachable = int(getattr(exc, "code", 0) or 0) in {200, 401, 403, 404, 405}
+                            last_error = f"HTTP {int(getattr(exc, 'code', 0) or 0)}"
+                            break
+                        except Exception as exc:
+                            last_error = trim(str(exc), 300)
+                            break
+                    if all_records:
+                        return self._send_json({
+                            "ok": True, "reachable": True, "provider": provider,
+                            "models": [str(r.get("id", "")).strip() for r in all_records],
+                            "model_records": [
+                                {"id": str(r.get("id", "")).strip(), "capabilities": dict(r.get("capabilities", {}))}
+                                for r in all_records
+                            ],
+                            "base_url": normalized_base, "scanned_url": models_url,
+                        })
+                for models_url in model_urls:
                     try:
                         req = urllib.request.Request(models_url, method="GET")
                         for hk, hv in probe_headers.items():
@@ -129416,7 +132023,12 @@ class Handler(BaseHTTPRequestHandler):
                             payload = json.loads(body_text)
                         except Exception:
                             payload = {}
-                        model_ids = extract_openai_compat_model_ids(payload)
+                        model_records = extract_openai_compat_model_records(payload)
+                        model_ids = [
+                            str(record.get("id", "")).strip()
+                            for record in model_records
+                            if isinstance(record, dict) and str(record.get("id", "")).strip()
+                        ]
                         if model_ids:
                             return self._send_json(
                                 {
@@ -129424,6 +132036,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "reachable": True,
                                     "provider": provider,
                                     "models": model_ids,
+                                    "model_records": [
+                                        {
+                                            "id": model_id,
+                                            "capabilities": dict(
+                                                model_records[index].get("capabilities", {})
+                                            )
+                                            if isinstance(model_records[index], dict)
+                                            else {},
+                                        }
+                                        for index, model_id in enumerate(model_ids)
+                                    ],
                                     "base_url": normalized_base,
                                     "scanned_url": models_url,
                                 }
@@ -129442,7 +132065,12 @@ class Handler(BaseHTTPRequestHandler):
                             payload = json.loads(body_text) if body_text else {}
                         except Exception:
                             payload = {}
-                        model_ids = extract_openai_compat_model_ids(payload)
+                        model_records = extract_openai_compat_model_records(payload)
+                        model_ids = [
+                            str(record.get("id", "")).strip()
+                            for record in model_records
+                            if isinstance(record, dict) and str(record.get("id", "")).strip()
+                        ]
                         if model_ids:
                             return self._send_json(
                                 {
@@ -129450,6 +132078,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "reachable": True,
                                     "provider": provider,
                                     "models": model_ids,
+                                    "model_records": [
+                                        {
+                                            "id": model_id,
+                                            "capabilities": dict(
+                                                model_records[index].get("capabilities", {})
+                                            )
+                                            if isinstance(model_records[index], dict)
+                                            else {},
+                                        }
+                                        for index, model_id in enumerate(model_ids)
+                                    ],
                                     "base_url": normalized_base,
                                     "scanned_url": models_url,
                                 }
@@ -129482,6 +132121,7 @@ class Handler(BaseHTTPRequestHandler):
                             "reachable": True,
                             "provider": provider,
                             "models": [],
+                            "model_records": [],
                             "base_url": normalized_base,
                             "note": "endpoint reachable; no standard model list returned",
                             "error": last_error,
@@ -129494,6 +132134,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reachable": False,
                         "provider": provider,
                         "models": [],
+                        "model_records": [],
                         "error": last_error or "unable to reach endpoint",
                         "base_url": normalized_base,
                         "attempts": notes[-6:],
@@ -129506,6 +132147,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reachable": False,
                         "provider": provider,
                         "models": [],
+                        "model_records": [],
                         "error": str(exc)[:300],
                         "base_url": extract_base_url(base_url),
                     }
@@ -129755,6 +132397,68 @@ class Handler(BaseHTTPRequestHandler):
                 return self._auth_error(exc)
             except Exception:
                 return self._send_json({"error": "invalid authentication request", "code": "invalid_request"}, status=400)
+        if path == "/api/admin/evolution/config":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.liquid_kernel.save_config(
+                    payload.get("values", payload), expected_revision=self._evolution_revision(payload),
+                    context=self._evolution_model_context(),
+                ))
+            except (LiquidKernelError, IDEAuthError) as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": getattr(exc, "details", {})}, status=exc.status)
+            except (ValueError, TypeError):
+                return self._send_json({"error": "invalid evolution policy values", "code": "invalid_config"}, status=400)
+            except (OSError, sqlite3.Error):
+                return self._send_json({"error": "evolution configuration storage is unavailable", "code": "config_storage_unavailable"}, status=503)
+        if path == "/api/admin/evolution/emergency-off":
+            if not self._require_admin():
+                return
+            try:
+                self._read_json()
+                return self._send_json(self.app.liquid_kernel.emergency_off())
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        if path == "/api/admin/evolution/runs":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.liquid_kernel.trigger("manual", expected_revision=self._evolution_revision(payload)), status=202)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_evolution_run_action = re.match(r"^/api/admin/evolution/runs/([^/]+)/(approve|reject|cancel)$", path)
+        if m_evolution_run_action:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                action = m_evolution_run_action.group(2)
+                if action == "approve":
+                    out = self.app.liquid_kernel.approve(m_evolution_run_action.group(1))
+                elif action == "reject":
+                    out = self.app.liquid_kernel.reject(m_evolution_run_action.group(1), str(payload.get("reason", "") or ""))
+                else:
+                    out = self.app.liquid_kernel.cancel(m_evolution_run_action.group(1))
+                return self._send_json(out)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_evolution_version_action = re.match(r"^/api/admin/evolution/versions/([^/]+)/(promote|rollback)$", path)
+        if m_evolution_version_action:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                if m_evolution_version_action.group(2) == "promote":
+                    out = self.app.liquid_kernel.registry.promote(m_evolution_version_action.group(1))
+                else:
+                    out = self.app.liquid_kernel.registry.rollback(
+                        m_evolution_version_action.group(1), reason=str(payload.get("reason", "manual rollback") or "manual rollback")
+                    )
+                return self._send_json(out)
+            except LiquidKernelError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
         mgr = self._session_mgr()
         m_process_stop = re.match(r"^/api/processes/([^/]+)/stop$", path)
         if m_process_stop:
@@ -129845,63 +132549,6 @@ class Handler(BaseHTTPRequestHandler):
                 expected_revision=str(payload.get("revision", "") or ""),
             )
             return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
-        if path == "/api/admin/evolution/config":
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                return self._send_json(self.app.liquid_kernel.save_config(
-                    payload.get("values", payload), expected_revision=int(payload.get("revision", 0) or 0)
-                ))
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        if path == "/api/admin/evolution/emergency-off":
-            if not self._require_admin():
-                return
-            try:
-                self._read_json()
-                return self._send_json(self.app.liquid_kernel.emergency_off())
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        if path == "/api/admin/evolution/runs":
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                return self._send_json(self.app.liquid_kernel.trigger(str(payload.get("trigger", "manual") or "manual")), status=202)
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        m_evolution_run_action = re.match(r"^/api/admin/evolution/runs/([^/]+)/(approve|reject|cancel)$", path)
-        if m_evolution_run_action:
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                action = m_evolution_run_action.group(2)
-                if action == "approve":
-                    out = self.app.liquid_kernel.approve(m_evolution_run_action.group(1))
-                elif action == "reject":
-                    out = self.app.liquid_kernel.reject(m_evolution_run_action.group(1), str(payload.get("reason", "") or ""))
-                else:
-                    out = self.app.liquid_kernel.cancel(m_evolution_run_action.group(1))
-                return self._send_json(out)
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        m_evolution_version_action = re.match(r"^/api/admin/evolution/versions/([^/]+)/(promote|rollback)$", path)
-        if m_evolution_version_action:
-            if not self._require_admin():
-                return
-            payload = self._read_json()
-            try:
-                if m_evolution_version_action.group(2) == "promote":
-                    out = self.app.liquid_kernel.registry.promote(m_evolution_version_action.group(1))
-                else:
-                    out = self.app.liquid_kernel.registry.rollback(
-                        m_evolution_version_action.group(1), reason=str(payload.get("reason", "manual rollback") or "manual rollback")
-                    )
-                return self._send_json(out)
-            except LiquidKernelError as exc:
-                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
         if path == "/api/admin/config/sync-active":
             if not self._require_admin():
                 return
@@ -130124,7 +132771,7 @@ class Handler(BaseHTTPRequestHandler):
             if not model:
                 return self._send_json({"error": "model required"}, status=400)
             try:
-                return self._send_json(mgr.set_runtime_model(model, None))
+                return self._send_json(mgr.set_runtime_model(model, None, normalize_model_runtime_settings(payload)))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/config/language":
@@ -130181,6 +132828,7 @@ class Handler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             model_override = payload.get("model_override")
+            runtime_settings = normalize_model_runtime_settings(payload)
             if bool(getattr(sess, "running", False)):
                 try:
                     sess._queue_deferred_runtime_update(
@@ -130188,6 +132836,7 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "selection": selection,
                             "model_override": model_override if isinstance(model_override, str) else "",
+                            "settings": runtime_settings,
                         },
                     )
                 except Exception as exc:
@@ -130199,8 +132848,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._send_json(queued)
             try:
-                out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None)
-                mgr._sync_from_session(sess, apply_to_all=False)
+                out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None, settings=runtime_settings)
+                mgr._sync_from_session(sess, apply_to_all=True)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_json(out)
@@ -130307,7 +132956,7 @@ class Handler(BaseHTTPRequestHandler):
             meta = sess.add_upload(filename, raw, mime)
             if isinstance(meta.get("model_catalog"), dict) and not bool(meta.get("model_catalog", {}).get("queued")):
                 try:
-                    mgr._sync_from_session(sess, apply_to_all=False)
+                    mgr._sync_from_session(sess, apply_to_all=True)
                 except Exception:
                     pass
             return self._send_json(meta, status=201)
@@ -131101,7 +133750,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             try:
-                return self._send_json(mgr.set_runtime_model(selection, None))
+                return self._send_json(mgr.set_runtime_model(selection, None, normalize_model_runtime_settings(payload)))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/skillslab/language":
@@ -132505,6 +135154,20 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._stream_ide_events(sess)
             except Exception as exc:
                 return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/history$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                requested_limit = int((query.get("limit", ["60"]) or ["60"])[0] or 0)
+                return self._send_json(
+                    self.app.ide_workspace_session_history(
+                        str(context["account"].get("user_id", "")),
+                        m.group(1),
+                        limit=requested_limit,
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/roots$", path)
         if m:
             try:
@@ -133091,11 +135754,15 @@ class IdeHandler(BaseHTTPRequestHandler):
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
+                workspace_session_id = ""
+                if not _to_bool_like(payload.get("new_workspace"), default=False):
+                    workspace_session_id = str(payload.get("workspace_session_id", "") or "").strip()
                 return self._send_json(
                     self.app.ide_create_session(
                         user_id,
                         str(payload.get("title", "") or "").strip() or None,
                         client_ip=self._client_ip(),
+                        workspace_session_id=workspace_session_id,
                     ),
                     status=201,
                 )
@@ -133234,6 +135901,7 @@ class IdeHandler(BaseHTTPRequestHandler):
                         m.group(1),
                         str(payload.get("selection", payload.get("model", "")) or ""),
                         client_ip=self._client_ip(),
+                        settings=normalize_model_runtime_settings(payload),
                     )
                 )
             except Exception as exc:
@@ -133432,6 +136100,17 @@ class IdeHandler(BaseHTTPRequestHandler):
                 if not deleted:
                     raise KeyError(m_application.group(1))
                 return self._send_json({"ok": True})
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_session = re.match(r"^/api/ide/sessions/([^/]+)$", path)
+        if m_session:
+            try:
+                return self._send_json(
+                    self.app.ide_delete_session(
+                        str(context["account"].get("user_id", "") or ""),
+                        m_session.group(1),
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
@@ -134160,6 +136839,85 @@ class McpServiceHandler(BaseHTTPRequestHandler):
 
 # Bootstrap sequence: load configuration, initialize shared application state,
 # and expose the HTTP service plus background runtime workers.
+def sqlite_failure_diagnostics(exc: BaseException, database=None) -> dict:
+    """Read-only process/storage probes for server logs, never public responses."""
+    details = {
+        "pid": os.getpid(),
+        "python": sys.version.split()[0],
+        "sqlite": sqlite3.sqlite_version,
+        "script": os.path.abspath(__file__),
+        "sqlite_errorcode": getattr(exc, "sqlite_errorcode", None),
+        "sqlite_errorname": getattr(exc, "sqlite_errorname", ""),
+        "operation": getattr(exc, "sqlite_operation", "query"),
+    }
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        details["fd_limit_soft"], details["fd_limit_hard"] = soft, hard
+    except (ImportError, OSError, ValueError):
+        pass
+    try:
+        fd = os.open(os.devnull, os.O_RDONLY)
+    except OSError as probe:
+        details["fd_probe_errno"] = probe.errno
+    else:
+        os.close(fd)
+        details["fd_probe_errno"] = 0
+    fd_directory = "/dev/fd" if sys.platform == "darwin" else "/proc/self/fd"
+    if os.name == "posix":
+        try:
+            names = os.listdir(fd_directory)
+            count = 0
+            for name in names:
+                try:
+                    os.fstat(int(name))
+                    count += 1
+                except (OSError, ValueError):
+                    continue
+            details["open_fds"] = count
+        except OSError as probe:
+            details["fd_count_errno"] = probe.errno
+    path = getattr(exc, "sqlite_database_path", None) or database
+    if path:
+        path = os.path.abspath(os.fspath(path))
+        details["database"] = path
+        states = {}
+        for label, target in (
+            ("parent", os.path.dirname(path)),
+            ("database", path),
+            ("wal", path + "-wal"),
+            ("shm", path + "-shm"),
+        ):
+            try:
+                info = os.stat(target)
+                states[label] = {
+                    "kind": "directory" if stat.S_ISDIR(info.st_mode) else "file",
+                    "mode": oct(stat.S_IMODE(info.st_mode)),
+                    "bytes": info.st_size,
+                }
+            except OSError as probe:
+                states[label] = {"errno": probe.errno}
+        details["paths"] = states
+        # No O_CREAT: a missing authentication/collaboration DB must stay missing.
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError as probe:
+            details["database_open_errno"] = probe.errno
+        else:
+            os.close(fd)
+            details["database_open_errno"] = 0
+    errors = {details.get(key) for key in ("fd_probe_errno", "fd_count_errno", "database_open_errno")}
+    if errors.intersection({errno.EMFILE, errno.ENFILE}):
+        details["cause"] = "file_descriptor_exhaustion"
+    elif details.get("database_open_errno") in {errno.EACCES, errno.EPERM, errno.EROFS}:
+        details["cause"] = "storage_access_denied"
+    elif details.get("database_open_errno") in {errno.ENOENT, errno.ENOTDIR}:
+        details["cause"] = "storage_path_unavailable"
+    else:
+        details["cause"] = "undetermined"
+    return details
+
+
 def collaboration_file_watcher_loop(
     app,
     stop_event,
@@ -134225,6 +136983,14 @@ def collaboration_file_watcher_loop(
                     "[collaboration] file watcher degraded: "
                     f"{trim(str(exc), 240)}; failures={failures}; retry_in={retry_delay:.1f}s"
                 )
+                if isinstance(exc, sqlite3.DatabaseError):
+                    try:
+                        diagnostics = sqlite_failure_diagnostics(
+                            exc, getattr(app.collaboration, "db_path", None)
+                        )
+                        log("[collaboration] storage diagnostics: " + json.dumps(diagnostics, ensure_ascii=True))
+                    except Exception as diagnostic_error:
+                        log(f"[collaboration] storage diagnostics unavailable: {type(diagnostic_error).__name__}")
 
 
 def collaboration_watcher_health(app) -> dict:
