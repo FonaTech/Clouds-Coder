@@ -28847,29 +28847,129 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
+
+# ``bash`` is intentionally classified by the caller, rather than only by
+# inspecting command text after the fact.  The declaration is part of the
+# provenance contract: it tells evidence/memory whether a shell call is a
+# source read, a document/media perception step, or ordinary execution.  The
+# runtime still accepts legacy calls without the field and falls back to the
+# older syntax-aware detector for compatibility.
+BASH_OPERATION_CODES = (
+    "execute",
+    "text_read",
+    "text_search",
+    "directory_inspect",
+    "document_extract",
+    "ocr",
+    "media_metadata",
+    "media_extract",
+    "custom_extract",
+    "validation",
+    "build_test",
+    "process_control",
+    "network",
+)
+BASH_OBSERVATION_OPERATION_CODES = frozenset(
+    {
+        "text_read",
+        "text_search",
+        "directory_inspect",
+        "document_extract",
+        "ocr",
+        "media_metadata",
+        "media_extract",
+        "custom_extract",
+    }
+)
+BASH_OPERATION_ALIASES = {
+    "read": "text_read",
+    "file_read": "text_read",
+    "text": "text_read",
+    "search": "text_search",
+    "file_search": "text_search",
+    "inspect": "directory_inspect",
+    "directory": "directory_inspect",
+    "pdf": "document_extract",
+    "pdf_extract": "document_extract",
+    "document": "document_extract",
+    "document_read": "document_extract",
+    "image_ocr": "ocr",
+    "vision_ocr": "ocr",
+    "metadata": "media_metadata",
+    "media_info": "media_metadata",
+    "extract": "media_extract",
+    "media": "media_extract",
+    "script_extract": "custom_extract",
+    "custom_reader": "custom_extract",
+    "test": "build_test",
+    "build": "build_test",
+    "run_test": "build_test",
+    "process": "process_control",
+    "shell": "execute",
+    "command": "execute",
+}
+
+
+def normalize_bash_operation(value: object, *, default: str = "execute") -> str:
+    """Normalize the model-provided shell operation code."""
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw.startswith("custom:") and re.fullmatch(r"custom:[a-z0-9_:.]{1,64}", raw):
+        return raw
+    raw = BASH_OPERATION_ALIASES.get(raw, raw)
+    if raw in BASH_OPERATION_CODES:
+        return raw
+    if raw and re.fullmatch(r"[a-z0-9_:.]{1,64}", raw):
+        # Preserve an agent-supplied, domain-specific marker without treating
+        # it as one of the built-in observation classes. This keeps bash open
+        # ended while still making the marker searchable in tool memory.
+        return f"custom:{raw}"
+    fallback = str(default or "execute").strip().lower().replace("-", "_").replace(" ", "_")
+    fallback = BASH_OPERATION_ALIASES.get(fallback, fallback)
+    return fallback if fallback in BASH_OPERATION_CODES else "execute"
+
+
+def bash_operation_is_observation(value: object) -> bool:
+    return normalize_bash_operation(value, default="execute") in BASH_OBSERVATION_OPERATION_CODES
+
+
+def bash_operation_is_marked_observation(value: object) -> bool:
+    operation = normalize_bash_operation(value, default="execute")
+    return operation in BASH_OBSERVATION_OPERATION_CODES or operation.startswith("custom:")
+
+
 TOOLS = [
     tool_def(
         "bash",
         (
-            "Run a shell command. Use shell-native readers/search pipelines when they are the most natural option; "
-            "successful output that can be verified against local source files is automatically merged into the same "
-            "source-addressable long-content memory used by read_file."
+            "Execute a shell command for builds, tests, validation, process control, or a pipeline that truly needs a shell. "
+            "For ordinary local file reading, searching, symbols, line windows, or exact source evidence, prefer read_file. "
+            "When a call is a special read/perception task, provide operation with the caller's intent code: text_read/text_search/directory_inspect "
+            "for source reads, document_extract for PDF/document conversion, ocr for OCR, media_metadata or "
+            "media_extract for image/audio/video perception, custom_extract for a Python/Node/other reader, "
+            "validation/build_test for checks, process_control for process operations, network for HTTP, or execute "
+            "for ordinary shell work. The field is optional so bash remains fully general; a declared observation is recorded even when output is short. Bash remains a "
+            "fallback when read_file cannot express the requested extraction; its exact output gets immutable evidence "
+            "and tool-memory trace, with source alignment when possible."
         ),
-        {"command": {"type": "string"}},
+        {
+            "command": {"type": "string"},
+            "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker. Known markers such as text_read, document_extract, ocr, media_metadata, custom_extract and validation receive specialized memory handling; arbitrary domain markers remain searchable without restricting shell use."},
+            "recognition_code": {"type": "string", "description": "Optional alias for operation when a task-specific recognition marker is clearer."},
+        },
         ["command"],
     ),
     tool_def(
         "read_file",
         (
-            "Read files or directories with structure-aware modes. "
+            "Preferred tool for reading local files and directories with structure-aware, source-addressable modes. "
             "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
             "and mode='full' when complete content is explicitly needed. Use mode='structure' or mode='segment' "
             "to resume a long-file reading pass from compact understanding cards. Reader choice is not mandatory: "
-            "read_file and source-aligned shell readers update the same long-content memory. Successful reads are "
-            "remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
+            "read_file and source-aligned shell readers update the same long-content memory. Successful reads receive an "
+            "immutable evidence_ref and are remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
@@ -29105,6 +29205,7 @@ TOOLS = [
             "status": {"type": "string"},
             "limit": {"type": "integer"},
             "max_chars": {"type": "integer"},
+            "depth": {"type": "integer", "description": "Causal evidence-trace depth for mode='trace' (0-4)."},
             "include_cached": {"type": "boolean"},
             "claim": {"type": "string", "description": "Important model-authored conclusion to retain, with exact parameter spelling."},
             "kind": {"type": "string", "enum": ["fact", "inference", "decision", "constraint", "procedure"]},
@@ -29383,7 +29484,17 @@ TOOLS = [
     tool_def("worktree_create", "Create git worktree.", {"name": {"type": "string"}, "task_id": {"type": "integer"}, "base_ref": {"type": "string"}}, ["name"]),
     tool_def("worktree_list", "List worktrees.", {}),
     tool_def("worktree_status", "Get worktree status.", {"name": {"type": "string"}}, ["name"]),
-    tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
+    tool_def(
+        "worktree_run",
+        "Run a shell command in a worktree. Set operation using the same bash provenance codes so reads and perception results enter evidence/tool-memory correctly.",
+        {
+            "name": {"type": "string"},
+            "command": {"type": "string"},
+            "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker; known markers receive specialized memory handling."},
+            "recognition_code": {"type": "string"},
+        },
+        ["name", "command"],
+    ),
     tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
     tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
         tool_def(
@@ -30122,6 +30233,16 @@ class EvidenceRetrievalController:
             db.execute("CREATE INDEX IF NOT EXISTS evidence_path ON evidence(path,created)")
             db.execute("CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, claim TEXT, kind TEXT, conditions TEXT, importance INTEGER, refs TEXT, status TEXT, created REAL, accessed REAL)")
             db.execute("CREATE TABLE IF NOT EXISTS evidence_links (source TEXT, target TEXT, relation TEXT, PRIMARY KEY(source,target,relation))")
+            # ``flow`` nodes and file heads intentionally live beside ordinary
+            # tool evidence.  This keeps one immutable id space for tool calls,
+            # UI events, loop state and file versions, while the head table gives
+            # us a cheap current-version index without rewriting old evidence.
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS file_evidence_heads ("
+                "path TEXT PRIMARY KEY, evidence_id TEXT, version TEXT, operation TEXT, "
+                "updated REAL, stale INTEGER NOT NULL DEFAULT 0, previous_evidence_id TEXT)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS file_heads_evidence ON file_evidence_heads(evidence_id)")
             self.fts = self.trigram = False
             try:
                 db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS source_terms USING fts5(tokens, content='blocks', content_rowid='id')")
@@ -30246,6 +30367,118 @@ class EvidenceRetrievalController:
             db.row_factory = sqlite3.Row
             return [dict(r) for r in db.execute("SELECT * FROM evidence_links WHERE source=? OR target=? LIMIT 40", (eid, eid))]
 
+    def record_flow(
+        self,
+        kind: str,
+        body: object,
+        *,
+        role: str = "",
+        metadata: dict | None = None,
+        parent_ids: list[str] | None = None,
+        status: str = "ok",
+    ) -> str:
+        """Persist a compact immutable node for any agentic-flow transition."""
+        flow_id = uuid.uuid4().hex
+        payload = {
+            "kind": str(kind or "flow"),
+            "flow_id": flow_id,
+            "metadata": dict(metadata or {}),
+            "body": body,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)
+        # Flow nodes are summaries; the exact large tool output remains in the
+        # ordinary tool evidence row referenced by parent_ids.
+        encoded = encoded[:24_000]
+        eid = self.remember(
+            "",
+            f"flow:{flow_id}",
+            f"flow:{str(kind or 'event')}",
+            role or "single",
+            {"flow_id": flow_id, **dict(metadata or {})},
+            encoded,
+            status,
+        )
+        for parent_id in list(parent_ids or [])[:24]:
+            parent = str(parent_id or "").strip()
+            if parent and parent != eid:
+                self.link(eid, parent, "continues")
+        return eid
+
+    def trace(self, eid: str, *, depth: int = 2, limit: int = 80) -> dict:
+        """Return one evidence row plus its bounded causal neighborhood."""
+        root_id = str(eid or "").strip()
+        rows = self.recall(eid=root_id, limit=1)
+        if not rows:
+            return {}
+        seen = {root_id}
+        frontier = [root_id]
+        nodes = [rows[0]]
+        edges: list[dict] = []
+        for _ in range(max(0, min(5, int(depth or 0)))):
+            next_frontier: list[str] = []
+            for current in frontier:
+                for edge in self.links(current):
+                    edges.append(edge)
+                    other = str(edge.get("target", "") or "")
+                    if other == current:
+                        other = str(edge.get("source", "") or "")
+                    if not other or other in seen or len(nodes) >= max(1, min(200, int(limit or 80))):
+                        continue
+                    found = self.recall(eid=other, limit=1)
+                    if found:
+                        seen.add(other)
+                        nodes.append(found[0])
+                        next_frontier.append(other)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return {"root": rows[0], "nodes": nodes, "links": edges[: max(1, min(400, int(limit or 80) * 4))]}
+
+    def file_head(self, path: str) -> dict:
+        rel = str(path or "").replace("\\", "/").strip()
+        if not rel:
+            return {}
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM file_evidence_heads WHERE path=?", (rel,)).fetchone()
+            return dict(row) if row else {}
+
+    def update_file_head(
+        self,
+        path: str,
+        evidence_id: str,
+        version: str,
+        operation: str,
+        *,
+        previous_evidence_id: str = "",
+    ) -> dict:
+        rel = str(path or "").replace("\\", "/").strip()
+        if not rel or not evidence_id:
+            return {}
+        previous = self.file_head(rel)
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.execute(
+                "INSERT INTO file_evidence_heads(path,evidence_id,version,operation,updated,stale,previous_evidence_id) "
+                "VALUES(?,?,?,?,?,0,?) ON CONFLICT(path) DO UPDATE SET evidence_id=excluded.evidence_id, "
+                "version=excluded.version, operation=excluded.operation, updated=excluded.updated, stale=0, "
+                "previous_evidence_id=excluded.previous_evidence_id",
+                (rel, evidence_id, str(version or ""), str(operation or ""), time.time(), previous_evidence_id or str(previous.get("evidence_id", "") or "")),
+            )
+        return previous
+
+    def mark_file_stale_if_changed(self, path: str, version: str) -> dict:
+        rel = str(path or "").replace("\\", "/").strip()
+        if not rel or not version:
+            return {}
+        head = self.file_head(rel)
+        if head and str(head.get("version", "") or "") != str(version):
+            with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+                db.execute("UPDATE file_evidence_heads SET stale=1, updated=? WHERE path=?", (time.time(), rel))
+                if head.get("evidence_id"):
+                    db.execute("UPDATE evidence SET status='stale' WHERE id=? AND status='ok'", (str(head.get("evidence_id")),))
+            head["stale"] = 1
+        return head
+
     def consolidate(self, claim: str, kind: str, conditions: str, importance: int, references: list[dict], supersedes: str = '') -> dict:
         if not claim.strip() or len(claim) > 2000 or len(conditions) > 1000:
             raise ValueError('claim is required (max 2000 chars); conditions max 1000 chars')
@@ -30326,12 +30559,92 @@ class SessionState:
                 self._evidence_retrieval_controller = controller
         return controller
 
+    def _flow_context(self, role: str = "", tool_call_id: str = "") -> dict:
+        """Capture the execution coordinates attached to every evidence node."""
+        sanitize_role = getattr(self, "_sanitize_agent_role", lambda value: str(value or "").strip().lower())
+        role_key = sanitize_role(role) or sanitize_role(getattr(self, "active_agent_role", "")) or "single"
+        alignment = {}
+        try:
+            alignment = self._agent_loop_todo_alignment(role_key)
+        except Exception:
+            alignment = {}
+        plan_step = {}
+        try:
+            plan_step = self._current_plan_step_row(self._ensure_blackboard()) or {}
+        except Exception:
+            plan_step = {}
+        with getattr(self, "_flow_event_lock", threading.RLock()):
+            parent = str(getattr(self, "_flow_last_evidence_by_role", {}).get(role_key, "") or "")
+            start = str(getattr(self, "_flow_tool_start_evidence", {}).get(str(tool_call_id or ""), "") or "")
+        return {
+            "run_generation": int(getattr(self, "run_generation", 0) or 0),
+            "agent_round_index": int(getattr(self, "agent_round_index", 0) or 0),
+            "current_phase": str(getattr(self, "current_phase", "idle") or "idle"),
+            "current_tool_name": str(getattr(self, "current_tool_name", "") or ""),
+            "active_agent_role": role_key,
+            "tool_call_id": trim(str(tool_call_id or ""), 240),
+            "todo_fp": trim(str(alignment.get("todo_fp", "") or ""), 40),
+            "todo_current": trim(str(alignment.get("current_todo", "") or ""), 240),
+            "plan_step_id": trim(str(plan_step.get("id", "") or ""), 80),
+            "plan_step_index": int(plan_step.get("plan_step_index", -1) or -1),
+            "parent_evidence_id": parent,
+            "tool_start_evidence_id": start,
+        }
+
+    def _record_flow_node(
+        self,
+        kind: str,
+        body: object,
+        *,
+        role: str = "",
+        metadata: dict | None = None,
+        parent_ids: list[str] | None = None,
+    ) -> str:
+        """Best-effort bridge from runtime state to immutable evidence."""
+        sanitize_role = getattr(self, "_sanitize_agent_role", lambda value: str(value or "").strip().lower())
+        role_key = sanitize_role(role) or sanitize_role(getattr(self, "active_agent_role", "")) or "single"
+        context = self._flow_context(role_key, str((metadata or {}).get("tool_call_id", "") or ""))
+        merged = {**context, **dict(metadata or {})}
+        parents = [str(value or "") for value in (parent_ids or []) if str(value or "").strip()]
+        for key in ("parent_evidence_id", "tool_start_evidence_id"):
+            value = str(merged.get(key, "") or "").strip()
+            if value and value not in parents:
+                parents.append(value)
+        try:
+            eid = self._evidence_controller().record_flow(
+                kind,
+                body,
+                role=role_key,
+                metadata=merged,
+                parent_ids=parents,
+            )
+        except Exception:
+            return ""
+        with getattr(self, "_flow_event_lock", threading.RLock()):
+            if not isinstance(getattr(self, "_flow_last_evidence_by_role", None), dict):
+                self._flow_last_evidence_by_role = {}
+            if not isinstance(getattr(self, "_flow_tool_start_evidence", None), dict):
+                self._flow_tool_start_evidence = {}
+            self._flow_last_evidence_by_role[role_key] = eid
+            call_id = str(merged.get("tool_call_id", "") or "").strip()
+            if call_id and kind == "tool_start":
+                self._flow_tool_start_evidence[call_id] = eid
+        return eid
+
+    @staticmethod
+    def _flow_safe_args(args: object) -> dict:
+        values = args if isinstance(args, dict) else {}
+        return {str(key): value for key, value in values.items() if not str(key).startswith("_")}
+
     def _trace_tool_result(self, name: str, args: dict, output: str, role: str = '') -> str:
         if name in {'tool_memory', 'compress'}:
             return output  # Memory recalls must not become new factual evidence.
         try:
             body = str(output or '')
-            path = str(args.get('path', '') or '')
+            raw_args = args if isinstance(args, dict) else {}
+            trace_context = raw_args.get('_flow_context', {}) if isinstance(raw_args.get('_flow_context', {}), dict) else {}
+            evidence_args = self._flow_safe_args(raw_args)
+            path = str(evidence_args.get('path', '') or '')
             fingerprint = self._read_source_fingerprint(path) if path else {}
             version = str(fingerprint.get('source_sha256', '') or '')
             rendered_version = re.search(r'\bsource_sha256=([a-f0-9]{64})', body[:900])
@@ -30341,17 +30654,140 @@ class SessionState:
                 version = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
             status = 'ok' if self._tool_result_compat_ok(name, body) else 'error'
             controller = self._evidence_controller()
-            eid = controller.remember(path, version, name, role or 'single', args, body, status)
-            parent_ids = args.get("trace_parent_ids", args.get("parent_evidence_ids", [])) if isinstance(args, dict) else []
+            eid = controller.remember(path, version, name, role or 'single', evidence_args, body, status)
+            parent_ids = evidence_args.get("trace_parent_ids", evidence_args.get("parent_evidence_ids", []))
             if isinstance(parent_ids, str):
                 parent_ids = [parent_ids]
-            if isinstance(parent_ids, list):
-                for parent_id in parent_ids[:16]:
-                    controller.link(eid, str(parent_id), "derived_from")
+            parent_ids = list(parent_ids) if isinstance(parent_ids, list) else []
+            for parent_id in (
+                trace_context.get("tool_start_evidence_id"),
+                trace_context.get("parent_evidence_id"),
+            ):
+                if parent_id and parent_id not in parent_ids:
+                    parent_ids.append(parent_id)
+            for parent_id in parent_ids[:24]:
+                controller.link(eid, str(parent_id), "derived_from")
+            # Connect source reads and mutations to the current file head. A
+            # write/edit supersedes the prior head; a read observes it. Bash
+            # source alignment uses the same path/version relation.
+            candidate_paths = []
+            if path:
+                candidate_paths.append(path)
+            changed = self._peek_tool_result_meta().get("changed_files", [])
+            if isinstance(changed, list):
+                candidate_paths.extend(str(value or "") for value in changed[:40])
+            if name in {"bash", "worktree_run", "background_run"}:
+                try:
+                    candidate_paths.extend(self._bash_file_read_targets(
+                        str(evidence_args.get("command", "") or ""),
+                        operation=str(evidence_args.get("operation", "") or ""),
+                    ))
+                except Exception:
+                    pass
+            for rel in list(dict.fromkeys(str(value or "").replace("\\", "/").strip() for value in candidate_paths))[:40]:
+                if not rel:
+                    continue
+                current_fp = self._read_source_fingerprint(rel)
+                current_version = str(current_fp.get("source_sha256", "") or "")
+                if not current_version:
+                    continue
+                head = controller.mark_file_stale_if_changed(rel, current_version)
+                if name in {"write_file", "edit_file"} and status == "ok" and rel == path:
+                    previous_id = str(head.get("evidence_id", "") or "") if head else ""
+                    previous_version = str(head.get("version", "") or "") if head else ""
+                    if previous_id and previous_id != eid:
+                        controller.link(eid, previous_id, "supersedes")
+                    if previous_version and previous_version != current_version:
+                        controller.link(eid, previous_id, "derived_from")
+                    controller.update_file_head(
+                        rel,
+                        eid,
+                        current_version,
+                        name,
+                        previous_evidence_id=previous_id,
+                    )
+                elif head and str(head.get("evidence_id", "") or "") and str(head.get("version", "") or "") == current_version:
+                    controller.link(eid, str(head.get("evidence_id")), "observes_version")
+                elif name in {"read_file", "bash", "worktree_run", "background_run", "check_background"} and status == "ok":
+                    previous_id = str(head.get("evidence_id", "") or "") if head else ""
+                    if previous_id and previous_id != eid:
+                        controller.link(eid, previous_id, "continues")
+                    controller.update_file_head(
+                        rel,
+                        eid,
+                        current_version,
+                        str(evidence_args.get("operation", "") or name),
+                        previous_evidence_id=previous_id,
+                    )
+            self._record_flow_node(
+                "tool_result",
+                {"name": name, "path": path, "status": status, "output": self._tool_result_compact_output(body, max_chars=1800)},
+                role=role,
+                metadata={**trace_context, "tool_call_id": trace_context.get("tool_call_id", "")},
+                parent_ids=[eid],
+            )
+            if canonicalize_tool_name(name) in {"TodoWrite", "TodoWriteRescue"}:
+                try:
+                    todo_rows = [
+                        dict(row) for row in self.todo.snapshot()
+                        if isinstance(row, dict)
+                    ][:80]
+                except Exception:
+                    todo_rows = []
+                self._record_flow_node(
+                    "todo_state",
+                    {"tool": name, "rows": todo_rows, "result": self._tool_result_compact_output(body, max_chars=900)},
+                    role=role,
+                    metadata={"tool_call_id": trace_context.get("tool_call_id", "")},
+                    parent_ids=[eid],
+                )
+            if canonicalize_tool_name(name) in {"ask_colleague", "send_message", "broadcast", "task", "spawn_teammate", "route_to_next_agent"}:
+                self._record_flow_node(
+                    "handoff",
+                    {"tool": name, "args": evidence_args, "result": self._tool_result_compact_output(body, max_chars=1200)},
+                    role=role,
+                    metadata={"tool_call_id": trace_context.get("tool_call_id", "")},
+                    parent_ids=[eid],
+                )
             self._set_tool_result_meta(**{**self._peek_tool_result_meta(), 'evidence_id': eid})
+            self._bind_tool_memory_evidence_id(name, args, body, role, eid)
             return body + f'\n[evidence_ref id={eid} tool={name}; tool_memory mode="trace" id="{eid}" returns exact evidence and verification locator]'
         except Exception as exc:
             return str(output or '') + f'\n[evidence storage unavailable: {type(exc).__name__}; retain this raw result for verification]'
+
+    def _bind_tool_memory_evidence_id(
+        self,
+        name: str,
+        args: dict | None,
+        output: str,
+        role: str = '',
+        evidence_id: str = '',
+    ) -> None:
+        """Attach the immutable trace id to the already-recorded tool-memory row."""
+        eid = str(evidence_id or '').strip()
+        if not eid or not isinstance(getattr(self, 'tool_memory_registry', {}), dict):
+            return
+        tool = canonicalize_tool_name(name)
+        role_key = self._sanitize_agent_role(role) or 'single'
+        body = str(output or '')
+        digest = hashlib.sha256(body.encode('utf-8', errors='replace')).hexdigest()
+        signature = self._tool_memory_signature_from_args(tool, args or {})
+        key = self._tool_memory_key(role_key, signature) if signature else ''
+        candidates: list[dict] = []
+        if key and isinstance(self.tool_memory_registry.get(key), dict):
+            candidates.append(self.tool_memory_registry[key])
+        candidates.extend(
+            row for row in self.tool_memory_registry.values()
+            if isinstance(row, dict)
+            and row not in candidates
+            and str(row.get('source_tool', '') or '') == tool
+            and str(row.get('agent_role', '') or '') == role_key
+        )
+        target = next((row for row in candidates if str(row.get('sha256', '') or '') == digest), None)
+        if target is None and candidates:
+            target = candidates[0]
+        if isinstance(target, dict):
+            target['evidence_id'] = eid
 
     @staticmethod
     def _evidence_body(output: str) -> str:
@@ -30710,6 +31146,12 @@ class SessionState:
         self.agent_round_index = 0
         self.current_phase = "idle"
         self.current_tool_name = ""
+        # Runtime-only indexes that connect visible events and tool results to
+        # the durable evidence graph.  The graph itself is persisted by the
+        # session-local EvidenceRetrievalController.
+        self._flow_last_evidence_by_role: dict[str, str] = {}
+        self._flow_tool_start_evidence: dict[str, str] = {}
+        self._flow_event_lock = threading.RLock()
         self.runtime_task_level = 0
         self.user_task_level_override = 0
         self.runtime_execution_mode = ""
@@ -34201,6 +34643,10 @@ class SessionState:
         command = str(values.get("command", "") or "").strip()
         if command:
             public["command"] = trim(command, 8000)
+        if tool_name in {"bash", "worktree_run", "background_run", "check_background"}:
+            operation, declared = self._bash_operation_from_args(values)
+            if declared:
+                public["operation"] = operation
         cwd = str(values.get("cwd", "") or "").strip()
         if not cwd and tool_name in {"bash", "worktree_run", "check_background"}:
             cwd = str(self.files_root)
@@ -34211,7 +34657,7 @@ class SessionState:
             if value:
                 public[key] = trim(value, 2000)
         details = result if isinstance(result, dict) else self._peek_tool_result_meta()
-        for key in ("exit_code", "duration_ms"):
+        for key in ("exit_code", "duration_ms", "evidence_id"):
             if details.get(key) is not None:
                 public[key] = details.get(key)
         if isinstance(details.get("changed_files"), list):
@@ -34274,10 +34720,39 @@ class SessionState:
             str(kind or "").strip().lower() == "web_search"
             and not bool(payload.get("conversation_visible", True))
         )
+        event_id = make_id("evt")
+        event_seq = self._next_event_seq()
+        tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
+        event_role = str(payload.get("agent_role", payload.get("role", "")) or "")
+        flow_kind = f"event:{str(kind or 'unknown').strip().lower() or 'unknown'}"
+        flow_parent = []
+        if str(kind or "").strip().lower() == "tool_result":
+            result_eid = str(payload.get("evidence_id", "") or "").strip()
+            if result_eid:
+                flow_parent.append(result_eid)
+            if tool_call_id:
+                flow_parent.append(str(getattr(self, "_flow_tool_start_evidence", {}).get(tool_call_id, "") or ""))
+        flow_body = {
+            "event_id": event_id,
+            "type": str(kind or ""),
+            "data": self._flow_safe_event_payload(payload),
+        }
+        flow_eid = self._record_flow_node(
+            flow_kind,
+            flow_body,
+            role=event_role,
+            metadata={"event_id": event_id, "seq": event_seq, "tool_call_id": tool_call_id},
+            parent_ids=flow_parent,
+        )
+        if flow_eid:
+            payload["evidence_id"] = flow_eid
+        if tool_call_id and str(kind or "").strip().lower() == "tool_start" and flow_eid:
+            with getattr(self, "_flow_event_lock", threading.RLock()):
+                self._flow_tool_start_evidence[tool_call_id] = flow_eid
         with self.lock:
             event = {
-                "id": make_id("evt"),
-                "seq": self._next_event_seq(),
+                "id": event_id,
+                "seq": event_seq,
                 "ts": now_ts(),
                 "type": kind,
                 "session_id": self.id,
@@ -34301,6 +34776,21 @@ class SessionState:
         self._maybe_persist_after_event(kind, payload)
         self._publish_collaboration_event_heartbeat(kind, payload)
         return event
+
+    @staticmethod
+    def _flow_safe_event_payload(payload: object) -> dict:
+        """Bound event data before it is copied into the durable flow graph."""
+        values = payload if isinstance(payload, dict) else {}
+        out: dict = {}
+        for key, value in values.items():
+            if key in {"output", "result", "text", "thinking", "diff", "diff_numbered"}:
+                value = trim(str(value or ""), 1800)
+            elif isinstance(value, list):
+                value = [trim(str(item or ""), 300) if not isinstance(item, dict) else dict(item) for item in value[:24]]
+            elif isinstance(value, dict):
+                value = {str(k): trim(str(v or ""), 500) for k, v in list(value.items())[:40]}
+            out[str(key)] = value
+        return out
 
     def record_scheduler_queued_message(
         self,
@@ -36450,7 +36940,7 @@ class SessionState:
                 f"{self._public_progress_prompt_instruction()}"
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
-            "Choose any local reading method that best fits the question. read_file offers mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context; shell-native grep/rg/sed/awk/head/tail or custom extractors are equally valid. Verified local-source output from every method is merged into one source-addressable long-content memory, so do not switch tools merely for memory retention. "
+            "For local file or directory inspection, use read_file first: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='evidence' for ranked cited excerpts, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context. Use bash for execution, builds, tests, validation, process control, or shell pipelines that read_file cannot express. When bash is used for a special read/perception task, optionally set operation (text_read/text_search/document_extract/ocr/media_metadata/media_extract/custom_extract) so short outputs are retained under the right memory category; this marker is caller-supplied and does not restrict general shell use. Bash file reads are source-aligned on a best-effort basis and share long-content memory, but read_file is the authoritative exact-source reader. Every successful result receives an immutable evidence_ref; use tool_memory/trace instead of repeating a broad read. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
                 f"{web_search_instruction}"
@@ -38219,6 +38709,9 @@ class SessionState:
         elif tool in {"bash", "background_run", "worktree_run"}:
             cmd = trim(str(src.get("command", "") or ""), 500)
             parts.append(f"command={cmd}")
+            operation, declared = self._bash_operation_from_args(src)
+            if declared:
+                parts.append(f"operation={operation}")
             if tool == "worktree_run":
                 parts.append(f"worktree={trim(str(src.get('name', '') or ''), 120)}")
         elif tool in {"load_skill", "unload_skill"}:
@@ -38334,6 +38827,7 @@ class SessionState:
                 "path": target_path,
                 "target_path": target_path,
                 "command": trim(str(raw_entry.get("command", "") or ""), 500),
+                "operation": normalize_bash_operation(raw_entry.get("operation", ""), default="execute") if tool in {"bash", "worktree_run", "background_run"} and str(raw_entry.get("operation", "") or "").strip() else "",
                 "signature": signature,
                 "agent_role": role_key,
                 "status": status,
@@ -38371,9 +38865,16 @@ class SessionState:
             "edit_error": 1,
             "file_patch": 2,
             "retrieval": 3,
+            "document_extraction": 4,
+            "ocr": 4,
+            "media_perception": 4,
+            "media_extraction": 4,
+            "custom_extraction": 4,
+            "custom_observation": 4,
+            "directory_observation": 5,
             "skill_loaded": 4,
-            "command_result": 5,
-            "file_read": 6,
+            "command_result": 6,
+            "file_read": 7,
         }
         status = str(entry.get("status", "active") or "active").lower()
         kind = str(entry.get("evidence_kind", "") or "").lower()
@@ -38960,6 +39461,62 @@ class SessionState:
                 break
         return trim(" ".join(picked), READ_CONTEXT_SUMMARY_MAX_CHARS)
 
+    @staticmethod
+    def _bash_operation_from_args(args: dict | None) -> tuple[str, bool]:
+        """Return the declared shell operation and whether it was explicit.
+
+        ``operation`` is the public contract. The aliases keep persisted calls
+        and older integrations readable while making the new field the one the
+        model is instructed to emit. Missing declarations intentionally remain
+        distinguishable so compatibility inference cannot masquerade as model
+        intent in provenance records.
+        """
+        src = args if isinstance(args, dict) else {}
+        raw = ""
+        for key in (
+            "operation",
+            "operation_code",
+            "recognition_code",
+            "perception_code",
+            "read_marker",
+            "bash_type",
+            "command_type",
+            "read_kind",
+        ):
+            value = str(src.get(key, "") or "").strip()
+            if value:
+                raw = value
+                break
+        if not raw:
+            return "execute", False
+        return normalize_bash_operation(raw), True
+
+    @classmethod
+    def _bash_declared_observation(cls, args: dict | None) -> tuple[str, bool]:
+        operation, declared = cls._bash_operation_from_args(args)
+        return operation, bool(declared and bash_operation_is_marked_observation(operation))
+
+    @staticmethod
+    def _bash_operation_evidence_kind(operation: object) -> str:
+        mapping = {
+            "text_read": "file_read",
+            "text_search": "file_read",
+            "directory_inspect": "directory_observation",
+            "document_extract": "document_extraction",
+            "ocr": "ocr",
+            "media_metadata": "media_perception",
+            "media_extract": "media_extraction",
+            "custom_extract": "custom_extraction",
+            "validation": "validation",
+            "build_test": "validation",
+            "process_control": "process_control",
+            "network": "network_observation",
+        }
+        normalized = normalize_bash_operation(operation)
+        if normalized.startswith("custom:"):
+            return "custom_observation"
+        return mapping.get(normalized, "command_result")
+
     def _shell_command_units(self, command: str) -> list[list[str]]:
         """Tokenize a shell expression into command/pipeline units.
 
@@ -39020,7 +39577,14 @@ class SessionState:
         except Exception:
             return ""
 
-    def _shell_source_candidates(self, command: str, output: str = "", *, likely_only: bool = False) -> list[str]:
+    def _shell_source_candidates(
+        self,
+        command: str,
+        output: str = "",
+        *,
+        likely_only: bool = False,
+        operation: object = "",
+    ) -> list[str]:
         """Find local source candidates without assuming a document domain.
 
         Known text-processing commands provide high-confidence candidates. For
@@ -39038,11 +39602,15 @@ class SessionState:
         candidate_cwds: list[Path] = [root] if root is not None else []
         likely: list[str] = []
         broad: list[str] = []
+        declared_operation = normalize_bash_operation(operation) if str(operation or "").strip() else ""
+        declared_observation = bash_operation_is_marked_observation(declared_operation)
         readers = {
             "cat", "tac", "nl", "head", "tail", "sed", "awk", "gawk", "mawk",
             "grep", "egrep", "fgrep", "rg", "ripgrep", "cut", "paste", "join",
             "sort", "uniq", "tr", "fold", "fmt", "column", "jq", "yq", "bat",
             "less", "more", "strings", "od", "hexdump", "xxd", "wc",
+            "pdftotext", "pdftoppm", "pdftocairo", "tesseract", "ocrmypdf",
+            "identify", "exiftool", "ffprobe", "ffmpeg", "mediainfo", "whisper",
         }
 
         def add(bucket: list[str], value: str) -> None:
@@ -39060,7 +39628,12 @@ class SessionState:
             if command_name in {"bash", "sh", "zsh"}:
                 for idx, token in enumerate(tokens[1:], 1):
                     if token in {"-c", "-lc", "-ic"} and idx + 1 < len(tokens):
-                        nested = self._shell_source_candidates(tokens[idx + 1], output, likely_only=likely_only)
+                        nested = self._shell_source_candidates(
+                            tokens[idx + 1],
+                            output,
+                            likely_only=likely_only,
+                            operation=declared_operation,
+                        )
                         for value in nested:
                             add(likely, value)
                         break
@@ -39081,6 +39654,13 @@ class SessionState:
             is_reader = command_name in readers or (
                 command_name == "git" and len(tokens) > 1 and str(tokens[1]).lower() in {"grep", "show", "diff"}
             )
+            if declared_observation:
+                # For an explicitly marked observation, custom executables and
+                # wrappers are treated as reader inputs too. The later source
+                # alignment step still verifies that output actually matches
+                # the candidate, so this does not turn arbitrary output into
+                # file comprehension.
+                is_reader = True
             for token in tokens[1:]:
                 if token.startswith("-") or token.isdigit() or token in {"<", ">", ">>", "2>", "1>"}:
                     continue
@@ -39162,8 +39742,8 @@ class SessionState:
         selected = likely if likely_only else likely + [x for x in broad if x not in likely]
         return selected[:SHELL_SOURCE_CANDIDATE_MAX]
 
-    def _bash_file_read_targets(self, command: str) -> list[str]:
-        targets = self._shell_source_candidates(command, likely_only=True)
+    def _bash_file_read_targets(self, command: str, operation: object = "") -> list[str]:
+        targets = self._shell_source_candidates(command, likely_only=True, operation=operation)
         if targets:
             return targets[:SHELL_SOURCE_CANDIDATE_MAX]
         # Lightweight fallback for partially initialized/test sessions where a
@@ -39171,8 +39751,9 @@ class SessionState:
         raw = str(command or "").strip()
         if not raw:
             return []
-        readers = r"(?:cat|tac|nl|head|tail|sed|awk|gawk|mawk|grep|egrep|fgrep|rg|ripgrep|cut|paste|jq|yq|bat|less|more|strings|wc)"
-        if not re.search(rf"(?:^|[;&|]\s*){readers}\b", raw, re.I):
+        readers = r"(?:cat|tac|nl|head|tail|sed|awk|gawk|mawk|grep|egrep|fgrep|rg|ripgrep|cut|paste|jq|yq|bat|less|more|strings|wc|pdftotext|pdftoppm|pdftocairo|tesseract|ocrmypdf|identify|exiftool|ffprobe|ffmpeg|mediainfo|whisper|python(?:3(?:\.13|\.14)?)?|node|nodejs|deno|bun)"
+        operation_value = normalize_bash_operation(operation) if str(operation or "").strip() else ""
+        if not operation_value and not re.search(rf"(?:^|[;&|]\s*){readers}\b", raw, re.I):
             return []
         out: list[str] = []
         for unit in self._shell_command_units(raw):
@@ -39187,8 +39768,10 @@ class SessionState:
                         out.append(value)
         return out[:SHELL_SOURCE_CANDIDATE_MAX]
 
-    def _bash_looks_like_file_read(self, command: str) -> bool:
-        return bool(self._bash_file_read_targets(command))
+    def _bash_looks_like_file_read(self, command: str, operation: object = "") -> bool:
+        if str(operation or "").strip() and bash_operation_is_marked_observation(operation):
+            return True
+        return bool(self._bash_file_read_targets(command, operation=operation))
 
     @staticmethod
     def _source_alignment_text(value: object) -> str:
@@ -39396,14 +39979,23 @@ class SessionState:
         command = str(src_args.get("command", "") or meta.get("command", "") or "").strip()
         if not command:
             return []
-        likely_candidates = set(self._shell_source_candidates(command, text, likely_only=True))
-        candidates = self._shell_source_candidates(command, text, likely_only=False)
+        operation, _declared = self._bash_operation_from_args(src_args)
+        likely_candidates = set(
+            self._shell_source_candidates(command, text, likely_only=True, operation=operation)
+        )
+        candidates = self._shell_source_candidates(command, text, likely_only=False, operation=operation)
         if not candidates:
             return []
         observations: list[dict] = []
         for rel in candidates[:SHELL_SOURCE_CANDIDATE_MAX]:
             try:
                 fp = self._session_path(rel)
+                if operation in {"document_extract", "ocr", "media_metadata", "media_extract"}:
+                    # These outputs are semantic/format conversions whose
+                    # source is not a trustworthy line-oriented text stream.
+                    # Keep their exact command output in evidence/tool-memory,
+                    # but do not manufacture long-content line coverage.
+                    continue
                 if not fp.is_file() or fp.suffix.lower() in IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS:
                     continue
                 source_text, source_fp = self._read_text_and_fingerprint(fp, rel)
@@ -39412,7 +40004,13 @@ class SessionState:
                     rel,
                     lines,
                     text,
-                    allow_fragments=rel in likely_candidates,
+                    allow_fragments=(
+                        rel in likely_candidates
+                        and (
+                            operation in {"text_read", "text_search", "custom_extract", "execute"}
+                            or operation.startswith("custom:")
+                        )
+                    ),
                 )
                 ranges = aligned.get("ranges", []) if isinstance(aligned, dict) else []
                 if not ranges:
@@ -39425,6 +40023,7 @@ class SessionState:
                     source_tool=tool,
                     role=role,
                     locator=command,
+                    operation=operation,
                     excerpts=list(aligned.get("excerpts", []) or []),
                     matched_lines=int(aligned.get("matched_lines", 0) or 0),
                     confidence=float(aligned.get("confidence", 0.0) or 0.0),
@@ -39456,9 +40055,12 @@ class SessionState:
             return "process_observation"
         if tool == "stop_background_process":
             return "process_control"
-        if tool in {"bash", "worktree_run"}:
+        if tool in {"bash", "background_run", "worktree_run"}:
             if not ok or self._command_output_has_error_shape(output):
                 return "command_error"
+            operation, declared = self._bash_operation_from_args(args)
+            if declared:
+                return self._bash_operation_evidence_kind(operation)
             if self._bash_looks_like_file_read(command):
                 return "file_read"
             if self._command_looks_like_validation(command):
@@ -39542,6 +40144,7 @@ class SessionState:
             return trim(f"{tool}: {path} :: {head}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"bash", "background_run", "worktree_run"} and isinstance(args, dict):
             cmd = trim(str(args.get("command", "") or ""), 180)
+            operation, declared = self._bash_operation_from_args(args)
             picked = []
             for ln in lines[:12]:
                 if ln.startswith("[long_output"):
@@ -39554,7 +40157,8 @@ class SessionState:
                 if len(" ".join(picked)) >= TOOL_MEMORY_SUMMARY_MAX_CHARS:
                     break
             body = " ".join(picked) if picked else "(no output)"
-            return trim(f"{tool}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
+            label = f"{tool}[{operation}]" if declared else tool
+            return trim(f"{label}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"load_skill", "unload_skill"} and isinstance(args, dict):
             return trim(f"{tool}: {args.get('name', '')} :: {' '.join(lines[:4])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"list_background_processes", "stop_background_process"} and isinstance(args, dict):
@@ -39571,6 +40175,14 @@ class SessionState:
         command = str((args or {}).get("command", "") or "") if isinstance(args, dict) else ""
         if not command.strip():
             return False
+        operation, declared = self._bash_operation_from_args(args)
+        if declared and bash_operation_is_marked_observation(operation):
+            # Explicitly marked reads/perception are evidence even when the
+            # extractor returns only a short result (OCR line, dimensions,
+            # media duration, or a one-line document answer).
+            return True
+        if declared and operation in {"validation", "build_test", "process_control", "network"}:
+            return True
         low = command.strip().lower()
         if re.match(r"^(pwd|date|whoami|clear)\b", low) and ok and len(str(output or "")) < 400:
             return False
@@ -39586,7 +40198,7 @@ class SessionState:
             return True
         if not ok:
             return True
-        if self._bash_looks_like_file_read(command) and len(str(output or "")) >= 40:
+        if self._bash_looks_like_file_read(command):
             return True
         if re.search(r"\b(rg|grep|find|fd|ls)\b", low) and len(str(output or "")) >= 120:
             return True
@@ -39635,10 +40247,20 @@ class SessionState:
         if not isinstance(registry, dict):
             registry = {}
         old = registry.get(key, {}) if isinstance(registry.get(key, {}), dict) else {}
-        source_fp = self._read_source_fingerprint(rel_path) if kind == "file_read" and rel_path else {}
+        operation, operation_declared = self._bash_operation_from_args(src_args)
+        source_fp = (
+            self._read_source_fingerprint(rel_path)
+            if rel_path and (kind == "file_read" or (operation_declared and bash_operation_is_marked_observation(operation)))
+            else {}
+        )
         sha = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         evidence_match = re.search(r"\[evidence_ref id=([a-f0-9]{24})\b", text)
-        evidence_id = evidence_match.group(1) if evidence_match else str(old.get("evidence_id", "") or "")
+        result_meta = self._peek_tool_result_meta()
+        evidence_id = (
+            evidence_match.group(1)
+            if evidence_match
+            else str(result_meta.get("evidence_id", "") or old.get("evidence_id", "") or "")
+        )
         cached = str(cache_path or old.get("cache_path", "") or "")
         if len(text) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
             not cached or str(old.get("sha256", "") or "") != sha
@@ -39665,6 +40287,12 @@ class SessionState:
             "path": rel_path,
             "target_path": rel_path,
             "command": cmd,
+            "operation": (
+                operation
+                if tool in {"bash", "worktree_run", "background_run"}
+                and operation_declared
+                else str(old.get("operation", "") or "")
+            ),
             "signature": signature,
             "agent_role": role_key,
             "status": entry_status,
@@ -40331,7 +40959,9 @@ class SessionState:
             rows.append(
                 "- "
                 f"id={entry.get('key','')} status={status} role={entry.get('agent_role','')} "
-                f"tool={tool} kind={kind} result={entry.get('result_status','ok')} {locator} "
+                f"tool={tool} kind={kind} result={entry.get('result_status','ok')} "
+                + (f"operation={entry.get('operation')} " if entry.get("operation") else "")
+                + f"{locator} "
                 f"chars={int(entry.get('chars', 0) or 0)} hits={int(entry.get('hit_count', 0) or 0)} "
                 f"age={_age(entry.get('last_ts', 0.0))} "
                 f"summary={trim(str(entry.get('summary','') or ''), 300)}"
@@ -40401,6 +41031,11 @@ class SessionState:
             cap = self._tool_max_chars(src.get("max_chars"))
             if len(body) > cap:
                 body = body[:cap] + "\n...[trace clipped; use read_file/bash verification locator]"
+            try:
+                trace_depth = max(0, min(4, int(src.get("depth", 2) or 2)))
+            except (TypeError, ValueError):
+                trace_depth = 2
+            neighborhood = controller.trace(str(row.get("id", eid)), depth=trace_depth, limit=80)
             return json_dumps({
                 "ok": True,
                 "mode": "trace",
@@ -40414,6 +41049,10 @@ class SessionState:
                 "exact_output": body,
                 "verification": {"tool": row.get("tool", ""), "path": row.get("path", ""), "args": row.get("args", "{}")},
                 "links": controller.links(str(row.get("id", eid))),
+                "causal_trace": {
+                    "nodes": neighborhood.get("nodes", []) if isinstance(neighborhood, dict) else [],
+                    "links": neighborhood.get("links", []) if isinstance(neighborhood, dict) else [],
+                },
             }, indent=2)
         if mode == "remember":
             try:
@@ -40995,6 +41634,20 @@ class SessionState:
         state.pop("next_action", None)
         store[role_key] = state
         self.agent_loop_progress_state = store
+        self._record_flow_node(
+            "loop_state",
+            {
+                "round_kind": state.get("round_kind", ""),
+                "round_tools": state.get("round_tools", []),
+                "evidence_fresh": state.get("evidence_fresh", 0),
+                "evidence_reused": state.get("evidence_reused", 0),
+                "reused_streak": state.get("reused_streak", 0),
+                "stagnant_evidence_streak": state.get("stagnant_evidence_streak", 0),
+                "guidance_reason": state.get("guidance_reason", ""),
+            },
+            role=role_key,
+            metadata={"todo_fp": todo_fp, "current_phase": str(getattr(self, "current_phase", "") or "")},
+        )
         return state
 
     def _mark_agent_loop_strategy_signal(self, role: str, reason: str) -> None:
@@ -41011,6 +41664,12 @@ class SessionState:
         state["updated_at"] = now_ts()
         store[role_key] = state
         self.agent_loop_progress_state = store
+        self._record_flow_node(
+            "loop_intervention",
+            {"reason": trim(str(reason or "strategy_signal"), 240), "state": {k: state.get(k) for k in ("round_kind", "guidance_reason", "reused_streak", "stagnant_evidence_streak")}},
+            role=role_key,
+            metadata={"intervention": trim(str(reason or "strategy_signal"), 120)},
+        )
 
     def _agent_loop_progress_prompt_block(self, for_role: str = "") -> str:
         """Render observation-only multi-agent progress telemetry.
@@ -41279,7 +41938,13 @@ class SessionState:
                 if isinstance(row, dict) and str(row.get("path", "") or "").strip()
             ]
             read_targets = list(dict.fromkeys(
-                observed_paths + self._bash_file_read_targets(command_text)
+                observed_paths
+                + self._bash_file_read_targets(
+                    command_text,
+                    operation=self._bash_operation_from_args(src_args)[0]
+                    if self._bash_operation_from_args(src_args)[1]
+                    else "",
+                )
             ))
             result_probe = {
                 "name": tool,
@@ -41301,9 +41966,13 @@ class SessionState:
                 "validation"
                 if negative_assertion
                 else (
-                    "file_read"
-                    if source_observations
-                    else self._tool_memory_evidence_kind(tool, src_args, text, ok)
+                    self._bash_operation_evidence_kind(self._bash_operation_from_args(src_args)[0])
+                    if self._bash_operation_from_args(src_args)[1]
+                    else (
+                        "file_read"
+                        if source_observations
+                        else self._tool_memory_evidence_kind(tool, src_args, text, ok)
+                    )
                 )
             )
             self._record_tool_memory(
@@ -46608,6 +47277,7 @@ body{padding:18px}
                 observations.append({
                     "id": observation_id,
                     "source_tool": trim(str(item.get("source_tool", "reader") or "reader"), 40),
+                    "operation": trim(str(item.get("operation", "") or ""), 80),
                     "agent_role": trim(str(item.get("agent_role", "single") or "single"), 40),
                     "locator": trim(str(item.get("locator", "") or ""), 500),
                     "ranges": ranges,
@@ -47611,6 +48281,7 @@ body{padding:18px}
         source_tool: str = "reader",
         role: str = "",
         locator: str = "",
+        operation: str = "",
         excerpts: list[str] | None = None,
         matched_lines: int = 0,
         confidence: float = 1.0,
@@ -47725,6 +48396,7 @@ body{padding:18px}
         objective_sig = self._long_content_objective_signature(self._long_content_objective())
         observation_basis = json_dumps({
             "tool": tool_name,
+            "operation": trim(str(operation or ""), 80),
             "locator": trim(str(locator or ""), 500),
             "ranges": clean_ranges,
             "evidence": bounded_evidence,
@@ -47740,6 +48412,7 @@ body{padding:18px}
             observations.append({
                 "id": observation_id,
                 "source_tool": tool_name,
+                "operation": trim(str(operation or ""), 80),
                 "agent_role": role_key,
                 "locator": trim(str(locator or ""), 500),
                 "ranges": [[a, b] for a, b in clean_ranges[:LONG_CONTENT_OBSERVATION_MAX_RANGES]],
@@ -47916,7 +48589,9 @@ body{padding:18px}
                     trim(str(x), 150) for x in (observation.get("excerpts", []) or [])[:3] if str(x).strip()
                 )
                 parts.append(
-                    f"  verified_observation tool={observation.get('source_tool','reader')} refs={refs}: {evidence}"
+                    f"  verified_observation tool={observation.get('source_tool','reader')}"
+                    + (f" operation={observation.get('operation')}" if observation.get("operation") else "")
+                    + f" refs={refs}: {evidence}"
                 )
             semantic = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
             if str(row.get("semantic_status", "") or "").lower() == "ready" and semantic:
@@ -51375,6 +52050,21 @@ body{padding:18px}
 
         for attempt in range(1, retry_budget + 2):
             try:
+                self._record_flow_node(
+                    "model_call",
+                    {
+                        "context_label": trim(str(context_label or "agent"), 120),
+                        "attempt": int(attempt),
+                        "tool_count": len(tools or []),
+                        "prompt_tokens_estimate": int(estimated_prompt_tokens or 0),
+                    },
+                    role=context_role_hint or getattr(self, "active_agent_role", ""),
+                    metadata={
+                        "attempt": int(attempt),
+                        "retry_budget": int(retry_budget),
+                        "context_label": trim(str(context_label or "agent"), 120),
+                    },
+                )
                 if visible_response_stream:
                     self._clear_live_response()
                     self._begin_live_response(
@@ -54088,32 +54778,43 @@ body{padding:18px}
 
     def run_subagent(self, prompt: str, agent_type: str = "Explore") -> str:
         subtools = [
-            tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
+            tool_def(
+                "bash",
+                "Execute a shell command. For a special read/perception task, optionally provide operation using the bash provenance codes (text_read/text_search/document_extract/ocr/media_metadata/media_extract/custom_extract/validation/build_test/process_control/network/execute); prefer read_file for exact ordinary source reads.",
+                {
+                    "command": {"type": "string"},
+                    "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker; known markers receive specialized memory handling."},
+                    "recognition_code": {"type": "string"},
+                },
+                ["command"],
+            ),
             tool_def(
                 "read_file",
                 (
-                    "Read files or directories with structure-aware modes. "
+                    "Preferred tool for reading files or directories with structure-aware, source-addressable modes. "
                     "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
                     "app.py line 240 -> mode='window' line=240 context=5; "
                     "run.txt E123 -> mode='search' query='E123'. "
                     "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed. "
-                    "Successful reads are remembered in the tool-memory registry."
+                    "Successful reads receive immutable evidence and are remembered in the tool-memory registry."
                 ),
                 {
                     "path": {"type": "string"},
                     "mode": {
                         "type": "string",
-                        "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
-                        "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                        "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "evidence", "directory"],
+                        "description": "Reading strategy. Use structure/overview for a bounded source map, segment for a remembered section, symbol with target for a function/class, search/evidence with query for text and ranked citations, and window with line/context for a line range. Avoid full for large logs when a query is known.",
                     },
                     "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
-                    "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
+                    "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure'."},
+                    "query": {"type": "string", "description": "Search text or regex for mode='search' or mode='evidence'; can also be used when target is unknown."},
                     "line": {"type": "integer", "description": "1-based center line for mode='window'."},
                     "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
                     "regex": {"type": "boolean", "description": "Treat query as a regular expression in mode='search'."},
                     "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
                     "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
                     "offset": {"type": "integer", "description": "0-based character offset for mode='full'; legacy 0-based line/entry offset for mode='window' or mode='directory'. Prefer mode='window' with line/context for line-oriented reads."},
+                    "fresh": {"type": "boolean", "description": "Force an exact source reread instead of reusing verified long-content memory."},
                 },
                 ["path"],
             ),
@@ -62534,7 +63235,11 @@ body{padding:18px}
             if name in {"read_file", "write_file", "edit_file"}:
                 _add(args.get("path", "") or args.get("file_path", ""))
             elif name in {"bash", "worktree_run"}:
-                for path in self._bash_file_read_targets(str(args.get("command", "") or ""))[:6]:
+                operation, declared = self._bash_operation_from_args(args)
+                for path in self._bash_file_read_targets(
+                    str(args.get("command", "") or ""),
+                    operation=operation if declared else "",
+                )[:6]:
                     _add(path)
         path_inference = self._plan_step_quality_path_inference(plan_step, paths)
         for path in path_inference.get("candidate_paths", []) if isinstance(path_inference, dict) else []:
@@ -63487,6 +64192,20 @@ body{padding:18px}
             self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-transition")
         except Exception:
             pass
+        self._record_flow_node(
+            "plan_step_transition",
+            {
+                "from": previous_focus,
+                "to": new_focus,
+                "actor": trim(str(actor or ""), 40),
+                "evidence": trim(str(evidence or ""), 600),
+            },
+            role=actor,
+            metadata={
+                "from_focus_id": str(previous_focus.get("id", "") or ""),
+                "to_focus_id": str(new_focus.get("id", "") or ""),
+            },
+        )
         return True
 
     def _post_execution_plan_step_check(self, route: dict, worker_step: dict) -> bool:
@@ -76626,7 +77345,10 @@ body{padding:18px}
                 self._blackboard_set_status("CODING")
         elif name in {"bash", "worktree_run", "check_background"}:
             cmd = trim(str(args.get("command", "") or "").strip(), 180)
+            operation, operation_declared = self._bash_operation_from_args(args)
             line = f"{name} {cmd}".strip()
+            if operation_declared:
+                line = f"{line}\noperation={operation}".strip()
             if output:
                 line = f"{line}\n{output}".strip()
             if item.get("exit_code") is not None:
@@ -76661,7 +77383,10 @@ body{padding:18px}
                     command=str(args.get("command", "") or ""),
                     tier="long",
                 )
-            bash_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
+            bash_paths = self._bash_file_read_targets(
+                str(args.get("command", "") or ""),
+                operation=operation if operation_declared else "",
+            )
             if bash_paths and ok:
                 self._blackboard_append_memory(
                     "file_read",
@@ -76804,7 +77529,12 @@ body{padding:18px}
             }
             if name in {"bash", "worktree_run"}:
                 file_paths = list(dict.fromkeys(
-                    self._bash_file_read_targets(str(args.get("command", "") or ""))
+                    self._bash_file_read_targets(
+                        str(args.get("command", "") or ""),
+                        operation=self._bash_operation_from_args(args)[0]
+                        if self._bash_operation_from_args(args)[1]
+                        else "",
+                    )
                     + list(changed_paths)
                 ))
             for value in file_paths[:8]:
@@ -80850,20 +81580,32 @@ body{padding:18px}
 
     def _clear_tool_result_meta(self) -> None:
         try:
-            self._tool_result_local.meta = {}
+            local = getattr(self, "_tool_result_local", None)
+            if local is None:
+                local = threading.local()
+                self._tool_result_local = local
+            local.meta = {}
         except Exception:
             pass
 
     def _set_tool_result_meta(self, **values) -> None:
         try:
             clean = {str(key): value for key, value in values.items() if value is not None}
-            self._tool_result_local.meta = clean
+            local = getattr(self, "_tool_result_local", None)
+            if local is None:
+                local = threading.local()
+                self._tool_result_local = local
+            local.meta = clean
         except Exception:
             pass
 
     def _peek_tool_result_meta(self) -> dict:
         try:
-            raw = getattr(self._tool_result_local, "meta", {})
+            local = getattr(self, "_tool_result_local", None)
+            if local is None:
+                local = threading.local()
+                self._tool_result_local = local
+            raw = getattr(local, "meta", {})
             return dict(raw) if isinstance(raw, dict) else {}
         except Exception:
             return {}
@@ -80934,6 +81676,10 @@ body{padding:18px}
             "ok": self._tool_result_ok(tool_name, output, meta),
         }
         if tool_name in {"bash", "worktree_run", "check_background"}:
+            operation, declared = self._bash_operation_from_args(item_args)
+            if declared or meta.get("operation"):
+                item["operation"] = str(meta.get("operation", operation) or operation)
+                item["operation_declared"] = bool(meta.get("operation_declared", declared))
             exit_code = self._effective_shell_exit_code(output, meta.get("exit_code"))
             if exit_code is not None:
                 item["exit_code"] = int(exit_code)
@@ -80942,6 +81688,10 @@ body{padding:18px}
         for key in ("duration_ms", "changed_files", "error", "evidence_id"):
             if meta.get(key) not in (None, "", []):
                 item[key] = meta.get(key)
+        if not item.get("evidence_id"):
+            match = re.search(r"\[evidence_ref id=([a-f0-9]{24})\b", str(output or ""))
+            if match:
+                item["evidence_id"] = match.group(1)
         item = self._annotate_negative_search_assertion(item)
         self._update_shell_failure_guidance(tool_name, item, meta)
         return self._annotate_tool_control_feedback(item)
@@ -80984,14 +81734,42 @@ body{padding:18px}
         if resume_alias and "resume" not in args and "continue" not in args and "resume_existing" not in args:
             args = {**args, "resume": True}
         if name == "agent_web_search" and not bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)):
-            return "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable)."
+            return self._trace_tool_result(
+                name,
+                args,
+                "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable).",
+                "",
+            )
         role_key = self._sanitize_agent_role(agent_role)
+        args = dict(args)
+        flow_context = self._flow_context(role_key, tool_call_id)
+        # Main agent loops emit a visible tool_start first. Subagent and
+        # programmatic callers may not; create the graph node only when no
+        # visible start node already exists for this call.
+        if not flow_context.get("tool_start_evidence_id"):
+            flow_context["tool_start_evidence_id"] = self._record_flow_node(
+                "tool_start",
+                {"name": name, "args": self._flow_safe_args(args)},
+                role=role_key,
+                metadata={**flow_context, "tool_call_id": tool_call_id},
+                parent_ids=[flow_context.get("parent_evidence_id", "")],
+            )
+        args["_flow_context"] = flow_context
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
-            return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
+            out = self._trace_tool_result(
+                name,
+                args,
+                f"Error: tool '{name}' is not allowed for agent role '{role_key}'",
+                role_key,
+            )
+            self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+            return out
         role_guard = self._guard_role_shell_mutation(role_key, name, args)
         if role_guard:
             self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=role_guard)
-            return role_guard
+            out = self._trace_tool_result(name, args, role_guard, role_key)
+            self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+            return out
         try:
             # Shell-backed tools have their own timeout/state mechanism; keep
             # them on this thread so structured outcome metadata is not lost at
@@ -81261,6 +82039,7 @@ body{padding:18px}
             self._emit("status", {"summary": f"calling MCP tool {name}"})
             return mgr.call(name, args if isinstance(args, dict) else {})
         if name == "bash":
+            operation, operation_declared = self._bash_operation_from_args(args)
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
                 self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=guard_error)
@@ -81292,6 +82071,8 @@ body{padding:18px}
             self._set_tool_result_meta(
                 exit_code=effective_exit,
                 shell_exit_code=meta.get("exit_code"),
+                operation=operation,
+                operation_declared=operation_declared,
                 duration_ms=meta.get("duration_ms"),
                 changed_files=list(meta.get("changed_files", []) or []),
                 error=str(meta.get("error", "") or ""),
@@ -81344,6 +82125,8 @@ body{padding:18px}
                 "command",
                 {
                     "name": "bash",
+                    "operation": operation,
+                    "operation_declared": operation_declared,
                     "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "command": meta["command"],
                     "effective_command": meta.get("effective_command", meta["command"]),
@@ -82042,6 +82825,7 @@ body{padding:18px}
         if name == "worktree_status":
             return self.worktrees.status(args["name"])
         if name == "worktree_run":
+            operation, operation_declared = self._bash_operation_from_args(args)
             wt_path = self.worktrees.resolve_path(args["name"])
             if wt_path is None:
                 return f"Error: unknown worktree '{args['name']}'"
@@ -82054,6 +82838,8 @@ body{padding:18px}
             self._set_tool_result_meta(
                 exit_code=effective_exit,
                 shell_exit_code=meta.get("exit_code"),
+                operation=operation,
+                operation_declared=operation_declared,
                 duration_ms=meta.get("duration_ms"),
                 changed_files=list(meta.get("changed_files", []) or []),
                 error=str(meta.get("error", "") or ""),
@@ -82064,6 +82850,8 @@ body{padding:18px}
                 "command",
                 {
                     "name": "worktree_run",
+                    "operation": operation,
+                    "operation_declared": operation_declared,
                     "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "worktree": args["name"],
                     "command": meta["command"],
