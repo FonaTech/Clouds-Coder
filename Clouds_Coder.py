@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 from __future__ import annotations
 
 import argparse
@@ -4464,12 +4463,12 @@ CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
     min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
 )
 LARGE_FILE_AUTO_PAGE_BYTES = max(
-    32 * 1024,
-    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
+    8 * 1024,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(30 * 1024)) or str(30 * 1024))),
 )
 LARGE_FILE_AUTO_PAGE_LINES = max(
-    1000,
-    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
+    400,
+    int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "1000") or "1000")),
 )
 LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
     1200,
@@ -4647,6 +4646,23 @@ READ_FILE_LOOP_THRESHOLD = 6
 READ_FILE_LOOP_DISTINCT_SOFT_LIMIT = 5
 READ_FILE_COMPACT_PIN_DISTINCT = 8
 READ_FILE_COMPACT_PIN_MAX_CHARS = 12_000
+# Total characters of recent distinct read_file results kept intact by
+# microcompact, per context tier (0 = no pressure ... 3 = heavy pressure).
+READ_FILE_PIN_TOTAL_CHARS = (60_000, 30_000, 12_000, 4_000)
+# Per-thread dispatch context for read bookkeeping. Teammate and subagent
+# threads dispatch tools concurrently with the main loop, so the current
+# tool_call_id and read role must not be shared instance attributes.
+_READ_DISPATCH_CONTEXT = threading.local()
+# Content that replaced a tool result during compaction. A message that starts
+# with one of these no longer carries the original body.
+READ_RESULT_PLACEHOLDER_PREFIXES = (
+    "[read_file cached",
+    "[tool_memory cached",
+    "[cleared by microcompact",
+    "[Previous:",
+    "[file_buffer:",
+    "[tool output",
+)
 READ_CONTEXT_REGISTRY_MAX = 80
 READ_CONTEXT_PROMPT_MAX_ITEMS = 14
 READ_CONTEXT_PROMPT_MAX_CHARS = 5_000
@@ -4700,7 +4716,7 @@ DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 # The loader deliberately accepts older rows (and future rows with extra
 # fields), so existing sessions/RAG evidence remain readable without a
 # migration step.
-LONG_CONTENT_MEMORY_VERSION = 4
+LONG_CONTENT_MEMORY_VERSION = 5
 LONG_CONTENT_MEMORY_MAX_ITEMS = max(
     8,
     min(160, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_ITEMS", "80") or "80"))),
@@ -4775,6 +4791,25 @@ LONG_CONTENT_DATA_EXTS = {
     ".xsd", ".xsl",
 }
 DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
+# In-session model request concurrency: how many model HTTP requests one
+# session may have in flight at once (main loop, sub-agents, teammates and
+# auxiliary background calls share the budget).  Sessions never share a gate;
+# max_user / max_user_sessions and the session scheduler are unaffected.
+SESSION_LLM_CONCURRENCY_MIN = 1
+SESSION_LLM_CONCURRENCY_MAX = 16
+SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT = 2
+
+
+def _session_llm_concurrency_env_default() -> int:
+    raw = str(os.getenv("AGENT_SESSION_LLM_CONCURRENCY", "") or "").strip()
+    try:
+        value = int(float(raw)) if raw else SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT
+    except Exception:
+        value = SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT
+    return max(SESSION_LLM_CONCURRENCY_MIN, min(SESSION_LLM_CONCURRENCY_MAX, value))
+
+
+DEFAULT_SESSION_LLM_CONCURRENCY = _session_llm_concurrency_env_default()
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 # Normal debugging often needs several corrected tool attempts before any
 # observable state changes. Keep this separate from the fused fault/error caps.
@@ -4934,6 +4969,11 @@ _TOOL_TIMEOUT_MAP = {
     "compress": 30,
 }
 _DEFAULT_TOOL_TIMEOUT = 90
+# Cooperative cancel flag for a timed tool's pool thread (see
+# SessionState._run_tool_with_cancel_event) and the lock guarding the
+# per-session orphan-thread counters.
+_TOOL_CANCEL_LOCAL = threading.local()
+_TOOL_ORPHAN_LOCK = threading.Lock()
 CONVERSATION_VISIBLE_TOOL_EVENTS = {
     "agent_web_search",
     "query_code_library",
@@ -5076,6 +5116,7 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<fault-prefill>",
     "<single-no-plan-todo-bootstrap>",
     "<single-no-plan-todo-bootstrap-retry>",
+    "<read-context-strategy>",
 )
 # These blocks are runtime plumbing rather than user-visible conversation.  Keep
 # user-facing structured controls such as live-user-adjustment and
@@ -5267,6 +5308,46 @@ BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP = 20
 BLACKBOARD_MEMORY_LONG_MAX = 96
 BLACKBOARD_MEMORY_INDEX_MAX = 260
 SKILL_REFRESH_MIN_INTERVAL_SECONDS = 1.5
+
+# IDE toolchain discovery is an expensive filesystem operation on machines
+# with long PATHs (especially conda, nvm and cargo installations).  Keep one
+# process-wide cache so repeated /api/ide/config requests do not rescan every
+# PATH entry.  The cache key includes the inputs used by shutil.which, so a
+# changed environment is detected without platform-specific path assumptions.
+IDE_TOOLCHAIN_CACHE_TTL_SECONDS = 60.0
+_IDE_TOOLCHAIN_CACHE_LOCK = threading.RLock()
+_IDE_TOOLCHAIN_CACHE: dict[tuple[str, str, str, str], tuple[float, list[dict]]] = {}
+_IDE_TOOLCHAIN_REFRESHING: set[tuple[str, str, str, str]] = set()
+SKILL_RECALL_CACHE_TTL_SECONDS = 2.0
+SKILL_RECALL_CACHE_MAX_ENTRIES = 256
+SKILL_RECALL_GENERIC_TOKENS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "this", "that", "use", "build", "create", "analyze",
+        "task", "step", "current", "plan", "phase", "direct", "objective", "execution", "run", "start",
+        "auto", "ide", "programming", "request", "workspace", "root", "writable", "path", "session",
+    }
+)
+
+
+def _skill_term_match(haystack: str, term: str) -> bool:
+    """Match a recall term without compiling a regular expression per hit."""
+    if not term:
+        return False
+    if any("\u3400" <= char <= "\u9fff" for char in term):
+        return term in haystack
+    start = 0
+    while True:
+        index = haystack.find(term, start)
+        if index < 0:
+            return False
+        left = haystack[index - 1] if index else ""
+        end = index + len(term)
+        right = haystack[end] if end < len(haystack) else ""
+        left_word = bool(left) and (left.isascii() and (left.isalnum() or left == "_"))
+        right_word = bool(right) and (right.isascii() and (right.isalnum() or right == "_"))
+        if not left_word and not right_word:
+            return True
+        start = index + max(1, len(term))
 SKILL_CATALOG_FULL_REFRESH_SECONDS = max(
     5.0,
     min(300.0, float(str(os.getenv("AGENT_SKILL_CATALOG_FULL_REFRESH_SECONDS", "30") or "30"))),
@@ -5282,6 +5363,12 @@ SKILL_AUTOLOAD_SCORE_THRESHOLD = 8.0
 SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD = 0.72
 SKILL_RUNTIME_EVALUATION_TTL_SECONDS = max(1.0, float(os.getenv("AGENT_SKILL_EVALUATION_TTL_SECONDS", "600")))
 SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS = max(0.1, float(os.getenv("AGENT_SKILL_EVALUATION_TIMEOUT_SECONDS", "8")))
+# Socket timeout for the advisory completed-subtask acceptance check.  It runs
+# synchronously on the agent thread, so the socket timeout is its only bound.
+ACCEPTANCE_VERIFY_TIMEOUT_SECONDS = max(
+    2.0,
+    min(60.0, float(str(os.getenv("AGENT_ACCEPTANCE_VERIFY_TIMEOUT_SECONDS", "15") or "15"))),
+)
 SKILL_RUNTIME_UNLOAD_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, float(os.getenv("AGENT_SKILL_UNLOAD_CONFIDENCE", "0.80"))))
 SKILL_RUNTIME_KEY_TOOL_INTERVAL = 12
 SKILL_RUNTIME_EVENTS_MAX = 160
@@ -7530,6 +7617,50 @@ def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
         for key in keys:
             if key in section:
                 return normalize_auto_task_level_ceiling(section.get(key))
+    return None
+
+
+def normalize_session_llm_concurrency(value: object, default: int = DEFAULT_SESSION_LLM_CONCURRENCY) -> int:
+    """Normalize the in-session model request concurrency to 1-16.
+
+    Missing or unparsable values use ``default``; numeric values outside the
+    range are clamped rather than rejected so a typo cannot disable the gate.
+    """
+    try:
+        fallback = int(default)
+    except Exception:
+        fallback = SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT
+    fallback = max(SESSION_LLM_CONCURRENCY_MIN, min(SESSION_LLM_CONCURRENCY_MAX, fallback))
+    try:
+        if value is None or isinstance(value, bool):
+            raw = fallback
+        else:
+            text = str(value).strip()
+            raw = int(float(text)) if text else fallback
+    except Exception:
+        raw = fallback
+    return max(SESSION_LLM_CONCURRENCY_MIN, min(SESSION_LLM_CONCURRENCY_MAX, int(raw)))
+
+
+def extract_session_llm_concurrency_setting(raw: object) -> int | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = (
+        "session_llm_concurrency",
+        "sessionLlmConcurrency",
+        "llm_concurrency_per_session",
+        "llmConcurrencyPerSession",
+    )
+    for key in keys:
+        if key in raw:
+            return normalize_session_llm_concurrency(raw.get(key))
+    for section_key in ("startup", "runtime", "classification", "manager", "agent", "limits"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return normalize_session_llm_concurrency(section.get(key))
     return None
 
 
@@ -11816,15 +11947,51 @@ def _map_todo_status_token(token: str) -> str:
     }.get(raw, "")
 
 
+# Short display ids ("t3") let the model address an existing Todo row.
+# TodoManager assigns them in first-appearance order and render() prints them
+# as "[ ] (t3) content"; the parsers strip a leading "(tN)" tag again and
+# return it as an id hint, so an echoed row updates its original instead of
+# becoming a new row whose text is "(t3) ...".
+_TODO_SHORT_ID_RE = re.compile(r"^t([1-9][0-9]{0,4})$", re.IGNORECASE)
+_TODO_SHORT_ID_TAG_RE = re.compile(r"^[(（]\s*(t[1-9][0-9]{0,4})\s*[)）]\s*", re.IGNORECASE)
+
+
+def normalize_todo_short_id(value: object) -> str:
+    """Return the canonical short id ("t3") or "" when value is not one."""
+    match = _TODO_SHORT_ID_RE.match(str(value or "").strip())
+    return f"t{int(match.group(1))}" if match else ""
+
+
+def strip_todo_short_id_tag(text: object) -> tuple[str, str]:
+    """Split a leading "(tN)" display tag off Todo text: (short_id, rest)."""
+    raw = str(text or "")
+    match = _TODO_SHORT_ID_TAG_RE.match(raw.lstrip())
+    if not match:
+        return "", raw
+    return normalize_todo_short_id(match.group(1)), raw.lstrip()[match.end():]
+
+
 def split_todo_status_text(text: object) -> tuple[str, str]:
+    status, content, _short_id = split_todo_status_text_with_id(text)
+    return status, content
+
+
+def split_todo_status_text_with_id(text: object) -> tuple[str, str, str]:
+    """Like split_todo_status_text, also returning a stripped "(tN)" id hint."""
     probe = normalize_embedded_newlines(text).strip()
     if not probe:
-        return "", ""
+        return "", "", ""
     status = ""
+    short_id = ""
     marker_prefix = r"(?:[-*•>]+\s*)?"
     for _ in range(4):
         before = probe
         probe = re.sub(r"^\s+", "", probe)
+        tag_id, tagged_rest = strip_todo_short_id_tag(re.sub(rf"^{marker_prefix}", "", probe))
+        if tag_id:
+            short_id = short_id or tag_id
+            probe = tagged_rest.strip()
+            continue
         matched = False
         for row_status, pattern in (
             (
@@ -11873,7 +12040,7 @@ def split_todo_status_text(text: object) -> tuple[str, str]:
             continue
         if probe == before:
             break
-    return status, probe.strip()
+    return status, probe.strip(), short_id
 
 
 def extract_todo_rows_from_text(
@@ -11905,7 +12072,18 @@ def extract_todo_rows_from_text(
                 variants.append(candidate)
         matched = False
         for candidate in variants:
-            status, content = split_todo_status_text(candidate)
+            status, content, short_id = split_todo_status_text_with_id(candidate)
+            if status and short_id and not content:
+                # "[x] (t3)": an id-only status line for an existing row.
+                row = {"content": "", "status": status, "short_id": short_id}
+                if parent_step_id:
+                    row["parent_step_id"] = parent_step_id
+                identity = (status, f"id:{short_id}", parent_step_id)
+                if identity not in seen:
+                    seen.add(identity)
+                    out.append(row)
+                matched = True
+                break
             if not status or not content:
                 continue
             cleaned = normalize_work_text(content, status) or content
@@ -11927,6 +12105,8 @@ def extract_todo_rows_from_text(
             }:
                 continue
             row = {"content": cleaned, "status": status}
+            if short_id:
+                row["short_id"] = short_id
             if parent_step_id:
                 row["parent_step_id"] = parent_step_id
             identity = (
@@ -12246,6 +12426,7 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
         return True, tags, ""
     except Exception as exc:
         return False, [], str(exc)
+
 
 def extract_ollama_model_capabilities(payload: object) -> dict:
     """Translate Ollama ``/api/show`` metadata to provider-neutral hints."""
@@ -16097,6 +16278,7 @@ def _admin_config_schema() -> list[dict]:
         row("web_search_enabled", "runtime", "Web search", "tri_state", "inherit", true_flag="--enable-web-search", false_flag="--disable-web-search", choices=["inherit", "enabled", "disabled"]),
         row("user_memory_mode", "runtime", "User memory mode", "enum", "weak", "--user-memory", choices=["off", "weak", "on"]),
         row("auto_task_level_ceiling", "runtime", "Auto task level ceiling", "integer", DEFAULT_AUTO_TASK_LEVEL_CEILING, "--auto_task_level_ceiling", minimum=0, maximum=5),
+        row("session_llm_concurrency", "runtime", "In-session model request concurrency", "integer", DEFAULT_SESSION_LLM_CONCURRENCY, "--session-llm-concurrency", minimum=SESSION_LLM_CONCURRENCY_MIN, maximum=SESSION_LLM_CONCURRENCY_MAX),
         row(
             "l2_todo_policy",
             "runtime",
@@ -17496,6 +17678,9 @@ class TodoManager:
             ):
                 if meta_key in raw and raw.get(meta_key) not in (None, ""):
                     row[meta_key] = raw.get(meta_key)
+            short_id = normalize_todo_short_id(raw.get("short_id", ""))
+            if short_id:
+                row["short_id"] = short_id
             if status == "completed" and not row.get("completed_at"):
                 row["completed_at"] = float(now_ts())
             if status == "in_progress" and not row.get("started_at"):
@@ -17505,6 +17690,7 @@ class TodoManager:
             validated.append(row)
         if len(validated) > 40:
             raise ValueError("max 40 todos")
+        self._assign_short_ids(validated)
         if validated and not any(x["status"] == "in_progress" for x in validated):
             for row in validated:
                 if row["status"] == "pending":
@@ -17520,6 +17706,66 @@ class TodoManager:
                 return self.no_changes_text()
             self.items = validated
         return self.render()
+
+    def _assign_short_ids(self, rows: list[dict]) -> None:
+        """Give every row a stable display id ("t3") the model can echo back.
+
+        Rows keep the id the merge path carried over. New rows take the next
+        number above any id seen so far, so a number is never reused while the
+        tree exists and an old reference can't silently land on another row.
+        """
+        with self.lock:
+            highest = int(getattr(self, "_short_id_high_water", 0) or 0)
+            current = list(self.items)
+        # Merge paths sometimes rebuild a row instead of copying the prior dict;
+        # inherit the id from the same row identity so the number stays put.
+        inherited: dict[tuple, str] = {}
+        for row in current:
+            sid = normalize_todo_short_id(row.get("short_id", ""))
+            if not sid:
+                continue
+            for ident in self._short_id_identities(row):
+                inherited.setdefault(ident, sid)
+        for row in current + rows:
+            sid = normalize_todo_short_id(row.get("short_id", ""))
+            if sid:
+                highest = max(highest, int(sid[1:]))
+        taken: set[str] = set()
+        for row in rows:
+            sid = normalize_todo_short_id(row.get("short_id", ""))
+            if not sid:
+                for ident in self._short_id_identities(row):
+                    candidate = inherited.get(ident, "")
+                    if candidate and candidate not in taken:
+                        sid = candidate
+                        break
+            if sid and sid not in taken:
+                row["short_id"] = sid
+                taken.add(sid)
+                continue
+            highest += 1
+            row["short_id"] = f"t{highest}"
+            taken.add(row["short_id"])
+        with self.lock:
+            self._short_id_high_water = highest
+
+    @staticmethod
+    def _short_id_identities(row: dict) -> list[tuple]:
+        """Identities that mean "the same row" across a rebuild, strongest first."""
+        out: list[tuple] = []
+        for field in ("subtask_id", "key", "external_subtask_id"):
+            value = str(row.get(field, "") or "").strip()
+            if value:
+                out.append((field, value))
+        content = re.sub(r"\s+", " ", str(row.get("content", "") or "").strip().casefold())
+        if content:
+            out.append((
+                "content",
+                content,
+                str(row.get("owner", "") or ""),
+                str(row.get("parent_step_id", "") or ""),
+            ))
+        return out
 
     def has_open_items(self) -> bool:
         with self.lock:
@@ -17538,7 +17784,9 @@ class TodoManager:
             suffix = (
                 f" <- {item['activeForm']}" if item["status"] == "in_progress" else ""
             )
-            lines.append(f"{marker} {item['content']}{suffix}")
+            # The short id lets the model address this row in the next TodoWrite.
+            id_tag = f"({item['short_id']}) " if item.get("short_id") else ""
+            lines.append(f"{marker} {id_tag}{item['content']}{suffix}")
         done = sum(1 for x in items if x["status"] == "completed")
         lines.append(f"\n{self._text('todo_footer', done=done, total=len(items))}")
         return "\n".join(lines)
@@ -21550,6 +21798,10 @@ class SkillStore:
         self.warnings: list[str] = []
         self.fingerprint = ""
         self.last_reload_ts = 0.0
+        self._metadata_cache: dict[str, dict] = {}
+        self._metadata_match_cache: dict[str, dict] = {}
+        self._recall_cache: dict[tuple, tuple[float, list[dict]]] = {}
+        self._recall_cache_order: deque[tuple] = deque()
         adopted = False
         if snapshot is not None:
             try:
@@ -21568,9 +21820,46 @@ class SkillStore:
                 self.warnings = list(snapshot.warnings)
                 self.fingerprint = str(snapshot.fingerprint or "")
                 self.last_reload_ts = now_ts()
+                self._rebuild_metadata_cache()
                 adopted = True
         if not adopted:
             self.reload(force=True)
+
+    def _clear_metadata_cache(self) -> None:
+        self._metadata_cache = {}
+        self._metadata_match_cache = {}
+        self._recall_cache = {}
+        self._recall_cache_order = deque()
+
+    def _rebuild_metadata_cache(self) -> None:
+        """Build immutable-ish routing metadata once per skill catalog revision."""
+        self._clear_metadata_cache()
+        for key, data in self.skills.items():
+            row = self._skill_metadata_record(key, data)
+            self._metadata_cache[key] = row
+            name = str(row.get("name", "") or "").casefold()
+            description = str(row.get("description", "") or "").casefold()
+            self._metadata_match_cache[key] = {
+                "negative_triggers": tuple(str(value).casefold() for value in row.get("negative_triggers", []) if str(value).strip()),
+                "terms": tuple(
+                    (str(value or "").strip().casefold(), str(value or "").strip())
+                    for value in list(row.get("triggers", [])) + list(row.get("keywords", [])) + list(row.get("aliases", []))
+                    if str(value or "").strip()
+                ),
+                "name": name,
+                "name_tokens": frozenset(
+                    part.casefold()
+                    for part in re.findall(r"[A-Za-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}", name, flags=re.UNICODE)
+                ),
+                "description_tokens": frozenset(
+                    part.casefold()
+                    for part in re.findall(r"[A-Za-z0-9+#.]{3,}|[\u3400-\u9fff]{2,}", description, flags=re.UNICODE)
+                ),
+            }
+
+    def _ensure_metadata_cache(self) -> None:
+        if len(self._metadata_cache) != len(self.skills) or set(self._metadata_cache) != set(self.skills):
+            self._rebuild_metadata_cache()
 
     def _sanitize_provider_id(self, raw: str, fallback: str) -> str:
         pid = re.sub(r"[^A-Za-z0-9._-]+", "-", (raw or "").strip().lower()).strip("-")
@@ -21684,6 +21973,10 @@ class SkillStore:
         return out[:24]
 
     def _skill_metadata_record(self, key: str, data: dict, *, score: float | None = None) -> dict:
+        if score is None:
+            cached = self._metadata_cache.get(str(key))
+            if isinstance(cached, dict):
+                return dict(cached)
         meta = dict(data.get("meta", {}) if isinstance(data.get("meta"), dict) else {})
         selection_meta = dict(meta)
         selection_meta.setdefault("description", str(data.get("description", "") or ""))
@@ -22253,6 +22546,7 @@ class SkillStore:
         for alias in self._skill_aliases(meta):
             if alias != skill_name:
                 self._register_alias(alias, key)
+        self._clear_metadata_cache()
 
     def _load_skill_file(self, skill_file: Path, provider_id: str, protocol: str, protocol_version: str):
         raw = try_read_text(skill_file)
@@ -22667,6 +22961,7 @@ class SkillStore:
         self.ambiguous = {}
         self.providers = {}
         self.warnings = []
+        self._clear_metadata_cache()
         if not self.skills_root.exists():
             self.fingerprint = fp
             self.last_reload_ts = now
@@ -22678,6 +22973,7 @@ class SkillStore:
         self._inject_builtin_skills()
         self.fingerprint = fp
         self.last_reload_ts = now
+        self._rebuild_metadata_cache()
 
     def _load_external_skill_roots(self):
         """Discover and load skills from external directories adjacent to skills_root.
@@ -22821,7 +23117,8 @@ class SkillStore:
         return sorted(names)
 
     def list_metadata(self) -> list[dict]:
-        out = [self._skill_metadata_record(key, data) for key, data in sorted(self.skills.items())]
+        self._ensure_metadata_cache()
+        out = [dict(self._metadata_cache[key]) for key in sorted(self.skills) if key in self._metadata_cache]
         if self.ambiguous:
             out.append(
                 {
@@ -22895,12 +23192,8 @@ class SkillStore:
         limit: int = 12,
         include_infrastructure: bool = False,
     ) -> list[dict]:
-        """Recall a bounded metadata candidate set without loading skill bodies."""
+        """Recall bounded metadata candidates using precomputed skill indexes."""
         raw_query = f"{focus or ''}\n{step or ''}\n{phase or ''}"
-        # Runtime wrappers describe where the request came from, not what the
-        # user is trying to accomplish.  Letting these lines participate in
-        # recall made tokens such as ``IDE`` and ``workspace`` outrank the
-        # actual current Todo/Plan step.
         meaningful_lines: list[str] = []
         for raw_line in normalize_embedded_newlines(raw_query).splitlines():
             line = re.sub(r"\s+", " ", str(raw_line or "").strip())
@@ -22914,79 +23207,71 @@ class SkillStore:
                 continue
             meaningful_lines.append(line)
         query = re.sub(r"\s+", " ", " ".join(meaningful_lines)).strip().casefold()
-        generic_tokens = {
-            "the", "and", "for", "with", "from", "this", "that", "use", "build", "create", "analyze",
-            "task", "step", "current", "plan", "phase", "direct", "objective", "execution", "run", "start",
-            "auto", "ide", "programming", "request", "workspace", "root", "writable", "path", "session",
-        }
         tokens: list[str] = []
         seen_tokens: set[str] = set()
         for token in re.findall(r"[\w.+#-]{2,}", query, flags=re.UNICODE):
             normalized = token.strip("._+-").casefold()
-            if not normalized or normalized in generic_tokens or normalized in seen_tokens:
+            if not normalized or normalized in SKILL_RECALL_GENERIC_TOKENS or normalized in seen_tokens:
                 continue
             seen_tokens.add(normalized)
             tokens.append(normalized)
 
-        def _ascii_term_match(haystack: str, term: str) -> bool:
-            if not term:
-                return False
-            if re.search(r"[\u3400-\u9fff]", term):
-                return term in haystack
-            return bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(term) + r"(?![A-Za-z0-9_])", haystack))
+        bounded_limit = max(1, min(50, int(limit or 12)))
+        cache_key = (
+            str(self.fingerprint or ""),
+            len(self.skills),
+            query,
+            str(step or "").strip().casefold(),
+            str(phase or "").strip().casefold(),
+            bounded_limit,
+            bool(include_infrastructure),
+        )
+        now = time.monotonic()
+        cached = self._recall_cache.get(cache_key)
+        if cached is not None and now - cached[0] < SKILL_RECALL_CACHE_TTL_SECONDS:
+            return [dict(row) for row in cached[1]]
 
+        self._ensure_metadata_cache()
         scored: list[tuple[float, str, dict]] = []
-        for key, data in self.skills.items():
-            meta = self._skill_metadata_record(key, data)
-            if meta.get("infrastructure_only") and not include_infrastructure:
+        generic_terms = SKILL_RECALL_GENERIC_TOKENS | {"skill"}
+        for key, base_meta in self._metadata_cache.items():
+            if base_meta.get("infrastructure_only") and not include_infrastructure:
                 continue
-            negatives = [str(x).casefold() for x in meta.get("negative_triggers", [])]
-            negative_hit = next((x for x in negatives if x and x in query), "")
+            match_meta = self._metadata_match_cache.get(key, {})
+            negatives = match_meta.get("negative_triggers", ())
+            negative_hit = next((value for value in negatives if value and value in query), "")
             if negative_hit:
-                meta["filter_reason"] = f"negative_trigger:{negative_hit}"
                 continue
             score = 0.0
-            # Explicit trigger/keyword/name matches are strong. Description is
-            # deliberately weak so words like Build/Use/Analyze do not dominate.
             seen_terms: set[str] = set()
-            for value in list(meta.get("triggers", [])) + list(meta.get("keywords", [])) + list(meta.get("aliases", [])):
-                raw_term = str(value or "").strip()
-                term = raw_term.casefold()
-                if not term or term in seen_terms or term in generic_tokens | {"skill"}:
+            for term, raw_term in match_meta.get("terms", ()):
+                if not term or term in seen_terms or term in generic_terms:
                     continue
                 seen_terms.add(term)
-                if _ascii_term_match(query, term):
-                    is_cjk = bool(re.search(r"[\u3400-\u9fff]", term))
+                if _skill_term_match(query, term):
+                    is_cjk = any("㐀" <= char <= "鿿" for char in term)
                     is_acronym = len(raw_term) >= 2 and raw_term.isupper()
                     score += 6.0 if is_cjk or is_acronym or " " in term or len(term) >= 6 else 2.0
-            name = str(meta.get("name", "") or "").casefold()
-            if name and _ascii_term_match(query, name):
+            name = str(match_meta.get("name", "") or "")
+            if name and _skill_term_match(query, name):
                 score += 8.0
-            name_tokens = {
-                part.casefold()
-                for part in re.findall(r"[A-Za-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}", name, flags=re.UNICODE)
-            }
-            description = str(meta.get("description", "") or "").casefold()
-            description_tokens = {
-                part.casefold()
-                for part in re.findall(r"[A-Za-z0-9+#.]{3,}|[\u3400-\u9fff]{2,}", description, flags=re.UNICODE)
-            }
+            name_tokens = match_meta.get("name_tokens", frozenset())
+            description_tokens = match_meta.get("description_tokens", frozenset())
             for token in tokens:
-                # Name matching uses normalized segments.  Arbitrary substring
-                # matching made ``ide`` match the middle of ``video``.
                 if token in name_tokens:
                     score += 2.5
                 elif token in description_tokens:
                     score += 0.35
-            # Keep unscored rows available only when the caller asks for an
-            # explicit catalog; automatic focus selection should stay empty.
             if score > 0:
-                scored.append((score, str(meta.get("canonical_id", key)), meta))
+                scored.append((score, str(base_meta.get("canonical_id", key)), dict(base_meta)))
         scored.sort(key=lambda row: (-row[0], row[1].casefold()))
-        return [
-            dict(row[2], score=round(row[0], 4))
-            for row in scored[: max(1, min(50, int(limit or 12)))]
-        ]
+        result = [dict(row[2], score=round(row[0], 4)) for row in scored[:bounded_limit]]
+        self._recall_cache[cache_key] = (now, result)
+        self._recall_cache_order.append(cache_key)
+        while len(self._recall_cache_order) > SKILL_RECALL_CACHE_MAX_ENTRIES:
+            old_key = self._recall_cache_order.popleft()
+            self._recall_cache.pop(old_key, None)
+        return [dict(row) for row in result]
 
     metadata_recall = recall_metadata
 
@@ -26238,6 +26523,443 @@ class OllamaError(RuntimeError):
         self.retryable = retryable
         self.transient = transient
 
+
+# Wake-up order for blocking model requests inside one session.  Lower rank is
+# served first; requests of the same class are served first-come first-served.
+SESSION_LLM_PRIORITY_RANKS = {"main": 0, "subagent": 1, "teammate": 2, "app": 3}
+SESSION_LLM_GATE_POLL_SECONDS = 0.25
+SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS = 16
+# Gate changes are pushed to the WebUI as one coalesced transient
+# ``llm_concurrency`` event per session per interval (trailing timer).
+SESSION_LLM_CONCURRENCY_PUSH_INTERVAL_SECONDS = 1.0
+# Model calls a single TodoWrite may make (intent, audit and review helpers
+# included) before the caller has to fall back to deterministic rules.
+TODO_LLM_CALL_BUDGET = 5
+TODO_LLM_TIMEOUT_FACTORY_DEFAULT = 15.0
+# Largest proposed tree the deterministic revision fallback may approve; it
+# matches TodoManager's hard 40-row cap.
+TODO_REVISION_FALLBACK_MAX_ROWS = 40
+
+
+def _todo_llm_timeout_env_default() -> float:
+    raw = str(os.getenv("AGENT_TODO_LLM_TIMEOUT_SECONDS", "") or "").strip()
+    try:
+        value = float(raw) if raw else TODO_LLM_TIMEOUT_FACTORY_DEFAULT
+    except Exception:
+        value = TODO_LLM_TIMEOUT_FACTORY_DEFAULT
+    if not math.isfinite(value):
+        value = TODO_LLM_TIMEOUT_FACTORY_DEFAULT
+    return max(2.0, min(120.0, value))
+
+
+# Socket timeout of model calls made inside a TodoWrite budget scope.  They run
+# synchronously on the agent thread, so a timeout is treated like a skip and
+# the caller applies its deterministic fallback instead of waiting.
+TODO_LLM_TIMEOUT_SECONDS = _todo_llm_timeout_env_default()
+
+
+class LLMGateBusy(RuntimeError):
+    """An auxiliary model request was skipped instead of waiting.
+
+    Raised before any HTTP request is sent when no in-session slot is free,
+    when the shared endpoint cooldown is active, or when too many orphaned
+    requests from earlier runs are still in flight.  Callers treat it as
+    "skip this time": no failure is recorded and nothing is cached.
+    """
+
+
+class TodoLLMBudgetExhausted(LLMGateBusy):
+    """The per-TodoWrite model-call budget on this thread is used up."""
+
+
+_TODO_LLM_BUDGET_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def todo_llm_budget_scope(limit: int = TODO_LLM_CALL_BUDGET):
+    """Cap model calls made on this thread while the scope is active.
+
+    ``OllamaClient.chat()`` counts every non-probe call made inside the scope
+    and raises ``TodoLLMBudgetExhausted`` once ``limit`` calls were made.
+    Nested scopes reuse the outer counter, so helper layers cannot grant
+    themselves extra calls.  Outside any scope calls are unlimited.  Yields
+    the live counter dict ``{"limit", "used", "denied"}``.
+    """
+    state = getattr(_TODO_LLM_BUDGET_LOCAL, "state", None)
+    if isinstance(state, dict):
+        yield state
+        return
+    try:
+        cap = max(0, int(limit))
+    except Exception:
+        cap = TODO_LLM_CALL_BUDGET
+    state = {"limit": cap, "used": 0, "denied": 0}
+    _TODO_LLM_BUDGET_LOCAL.state = state
+    try:
+        yield state
+    finally:
+        _TODO_LLM_BUDGET_LOCAL.state = None
+
+
+def _consume_todo_llm_budget() -> None:
+    state = getattr(_TODO_LLM_BUDGET_LOCAL, "state", None)
+    if not isinstance(state, dict):
+        return
+    if int(state.get("used", 0) or 0) >= int(state.get("limit", 0) or 0):
+        state["denied"] = int(state.get("denied", 0) or 0) + 1
+        raise TodoLLMBudgetExhausted(
+            f"TodoWrite model-call budget exhausted ({int(state.get('limit', 0) or 0)} calls)"
+        )
+    state["used"] = int(state.get("used", 0) or 0) + 1
+
+
+def todo_llm_budget_active() -> bool:
+    """True while this thread is inside a ``todo_llm_budget_scope``."""
+    return isinstance(getattr(_TODO_LLM_BUDGET_LOCAL, "state", None), dict)
+
+
+def todo_llm_skip_reason(exc: BaseException | None) -> str:
+    """Why a TodoWrite helper's model call produced no verdict.
+
+    Returns ``"budget"`` (TodoWrite call budget used up), ``"busy"`` (no
+    in-session slot or an active endpoint cooldown), ``"timeout"`` (socket or
+    HTTP timeout), or ``""`` for any other failure.  Only the first three are
+    skips that may use a deterministic fallback; everything else, such as
+    invalid JSON or a provider error, keeps the caller's fail-closed path.
+    """
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TodoLLMBudgetExhausted):
+            return "budget"
+        if isinstance(current, LLMGateBusy):
+            return "busy"
+        if isinstance(current, (TimeoutError, socket.timeout)):
+            return "timeout"
+        if int(getattr(current, "status", 0) or 0) in {408, 504}:
+            return "timeout"
+        current = current.__cause__ or current.__context__
+    text = str(exc or "").lower()
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    return ""
+
+
+class SessionLLMGate:
+    """Per-session counting gate for in-flight model HTTP requests.
+
+    * Blocking requests wait by priority (main > subagent > teammate > app) and
+      first-come first-served within a class; a lower class never takes a
+      slot while a higher class is queued.
+    * Auxiliary requests never wait: they may hold at most ``max(0, limit-1)``
+      slots (with limit 1 they only run when the session is idle), are refused
+      while any blocking request is queued, and are refused once orphaned
+      requests reach ``limit``.  Refusals raise ``LLMGateBusy``.
+    * Every request records the run generation it started in.  After
+      ``set_generation`` moves on, leftovers from earlier runs are ``orphaned``:
+      they stay visible but no longer count against the limit.
+    * ``abandoned`` entries (the caller stopped waiting) keep counting until
+      their thread really finishes and releases the slot.
+    * ``on_change(snapshot)`` is always invoked outside the gate lock.
+
+    Counters ``total``, ``peak``, ``queued_waits``, ``skipped_busy``,
+    ``abandoned`` and ``orphaned`` are cumulative; ``snapshot()`` also reports
+    the live in-flight/queued/abandoned/orphaned counts.
+    """
+
+    def __init__(self, limit: int = DEFAULT_SESSION_LLM_CONCURRENCY, *, generation: int = 0, on_change=None):
+        self._cond = threading.Condition(threading.Lock())
+        self.limit = normalize_session_llm_concurrency(limit)
+        try:
+            self.generation = int(generation or 0)
+        except Exception:
+            self.generation = 0
+        self.on_change = on_change
+        self.role_provider = None
+        self._seq = 0
+        self._in_flight: dict[str, dict] = {}
+        self._waiters: list[dict] = []
+        self.total = 0
+        self.peak = 0
+        self.peak_in_flight = 0
+        self.queued_waits = 0
+        self.skipped_busy = 0
+        self.abandoned = 0
+        self.orphaned = 0
+
+    @staticmethod
+    def _priority_name(priority: object) -> str:
+        name = str(priority or "main").strip().lower()
+        return name if name in SESSION_LLM_PRIORITY_RANKS else "main"
+
+    def _counts_locked(self) -> tuple[int, int, int]:
+        active = orphaned = aux_active = 0
+        for entry in self._in_flight.values():
+            if entry.get("orphaned"):
+                orphaned += 1
+                continue
+            active += 1
+            if entry.get("auxiliary"):
+                aux_active += 1
+        return active, orphaned, aux_active
+
+    def _admit_locked(self, *, priority: str, auxiliary: bool, label: str, role: str) -> str:
+        self._seq += 1
+        ticket = f"llm{self._seq}"
+        self._in_flight[ticket] = {
+            "id": ticket,
+            "priority": priority,
+            "label": trim(str(label or ""), 80),
+            "role": trim(str(role or ""), 80),
+            "auxiliary": bool(auxiliary),
+            "run_generation": int(self.generation),
+            "started_at": now_ts(),
+            "started_mono": time.monotonic(),
+            "thread_ident": threading.get_ident(),
+            "abandoned": False,
+            "orphaned": False,
+        }
+        self.total += 1
+        active, _orphaned, _aux = self._counts_locked()
+        self.peak = max(self.peak, active)
+        self.peak_in_flight = max(self.peak_in_flight, len(self._in_flight))
+        return ticket
+
+    def _aux_allowed_locked(self) -> bool:
+        active, orphaned, aux_active = self._counts_locked()
+        if orphaned >= self.limit:
+            return False
+        if self._waiters:
+            return False
+        if active >= self.limit:
+            return False
+        return aux_active < max(0, self.limit - 1) or active == 0
+
+    def _held_by_current_thread_locked(self) -> bool:
+        ident = threading.get_ident()
+        return any(entry.get("thread_ident") == ident for entry in self._in_flight.values())
+
+    def _notify_change(self) -> None:
+        callback = self.on_change
+        if not callable(callback):
+            return
+        try:
+            callback(self.snapshot())
+        except Exception:
+            pass
+
+    def acquire(
+        self,
+        *,
+        priority: str = "main",
+        auxiliary: bool = False,
+        label: str = "",
+        role: str = "",
+        cancel_check=None,
+    ) -> str:
+        """Take a slot and return its ticket for ``release``.
+
+        Auxiliary requests raise ``LLMGateBusy`` instead of waiting.  A waiting
+        blocking request polls ``cancel_check`` every 0.25s and raises the
+        client's usual ``OllamaError("interrupted by user", status=499)``.
+        """
+        prio = self._priority_name(priority)
+        role_text = str(role or "")
+        if not role_text and callable(self.role_provider):
+            try:
+                role_text = str(self.role_provider() or "")
+            except Exception:
+                role_text = ""
+        if auxiliary:
+            with self._cond:
+                if self._aux_allowed_locked():
+                    ticket = self._admit_locked(priority=prio, auxiliary=True, label=label, role=role_text)
+                    admitted = True
+                else:
+                    self.skipped_busy += 1
+                    admitted = False
+            self._notify_change()
+            if not admitted:
+                raise LLMGateBusy(f"in-session model slot busy (limit {self.limit}); auxiliary request skipped")
+            return ticket
+        with self._cond:
+            active, _orphaned, _aux = self._counts_locked()
+            if self._held_by_current_thread_locked() or (not self._waiters and active < self.limit):
+                # A thread that already holds a slot is never made to wait for
+                # itself; that would deadlock the session at limit 1.
+                ticket = self._admit_locked(priority=prio, auxiliary=False, label=label, role=role_text)
+                queued = False
+            else:
+                self._seq += 1
+                waiter = {
+                    "key": (SESSION_LLM_PRIORITY_RANKS[prio], self._seq),
+                    "priority": prio,
+                    "label": trim(str(label or ""), 80),
+                    "queued_mono": time.monotonic(),
+                }
+                self._waiters.append(waiter)
+                self.queued_waits += 1
+                queued = True
+        if not queued:
+            self._notify_change()
+            return ticket
+        self._notify_change()
+        ticket = ""
+        try:
+            while True:
+                with self._cond:
+                    head = min(self._waiters, key=lambda row: row["key"]) if self._waiters else None
+                    active, _orphaned, _aux = self._counts_locked()
+                    if head is waiter and active < self.limit:
+                        self._waiters.remove(waiter)
+                        ticket = self._admit_locked(priority=prio, auxiliary=False, label=label, role=role_text)
+                        # Another slot may still be free for the next waiter.
+                        self._cond.notify_all()
+                        break
+                    self._cond.wait(SESSION_LLM_GATE_POLL_SECONDS)
+                if cancel_check is not None:
+                    # Called outside the gate lock: the callback may take
+                    # session locks of its own.
+                    try:
+                        if cancel_check():
+                            raise OllamaError("interrupted by user", status=499)
+                    except OllamaError:
+                        raise
+                    except Exception:
+                        pass
+        finally:
+            if not ticket:
+                with self._cond:
+                    if waiter in self._waiters:
+                        self._waiters.remove(waiter)
+                    self._cond.notify_all()
+            self._notify_change()
+        return ticket
+
+    def release(self, ticket: str) -> None:
+        if not ticket:
+            return
+        with self._cond:
+            removed = self._in_flight.pop(str(ticket), None)
+            self._cond.notify_all()
+        if removed is not None:
+            self._notify_change()
+
+    def note_skipped(self) -> None:
+        """Count an auxiliary request skipped by the caller before acquiring."""
+        with self._cond:
+            self.skipped_busy += 1
+        self._notify_change()
+
+    def set_limit(self, n: object) -> int:
+        limit = normalize_session_llm_concurrency(n, default=self.limit)
+        with self._cond:
+            changed = limit != self.limit
+            self.limit = limit
+            self._cond.notify_all()
+        if changed:
+            self._notify_change()
+        return limit
+
+    def set_generation(self, n: object) -> int:
+        try:
+            generation = int(n or 0)
+        except Exception:
+            return int(self.generation)
+        newly_orphaned = 0
+        with self._cond:
+            if generation != self.generation:
+                self.generation = generation
+                for entry in self._in_flight.values():
+                    if not entry.get("orphaned") and int(entry.get("run_generation", 0) or 0) != generation:
+                        entry["orphaned"] = True
+                        newly_orphaned += 1
+                self.orphaned += newly_orphaned
+                self._cond.notify_all()
+                changed = True
+            else:
+                changed = False
+        if changed:
+            self._notify_change()
+        return generation
+
+    def mark_abandoned(self, thread_ident: int | None = None) -> int:
+        """Flag in-flight requests whose caller stopped waiting.
+
+        ``thread_ident`` selects the worker thread that owns the request;
+        ``None`` flags every request currently in flight.  Abandoned requests
+        keep their slot until the thread finishes.  Returns how many entries
+        were newly flagged.
+        """
+        marked = 0
+        with self._cond:
+            for entry in self._in_flight.values():
+                if entry.get("abandoned"):
+                    continue
+                if thread_ident is not None and entry.get("thread_ident") != thread_ident:
+                    continue
+                entry["abandoned"] = True
+                marked += 1
+            self.abandoned += marked
+        if marked:
+            self._notify_change()
+        return marked
+
+    def snapshot(self) -> dict:
+        now_mono = time.monotonic()
+        with self._cond:
+            active, orphaned, aux_active = self._counts_locked()
+            entries = sorted(self._in_flight.values(), key=lambda row: float(row.get("started_mono", 0.0) or 0.0))
+            requests = [
+                {
+                    "id": row.get("id", ""),
+                    "priority": row.get("priority", "main"),
+                    "label": row.get("label", ""),
+                    "role": row.get("role", ""),
+                    "auxiliary": bool(row.get("auxiliary")),
+                    "run_generation": int(row.get("run_generation", 0) or 0),
+                    "started_at": float(row.get("started_at", 0.0) or 0.0),
+                    "elapsed": round(max(0.0, now_mono - float(row.get("started_mono", now_mono) or now_mono)), 3),
+                    "thread_ident": row.get("thread_ident"),
+                    "abandoned": bool(row.get("abandoned")),
+                    "orphaned": bool(row.get("orphaned")),
+                }
+                for row in entries[:SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS]
+            ]
+            return {
+                "limit": int(self.limit),
+                "generation": int(self.generation),
+                "in_flight": int(active),
+                "in_flight_total": len(self._in_flight),
+                "auxiliary_in_flight": int(aux_active),
+                "queued": len(self._waiters),
+                "abandoned_in_flight": sum(1 for row in self._in_flight.values() if row.get("abandoned")),
+                "orphaned_in_flight": int(orphaned),
+                "total": int(self.total),
+                "peak": int(self.peak),
+                "peak_in_flight": int(self.peak_in_flight),
+                "queued_waits": int(self.queued_waits),
+                "skipped_busy": int(self.skipped_busy),
+                "abandoned": int(self.abandoned),
+                "orphaned": int(self.orphaned),
+                "requests": requests,
+            }
+
+
+_SESSION_LLM_GATE_INIT_LOCK = threading.Lock()
+
+
+def set_session_llm_concurrency_on_runtime(target: object, value: object) -> int:
+    """Store a normalized concurrency on a session or manager and resize its gate."""
+    limit = normalize_session_llm_concurrency(value)
+    setattr(target, "session_llm_concurrency", limit)
+    gate = getattr(target, "llm_gate", None)
+    if isinstance(gate, SessionLLMGate):
+        gate.set_limit(limit)
+    return limit
+
+
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
     _retry_lock = threading.RLock()
@@ -26280,6 +27002,81 @@ class OllamaClient:
         self.telemetry_callback = None
         self.telemetry_context_provider = None
         self.telemetry_name = "chat"
+        # Optional per-session SessionLLMGate; SessionState attaches it.
+        self.request_gate = None
+        # Per-call request overrides (socket timeout, auxiliary marker) are
+        # thread-local so one thread's short timeout never leaks into another.
+        self._request_timeout_override = threading.local()
+
+    def _request_local(self) -> threading.local:
+        local = getattr(self, "_request_timeout_override", None)
+        if not isinstance(local, threading.local):
+            with self._retry_lock:
+                local = getattr(self, "_request_timeout_override", None)
+                if not isinstance(local, threading.local):
+                    local = threading.local()
+                    self._request_timeout_override = local
+        return local
+
+    def _effective_request_timeout(self) -> float:
+        """Socket timeout for the request being sent on this thread.
+
+        ``chat(request_timeout=...)`` sets a thread-local override for one
+        call; everything else keeps using ``self.timeout``.
+        """
+        local = getattr(self, "_request_timeout_override", None)
+        override = getattr(local, "timeout", None) if local is not None else None
+        if override is not None:
+            return override
+        return self.timeout
+
+    @staticmethod
+    def _normalize_request_timeout_override(value: object) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            seconds = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(seconds) or seconds <= 0:
+            return None
+        return max(0.1, min(float(MAX_TIMEOUT_SECONDS), seconds))
+
+    def _auxiliary_request_active(self) -> bool:
+        local = getattr(self, "_request_timeout_override", None)
+        return bool(getattr(local, "auxiliary", False)) if local is not None else False
+
+    def _raise_if_auxiliary_cooldown(self, cooldown: float, url: str) -> None:
+        # Auxiliary calls never wait out a shared endpoint cooldown; the
+        # pre-check in chat() covers the common case, this covers a cooldown
+        # set by another thread after that check.
+        if cooldown > 0 and self._auxiliary_request_active():
+            raise LLMGateBusy(
+                f"endpoint cooldown active ({round(cooldown, 1)}s) for {trim(str(url or ''), 160)}; auxiliary request skipped"
+            )
+
+    def _chat_request_url(self) -> str:
+        """URL ``_chat_impl`` sends to first, for cooldown-key computation."""
+        provider = (self.provider or "ollama").lower()
+        endpoint = str(self.endpoint or "").strip()
+        if is_openai_compat_provider(provider):
+            return endpoint or complete_chat_endpoint(self.base_url)
+        if provider == "anthropic":
+            if endpoint:
+                return endpoint
+            base = str(self.base_url or "").strip().rstrip("/")
+            return f"{base}/v1/messages" if base else "https://api.anthropic.com/v1/messages"
+        if provider == "custom_http":
+            return endpoint
+        # Native Ollama: /v1/chat/completions and the /api/chat fallback share
+        # the host, so both map to the same cooldown key.
+        return f"{self.base_url}/v1/chat/completions"
+
+    def _chat_cooldown_remaining(self) -> float:
+        url = self._chat_request_url()
+        if not url:
+            return 0.0
+        return self._cooldown_remaining(self._http_retry_key(url))
 
     def set_telemetry(self, callback=None, context_provider=None, name: str = "chat") -> None:
         self.telemetry_callback = callback
@@ -26345,6 +27142,7 @@ class OllamaClient:
         probe_mode: bool = False,
         provider_snapshot: str = "",
         model_snapshot: str = "",
+        label: str = "",
     ) -> None:
         callback = getattr(self, "telemetry_callback", None)
         if not callable(callback):
@@ -26359,9 +27157,16 @@ class OllamaClient:
             except Exception:
                 context = {}
         usage = self._usage_tokens(response)
+        # The llm_call name says where the call came from: probes stay
+        # capability_probe, labeled calls use their label (the agent loop
+        # passes "main"), unlabeled calls keep the client's telemetry_name.
+        if probe_mode:
+            call_name = "capability_probe"
+        else:
+            call_name = trim(str(label or "").strip(), 80) or str(getattr(self, "telemetry_name", "chat") or "chat")
         fields = {
             **context,
-            "name": "capability_probe" if probe_mode else str(getattr(self, "telemetry_name", "chat") or "chat"),
+            "name": call_name,
             "status": status,
             "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
             "provider": str(provider_snapshot or self.provider or ""),
@@ -26681,9 +27486,9 @@ class OllamaClient:
     def clear_global_probe_cache(cls):
         cls._probe_cache.clear()
 
-    def _post_json(self, path: str, payload: dict) -> dict:
+    def _post_json(self, path: str, payload: dict, *, max_attempts: int | None = None) -> dict:
         url = f"{self.base_url}{path}"
-        return self._post_json_url_with_retries(url, payload)
+        return self._post_json_url_with_retries(url, payload, max_attempts=max_attempts)
 
     def _post_json_url(self, url: str, payload: dict, headers: dict | None = None) -> dict:
         req_headers = {"Content-Type": "application/json"}
@@ -26696,7 +27501,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self._effective_request_timeout()) as resp:
                 body = resp.read().decode("utf-8")
                 return json.loads(body) if body else {}
         except HTTPError as exc:
@@ -26730,6 +27535,7 @@ class OllamaClient:
         for attempt in range(0, retry_budget + 1):
             cooldown = self._cooldown_remaining(key)
             if cooldown > 0:
+                self._raise_if_auxiliary_cooldown(cooldown, url)
                 if on_retry:
                     try:
                         on_retry(
@@ -26791,7 +27597,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self._effective_request_timeout()) as resp:
                 while True:
                     if cancel_check is not None:
                         try:
@@ -26838,6 +27644,7 @@ class OllamaClient:
         for attempt in range(0, retry_budget + 1):
             cooldown = self._cooldown_remaining(key)
             if cooldown > 0:
+                self._raise_if_auxiliary_cooldown(cooldown, url)
                 if on_retry:
                     try:
                         on_retry(
@@ -26899,7 +27706,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self._effective_request_timeout()) as resp:
                 ctype = str(resp.headers.get("Content-Type", "") or "").strip()
                 body = resp.read()
                 return body, ctype
@@ -27956,6 +28763,8 @@ class OllamaClient:
                     )
                     return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
                 raise
+            except LLMGateBusy:
+                raise
             except Exception as exc:
                 raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
         payload["stream"] = False
@@ -28090,7 +28899,7 @@ class OllamaClient:
                     on_retry=on_http_retry,
                 )
                 return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
-            except OllamaError:
+            except (OllamaError, LLMGateBusy):
                 raise
             except Exception as exc:
                 raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
@@ -28412,6 +29221,7 @@ class OllamaClient:
         think: bool = False,
         on_thinking_chunk=None,
         on_content_delta=None,
+        max_attempts: int | None = None,
     ) -> dict:
         effective_max = max_tokens
         if tools:
@@ -28444,6 +29254,7 @@ class OllamaClient:
             f"{self.base_url}/api/chat",
             payload,
             headers={"Content-Type": "application/json"},
+            max_attempts=max_attempts,
         ):
             row = str(row_line or "").strip()
             if not row:
@@ -28523,6 +29334,8 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         effort: str = "",
+        auxiliary: bool = False,
+        no_http_retry: bool = False,
     ) -> dict:
         provider = (self.provider or "ollama").lower()
         # Resolve provider-neutral effort into native reasoning mutations once.
@@ -28548,7 +29361,10 @@ class OllamaClient:
             tools = None
             stream_thinking = False
             response_stream = False
-        http_retry_attempts = 0 if probe_mode else None
+        # Probes, auxiliary calls and calls inside a TodoWrite budget scope
+        # (no_http_retry) never retry, so they never write or wait on the
+        # shared endpoint cooldown that the main loop also uses.
+        http_retry_attempts = 0 if (probe_mode or auxiliary or no_http_retry) else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
         # Some providers require all system messages at the beginning (or merged into one)
@@ -28617,10 +29433,14 @@ class OllamaClient:
                     think=bool(think),
                     on_thinking_chunk=on_thinking_chunk,
                     on_content_delta=on_content_delta if response_stream else None,
+                    max_attempts=http_retry_attempts,
                 )
             except OllamaError:
                 if response_stream:
                     raise
+        # Only pass the retry budget when one is set, so the default call
+        # shape of ``_post_json(path, payload)`` is unchanged for main calls.
+        ollama_retry_kwargs = {} if http_retry_attempts is None else {"max_attempts": http_retry_attempts}
         openai_payload = {
             "model": self.model,
             "messages": req_messages,
@@ -28638,7 +29458,7 @@ class OllamaClient:
                     cancel_check=cancel_check,
                 )
                 return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
-            raw = self._post_json("/v1/chat/completions", openai_payload)
+            raw = self._post_json("/v1/chat/completions", openai_payload, **ollama_retry_kwargs)
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
             return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
         except OllamaError as exc:
@@ -28669,7 +29489,7 @@ class OllamaClient:
             native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools
-        raw = self._post_json("/api/chat", native_payload)
+        raw = self._post_json("/api/chat", native_payload, **ollama_retry_kwargs)
         msg = raw.get("message", {})
         if not isinstance(msg, dict):
             msg = {}
@@ -28716,13 +29536,85 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         effort: str = "",
+        priority: str = "main",
+        auxiliary: bool = False,
+        label: str = "",
+        request_timeout: float | None = None,
     ) -> dict:
+        """Send one model request.
+
+        ``priority`` orders waiting requests in the session gate, ``auxiliary``
+        makes the request non-blocking (``LLMGateBusy`` instead of waiting) and
+        disables HTTP retries, ``label`` names the in-flight entry and the
+        ``llm_call`` telemetry row (unlabeled calls keep the client's
+        ``telemetry_name``), and ``request_timeout`` is a socket timeout for
+        this call only.  Skipped
+        requests (``LLMGateBusy``) emit no ``llm_call`` telemetry because no
+        request was sent.
+
+        Inside a ``todo_llm_budget_scope`` (a TodoWrite transaction on this
+        thread) every call is counted against the budget and, unless the
+        caller says otherwise, uses ``TODO_LLM_TIMEOUT_SECONDS`` and the label
+        ``todo_audit``.  Such calls stay blocking ``main`` requests but never
+        retry over HTTP and never wait out an endpoint cooldown, so a slow or
+        throttled reviewer cannot stall the agent loop; the TodoWrite helpers
+        fall back to their deterministic rules instead.
+        """
+        auxiliary = bool(auxiliary) and not probe_mode
+        todo_scope = (not probe_mode) and todo_llm_budget_active()
+        # (a) Per-TodoWrite budget; capability probes are not counted.
+        if not probe_mode:
+            _consume_todo_llm_budget()
+        gate = None if probe_mode else getattr(self, "request_gate", None)
+        if todo_scope and not label:
+            label = "todo_audit"
+        entry_label = str(label or getattr(self, "telemetry_name", "") or "chat")
+        # (b) Auxiliary requests (and TodoWrite-scope requests, which have a
+        # deterministic fallback) never wait out the shared endpoint cooldown.
+        if auxiliary or todo_scope:
+            cooldown = self._chat_cooldown_remaining()
+            if cooldown > 0:
+                if gate is not None:
+                    try:
+                        gate.note_skipped()
+                    except Exception:
+                        pass
+                raise LLMGateBusy(
+                    f"endpoint cooldown active ({round(cooldown, 1)}s); "
+                    + ("TodoWrite review request skipped" if todo_scope and not auxiliary else "auxiliary request skipped")
+                )
+        local = self._request_local()
+        prev_timeout = getattr(local, "timeout", None)
+        prev_auxiliary = getattr(local, "auxiliary", False)
+        timeout_override = self._normalize_request_timeout_override(request_timeout)
+        if todo_scope and timeout_override is None:
+            timeout_override = self._normalize_request_timeout_override(TODO_LLM_TIMEOUT_SECONDS)
+        # (c) In-session slot. Blocking callers wait by priority; auxiliary
+        # callers get LLMGateBusy when no slot is free.
+        ticket = ""
+        if gate is not None:
+            ticket = gate.acquire(
+                priority=priority,
+                auxiliary=auxiliary,
+                label=entry_label,
+                cancel_check=cancel_check,
+            )
+        # Measured after the slot is granted so duration_ms keeps meaning
+        # request time rather than queue time.
         started = time.monotonic()
         provider_snapshot = str(self.provider or "")
         model_snapshot = str(self.model or "")
         response: dict | None = None
         status = "error"
+        emit_telemetry = True
         try:
+            # (d) Per-call socket timeout for this thread only.
+            if timeout_override is not None:
+                local.timeout = timeout_override
+            # The retry helpers read this flag to skip (LLMGateBusy) instead
+            # of waiting when another thread set a cooldown after (b).
+            local.auxiliary = auxiliary or todo_scope
+            # (e)
             response = self._chat_impl(
                 messages,
                 tools=tools,
@@ -28740,21 +29632,43 @@ class OllamaClient:
                 cancel_check=cancel_check,
                 on_http_retry=on_http_retry,
                 effort=effort,
+                auxiliary=auxiliary,
+                **({"no_http_retry": True} if todo_scope else {}),
             )
             status = "success"
             return response
+        except LLMGateBusy:
+            # A cooldown set by another thread after the pre-check: the
+            # auxiliary request was skipped, not failed.
+            emit_telemetry = False
+            if gate is not None:
+                try:
+                    gate.note_skipped()
+                except Exception:
+                    pass
+            raise
         except Exception as exc:
             status = self._operation_status_from_exception(exc)
             raise
         finally:
-            self._emit_chat_telemetry(
-                response,
-                started,
-                status,
-                probe_mode=probe_mode,
-                provider_snapshot=provider_snapshot,
-                model_snapshot=model_snapshot,
-            )
+            # (f) Clear the override and free the slot before telemetry I/O.
+            local.timeout = prev_timeout
+            local.auxiliary = prev_auxiliary
+            if ticket and gate is not None:
+                try:
+                    gate.release(ticket)
+                except Exception:
+                    pass
+            if emit_telemetry:
+                self._emit_chat_telemetry(
+                    response,
+                    started,
+                    status,
+                    probe_mode=probe_mode,
+                    provider_snapshot=provider_snapshot,
+                    model_snapshot=model_snapshot,
+                    label=label,
+                )
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -28770,36 +29684,136 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
+
+# ``bash`` is intentionally classified by the caller, rather than only by
+# inspecting command text after the fact.  The declaration is part of the
+# provenance contract: it tells evidence/memory whether a shell call is a
+# source read, a document/media perception step, or ordinary execution.  The
+# runtime still accepts legacy calls without the field and falls back to the
+# older syntax-aware detector for compatibility.
+BASH_OPERATION_CODES = (
+    "execute",
+    "text_read",
+    "text_search",
+    "directory_inspect",
+    "document_extract",
+    "ocr",
+    "media_metadata",
+    "media_extract",
+    "custom_extract",
+    "validation",
+    "build_test",
+    "process_control",
+    "network",
+)
+BASH_OBSERVATION_OPERATION_CODES = frozenset(
+    {
+        "text_read",
+        "text_search",
+        "directory_inspect",
+        "document_extract",
+        "ocr",
+        "media_metadata",
+        "media_extract",
+        "custom_extract",
+    }
+)
+BASH_OPERATION_ALIASES = {
+    "read": "text_read",
+    "file_read": "text_read",
+    "text": "text_read",
+    "search": "text_search",
+    "file_search": "text_search",
+    "inspect": "directory_inspect",
+    "directory": "directory_inspect",
+    "pdf": "document_extract",
+    "pdf_extract": "document_extract",
+    "document": "document_extract",
+    "document_read": "document_extract",
+    "image_ocr": "ocr",
+    "vision_ocr": "ocr",
+    "metadata": "media_metadata",
+    "media_info": "media_metadata",
+    "extract": "media_extract",
+    "media": "media_extract",
+    "script_extract": "custom_extract",
+    "custom_reader": "custom_extract",
+    "test": "build_test",
+    "build": "build_test",
+    "run_test": "build_test",
+    "process": "process_control",
+    "shell": "execute",
+    "command": "execute",
+}
+
+
+def normalize_bash_operation(value: object, *, default: str = "execute") -> str:
+    """Normalize the model-provided shell operation code."""
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw.startswith("custom:") and re.fullmatch(r"custom:[a-z0-9_:.]{1,64}", raw):
+        return raw
+    raw = BASH_OPERATION_ALIASES.get(raw, raw)
+    if raw in BASH_OPERATION_CODES:
+        return raw
+    if raw and re.fullmatch(r"[a-z0-9_:.]{1,64}", raw):
+        # Preserve an agent-supplied, domain-specific marker without treating
+        # it as one of the built-in observation classes. This keeps bash open
+        # ended while still making the marker searchable in tool memory.
+        return f"custom:{raw}"
+    fallback = str(default or "execute").strip().lower().replace("-", "_").replace(" ", "_")
+    fallback = BASH_OPERATION_ALIASES.get(fallback, fallback)
+    return fallback if fallback in BASH_OPERATION_CODES else "execute"
+
+
+def bash_operation_is_observation(value: object) -> bool:
+    return normalize_bash_operation(value, default="execute") in BASH_OBSERVATION_OPERATION_CODES
+
+
+def bash_operation_is_marked_observation(value: object) -> bool:
+    operation = normalize_bash_operation(value, default="execute")
+    return operation in BASH_OBSERVATION_OPERATION_CODES or operation.startswith("custom:")
+
+
 TOOLS = [
     tool_def(
         "bash",
         (
-            "Run a shell command. Use shell-native readers/search pipelines when they are the most natural option; "
-            "successful output that can be verified against local source files is automatically merged into the same "
-            "source-addressable long-content memory used by read_file."
+            "Execute a shell command for builds, tests, validation, process control, or a pipeline that truly needs a shell. "
+            "For ordinary local file reading, searching, symbols, line windows, or exact source evidence, prefer read_file. "
+            "When a call is a special read/perception task, provide operation with the caller's intent code: text_read/text_search/directory_inspect "
+            "for source reads, document_extract for PDF/document conversion, ocr for OCR, media_metadata or "
+            "media_extract for image/audio/video perception, custom_extract for a Python/Node/other reader, "
+            "validation/build_test for checks, process_control for process operations, network for HTTP, or execute "
+            "for ordinary shell work. The field is optional so bash remains fully general; a declared observation is recorded even when output is short. Bash remains a "
+            "fallback when read_file cannot express the requested extraction; its exact output gets immutable evidence "
+            "and tool-memory trace, with source alignment when possible."
         ),
-        {"command": {"type": "string"}},
+        {
+            "command": {"type": "string"},
+            "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker. Known markers such as text_read, document_extract, ocr, media_metadata, custom_extract and validation receive specialized memory handling; arbitrary domain markers remain searchable without restricting shell use."},
+            "recognition_code": {"type": "string", "description": "Optional alias for operation when a task-specific recognition marker is clearer."},
+        },
         ["command"],
     ),
     tool_def(
         "read_file",
         (
-            "Read files or directories with structure-aware modes. "
+            "Preferred tool for reading local files and directories with structure-aware, source-addressable modes. "
             "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
             "and mode='full' when complete content is explicitly needed. Use mode='structure' or mode='segment' "
             "to resume a long-file reading pass from compact understanding cards. Reader choice is not mandatory: "
-            "read_file and source-aligned shell readers update the same long-content memory. Successful reads are "
-            "remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
+            "read_file and source-aligned shell readers update the same long-content memory. Successful reads receive an "
+            "immutable evidence_ref and are remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
             "mode": {
                 "type": "string",
-                "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"],
-                "description": "Reading strategy. Use structure/overview to inspect a long source memory, segment with target/query to read one remembered section, symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "evidence", "directory"],
+                "description": "Reading strategy. Use structure/overview to inspect a source memory, segment with target/query to read one remembered section, symbol with target for a function/class; search with query for literal text/errors; evidence with query for ranked excerpts and traceable line evidence; window with line/context for a line range. Avoid full for large logs when a query is known.",
             },
             "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
             "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure', for example 's0001'."},
@@ -28826,7 +29840,9 @@ TOOLS = [
             "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
             "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
             "Use 'rework_completed' only when failure/reviewer evidence requires reopening completed work. "
-            "Preferred items are objects with content/status/owner/parent_step_id/subtask_id."
+            "Preferred items are objects with content/status/owner/parent_step_id/subtask_id. "
+            "Every row is listed with a short id such as (t3): to update or reword an existing row, include its id "
+            "(e.g. {\"id\": \"t3\", \"status\": \"completed\"}); a row without an id is treated as new work."
         ),
         {
             "items": {"type": "array", "items": {}},
@@ -28868,7 +29884,7 @@ TOOLS = [
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Inspect existing canonical rows first and choose reuse/update, independent add, or evidence-backed removal. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Inspect existing canonical rows first and choose reuse/update, independent add, or evidence-backed removal. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id; include a row's short id (e.g. \"id\": \"t3\") to update it, since rows without an id are treated as new. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -29014,10 +30030,13 @@ TOOLS = [
         (
             "Inspect remembered tool evidence from the current session before repeating read_file/bash/query/edit calls. "
             "Use mode='summary' for the active map, mode='search' with query/path/command terms, "
-            "or mode='detail' with id to load an entry and optional cached preview."
+            "or mode='trace' with an evidence id for exact output and verification. "
+            "Proactively use mode='remember' to consolidate important facts, decisions and uncertainties "
+            "with exact source references; mode='recall' returns those memories and their evidence. "
+            "Use kind='inference' for derived conclusions; do not treat a summary as verified source truth."
         ),
         {
-            "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail"]},
+            "mode": {"type": "string", "enum": ["summary", "search", "recent", "detail", "trace", "remember", "recall"]},
             "query": {"type": "string"},
             "id": {"type": "string"},
             "tool": {"type": "string"},
@@ -29025,7 +30044,15 @@ TOOLS = [
             "status": {"type": "string"},
             "limit": {"type": "integer"},
             "max_chars": {"type": "integer"},
+            "depth": {"type": "integer", "description": "Causal evidence-trace depth for mode='trace' (0-4)."},
             "include_cached": {"type": "boolean"},
+            "claim": {"type": "string", "description": "Important model-authored conclusion to retain, with exact parameter spelling."},
+            "kind": {"type": "string", "enum": ["fact", "inference", "decision", "constraint", "procedure"]},
+            "conditions": {"type": "string", "description": "Scope, units, assumptions and unresolved qualifications."},
+            "importance": {"type": "integer", "minimum": 1, "maximum": 5},
+            "references": {"type": "array", "items": {"type": "object", "properties": {"evidence_id": {"type": "string"}, "quote": {"type": "string"}}, "required": ["evidence_id", "quote"]}},
+            "supersedes": {"type": "string", "description": "Explicit prior memory id; conflicting memories are never silently merged."},
+            "offset": {"type": "integer", "description": "Character offset into exact trace output."},
         },
     ),
         tool_def(
@@ -29296,7 +30323,17 @@ TOOLS = [
     tool_def("worktree_create", "Create git worktree.", {"name": {"type": "string"}, "task_id": {"type": "integer"}, "base_ref": {"type": "string"}}, ["name"]),
     tool_def("worktree_list", "List worktrees.", {}),
     tool_def("worktree_status", "Get worktree status.", {"name": {"type": "string"}}, ["name"]),
-    tool_def("worktree_run", "Run command in worktree.", {"name": {"type": "string"}, "command": {"type": "string"}}, ["name", "command"]),
+    tool_def(
+        "worktree_run",
+        "Run a shell command in a worktree. Set operation using the same bash provenance codes so reads and perception results enter evidence/tool-memory correctly.",
+        {
+            "name": {"type": "string"},
+            "command": {"type": "string"},
+            "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker; known markers receive specialized memory handling."},
+            "recognition_code": {"type": "string"},
+        },
+        ["name", "command"],
+    ),
     tool_def("worktree_keep", "Mark worktree kept.", {"name": {"type": "string"}}, ["name"]),
     tool_def("worktree_remove", "Remove worktree.", {"name": {"type": "string"}, "force": {"type": "boolean"}, "complete_task": {"type": "boolean"}}, ["name"]),
         tool_def(
@@ -30013,7 +31050,663 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
+class EvidenceRetrievalController:
+    """Session-local, rebuildable source index and immutable tool evidence.
+
+    Indexing is not reading/comprehension. Only bytes returned by a tool are
+    evidence; summaries remain hypotheses. All SQLite connections are scoped.
+    """
+
+    def __init__(self, root: Path):
+        self.path = Path(root) / "evidence" / "sources.sqlite3"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.metrics = Counter()
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE IF NOT EXISTS sources (version TEXT PRIMARY KEY, lines INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS blocks (id INTEGER PRIMARY KEY, version TEXT, start INTEGER, stop INTEGER, body TEXT, tokens TEXT)")
+            db.execute("CREATE INDEX IF NOT EXISTS blocks_source ON blocks(version,start)")
+            db.execute("CREATE TABLE IF NOT EXISTS evidence (id TEXT PRIMARY KEY, path TEXT, version TEXT, tool TEXT, role TEXT, args TEXT, digest TEXT, body TEXT, status TEXT, created REAL)")
+            db.execute("CREATE INDEX IF NOT EXISTS evidence_digest ON evidence(digest,path)")
+            db.execute("CREATE INDEX IF NOT EXISTS evidence_path ON evidence(path,created)")
+            db.execute("CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, claim TEXT, kind TEXT, conditions TEXT, importance INTEGER, refs TEXT, status TEXT, created REAL, accessed REAL)")
+            db.execute("CREATE TABLE IF NOT EXISTS evidence_links (source TEXT, target TEXT, relation TEXT, PRIMARY KEY(source,target,relation))")
+            # ``flow`` nodes and file heads intentionally live beside ordinary
+            # tool evidence.  This keeps one immutable id space for tool calls,
+            # UI events, loop state and file versions, while the head table gives
+            # us a cheap current-version index without rewriting old evidence.
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS file_evidence_heads ("
+                "path TEXT PRIMARY KEY, evidence_id TEXT, version TEXT, operation TEXT, "
+                "updated REAL, stale INTEGER NOT NULL DEFAULT 0, previous_evidence_id TEXT)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS file_heads_evidence ON file_evidence_heads(evidence_id)")
+            self.fts = self.trigram = False
+            try:
+                db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS source_terms USING fts5(tokens, content='blocks', content_rowid='id')")
+                self.fts = True
+                db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS source_substrings USING fts5(body, content='blocks', content_rowid='id', tokenize='trigram')")
+                self.trigram = True
+            except sqlite3.OperationalError:
+                pass  # Exact streamed search remains available without FTS5.
+
+    @staticmethod
+    def terms(text: str) -> list[str]:
+        tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", str(text).casefold())
+        out = []
+        for token in tokens:
+            out.append(token)
+            if re.fullmatch(r"[\u4e00-\u9fff]{3,}", token):
+                out.extend(token[i:i + 2] for i in range(len(token) - 1))
+        return list(dict.fromkeys(out))
+
+    def index(self, version: str, lines: list[str]) -> None:
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            if db.execute("SELECT 1 FROM sources WHERE version=?", (version,)).fetchone():
+                self.metrics["index_hits"] += 1
+                return
+            # A transaction publishes the version only after all blocks exist.
+            for start in range(0, len(lines), 64):
+                body = "\n".join(lines[start:start + 64])
+                tokens = " ".join(self.terms(body))
+                row_id = db.execute("INSERT INTO blocks(version,start,stop,body,tokens) VALUES(?,?,?,?,?)",
+                                    (version, start + 1, min(len(lines), start + 64), body, tokens)).lastrowid
+                if self.fts:
+                    db.execute("INSERT INTO source_terms(rowid,tokens) VALUES(?,?)", (row_id, tokens))
+                if self.trigram:
+                    db.execute("INSERT INTO source_substrings(rowid,body) VALUES(?,?)", (row_id, body))
+            db.execute("INSERT INTO sources VALUES(?,?)", (version, len(lines)))
+            self.metrics["index_builds"] += 1
+            self.metrics["indexed_lines"] += len(lines)
+
+    def search(self, version: str, query: str, *, ranked: bool = False, offset: int = 0) -> dict:
+        """Literal searches are exact; ranked retrieval is explicitly partial."""
+        terms = self.terms(query)
+        matches = []
+        scanned = 0
+        truncated = False
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            if ranked and self.fts and terms:
+                expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms[:32])
+                rows = db.execute(
+                    "SELECT b.start,b.body FROM source_terms JOIN blocks b ON b.id=source_terms.rowid "
+                    "WHERE source_terms MATCH ? AND b.version=? AND b.stop>? ORDER BY rank LIMIT 65",
+                    (expression, version, offset))
+            elif self.trigram and len(query) >= 3 and "\n" not in query:
+                expression = '"' + query.replace('"', '""') + '"'
+                rows = db.execute(
+                    "SELECT b.start,b.body FROM source_substrings JOIN blocks b ON b.id=source_substrings.rowid "
+                    "WHERE source_substrings MATCH ? AND b.version=? AND b.stop>? ORDER BY b.start",
+                    (expression, version, offset))
+            else:
+                rows = db.execute("SELECT start,body FROM blocks WHERE version=? AND stop>? ORDER BY start", (version, offset))
+            for block_start, body in rows:
+                scanned += 1
+                if ranked and scanned > 64:
+                    truncated = True
+                    break
+                for i, line in enumerate(body.split("\n"), block_start):
+                    if i <= offset:
+                        continue
+                    low = line.casefold()
+                    exact = query.casefold() in low
+                    score = sum(1 for term in terms if term in low) if ranked else int(exact)
+                    if (ranked and score) or exact:
+                        matches.append((score + (8 if exact else 0), i))
+                    if not ranked and len(matches) > 120:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            self.metrics["queries"] += 1
+            self.metrics["scanned_blocks"] += scanned
+        if ranked:
+            matches.sort(key=lambda item: (-item[0], item[1]))
+        return {"matches": matches[:120], "partial": truncated or ranked,
+                "scanned_blocks": scanned, "method": "ranked" if ranked else "literal"}
+
+    def remember(self, path: str, version: str, tool: str, role: str, args: dict, body: str, status: str) -> str:
+        digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+        arg_text = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+        eid = hashlib.sha256(f"{path}\0{version}\0{tool}\0{role}\0{arg_text}\0{digest}".encode()).hexdigest()[:24]
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (eid, path, version, tool, role, arg_text, digest, body, status, time.time()))
+        return eid
+
+    def recall(self, *, eid: str = "", digest: str = "", path: str = "", query: str = "", role: str = "", tool: str = "", limit: int = 8) -> list[dict]:
+        clauses, params = [], []
+        for key, value in (("id", eid), ("digest", digest), ("path", path), ("role", role), ("tool", tool)):
+            if value:
+                clauses.append(f"{key}=?")
+                params.append(value)
+        if query:
+            # Parameter names/values and command errors survive summary loss.
+            tokens = self.terms(query)[:16]
+            if tokens:
+                clauses.append("(" + " OR ".join("instr(lower(path || ' ' || args || ' ' || body),?)>0" for _ in tokens) + ")")
+                params.extend(tokens)
+        sql = "SELECT id,path,version,tool,role,args,digest,body,status,created FROM evidence"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created DESC LIMIT ?"
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.row_factory = sqlite3.Row
+            return [dict(row) for row in db.execute(sql, [*params, max(1, min(200, limit))])]
+
+
+    def link(self, source: str, target: str, relation: str) -> None:
+        if source and target and source != target:
+            with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+                db.execute("INSERT OR IGNORE INTO evidence_links VALUES(?,?,?)", (source, target, relation))
+
+    def links(self, eid: str) -> list[dict]:
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.row_factory = sqlite3.Row
+            return [dict(r) for r in db.execute("SELECT * FROM evidence_links WHERE source=? OR target=? LIMIT 40", (eid, eid))]
+
+    def record_flow(
+        self,
+        kind: str,
+        body: object,
+        *,
+        role: str = "",
+        metadata: dict | None = None,
+        parent_ids: list[str] | None = None,
+        status: str = "ok",
+    ) -> str:
+        """Persist a compact immutable node for any agentic-flow transition."""
+        flow_id = uuid.uuid4().hex
+        payload = {
+            "kind": str(kind or "flow"),
+            "flow_id": flow_id,
+            "metadata": dict(metadata or {}),
+            "body": body,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)
+        # Flow nodes are summaries; the exact large tool output remains in the
+        # ordinary tool evidence row referenced by parent_ids.
+        encoded = encoded[:24_000]
+        eid = self.remember(
+            "",
+            f"flow:{flow_id}",
+            f"flow:{str(kind or 'event')}",
+            role or "single",
+            {"flow_id": flow_id, **dict(metadata or {})},
+            encoded,
+            status,
+        )
+        for parent_id in list(parent_ids or [])[:24]:
+            parent = str(parent_id or "").strip()
+            if parent and parent != eid:
+                self.link(eid, parent, "continues")
+        return eid
+
+    def trace(self, eid: str, *, depth: int = 2, limit: int = 80) -> dict:
+        """Return one evidence row plus its bounded causal neighborhood."""
+        root_id = str(eid or "").strip()
+        rows = self.recall(eid=root_id, limit=1)
+        if not rows:
+            return {}
+        seen = {root_id}
+        frontier = [root_id]
+        nodes = [rows[0]]
+        edges: list[dict] = []
+        for _ in range(max(0, min(5, int(depth or 0)))):
+            next_frontier: list[str] = []
+            for current in frontier:
+                for edge in self.links(current):
+                    edges.append(edge)
+                    other = str(edge.get("target", "") or "")
+                    if other == current:
+                        other = str(edge.get("source", "") or "")
+                    if not other or other in seen or len(nodes) >= max(1, min(200, int(limit or 80))):
+                        continue
+                    found = self.recall(eid=other, limit=1)
+                    if found:
+                        seen.add(other)
+                        nodes.append(found[0])
+                        next_frontier.append(other)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return {"root": rows[0], "nodes": nodes, "links": edges[: max(1, min(400, int(limit or 80) * 4))]}
+
+    def file_head(self, path: str) -> dict:
+        rel = str(path or "").replace("\\", "/").strip()
+        if not rel:
+            return {}
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM file_evidence_heads WHERE path=?", (rel,)).fetchone()
+            return dict(row) if row else {}
+
+    def update_file_head(
+        self,
+        path: str,
+        evidence_id: str,
+        version: str,
+        operation: str,
+        *,
+        previous_evidence_id: str = "",
+    ) -> dict:
+        rel = str(path or "").replace("\\", "/").strip()
+        if not rel or not evidence_id:
+            return {}
+        previous = self.file_head(rel)
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.execute(
+                "INSERT INTO file_evidence_heads(path,evidence_id,version,operation,updated,stale,previous_evidence_id) "
+                "VALUES(?,?,?,?,?,0,?) ON CONFLICT(path) DO UPDATE SET evidence_id=excluded.evidence_id, "
+                "version=excluded.version, operation=excluded.operation, updated=excluded.updated, stale=0, "
+                "previous_evidence_id=excluded.previous_evidence_id",
+                (rel, evidence_id, str(version or ""), str(operation or ""), time.time(), previous_evidence_id or str(previous.get("evidence_id", "") or "")),
+            )
+        return previous
+
+    def mark_file_stale_if_changed(self, path: str, version: str) -> dict:
+        rel = str(path or "").replace("\\", "/").strip()
+        if not rel or not version:
+            return {}
+        head = self.file_head(rel)
+        if head and str(head.get("version", "") or "") != str(version):
+            with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+                db.execute("UPDATE file_evidence_heads SET stale=1, updated=? WHERE path=?", (time.time(), rel))
+                if head.get("evidence_id"):
+                    db.execute("UPDATE evidence SET status='stale' WHERE id=? AND status='ok'", (str(head.get("evidence_id")),))
+            head["stale"] = 1
+        return head
+
+    def consolidate(self, claim: str, kind: str, conditions: str, importance: int, references: list[dict], supersedes: str = '') -> dict:
+        if not claim.strip() or len(claim) > 2000 or len(conditions) > 1000:
+            raise ValueError('claim is required (max 2000 chars); conditions max 1000 chars')
+        if kind not in {'fact', 'inference', 'decision', 'constraint', 'procedure'}:
+            raise ValueError('unknown memory kind')
+        if not isinstance(references, list) or not 1 <= len(references) <= 12:
+            raise ValueError('supply 1-12 references with evidence_id and an exact quote')
+        refs = []
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            for ref in references:
+                eid, quote = str(ref.get('evidence_id', '')), str(ref.get('quote', ''))
+                row = db.execute("SELECT body,digest,status FROM evidence WHERE id=?", (eid,)).fetchone()
+                if not row or not quote.strip() or len(quote) > 4000 or quote not in row[0]:
+                    raise ValueError(f'reference {eid} is unavailable or quote does not exactly match the tool result')
+                refs.append({'evidence_id': eid, 'quote': quote, 'digest': row[1], 'source_status': row[2]})
+            # Exact numerical spelling is mandatory for a factual memory.
+            # Conversions/calculations belong to inference with source refs.
+            if kind == 'fact':
+                number_re = r'(?<![\w])[-+−]?\d+(?:\.\d+)?(?:[eEdD][-+]?\d+)?'
+                available = set(re.findall(number_re, ' '.join(r['quote'] for r in refs)))
+                if not set(re.findall(number_re, claim)).issubset(available):
+                    raise ValueError('factual numerical values must occur verbatim in the cited quotes; use inference for a derived value')
+                key_match = re.match(r"\s*([A-Za-z_][\w .-]{1,96})\s*(?:=|:)\s*", claim)
+                if key_match and not supersedes:
+                    fact_key = key_match.group(1).strip().casefold()
+                    for existing_claim, existing_id in db.execute(
+                        "SELECT claim,id FROM memories WHERE status='active' AND kind='fact'"
+                    ):
+                        existing_match = re.match(
+                            r"\s*([A-Za-z_][\w .-]{1,96})\s*(?:=|:)\s*", str(existing_claim or '')
+                        )
+                        if existing_match and existing_match.group(1).strip().casefold() == fact_key and str(existing_claim).strip() != claim.strip():
+                            raise ValueError(
+                                f'conflict with active memory {existing_id}; cite the new evidence and set supersedes explicitly'
+                            )
+            packed = json.dumps(refs, sort_keys=True, ensure_ascii=False)
+            mid = 'mem_' + hashlib.sha256((claim + kind + conditions + packed).encode()).hexdigest()[:20]
+            if supersedes and not db.execute("SELECT 1 FROM memories WHERE id=?", (supersedes,)).fetchone():
+                raise ValueError('superseded memory does not exist')
+            db.execute("INSERT OR IGNORE INTO memories VALUES(?,?,?,?,?,?,?,?,?)",
+                       (mid, claim, kind, conditions, max(1, min(5, importance)), packed, 'active', time.time(), time.time()))
+            for ref in refs:
+                db.execute("INSERT OR IGNORE INTO evidence_links VALUES(?,?,?)", (mid, ref['evidence_id'], 'cites'))
+            if supersedes and supersedes != mid:
+                db.execute("UPDATE memories SET status='superseded' WHERE id=?", (supersedes,))
+                db.execute("INSERT OR IGNORE INTO evidence_links VALUES(?,?,?)", (mid, supersedes, 'supersedes'))
+        return {'id': mid, 'kind': kind, 'status': 'active', 'validation': 'exact citations checked; claim remains model-authored'}
+
+    def memories(self, query: str = '', mid: str = '', limit: int = 6) -> list[dict]:
+        with self.lock, _connect_sqlite(self.path, timeout=5.0) as db:
+            db.row_factory = sqlite3.Row
+            sql = "SELECT * FROM memories WHERE status='active'"
+            params = []
+            if mid:
+                sql += ' AND id=?'
+                params.append(mid)
+            terms = self.terms(query)[:16]
+            if terms:
+                sql += ' AND (' + ' OR '.join("instr(lower(claim || ' ' || conditions),?)>0" for _ in terms) + ')'
+                params.extend(terms)
+            sql += ' ORDER BY importance DESC, accessed DESC LIMIT ?'
+            rows = [dict(r) for r in db.execute(sql, [*params, max(1, min(40, limit))])]
+            for row in rows:
+                row['references'] = json.loads(row.pop('refs'))
+                db.execute('UPDATE memories SET accessed=? WHERE id=?', (time.time(), row['id']))
+            return rows
+
+
+_EVIDENCE_CONTROLLER_INIT_LOCK = threading.Lock()
+
+
 class SessionState:
+    def _evidence_controller(self) -> EvidenceRetrievalController:
+        with _EVIDENCE_CONTROLLER_INIT_LOCK:
+            controller = getattr(self, '_evidence_retrieval_controller', None)
+            if controller is None:
+                controller = EvidenceRetrievalController(self.root)
+                self._evidence_retrieval_controller = controller
+        return controller
+
+    def _flow_context(self, role: str = "", tool_call_id: str = "") -> dict:
+        """Capture the execution coordinates attached to every evidence node."""
+        sanitize_role = getattr(self, "_sanitize_agent_role", lambda value: str(value or "").strip().lower())
+        role_key = sanitize_role(role) or sanitize_role(getattr(self, "active_agent_role", "")) or "single"
+        alignment = {}
+        try:
+            alignment = self._agent_loop_todo_alignment(role_key)
+        except Exception:
+            alignment = {}
+        plan_step = {}
+        try:
+            plan_step = self._current_plan_step_row(self._ensure_blackboard()) or {}
+        except Exception:
+            plan_step = {}
+        with getattr(self, "_flow_event_lock", threading.RLock()):
+            parent = str(getattr(self, "_flow_last_evidence_by_role", {}).get(role_key, "") or "")
+            start = str(getattr(self, "_flow_tool_start_evidence", {}).get(str(tool_call_id or ""), "") or "")
+        return {
+            "run_generation": int(getattr(self, "run_generation", 0) or 0),
+            "agent_round_index": int(getattr(self, "agent_round_index", 0) or 0),
+            "current_phase": str(getattr(self, "current_phase", "idle") or "idle"),
+            "current_tool_name": str(getattr(self, "current_tool_name", "") or ""),
+            "active_agent_role": role_key,
+            "tool_call_id": trim(str(tool_call_id or ""), 240),
+            "todo_fp": trim(str(alignment.get("todo_fp", "") or ""), 40),
+            "todo_current": trim(str(alignment.get("current_todo", "") or ""), 240),
+            "plan_step_id": trim(str(plan_step.get("id", "") or ""), 80),
+            "plan_step_index": int(plan_step.get("plan_step_index", -1) or -1),
+            "parent_evidence_id": parent,
+            "tool_start_evidence_id": start,
+        }
+
+    def _record_flow_node(
+        self,
+        kind: str,
+        body: object,
+        *,
+        role: str = "",
+        metadata: dict | None = None,
+        parent_ids: list[str] | None = None,
+    ) -> str:
+        """Best-effort bridge from runtime state to immutable evidence."""
+        sanitize_role = getattr(self, "_sanitize_agent_role", lambda value: str(value or "").strip().lower())
+        role_key = sanitize_role(role) or sanitize_role(getattr(self, "active_agent_role", "")) or "single"
+        context = self._flow_context(role_key, str((metadata or {}).get("tool_call_id", "") or ""))
+        merged = {**context, **dict(metadata or {})}
+        parents = [str(value or "") for value in (parent_ids or []) if str(value or "").strip()]
+        for key in ("parent_evidence_id", "tool_start_evidence_id"):
+            value = str(merged.get(key, "") or "").strip()
+            if value and value not in parents:
+                parents.append(value)
+        try:
+            eid = self._evidence_controller().record_flow(
+                kind,
+                body,
+                role=role_key,
+                metadata=merged,
+                parent_ids=parents,
+            )
+        except Exception:
+            return ""
+        with getattr(self, "_flow_event_lock", threading.RLock()):
+            if not isinstance(getattr(self, "_flow_last_evidence_by_role", None), dict):
+                self._flow_last_evidence_by_role = {}
+            if not isinstance(getattr(self, "_flow_tool_start_evidence", None), dict):
+                self._flow_tool_start_evidence = {}
+            self._flow_last_evidence_by_role[role_key] = eid
+            call_id = str(merged.get("tool_call_id", "") or "").strip()
+            if call_id and kind == "tool_start":
+                self._flow_tool_start_evidence[call_id] = eid
+        return eid
+
+    @staticmethod
+    def _flow_safe_args(args: object) -> dict:
+        values = args if isinstance(args, dict) else {}
+        return {str(key): value for key, value in values.items() if not str(key).startswith("_")}
+
+    def _trace_tool_result(self, name: str, args: dict, output: str, role: str = '') -> str:
+        if name in {'tool_memory', 'compress'}:
+            return output  # Memory recalls must not become new factual evidence.
+        try:
+            body = str(output or '')
+            raw_args = args if isinstance(args, dict) else {}
+            trace_context = raw_args.get('_flow_context', {}) if isinstance(raw_args.get('_flow_context', {}), dict) else {}
+            evidence_args = self._flow_safe_args(raw_args)
+            path = str(evidence_args.get('path', '') or '')
+            fingerprint = self._read_source_fingerprint(path) if path else {}
+            version = str(fingerprint.get('source_sha256', '') or '')
+            rendered_version = re.search(r'\bsource_sha256=([a-f0-9]{64})', body[:900])
+            if rendered_version:
+                version = rendered_version.group(1)
+            if not version:
+                version = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+            status = 'ok' if self._tool_result_compat_ok(name, body) else 'error'
+            controller = self._evidence_controller()
+            eid = controller.remember(path, version, name, role or 'single', evidence_args, body, status)
+            parent_ids = evidence_args.get("trace_parent_ids", evidence_args.get("parent_evidence_ids", []))
+            if isinstance(parent_ids, str):
+                parent_ids = [parent_ids]
+            parent_ids = list(parent_ids) if isinstance(parent_ids, list) else []
+            for parent_id in (
+                trace_context.get("tool_start_evidence_id"),
+                trace_context.get("parent_evidence_id"),
+            ):
+                if parent_id and parent_id not in parent_ids:
+                    parent_ids.append(parent_id)
+            for parent_id in parent_ids[:24]:
+                controller.link(eid, str(parent_id), "derived_from")
+            # Connect source reads and mutations to the current file head. A
+            # write/edit supersedes the prior head; a read observes it. Bash
+            # source alignment uses the same path/version relation.
+            candidate_paths = []
+            if path:
+                candidate_paths.append(path)
+            changed = self._peek_tool_result_meta().get("changed_files", [])
+            if isinstance(changed, list):
+                candidate_paths.extend(str(value or "") for value in changed[:40])
+            if name in {"bash", "worktree_run", "background_run"}:
+                try:
+                    candidate_paths.extend(self._bash_file_read_targets(
+                        str(evidence_args.get("command", "") or ""),
+                        operation=str(evidence_args.get("operation", "") or ""),
+                    ))
+                except Exception:
+                    pass
+            source_versions = {}
+            for rel in list(dict.fromkeys(str(value or "").replace("\\", "/").strip() for value in candidate_paths))[:40]:
+                if not rel:
+                    continue
+                current_fp = self._read_source_fingerprint(rel)
+                current_version = str(current_fp.get("source_sha256", "") or "")
+                if not current_version:
+                    continue
+                source_versions[rel] = current_version
+                head = controller.mark_file_stale_if_changed(rel, current_version)
+                if name in {"write_file", "edit_file"} and status == "ok" and rel == path:
+                    previous_id = str(head.get("evidence_id", "") or "") if head else ""
+                    previous_version = str(head.get("version", "") or "") if head else ""
+                    if previous_id and previous_id != eid:
+                        controller.link(eid, previous_id, "supersedes")
+                    if previous_version and previous_version != current_version:
+                        controller.link(eid, previous_id, "derived_from")
+                    controller.update_file_head(
+                        rel,
+                        eid,
+                        current_version,
+                        name,
+                        previous_evidence_id=previous_id,
+                    )
+                elif name in {"bash", "worktree_run", "background_run", "check_background"} and status == "ok":
+                    # A command may mention several sources. Each file gets an
+                    # identity/version node, never a head claiming that the
+                    # combined shell output is that file's complete contents.
+                    previous_id = str(head.get("evidence_id", "") or "")
+                    same_version = bool(head and str(head.get("version", "")) == current_version)
+                    # Every shell observation receives its own lightweight node,
+                    # even when the source version is unchanged. This preserves
+                    # command-specific provenance while keeping the full output
+                    # only once in the parent Bash evidence row.
+                    observation_id = controller.remember(
+                        rel, current_version, "flow:file_observation", role or "single",
+                        {"operation": str(evidence_args.get("operation", "") or name), "source_evidence_id": eid},
+                        json_dumps({"path": rel, "source_sha256": current_version,
+                                    "source_evidence_id": eid, "coverage": "identity_only",
+                                    "verification": "Trace the command output for visible evidence; use read_file for exact source windows."}),
+                        "ok",
+                    )
+                    controller.link(observation_id, eid, "derived_from")
+                    if previous_id and previous_id != observation_id:
+                        controller.link(observation_id, previous_id, "continues" if same_version else "supersedes")
+                    controller.update_file_head(rel, observation_id, current_version,
+                                                str(evidence_args.get("operation", "") or name),
+                                                previous_evidence_id=previous_id)
+                elif head and str(head.get("evidence_id", "") or "") and str(head.get("version", "") or "") == current_version:
+                    controller.link(eid, str(head.get("evidence_id")), "observes_version")
+                elif name in {"read_file", "bash", "worktree_run", "background_run", "check_background"} and status == "ok":
+                    previous_id = str(head.get("evidence_id", "") or "") if head else ""
+                    if previous_id and previous_id != eid:
+                        controller.link(eid, previous_id, "continues")
+                    controller.update_file_head(
+                        rel,
+                        eid,
+                        current_version,
+                        str(evidence_args.get("operation", "") or name),
+                        previous_evidence_id=previous_id,
+                    )
+            self._record_flow_node(
+                "tool_result",
+                {"name": name, "path": path, "status": status, "output": self._tool_result_compact_output(body, max_chars=1800)},
+                role=role,
+                metadata={**trace_context, "tool_call_id": trace_context.get("tool_call_id", "")},
+                parent_ids=[eid],
+            )
+            if canonicalize_tool_name(name) in {"TodoWrite", "TodoWriteRescue"}:
+                try:
+                    todo_rows = [
+                        dict(row) for row in self.todo.snapshot()
+                        if isinstance(row, dict)
+                    ][:80]
+                except Exception:
+                    todo_rows = []
+                self._record_flow_node(
+                    "todo_state",
+                    {"tool": name, "rows": todo_rows, "result": self._tool_result_compact_output(body, max_chars=900)},
+                    role=role,
+                    metadata={"tool_call_id": trace_context.get("tool_call_id", "")},
+                    parent_ids=[eid],
+                )
+            if canonicalize_tool_name(name) in {"ask_colleague", "send_message", "broadcast", "task", "spawn_teammate", "route_to_next_agent"}:
+                self._record_flow_node(
+                    "handoff",
+                    {"tool": name, "args": evidence_args, "result": self._tool_result_compact_output(body, max_chars=1200)},
+                    role=role,
+                    metadata={"tool_call_id": trace_context.get("tool_call_id", "")},
+                    parent_ids=[eid],
+                )
+            self._set_tool_result_meta(**{
+                **self._peek_tool_result_meta(), 'evidence_id': eid,
+                'evidence_digest': self._observation_digest(body), 'source_versions': source_versions,
+            })
+            self._bind_tool_memory_evidence_id(name, args, body, role, eid)
+            return body + f'\n[evidence_ref id={eid} tool={name}; tool_memory mode="trace" id="{eid}" returns exact evidence and verification locator]'
+        except Exception as exc:
+            return str(output or '') + f'\n[evidence storage unavailable: {type(exc).__name__}; retain this raw result for verification]'
+
+    def _bind_tool_memory_evidence_id(
+        self,
+        name: str,
+        args: dict | None,
+        output: str,
+        role: str = '',
+        evidence_id: str = '',
+    ) -> None:
+        """Attach the immutable trace id to the already-recorded tool-memory row."""
+        eid = str(evidence_id or '').strip()
+        if not eid or not isinstance(getattr(self, 'tool_memory_registry', {}), dict):
+            return
+        tool = canonicalize_tool_name(name)
+        role_key = self._sanitize_agent_role(role) or 'single'
+        body = str(output or '')
+        digest = hashlib.sha256(body.encode('utf-8', errors='replace')).hexdigest()
+        signature = self._tool_memory_signature_from_args(tool, args or {})
+        key = self._tool_memory_key(role_key, signature) if signature else ''
+        candidates: list[dict] = []
+        if key and isinstance(self.tool_memory_registry.get(key), dict):
+            candidates.append(self.tool_memory_registry[key])
+        candidates.extend(
+            row for row in self.tool_memory_registry.values()
+            if isinstance(row, dict)
+            and row not in candidates
+            and str(row.get('source_tool', '') or '') == tool
+            and str(row.get('agent_role', '') or '') == role_key
+        )
+        target = next((row for row in candidates if str(row.get('sha256', '') or '') == digest), None)
+        if target is None and candidates:
+            target = candidates[0]
+        if isinstance(target, dict):
+            target['evidence_id'] = eid
+
+    @staticmethod
+    def _evidence_body(output: str) -> str:
+        return re.sub(r'\n\[evidence_ref id=[a-f0-9]+[^\n]*\]$', '', str(output or ''))
+
+    def _source_lines(self, fp: Path, rel: str, *, fresh: bool = False) -> tuple[list[str], str, dict]:
+        if fresh:
+            getattr(self, '_long_content_source_cache', {}).pop(rel, None)
+            getattr(self, '_source_fingerprint_cache', {}).pop(rel, None)
+        text, fingerprint = self._read_text_and_fingerprint(fp, rel)
+        cache = getattr(self, '_long_content_source_cache', {}).get(rel, {})
+        lines = cache.get('lines')
+        if not isinstance(lines, list):
+            lines = text.splitlines()
+            if cache:
+                cache['lines'] = lines
+        return lines, text, fingerprint
+
+    def _render_evidence_windows(self, rel: str, lines: list[str], ranges: list[tuple[int, int]], *, label: str = 'window', max_chars: object = None, detail: str = '') -> str:
+        """Bound output before marking coverage. Omitted lines are never read."""
+        cap = self._read_file_max_chars(max_chars)
+        fp = self._read_source_fingerprint(rel)
+        header = f'[read_file {label} path={rel} source_sha256={fp.get("source_sha256", "unknown")} total_lines={len(lines)} {detail}]'
+        rows = [header]
+        used = len(header) + 1
+        delivered = set()
+        omitted = []
+        for a, b in ranges:
+            start, end = max(1, int(a)), min(len(lines), int(b))
+            local = []
+            for line_no in range(start, end + 1):
+                if line_no in delivered:
+                    continue
+                row = f'{line_no}: {lines[line_no - 1]}'
+                if used + len(row) + 120 > cap:
+                    omitted.append([line_no, end])
+                    break
+                local.append(row)
+                delivered.add(line_no)
+                used += len(row) + 1
+            if local:
+                first = int(local[0].split(':', 1)[0])
+                last = int(local[-1].split(':', 1)[0])
+                marker = f'@@ lines {first}-{last} @@'
+                rows.extend([marker, *local])
+                used += len(marker) + 1
+        if omitted:
+            rows.append('[partial evidence: omitted ranges=' + json.dumps(omitted) + '; read mode="window" at an omitted line; use mode="full" offset for an oversized single line]')
+        rows.append('[source excerpts; preserve values, signs, units, labels and conditions together. Coverage is delivery, not understanding.]')
+        return '\n'.join(rows)
+
     @staticmethod
     def _normalize_workspace_id(value: object, fallback: str) -> str:
         """Normalize persisted workspace lineage without allowing path traversal."""
@@ -30086,6 +31779,7 @@ class SessionState:
         kernel_runtime=None,
         skills_snapshot: SkillStore | None = None,
         defer_initial_persist: bool = False,
+        session_llm_concurrency: int | None = None,
     ):
         self.id = session_id
         self.title = title
@@ -30218,6 +31912,10 @@ class SessionState:
         # structured outcome metadata (notably the real shell exit code) is
         # carried alongside it in thread-local state for the orchestrator.
         self._tool_result_local = threading.local()
+        # Pooled tool threads still running after their timeout result was
+        # returned (live gauge) and how many ever were (cumulative).
+        self.tool_orphan_threads = 0
+        self.tool_orphan_threads_total = 0
         self._application_snapshot_integrity_lock = threading.RLock()
         self.single_advance_prompt_enhance = False
         cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
@@ -30321,6 +32019,12 @@ class SessionState:
         self.agent_round_index = 0
         self.current_phase = "idle"
         self.current_tool_name = ""
+        # Runtime-only indexes that connect visible events and tool results to
+        # the durable evidence graph.  The graph itself is persisted by the
+        # session-local EvidenceRetrievalController.
+        self._flow_last_evidence_by_role: dict[str, str] = {}
+        self._flow_tool_start_evidence: dict[str, str] = {}
+        self._flow_event_lock = threading.RLock()
         self.runtime_task_level = 0
         self.user_task_level_override = 0
         self.runtime_execution_mode = ""
@@ -30337,6 +32041,17 @@ class SessionState:
         self.runtime_task_level_floor = 0
         self.runtime_task_level_ceiling = 0  # 0 = no ceiling; set from plan risk on approval
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        # One in-session model request gate, shared by self.ollama and the
+        # derived arbiter/auto-title clients.
+        self.session_llm_concurrency = normalize_session_llm_concurrency(session_llm_concurrency)
+        # Coalesced WebUI push of gate state; enabled once restore is done.
+        self._llm_concurrency_push_lock = threading.Lock()
+        self._llm_concurrency_push_timer: threading.Timer | None = None
+        self._llm_concurrency_push_dirty = False
+        self._llm_concurrency_last_push_mono = 0.0
+        self._llm_concurrency_push_ready = False
+        self.llm_gate: SessionLLMGate | None = None
+        self._ensure_llm_gate()
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(default_llm_config or {})
         self.l2_todo_policy = normalize_l2_todo_policy(
             l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
@@ -30381,6 +32096,7 @@ class SessionState:
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state: dict[str, dict] = {}
+        self._loop_stop_requested: dict[str, dict] = {}
         # Per-role, per-run progress telemetry. This is deliberately transient:
         # durable task truth remains in Todo/blackboard/tool memory, while this
         # state only helps the next model turn distinguish progress from reused
@@ -30559,9 +32275,168 @@ class SessionState:
         self.blackboard = self._new_blackboard("")
         self._init_llm_profiles(default_llm_config or {})
         self._load_if_exists()
+        # Gate changes seen while restoring were only recorded; from here on
+        # they are pushed to the WebUI (see _on_llm_gate_change).
+        self._llm_concurrency_push_ready = True
 
     def _sanitize_profile_id(self, raw: str) -> str:
         return sanitize_profile_id(raw)
+
+    def _ensure_llm_gate(self) -> SessionLLMGate:
+        """Return this session's model request gate, creating it lazily.
+
+        Sessions built with ``SessionState.__new__`` (tests, restores) get a
+        gate on first use.  The gate is (re)attached to ``self.ollama`` so a
+        rebuilt client keeps the same per-session limit.
+        """
+        gate = getattr(self, "llm_gate", None)
+        if not isinstance(gate, SessionLLMGate):
+            with _SESSION_LLM_GATE_INIT_LOCK:
+                gate = getattr(self, "llm_gate", None)
+                if not isinstance(gate, SessionLLMGate):
+                    try:
+                        generation = int(getattr(self, "run_generation", 0) or 0)
+                    except Exception:
+                        generation = 0
+                    gate = SessionLLMGate(
+                        normalize_session_llm_concurrency(getattr(self, "session_llm_concurrency", None)),
+                        generation=generation,
+                    )
+                    gate.role_provider = lambda: str(getattr(self, "active_agent_role", "") or "")
+                    # Called outside the gate lock; only schedules a push.
+                    gate.on_change = self._on_llm_gate_change
+                    self.llm_gate = gate
+        client = getattr(self, "ollama", None)
+        if isinstance(client, OllamaClient) and getattr(client, "request_gate", None) is not gate:
+            client.request_gate = gate
+        return gate
+
+    def set_session_llm_concurrency(self, value: object) -> int:
+        """Set the in-session model concurrency and resize the live gate."""
+        limit = normalize_session_llm_concurrency(value)
+        self.session_llm_concurrency = limit
+        self._ensure_llm_gate().set_limit(limit)
+        return limit
+
+    def _sync_llm_gate_generation(self) -> None:
+        try:
+            self._ensure_llm_gate().set_generation(int(getattr(self, "run_generation", 0) or 0))
+        except Exception:
+            pass
+
+    def _mark_llm_worker_abandoned(self, worker: threading.Thread | None) -> int:
+        """Flag the in-flight model requests of a worker its caller gave up on.
+
+        Used where a caller joins a model-call thread with a timeout (or the
+        user cancels) and returns while the thread is still alive.  The slot
+        stays occupied until the request really ends; this only makes it
+        visible as ``abandoned``.  Never raises.
+        """
+        gate = getattr(self, "llm_gate", None)
+        if gate is None or worker is None:
+            return 0
+        try:
+            return int(gate.mark_abandoned(worker.ident) or 0)
+        except Exception:
+            return 0
+
+    def _llm_concurrency_snapshot(self) -> dict:
+        """Live in-session model concurrency for snapshots and WebUI pushes.
+
+        ``SessionLLMGate.snapshot()`` counters plus the tool orphan gauges,
+        with at most ``SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS`` compact request
+        rows.  Read on every call (never served from a snapshot cache); returns
+        ``{}`` when the session has no gate yet.  Never raises.
+        """
+        gate = getattr(self, "llm_gate", None)
+        if not isinstance(gate, SessionLLMGate):
+            return {}
+        try:
+            data = gate.snapshot()
+        except Exception:
+            return {}
+        rows: list[dict] = []
+        for row in list(data.get("requests", []) or [])[:SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS]:
+            if not isinstance(row, dict):
+                continue
+            rows.append(
+                {
+                    "id": str(row.get("id", "") or ""),
+                    "priority": str(row.get("priority", "main") or "main"),
+                    "label": str(row.get("label", "") or ""),
+                    "role": str(row.get("role", "") or ""),
+                    "elapsed_seconds": round(float(row.get("elapsed", 0.0) or 0.0), 1),
+                    "abandoned": bool(row.get("abandoned")),
+                    "orphaned": bool(row.get("orphaned")),
+                }
+            )
+        data["requests"] = rows
+        data["tool_orphan_threads"] = max(0, int(getattr(self, "tool_orphan_threads", 0) or 0))
+        data["tool_orphan_threads_total"] = max(0, int(getattr(self, "tool_orphan_threads_total", 0) or 0))
+        return data
+
+    def _on_llm_gate_change(self, _snapshot: dict | None = None) -> None:
+        """Gate ``on_change`` hook: schedule a coalesced ``llm_concurrency`` push.
+
+        Runs on whichever thread changed the gate (outside the gate lock) and
+        never emits from there, because that thread may be restoring the
+        session or hold ``self.lock``.  A daemon timer sends at most one
+        transient event per ``SESSION_LLM_CONCURRENCY_PUSH_INTERVAL_SECONDS``
+        and always reads the latest gate state, so the last change in a burst
+        is never lost.
+        """
+        if not bool(getattr(self, "_llm_concurrency_push_ready", False)):
+            return
+        lock = getattr(self, "_llm_concurrency_push_lock", None)
+        if lock is None:
+            with _SESSION_LLM_GATE_INIT_LOCK:
+                lock = getattr(self, "_llm_concurrency_push_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._llm_concurrency_push_lock = lock
+        with lock:
+            self._llm_concurrency_push_dirty = True
+            if getattr(self, "_llm_concurrency_push_timer", None) is not None:
+                # A push is pending or being sent; it (or its trailing
+                # follow-up) will carry the newest state.
+                return
+            self._start_llm_concurrency_push_timer_locked()
+
+    def _start_llm_concurrency_push_timer_locked(self) -> None:
+        last = float(getattr(self, "_llm_concurrency_last_push_mono", 0.0) or 0.0)
+        delay = 0.0
+        if last > 0.0:
+            delay = max(0.0, SESSION_LLM_CONCURRENCY_PUSH_INTERVAL_SECONDS - (time.monotonic() - last))
+        timer = threading.Timer(delay, self._flush_llm_concurrency_push)
+        timer.daemon = True
+        self._llm_concurrency_push_timer = timer
+        try:
+            timer.start()
+        except Exception:
+            self._llm_concurrency_push_timer = None
+
+    def _flush_llm_concurrency_push(self) -> None:
+        lock = getattr(self, "_llm_concurrency_push_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._llm_concurrency_push_dirty = False
+            self._llm_concurrency_last_push_mono = time.monotonic()
+        try:
+            payload = self._llm_concurrency_snapshot()
+            if payload:
+                # Transient only: _emit would fill the 500-row operations log.
+                self._emit_transient("llm_concurrency", payload, heartbeat=False)
+        except Exception:
+            pass
+        finally:
+            # The timer slot stays taken until the push is sent, so a busy
+            # session lock never stacks up timer threads.  Changes that came
+            # in meanwhile get exactly one trailing push.
+            with lock:
+                self._llm_concurrency_push_timer = None
+                if bool(getattr(self, "_llm_concurrency_push_dirty", False)):
+                    self._start_llm_concurrency_push_timer_locked()
 
     def _profile_cache_key(self, profile: dict | None = None, model_override: str = "") -> str:
         row = profile if isinstance(profile, dict) else dict(self.model_profiles.get(self.active_profile_id, {}))
@@ -31310,6 +33185,7 @@ class SessionState:
         # client must not promote them to profile-level defaults, otherwise a
         # later model switch would inherit the previous model's settings.
         self.ollama.apply_profile(row)
+        self._ensure_llm_gate()
         self.thinking = False
 
     def _profile_is_runnable(self, profile: dict) -> bool:
@@ -31727,6 +33603,9 @@ class SessionState:
         cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(profile)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+        cfg_session_llm_concurrency = extract_session_llm_concurrency_setting(profile)
+        if cfg_session_llm_concurrency is not None:
+            self.set_session_llm_concurrency(cfg_session_llm_concurrency)
         self.updated_at = now_ts()
         self._persist()
         self._emit(
@@ -32143,6 +34022,12 @@ class SessionState:
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
                     )
                 )
+                self.set_session_llm_concurrency(
+                    raw.get(
+                        "session_llm_concurrency",
+                        getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
+                    )
+                )
                 if "l2_todo_policy" in raw:
                     self.l2_todo_policy = normalize_l2_todo_policy(
                         raw.get("l2_todo_policy"),
@@ -32393,6 +34278,7 @@ class SessionState:
                         )
                     self.user_bubble_log = clean_bubbles[-MAX_USER_BUBBLE_LOG:]
                 self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
+                self._sync_llm_gate_generation()
                 self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
                 self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
                 if self.current_phase == self._startup_phase("auto-title"):
@@ -32912,6 +34798,9 @@ class SessionState:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "session_llm_concurrency": normalize_session_llm_concurrency(
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+            ),
             "l2_todo_policy": normalize_l2_todo_policy(
                 getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
             ),
@@ -33267,6 +35156,7 @@ class SessionState:
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state = {}
+        self._loop_stop_requested = {}
         self._readonly_bash_cache = {}
         self.agent_loop_progress_state = {}
         self.stall_severity_score = 0
@@ -33812,6 +35702,10 @@ class SessionState:
         command = str(values.get("command", "") or "").strip()
         if command:
             public["command"] = trim(command, 8000)
+        if tool_name in {"bash", "worktree_run", "background_run", "check_background"}:
+            operation, declared = self._bash_operation_from_args(values)
+            if declared:
+                public["operation"] = operation
         cwd = str(values.get("cwd", "") or "").strip()
         if not cwd and tool_name in {"bash", "worktree_run", "check_background"}:
             cwd = str(self.files_root)
@@ -33822,7 +35716,7 @@ class SessionState:
             if value:
                 public[key] = trim(value, 2000)
         details = result if isinstance(result, dict) else self._peek_tool_result_meta()
-        for key in ("exit_code", "duration_ms"):
+        for key in ("exit_code", "duration_ms", "evidence_id"):
             if details.get(key) is not None:
                 public[key] = details.get(key)
         if isinstance(details.get("changed_files"), list):
@@ -33885,10 +35779,39 @@ class SessionState:
             str(kind or "").strip().lower() == "web_search"
             and not bool(payload.get("conversation_visible", True))
         )
+        event_id = make_id("evt")
+        event_seq = self._next_event_seq()
+        tool_call_id = str(payload.get("tool_call_id", "") or "").strip()
+        event_role = str(payload.get("agent_role", payload.get("role", "")) or "")
+        flow_kind = f"event:{str(kind or 'unknown').strip().lower() or 'unknown'}"
+        flow_parent = []
+        if str(kind or "").strip().lower() == "tool_result":
+            result_eid = str(payload.get("evidence_id", "") or "").strip()
+            if result_eid:
+                flow_parent.append(result_eid)
+            if tool_call_id:
+                flow_parent.append(str(getattr(self, "_flow_tool_start_evidence", {}).get(tool_call_id, "") or ""))
+        flow_body = {
+            "event_id": event_id,
+            "type": str(kind or ""),
+            "data": self._flow_safe_event_payload(payload),
+        }
+        flow_eid = self._record_flow_node(
+            flow_kind,
+            flow_body,
+            role=event_role,
+            metadata={"event_id": event_id, "seq": event_seq, "tool_call_id": tool_call_id},
+            parent_ids=flow_parent,
+        )
+        if flow_eid:
+            payload["evidence_id"] = flow_eid
+        if tool_call_id and str(kind or "").strip().lower() == "tool_start" and flow_eid:
+            with getattr(self, "_flow_event_lock", threading.RLock()):
+                self._flow_tool_start_evidence[tool_call_id] = flow_eid
         with self.lock:
             event = {
-                "id": make_id("evt"),
-                "seq": self._next_event_seq(),
+                "id": event_id,
+                "seq": event_seq,
                 "ts": now_ts(),
                 "type": kind,
                 "session_id": self.id,
@@ -33912,6 +35835,21 @@ class SessionState:
         self._maybe_persist_after_event(kind, payload)
         self._publish_collaboration_event_heartbeat(kind, payload)
         return event
+
+    @staticmethod
+    def _flow_safe_event_payload(payload: object) -> dict:
+        """Bound event data before it is copied into the durable flow graph."""
+        values = payload if isinstance(payload, dict) else {}
+        out: dict = {}
+        for key, value in values.items():
+            if key in {"output", "result", "text", "thinking", "diff", "diff_numbered"}:
+                value = trim(str(value or ""), 1800)
+            elif isinstance(value, list):
+                value = [trim(str(item or ""), 300) if not isinstance(item, dict) else dict(item) for item in value[:24]]
+            elif isinstance(value, dict):
+                value = {str(k): trim(str(v or ""), 500) for k, v in list(value.items())[:40]}
+            out[str(key)] = value
+        return out
 
     def record_scheduler_queued_message(
         self,
@@ -34030,12 +35968,15 @@ class SessionState:
                 pass
         return out
 
-    def _emit_transient(self, kind: str, data: dict):
-        try:
-            if bool(getattr(self, "running", False)):
-                self.run_last_heartbeat = now_ts()
-        except Exception:
-            pass
+    def _emit_transient(self, kind: str, data: dict, *, heartbeat: bool = True):
+        # ``heartbeat=False`` is for monitoring pushes that can come from
+        # background threads; they must not make a stalled run look alive.
+        if heartbeat:
+            try:
+                if bool(getattr(self, "running", False)):
+                    self.run_last_heartbeat = now_ts()
+            except Exception:
+                pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -34919,6 +36860,10 @@ class SessionState:
                 response_box["response"] = client.chat(
                     [{"role": "user", "content": json_dumps(payload, ensure_ascii=False)}],
                     system=system, max_tokens=2200, temperature=0.0, think=False, stream_thinking=False,
+                    auxiliary=True, label="step_skill_eval",
+                    # Socket timeout follows the join below, so an abandoned
+                    # request ends within seconds instead of after 600s.
+                    request_timeout=SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS + 2.0,
                 )
             except Exception as exc:
                 response_box["error"] = exc
@@ -34927,6 +36872,7 @@ class SessionState:
         worker.start()
         worker.join(timeout=SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS)
         if worker.is_alive():
+            self._mark_llm_worker_abandoned(worker)
             raise TimeoutError("step skill evaluation timed out")
         if "error" in response_box:
             raise response_box["error"]
@@ -35118,6 +37064,13 @@ class SessionState:
                 state["keep_intents"] = {}
                 state["model_unloads"] = {}
             evaluation_trigger = "session-resume" if restarted else ("step-start" if new_step else "focus-changed" if changed else ",".join(state["pending_triggers"]) or trigger or "ttl-expired")
+            # Restored when the evaluator is skipped because the session's
+            # model slots are busy: a skip must not count as an evaluation.
+            prior_evaluation = {
+                key: state[key]
+                for key in ("focus_signature", "last_evaluation_at", "evaluation_status", "evaluation_error", "evaluation_id")
+            }
+            prior_pending_triggers = list(state["pending_triggers"])
             state.update(
                 step_id=focus["step_id"], step_epoch=focus["step_epoch"], focus_signature=signature,
                 evaluation_id=uuid.uuid4().hex, last_evaluation_at=float(now_ts()), last_evaluation_trigger=evaluation_trigger,
@@ -35150,6 +37103,26 @@ class SessionState:
                 if signature != self._step_skill_focus_signature() or latest["revision"] != state["revision"]:
                     raise ValueError("execution focus or model skill intent changed during evaluation")
                 return self._apply_step_skill_evaluation(result, payload=payload, evaluation_id=state["evaluation_id"])
+            except LLMGateBusy as exc:
+                # No free in-session slot: skip without recording a failure.
+                # Undo the bookkeeping written before the call so the focus is
+                # still "unevaluated", and queue a recheck for the next round.
+                board = self._ensure_blackboard()
+                latest = self._normalize_step_skill_state(board.get("step_skill_state"))
+                latest.update(prior_evaluation)
+                for queued in prior_pending_triggers:
+                    if queued not in latest["pending_triggers"]:
+                        latest["pending_triggers"].append(queued)
+                board["step_skill_state"] = latest
+                self.blackboard = board
+                self._step_skill_restore_pending = restarted
+                # One real trigger name: evaluation_trigger may be several
+                # pending triggers joined by commas (restored above).
+                self._queue_step_skill_recheck(
+                    trigger or (prior_pending_triggers[-1] if prior_pending_triggers else evaluation_trigger)
+                )
+                latest = self._normalize_step_skill_state(self._ensure_blackboard().get("step_skill_state"))
+                return {"status": "skipped", "skipped": True, "reason": "llm_gate_busy", "error": str(exc), "state": latest}
             except Exception as exc:
                 board = self._ensure_blackboard()
                 latest = self._normalize_step_skill_state(board.get("step_skill_state"))
@@ -35979,6 +37952,7 @@ class SessionState:
         code_ref_block = self._runtime_code_reference_prompt_block()
         knowledge_ref_block = self._runtime_knowledge_reference_prompt_block()
         long_content_memory_block = self._long_content_memory_prompt_block()
+        long_content_memory_block += "\n" + self._evidence_memory_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -36060,7 +38034,7 @@ class SessionState:
                 f"{self._public_progress_prompt_instruction()}"
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
-            "Choose any local reading method that best fits the question. read_file offers mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context; shell-native grep/rg/sed/awk/head/tail or custom extractors are equally valid. Verified local-source output from every method is merged into one source-addressable long-content memory, so do not switch tools merely for memory retention. "
+            "For local file or directory inspection, use read_file first: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='evidence' for ranked cited excerpts, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context. Use bash for execution, builds, tests, validation, process control, or shell pipelines that read_file cannot express. When bash is used for a special read/perception task, optionally set operation (text_read/text_search/document_extract/ocr/media_metadata/media_extract/custom_extract) so short outputs are retained under the right memory category; this marker is caller-supplied and does not restrict general shell use. Bash file reads are source-aligned on a best-effort basis and share long-content memory, but read_file is the authoritative exact-source reader. Every successful result receives an immutable evidence_ref; use tool_memory/trace instead of repeating a broad read. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
                 f"{web_search_instruction}"
@@ -37007,15 +38981,17 @@ class SessionState:
             if tier >= 2:
                 self._compact_shared_context(tier)
         elif role_key:
+            # Tier 0 has no context pressure: keep file reads intact so the
+            # model is not forced to read the same file again.
             if role_key == "manager":
-                self._microcompact_agent_messages(self.manager_context, keep_recent=3)
+                self._microcompact_agent_messages(self.manager_context, keep_recent=3, preserve_reads=True)
             else:
-                self._microcompact_agent_messages(self._agent_context(role_key), keep_recent=3)
+                self._microcompact_agent_messages(self._agent_context(role_key), keep_recent=3, preserve_reads=True)
         elif tier >= 1:
             keep = max(1, 3 - tier)
             self._microcompact(keep_recent=keep)
         else:
-            self._microcompact()
+            self._microcompact(preserve_reads=True)
         # Tier 2+: compact agent contexts proactively
         if tier >= 2 and not role_key:
             self._compact_agent_contexts(tier)
@@ -37829,6 +39805,9 @@ class SessionState:
         elif tool in {"bash", "background_run", "worktree_run"}:
             cmd = trim(str(src.get("command", "") or ""), 500)
             parts.append(f"command={cmd}")
+            operation, declared = self._bash_operation_from_args(src)
+            if declared:
+                parts.append(f"operation={operation}")
             if tool == "worktree_run":
                 parts.append(f"worktree={trim(str(src.get('name', '') or ''), 120)}")
         elif tool in {"load_skill", "unload_skill"}:
@@ -37944,6 +39923,7 @@ class SessionState:
                 "path": target_path,
                 "target_path": target_path,
                 "command": trim(str(raw_entry.get("command", "") or ""), 500),
+                "operation": normalize_bash_operation(raw_entry.get("operation", ""), default="execute") if tool in {"bash", "worktree_run", "background_run"} and str(raw_entry.get("operation", "") or "").strip() else "",
                 "signature": signature,
                 "agent_role": role_key,
                 "status": status,
@@ -37981,9 +39961,16 @@ class SessionState:
             "edit_error": 1,
             "file_patch": 2,
             "retrieval": 3,
+            "document_extraction": 4,
+            "ocr": 4,
+            "media_perception": 4,
+            "media_extraction": 4,
+            "custom_extraction": 4,
+            "custom_observation": 4,
+            "directory_observation": 5,
             "skill_loaded": 4,
-            "command_result": 5,
-            "file_read": 6,
+            "command_result": 6,
+            "file_read": 7,
         }
         status = str(entry.get("status", "active") or "active").lower()
         kind = str(entry.get("evidence_kind", "") or "").lower()
@@ -38570,6 +40557,62 @@ class SessionState:
                 break
         return trim(" ".join(picked), READ_CONTEXT_SUMMARY_MAX_CHARS)
 
+    @staticmethod
+    def _bash_operation_from_args(args: dict | None) -> tuple[str, bool]:
+        """Return the declared shell operation and whether it was explicit.
+
+        ``operation`` is the public contract. The aliases keep persisted calls
+        and older integrations readable while making the new field the one the
+        model is instructed to emit. Missing declarations intentionally remain
+        distinguishable so compatibility inference cannot masquerade as model
+        intent in provenance records.
+        """
+        src = args if isinstance(args, dict) else {}
+        raw = ""
+        for key in (
+            "operation",
+            "operation_code",
+            "recognition_code",
+            "perception_code",
+            "read_marker",
+            "bash_type",
+            "command_type",
+            "read_kind",
+        ):
+            value = str(src.get(key, "") or "").strip()
+            if value:
+                raw = value
+                break
+        if not raw:
+            return "execute", False
+        return normalize_bash_operation(raw), True
+
+    @classmethod
+    def _bash_declared_observation(cls, args: dict | None) -> tuple[str, bool]:
+        operation, declared = cls._bash_operation_from_args(args)
+        return operation, bool(declared and bash_operation_is_marked_observation(operation))
+
+    @staticmethod
+    def _bash_operation_evidence_kind(operation: object) -> str:
+        mapping = {
+            "text_read": "file_read",
+            "text_search": "file_read",
+            "directory_inspect": "directory_observation",
+            "document_extract": "document_extraction",
+            "ocr": "ocr",
+            "media_metadata": "media_perception",
+            "media_extract": "media_extraction",
+            "custom_extract": "custom_extraction",
+            "validation": "validation",
+            "build_test": "validation",
+            "process_control": "process_control",
+            "network": "network_observation",
+        }
+        normalized = normalize_bash_operation(operation)
+        if normalized.startswith("custom:"):
+            return "custom_observation"
+        return mapping.get(normalized, "command_result")
+
     def _shell_command_units(self, command: str) -> list[list[str]]:
         """Tokenize a shell expression into command/pipeline units.
 
@@ -38601,9 +40644,47 @@ class SessionState:
             units.append(current)
         return units
 
+    def _expand_shell_root_variables(self, raw: str) -> list[str]:
+        """Concrete paths a ``$SESSION_ROOT/...`` style token can name.
+
+        The system prompt tells the model to address files through these
+        variables, so a bash read written that way must count as a read.
+        - Locally, SESSION_ROOT is files_root and WORKSPACE_ROOT is root.
+        - The docker sandbox mounts the session files at /workspace.
+        - Remote mode uses the process home for both.
+        Every candidate is still confined to files_root by the caller.
+        """
+        match = re.match(r"^\$(?:\{(\w+)\}|(\w+))(.*)$", raw)
+        if not match:
+            if raw.startswith("/workspace/"):
+                files_root = getattr(self, "files_root", None)
+                return [str(Path(files_root) / raw[len("/workspace/"):])] if files_root else []
+            return [raw]
+        name = match.group(1) or match.group(2)
+        rest = match.group(3) or ""
+        files_root = getattr(self, "files_root", None)
+        session_root = getattr(self, "root", None)
+        roots: list[object] = []
+        if name in {"SESSION_ROOT", "SESSION_FILES_ROOT"}:
+            roots = [files_root]
+        elif name == "WORKSPACE_ROOT":
+            roots = [session_root, files_root]
+        out = []
+        for root in roots:
+            if root:
+                out.append(str(root) + rest)
+        return out
+
     def _shell_candidate_rel_path(self, token: object, cwd: Path | None = None) -> str:
         """Resolve one explicit shell token to a session-local file path."""
         raw = str(token or "").strip()
+        if raw.startswith(("$SESSION_ROOT", "${SESSION_ROOT}", "$WORKSPACE_ROOT", "${WORKSPACE_ROOT}",
+                           "$SESSION_FILES_ROOT", "${SESSION_FILES_ROOT}", "/workspace/")):
+            for expanded in self._expand_shell_root_variables(raw):
+                resolved = self._shell_candidate_rel_path(expanded, cwd)
+                if resolved:
+                    return resolved
+            return ""
         if not raw or raw in {"-", ".", ".."} or raw.startswith(("$", "http://", "https://")):
             return ""
         raw = raw[1:] if raw.startswith("@") and len(raw) > 1 else raw
@@ -38630,7 +40711,14 @@ class SessionState:
         except Exception:
             return ""
 
-    def _shell_source_candidates(self, command: str, output: str = "", *, likely_only: bool = False) -> list[str]:
+    def _shell_source_candidates(
+        self,
+        command: str,
+        output: str = "",
+        *,
+        likely_only: bool = False,
+        operation: object = "",
+    ) -> list[str]:
         """Find local source candidates without assuming a document domain.
 
         Known text-processing commands provide high-confidence candidates. For
@@ -38648,11 +40736,15 @@ class SessionState:
         candidate_cwds: list[Path] = [root] if root is not None else []
         likely: list[str] = []
         broad: list[str] = []
+        declared_operation = normalize_bash_operation(operation) if str(operation or "").strip() else ""
+        declared_observation = bash_operation_is_marked_observation(declared_operation)
         readers = {
             "cat", "tac", "nl", "head", "tail", "sed", "awk", "gawk", "mawk",
             "grep", "egrep", "fgrep", "rg", "ripgrep", "cut", "paste", "join",
             "sort", "uniq", "tr", "fold", "fmt", "column", "jq", "yq", "bat",
             "less", "more", "strings", "od", "hexdump", "xxd", "wc",
+            "pdftotext", "pdftoppm", "pdftocairo", "tesseract", "ocrmypdf",
+            "identify", "exiftool", "ffprobe", "ffmpeg", "mediainfo", "whisper",
         }
 
         def add(bucket: list[str], value: str) -> None:
@@ -38670,7 +40762,12 @@ class SessionState:
             if command_name in {"bash", "sh", "zsh"}:
                 for idx, token in enumerate(tokens[1:], 1):
                     if token in {"-c", "-lc", "-ic"} and idx + 1 < len(tokens):
-                        nested = self._shell_source_candidates(tokens[idx + 1], output, likely_only=likely_only)
+                        nested = self._shell_source_candidates(
+                            tokens[idx + 1],
+                            output,
+                            likely_only=likely_only,
+                            operation=declared_operation,
+                        )
                         for value in nested:
                             add(likely, value)
                         break
@@ -38691,6 +40788,13 @@ class SessionState:
             is_reader = command_name in readers or (
                 command_name == "git" and len(tokens) > 1 and str(tokens[1]).lower() in {"grep", "show", "diff"}
             )
+            if declared_observation:
+                # For an explicitly marked observation, custom executables and
+                # wrappers are treated as reader inputs too. The later source
+                # alignment step still verifies that output actually matches
+                # the candidate, so this does not turn arbitrary output into
+                # file comprehension.
+                is_reader = True
             for token in tokens[1:]:
                 if token.startswith("-") or token.isdigit() or token in {"<", ">", ">>", "2>", "1>"}:
                     continue
@@ -38772,8 +40876,8 @@ class SessionState:
         selected = likely if likely_only else likely + [x for x in broad if x not in likely]
         return selected[:SHELL_SOURCE_CANDIDATE_MAX]
 
-    def _bash_file_read_targets(self, command: str) -> list[str]:
-        targets = self._shell_source_candidates(command, likely_only=True)
+    def _bash_file_read_targets(self, command: str, operation: object = "") -> list[str]:
+        targets = self._shell_source_candidates(command, likely_only=True, operation=operation)
         if targets:
             return targets[:SHELL_SOURCE_CANDIDATE_MAX]
         # Lightweight fallback for partially initialized/test sessions where a
@@ -38781,8 +40885,9 @@ class SessionState:
         raw = str(command or "").strip()
         if not raw:
             return []
-        readers = r"(?:cat|tac|nl|head|tail|sed|awk|gawk|mawk|grep|egrep|fgrep|rg|ripgrep|cut|paste|jq|yq|bat|less|more|strings|wc)"
-        if not re.search(rf"(?:^|[;&|]\s*){readers}\b", raw, re.I):
+        readers = r"(?:cat|tac|nl|head|tail|sed|awk|gawk|mawk|grep|egrep|fgrep|rg|ripgrep|cut|paste|jq|yq|bat|less|more|strings|wc|pdftotext|pdftoppm|pdftocairo|tesseract|ocrmypdf|identify|exiftool|ffprobe|ffmpeg|mediainfo|whisper|python(?:3(?:\.13|\.14)?)?|node|nodejs|deno|bun)"
+        operation_value = normalize_bash_operation(operation) if str(operation or "").strip() else ""
+        if not operation_value and not re.search(rf"(?:^|[;&|]\s*){readers}\b", raw, re.I):
             return []
         out: list[str] = []
         for unit in self._shell_command_units(raw):
@@ -38797,8 +40902,10 @@ class SessionState:
                         out.append(value)
         return out[:SHELL_SOURCE_CANDIDATE_MAX]
 
-    def _bash_looks_like_file_read(self, command: str) -> bool:
-        return bool(self._bash_file_read_targets(command))
+    def _bash_looks_like_file_read(self, command: str, operation: object = "") -> bool:
+        if str(operation or "").strip() and bash_operation_is_marked_observation(operation):
+            return True
+        return bool(self._bash_file_read_targets(command, operation=operation))
 
     @staticmethod
     def _source_alignment_text(value: object) -> str:
@@ -38986,6 +41093,36 @@ class SessionState:
             "confidence": confidence,
         }
 
+    @staticmethod
+    def _shell_command_line_range(command: str, total_lines: int) -> tuple[int, int] | None:
+        """Exact 1-based line range of a single-file sed/head/tail read, if stated.
+
+        Only the simple forms are recognised: one command, optionally followed
+        by a stderr/stdout discard. Pipelines and other cases return None and
+        keep output alignment as the only evidence.
+        """
+        raw = re.sub(r"\s+", " ", str(command or "").strip())
+        raw = re.sub(r"\s(?:2>/dev/null|1>/dev/null|>/dev/null|2>&1)\s*$", "", raw)
+        if not raw or any(ch in raw for ch in "|;&`") or "$(" in raw:
+            return None
+        if total_lines <= 0:
+            return None
+        match = re.match(r"^sed -n ['\"]?(\d+)(?:,(\d+))?p['\"]? \S+$", raw)
+        if match:
+            lo = int(match.group(1))
+            hi = int(match.group(2) or match.group(1))
+            lo, hi = max(1, lo), min(total_lines, hi)
+            return (lo, hi) if lo <= hi else None
+        match = re.match(r"^head (?:-n ?(\d+)|-(\d+)) \S+$", raw)
+        if match:
+            count = int(match.group(1) or match.group(2))
+            return (1, min(total_lines, count)) if count > 0 else None
+        match = re.match(r"^tail (?:-n ?(\d+)|-(\d+)) \S+$", raw)
+        if match:
+            count = int(match.group(1) or match.group(2))
+            return (max(1, total_lines - count + 1), total_lines) if count > 0 else None
+        return None
+
     def _ingest_shell_read_observations(
         self,
         source_tool: str,
@@ -39006,14 +41143,23 @@ class SessionState:
         command = str(src_args.get("command", "") or meta.get("command", "") or "").strip()
         if not command:
             return []
-        likely_candidates = set(self._shell_source_candidates(command, text, likely_only=True))
-        candidates = self._shell_source_candidates(command, text, likely_only=False)
+        operation, _declared = self._bash_operation_from_args(src_args)
+        likely_candidates = set(
+            self._shell_source_candidates(command, text, likely_only=True, operation=operation)
+        )
+        candidates = self._shell_source_candidates(command, text, likely_only=False, operation=operation)
         if not candidates:
             return []
         observations: list[dict] = []
         for rel in candidates[:SHELL_SOURCE_CANDIDATE_MAX]:
             try:
                 fp = self._session_path(rel)
+                if operation in {"document_extract", "ocr", "media_metadata", "media_extract"}:
+                    # These outputs are semantic/format conversions whose
+                    # source is not a trustworthy line-oriented text stream.
+                    # Keep their exact command output in evidence/tool-memory,
+                    # but do not manufacture long-content line coverage.
+                    continue
                 if not fp.is_file() or fp.suffix.lower() in IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS:
                     continue
                 source_text, source_fp = self._read_text_and_fingerprint(fp, rel)
@@ -39022,9 +41168,25 @@ class SessionState:
                     rel,
                     lines,
                     text,
-                    allow_fragments=rel in likely_candidates,
+                    allow_fragments=(
+                        rel in likely_candidates
+                        and (
+                            operation in {"text_read", "text_search", "custom_extract", "execute"}
+                            or operation.startswith("custom:")
+                        )
+                    ),
                 )
                 ranges = aligned.get("ranges", []) if isinstance(aligned, dict) else []
+                # Output alignment skips blank and very short lines, which left
+                # holes in an otherwise complete `sed -n 'X,Yp'` / head / tail
+                # read. The command states its exact range; use it when the
+                # output really contains those source lines.
+                explicit = self._shell_command_line_range(command, len(lines))
+                if explicit:
+                    lo, hi = explicit
+                    expected = "\n".join(lines[lo - 1:hi]).strip()
+                    if expected and expected in text:
+                        ranges = [[lo, hi]]
                 if not ranges:
                     continue
                 memory = self._merge_long_content_observation(
@@ -39035,11 +41197,18 @@ class SessionState:
                     source_tool=tool,
                     role=role,
                     locator=command,
+                    operation=operation,
                     excerpts=list(aligned.get("excerpts", []) or []),
                     matched_lines=int(aligned.get("matched_lines", 0) or 0),
                     confidence=float(aligned.get("confidence", 0.0) or 0.0),
                 )
                 if memory:
+                    # A bash read counts as much as read_file. Record which message
+                    # carries the lines; read_file's reuse/delta checks consult
+                    # this same long-content memory, so a later read_file of these
+                    # lines sees them. (The read-context registry is not written
+                    # here: it would duplicate the bash entry in tool_memory search.)
+                    self._record_visible_read(memory, ranges, getattr(_READ_DISPATCH_CONTEXT, "tool_call_id", ""))
                     observations.append({
                         "path": rel,
                         "ranges": ranges,
@@ -39066,9 +41235,12 @@ class SessionState:
             return "process_observation"
         if tool == "stop_background_process":
             return "process_control"
-        if tool in {"bash", "worktree_run"}:
+        if tool in {"bash", "background_run", "worktree_run"}:
             if not ok or self._command_output_has_error_shape(output):
                 return "command_error"
+            operation, declared = self._bash_operation_from_args(args)
+            if declared:
+                return self._bash_operation_evidence_kind(operation)
             if self._bash_looks_like_file_read(command):
                 return "file_read"
             if self._command_looks_like_validation(command):
@@ -39152,6 +41324,7 @@ class SessionState:
             return trim(f"{tool}: {path} :: {head}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"bash", "background_run", "worktree_run"} and isinstance(args, dict):
             cmd = trim(str(args.get("command", "") or ""), 180)
+            operation, declared = self._bash_operation_from_args(args)
             picked = []
             for ln in lines[:12]:
                 if ln.startswith("[long_output"):
@@ -39164,7 +41337,8 @@ class SessionState:
                 if len(" ".join(picked)) >= TOOL_MEMORY_SUMMARY_MAX_CHARS:
                     break
             body = " ".join(picked) if picked else "(no output)"
-            return trim(f"{tool}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
+            label = f"{tool}[{operation}]" if declared else tool
+            return trim(f"{label}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"load_skill", "unload_skill"} and isinstance(args, dict):
             return trim(f"{tool}: {args.get('name', '')} :: {' '.join(lines[:4])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"list_background_processes", "stop_background_process"} and isinstance(args, dict):
@@ -39181,6 +41355,14 @@ class SessionState:
         command = str((args or {}).get("command", "") or "") if isinstance(args, dict) else ""
         if not command.strip():
             return False
+        operation, declared = self._bash_operation_from_args(args)
+        if declared and bash_operation_is_marked_observation(operation):
+            # Explicitly marked reads/perception are evidence even when the
+            # extractor returns only a short result (OCR line, dimensions,
+            # media duration, or a one-line document answer).
+            return True
+        if declared and operation in {"validation", "build_test", "process_control", "network"}:
+            return True
         low = command.strip().lower()
         if re.match(r"^(pwd|date|whoami|clear)\b", low) and ok and len(str(output or "")) < 400:
             return False
@@ -39196,7 +41378,7 @@ class SessionState:
             return True
         if not ok:
             return True
-        if self._bash_looks_like_file_read(command) and len(str(output or "")) >= 40:
+        if self._bash_looks_like_file_read(command):
             return True
         if re.search(r"\b(rg|grep|find|fd|ls)\b", low) and len(str(output or "")) >= 120:
             return True
@@ -39245,8 +41427,20 @@ class SessionState:
         if not isinstance(registry, dict):
             registry = {}
         old = registry.get(key, {}) if isinstance(registry.get(key, {}), dict) else {}
-        source_fp = self._read_source_fingerprint(rel_path) if kind == "file_read" and rel_path else {}
+        operation, operation_declared = self._bash_operation_from_args(src_args)
+        source_fp = (
+            self._read_source_fingerprint(rel_path)
+            if rel_path and (kind == "file_read" or (operation_declared and bash_operation_is_marked_observation(operation)))
+            else {}
+        )
         sha = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        evidence_match = re.search(r"\[evidence_ref id=([a-f0-9]{24})\b", text)
+        result_meta = self._peek_tool_result_meta()
+        evidence_id = (
+            evidence_match.group(1)
+            if evidence_match
+            else str(result_meta.get("evidence_id", "") or old.get("evidence_id", "") or "")
+        )
         cached = str(cache_path or old.get("cache_path", "") or "")
         if len(text) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
             not cached or str(old.get("sha256", "") or "") != sha
@@ -39273,6 +41467,12 @@ class SessionState:
             "path": rel_path,
             "target_path": rel_path,
             "command": cmd,
+            "operation": (
+                operation
+                if tool in {"bash", "worktree_run", "background_run"}
+                and operation_declared
+                else str(old.get("operation", "") or "")
+            ),
             "signature": signature,
             "agent_role": role_key,
             "status": entry_status,
@@ -39280,6 +41480,7 @@ class SessionState:
             "chars": len(text),
             "lines": text.count("\n") + (1 if text else 0),
             "sha256": sha,
+            "evidence_id": evidence_id,
             "summary": trim(summary or self._tool_memory_summary_from_output(tool, src_args, text), TOOL_MEMORY_SUMMARY_MAX_CHARS),
             "cache_path": cached,
             "cache_source_complete": bool(
@@ -39925,6 +42126,25 @@ class SessionState:
                 "hot_recent=" + " | ".join(hot_bits)
                 + " ; these are recent tool results also likely still present in raw conversation context."
             )
+        # Per-path visible line ranges, computed once. Each row can then say
+        # which lines of the source are still readable in context, instead of
+        # implying "already read" after compaction removed the text.
+        try:
+            visible_by_path: dict[str, str] = {}
+            store = getattr(self, "long_content_memory", {}) if isinstance(getattr(self, "long_content_memory", {}), dict) else {}
+            prompt_role = "" if not for_role or self._sanitize_agent_role(for_role) in {"", "single"} else for_role
+            for memory in store.values():
+                if not isinstance(memory, dict):
+                    continue
+                spans = self._visible_read_ranges(memory, prompt_role)
+                if spans is None:
+                    continue
+                label = ",".join(f"{a}-{b}" for a, b in sorted(set(spans))[:4])
+                for source_path in [memory.get("source_path", "")] + list(memory.get("source_paths", []) or []):
+                    if source_path:
+                        visible_by_path[str(source_path)] = label
+        except Exception:
+            visible_by_path = {}
         for entry in selected:
             status = str(entry.get("status", "active") or "active")
             tool = str(entry.get("source_tool", "") or "")
@@ -39932,16 +42152,22 @@ class SessionState:
             path = str(entry.get("target_path", entry.get("path", "")) or "")
             cmd = str(entry.get("command", "") or "")
             locator = f"path={path}" if path else (f"command={trim(cmd, 140)}" if cmd else "target=-")
+            if path and path in visible_by_path:
+                spans = visible_by_path[path]
+                locator += f" lines={spans} in_context=yes" if spans else " in_context=no"
             cache = str(entry.get("cache_path", "") or "")
             buffer_ref = str(entry.get("buffer_ref", "") or "")
             temp_output_path = str(entry.get("temp_output_path", "") or "")
             rows.append(
                 "- "
                 f"id={entry.get('key','')} status={status} role={entry.get('agent_role','')} "
-                f"tool={tool} kind={kind} result={entry.get('result_status','ok')} {locator} "
+                f"tool={tool} kind={kind} result={entry.get('result_status','ok')} "
+                + (f"operation={entry.get('operation')} " if entry.get("operation") else "")
+                + f"{locator} "
                 f"chars={int(entry.get('chars', 0) or 0)} hits={int(entry.get('hit_count', 0) or 0)} "
                 f"age={_age(entry.get('last_ts', 0.0))} "
                 f"summary={trim(str(entry.get('summary','') or ''), 300)}"
+                + (f" evidence_id={entry.get('evidence_id')}" if entry.get("evidence_id") else "")
                 + (f" cache={cache}" if cache else "")
                 + (
                     " cache_scope=source-prefix"
@@ -39961,8 +42187,104 @@ class SessionState:
         rows.append("</tool-memory-registry>")
         return trim("\n".join(rows), max_chars)
 
+    def _evidence_memory_prompt_block(self, *, max_chars: int = 2600) -> str:
+        """Inject a bounded claim index while keeping exact source outside context."""
+        try:
+            rows = self._evidence_controller().memories(limit=8)
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        parts = [
+            "CLAIM MEMORY (model-authored consolidation; summaries are not source truth):",
+            "Use the cited evidence_id and exact quote to verify every important value before acting. "
+            "Facts require verbatim source wording; derived values must be marked inference.",
+        ]
+        for row in rows:
+            refs = row.get("references", []) if isinstance(row.get("references"), list) else []
+            ref_text = ", ".join(
+                f"{str(ref.get('evidence_id', ''))[:24]}:{trim(str(ref.get('quote', '')), 120)}"
+                for ref in refs[:2] if isinstance(ref, dict)
+            )
+            parts.append(
+                f"- {row.get('id', '')} kind={row.get('kind', 'fact')} importance={row.get('importance', 1)} "
+                f"claim={trim(str(row.get('claim', '')), 420)} "
+                f"conditions={trim(str(row.get('conditions', '')), 180)} "
+                f"evidence={ref_text or 'missing'}"
+            )
+        parts.append("To inspect exact output use tool_memory mode='trace' id='<evidence_id>'; "
+                     "to save a durable claim use mode='remember' with exact references.")
+        return trim("\n".join(parts), max_chars)
+
+    def _evidence_memory_tool(self, args: dict | None, role: str = "") -> str:
+        """Handle trace/remember/recall without copying evidence into normal memory."""
+        src = args if isinstance(args, dict) else {}
+        mode = str(src.get("mode", "trace") or "trace").strip().lower()
+        controller = self._evidence_controller()
+        if mode == "trace":
+            eid = str(src.get("id", "") or src.get("evidence_id", "")).strip()
+            if not eid:
+                return json_dumps({"ok": False, "error": "trace requires evidence id"}, indent=2)
+            rows = controller.recall(eid=eid, limit=1)
+            if not rows:
+                return json_dumps({"ok": False, "error": "evidence not found", "evidence_id": eid}, indent=2)
+            row = rows[0]
+            body = str(row.get("body", "") or "")
+            cap = self._tool_max_chars(src.get("max_chars"))
+            if len(body) > cap:
+                body = body[:cap] + "\n...[trace clipped; use read_file/bash verification locator]"
+            try:
+                trace_depth = max(0, min(4, int(src.get("depth", 2) or 2)))
+            except (TypeError, ValueError):
+                trace_depth = 2
+            neighborhood = controller.trace(str(row.get("id", eid)), depth=trace_depth, limit=80)
+            return json_dumps({
+                "ok": True,
+                "mode": "trace",
+                "evidence_id": row.get("id", eid),
+                "status": row.get("status", "ok"),
+                "tool": row.get("tool", ""),
+                "path": row.get("path", ""),
+                "version": row.get("version", ""),
+                "digest": row.get("digest", ""),
+                "created": row.get("created", 0),
+                "exact_output": body,
+                "verification": {"tool": row.get("tool", ""), "path": row.get("path", ""), "args": row.get("args", "{}")},
+                "links": controller.links(str(row.get("id", eid))),
+                "causal_trace": {
+                    "nodes": neighborhood.get("nodes", []) if isinstance(neighborhood, dict) else [],
+                    "links": neighborhood.get("links", []) if isinstance(neighborhood, dict) else [],
+                },
+            }, indent=2)
+        if mode == "remember":
+            try:
+                references = src.get("references", [])
+                if not isinstance(references, list):
+                    references = []
+                result = controller.consolidate(
+                    str(src.get("claim", "")),
+                    str(src.get("kind", "fact") or "fact"),
+                    str(src.get("conditions", "")),
+                    int(src.get("importance", 3) or 3),
+                    references,
+                    str(src.get("supersedes", "")),
+                )
+                return json_dumps({"ok": True, "mode": "remember", **result}, indent=2)
+            except (TypeError, ValueError) as exc:
+                return json_dumps({"ok": False, "mode": "remember", "error": str(exc)}, indent=2)
+        if mode == "recall":
+            rows = controller.memories(
+                query=str(src.get("query", "") or ""),
+                mid=str(src.get("id", "") or ""),
+                limit=max(1, min(40, int(src.get("limit", 8) or 8))),
+            )
+            return json_dumps({"ok": True, "mode": "recall", "memories": rows}, indent=2)
+        return json_dumps({"ok": False, "error": f"unsupported evidence memory mode: {mode}"}, indent=2)
+
     def _tool_memory_tool(self, args: dict | None, role: str = "") -> str:
         src = args if isinstance(args, dict) else {}
+        if str(src.get("mode", "")) in {"remember", "recall", "trace"}:
+            return self._evidence_memory_tool(src, role)
         registry = getattr(self, "tool_memory_registry", {})
         if (not isinstance(registry, dict) or not registry) and getattr(self, "read_context_registry", {}):
             registry = self._tool_memory_from_read_context_registry(getattr(self, "read_context_registry", {}))
@@ -40097,6 +42419,7 @@ class SessionState:
                 "cache_source_complete": bool(entry.get("cache_source_complete", True)),
                 "buffer_ref": entry.get("buffer_ref", ""),
                 "full_output_path": entry.get("temp_output_path", ""),
+                "evidence_id": entry.get("evidence_id", ""),
             }
             hit = cache_hits.get(str(entry.get("key", "") or ""))
             if hit and mode in {"search", "detail"}:
@@ -40367,11 +42690,24 @@ class SessionState:
             "todo_fp": todo_fp,
         }
 
+    @staticmethod
+    def _observation_digest(output: object) -> str:
+        text = str(output or "")
+        text = re.sub(r"^\[bash cached command=.*?source_versions_unchanged=true\]\n", "", text, count=1, flags=re.S)
+        text = re.sub(r"\n\[evidence_ref id=[a-f0-9]{24}[^\n]*\]$", "", text)
+        # A reused/delta/window header changes on every read (coverage, ranges),
+        # which made an identical body look like fresh evidence. Hash the body
+        # only. An "unchanged" marker has no body: it hashes to the same value
+        # each time, so repeats of it count as reuse rather than progress.
+        text = re.sub(r"^\[read_file (?:reused|delta|window|cached)[^\n]*\]\n?", "", text, count=1)
+        return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
     def _update_agent_loop_progress_state(self, tool_results: list[dict], role: str = "") -> dict:
         """Classify one tool round as progress, new evidence, or evidence reuse.
 
-        The classifier is deterministic and local. It does not stop execution or
-        restrict tools; it only updates the adaptive next-turn system prompt.
+        Novel source windows remain progress even during long research tasks.
+        Recovery uses repeated result content plus source versions, not tool names
+        or elapsed read counts. Tools remain available during recovery.
         """
         rows = [row for row in (tool_results or []) if isinstance(row, dict)]
         role_key = self._sanitize_agent_role(role) or "single"
@@ -40380,6 +42716,8 @@ class SessionState:
             store = {}
         previous = dict(store.get(role_key, {})) if isinstance(store.get(role_key), dict) else {}
         observations = dict(previous.get("observations", {})) if isinstance(previous.get("observations"), dict) else {}
+        content_observations = list(previous.get("content_observations", []))[-96:]
+        evidence_refs = list(previous.get("evidence_refs", []))[-6:]
         alignment = self._agent_loop_todo_alignment(role_key)
         previous_todo_fp = str(previous.get("todo_fp", "") or "")
         todo_fp = str(alignment.get("todo_fp", "") or "")
@@ -40392,7 +42730,6 @@ class SessionState:
             "tool_memory", "context_recall", "read_from_blackboard", "list_files", "search_files",
         }
         mutation_tools = {"write_file", "edit_file", "apply_patch", "stop_background_process"}
-        todo_tools = {"TodoWrite", "TodoWriteRescue", "update_todos", "update_plan"}
         evidence_total = 0
         evidence_fresh = 0
         evidence_reused = 0
@@ -40419,16 +42756,25 @@ class SessionState:
             evidence_total += 1
             args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
             signature = self._tool_memory_signature_from_args(name, args)
-            digest_payload = {
-                "ok": ok,
-                "exit": row.get("exit_code"),
-                "changed": changed_files if isinstance(changed_files, list) else [],
-                "output": trim(str(row.get("output", "") or ""), 3000),
-            }
-            digest = hashlib.sha1(
-                json_dumps(digest_payload).encode("utf-8", errors="replace")
-            ).hexdigest()[:16]
-            reused = bool(signature and observations.get(signature) == digest)
+            sources = row.get("source_versions", {})
+            sources = sources if isinstance(sources, dict) else {}
+            result_digest = str(row.get("evidence_digest", "") or self._observation_digest(row.get("output", "")))
+            digest = hashlib.sha256(json_dumps({
+                "ok": ok, "exit": row.get("exit_code"), "output": result_digest,
+                "sources": sources, "changed": changed_files,
+            }).encode("utf-8")).hexdigest()
+            # Different commands can project the same evidence. Require both
+            # matching source versions AND matching full output; equal file
+            # versions alone never imply that a new window is redundant.
+            content_key = digest if sources else ""
+            reused = bool((signature and observations.get(signature) == digest)
+                          or (content_key and content_key in content_observations))
+            if content_key and content_key not in content_observations:
+                content_observations.append(content_key)
+            eid = str(row.get("evidence_id", "") or "")
+            if eid:
+                evidence_refs = [ref for ref in evidence_refs if ref.get("id") != eid]
+                evidence_refs.append({"id": eid, "tool": name, "path": trim(str(args.get("path", "") or ", ".join(sources)), 180)})
             if reused:
                 evidence_reused += 1
             else:
@@ -40462,8 +42808,6 @@ class SessionState:
                 reused_streak = 0
         else:
             reused_streak = 0
-            if any(name in todo_tools for name in names):
-                stagnant_evidence_streak = 0
 
         phase = str(alignment.get("phase", "") or "execute").strip().lower()
         stagnant_limit = 4 if phase == "research" else 3
@@ -40491,7 +42835,10 @@ class SessionState:
             "role": role_key,
             "todo_fp": todo_fp,
             "alignment": alignment,
-            "observations": observations,
+            "observations": {} if concrete_progress else observations,
+            "content_observations": [] if concrete_progress else content_observations[-96:],
+            "evidence_refs": evidence_refs[-6:],
+            "recovery": {} if concrete_progress or evidence_fresh or any_failure else dict(previous.get("recovery", {})),
             "round_kind": round_kind,
             "round_tools": list(dict.fromkeys(names))[:10],
             "evidence_fresh": evidence_fresh,
@@ -40513,7 +42860,83 @@ class SessionState:
         state.pop("next_action", None)
         store[role_key] = state
         self.agent_loop_progress_state = store
+        self._record_flow_node(
+            "loop_state",
+            {
+                "round_kind": state.get("round_kind", ""),
+                "round_tools": state.get("round_tools", []),
+                "evidence_fresh": state.get("evidence_fresh", 0),
+                "evidence_reused": state.get("evidence_reused", 0),
+                "reused_streak": state.get("reused_streak", 0),
+                "stagnant_evidence_streak": state.get("stagnant_evidence_streak", 0),
+                "guidance_reason": state.get("guidance_reason", ""),
+            },
+            role=role_key,
+            metadata={"todo_fp": todo_fp, "current_phase": str(getattr(self, "current_phase", "") or "")},
+        )
         return state
+
+    def _advance_evidence_loop_recovery(self, state: dict, role: str) -> bool:
+        """Offer two autonomous recovery opportunities before pausing a proven cycle."""
+        role_key = self._sanitize_agent_role(role) or "single"
+        if state.get("round_kind") != "evidence_reused" or int(state.get("reused_streak", 0)) < 2:
+            return False
+        # Legacy/unit callers without immutable evidence IDs only receive the
+        # observational strategy signal; a circuit breaker requires traceable
+        # source evidence so it can explain exactly what was repeated.
+        if not state.get("evidence_refs"):
+            return False
+        recovery = state.setdefault("recovery", {})
+        repeats = int(state.get("reused_streak", 0))
+        attempts = int(recovery.get("attempts", 0))
+        if attempts and (not recovery.get("delivered") or repeats - int(recovery.get("at_repeat", 0)) < 3):
+            return False
+        if attempts >= 2:
+            stops = getattr(self, "_loop_stop_requested", {})
+            if not isinstance(stops, dict):
+                stops = {}
+            if role_key not in stops:
+                stops[role_key] = {
+                    "reason": "Repeated identical evidence after two recovery prompts; no new source content, mutation, validation or Todo progress.",
+                    "evidence_refs": list(state.get("evidence_refs", [])),
+                    "reused_streak": repeats,
+                }
+                self._loop_stop_requested = stops
+                self._record_flow_node(
+                    "loop_circuit_breaker",
+                    stops[role_key],
+                    role=role_key,
+                    parent_ids=[
+                        str(ref.get("id", ""))
+                        for ref in state.get("evidence_refs", [])
+                        if isinstance(ref, dict) and str(ref.get("id", "")).strip()
+                    ],
+                )
+            return True
+        recovery.update(attempts=attempts + 1, at_repeat=repeats, delivered=False)
+        self._mark_agent_loop_strategy_signal(role_key, "evidence_recovery")
+        return True
+
+    def _enter_evidence_loop_paused_state(self, role: str) -> bool:
+        role_key = self._sanitize_agent_role(role) or "single"
+        stops = getattr(self, "_loop_stop_requested", {})
+        stop = stops.get(role_key, {}) if isinstance(stops, dict) else {}
+        if not stop:
+            return False
+        if stop.get("announced"):
+            return True
+        stop["announced"] = True
+        self._blackboard_set_status("PAUSED", str(stop["reason"]))
+        refs = ", ".join(str(ref.get("id", "")) for ref in stop.get("evidence_refs", [])[-3:])
+        note = (
+            "当前运行已暂停：两次恢复提示后仍重复获取相同证据，没有新增信息或任务进展。"
+            "已有文件、计划和证据已保留，任务尚未完成。继续时可明确未解决的问题、回查证据，或调整验证方式。"
+            f" Evidence ID: {refs or '(none)'}"
+        )
+        self.messages.append({"role": "assistant", "content": note, "ts": now_ts(), "agent_role": role_key})
+        self._emit("message", {"role": "assistant", "text": note, "summary": "evidence loop paused", "agent_role": role_key})
+        self._emit("status", {"summary": "evidence loop paused; task remains incomplete", "agent_role": role_key})
+        return True
 
     def _mark_agent_loop_strategy_signal(self, role: str, reason: str) -> None:
         role_key = self._sanitize_agent_role(role) or "single"
@@ -40529,19 +42952,23 @@ class SessionState:
         state["updated_at"] = now_ts()
         store[role_key] = state
         self.agent_loop_progress_state = store
+        self._record_flow_node(
+            "loop_intervention",
+            {"reason": trim(str(reason or "strategy_signal"), 240), "state": {k: state.get(k) for k in ("round_kind", "guidance_reason", "reused_streak", "stagnant_evidence_streak")}},
+            role=role_key,
+            metadata={"intervention": trim(str(reason or "strategy_signal"), 120)},
+        )
 
     def _agent_loop_progress_prompt_block(self, for_role: str = "") -> str:
-        """Render observation-only multi-agent progress telemetry.
-
-        Single and plan+single intentionally keep their original autonomous
-        prompt path. Sequential/sync receive shared facts, never a runtime-
-        selected phase, role, tool, or next action.
-        """
-        if not self._is_multi_agent_mode():
-            return ""
+        """Expose recovery evidence to every execution mode without selecting tools."""
         role_key = self._sanitize_agent_role(for_role) or "single"
         store = getattr(self, "agent_loop_progress_state", {})
         state = dict(store.get(role_key, {})) if isinstance(store, dict) and isinstance(store.get(role_key), dict) else {}
+        if not self._is_multi_agent_mode() and not bool(state.get("recovery")):
+            return ""
+        recovery = state.get("recovery", {})
+        if recovery:
+            recovery["delivered"] = True
         alignment = state.get("alignment") if isinstance(state.get("alignment"), dict) else self._agent_loop_todo_alignment(role_key)
         focus = trim(str(alignment.get("current_todo", "") or alignment.get("step", "") or ""), 240)
         if not focus and not bool(state.get("guidance_active", False)):
@@ -40569,6 +42996,21 @@ class SessionState:
             )
         else:
             rows.append("progress_signal=normal")
+        if recovery:
+            rows.append(
+                "Recovery: identify the exact unanswered question and compare it with the cited results before requesting more evidence. "
+                "Choose autonomously: synthesize supported findings, persist useful facts with tool_memory/remember and exact quotes, "
+                "retrieve a genuinely new window, or perform a justified edit/validation. All tools, including bash, remain available. "
+                "Do not claim a change or a passing test without evidence. If blocked, explain the missing information. "
+                "Continued identical evidence without progress will pause this run."
+            )
+            for ref in state.get("evidence_refs", [])[-3:]:
+                if not isinstance(ref, dict) or not str(ref.get("id", "")).strip():
+                    continue
+                rows.append(
+                    f"evidence: {str(ref.get('tool', 'tool'))} {str(ref.get('path', ''))} — "
+                    f"tool_memory mode='trace' id='{ref.get('id')}' (verify exact output)"
+                )
         try:
             canonical_rows = [
                 row for row in self.todo.snapshot()
@@ -40581,7 +43023,7 @@ class SessionState:
                 "CURRENT CANONICAL TODO ROWS (inspect before any update):\n"
                 + "\n".join(
                     f"- [{str(row.get('status', 'pending')).lower()}] "
-                    f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 80)} "
+                    f"({row.get('short_id') or '-'}) id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 80)} "
                     f"{trim(str(row.get('content', '') or ''), 180)}"
                     for row in canonical_rows[:24]
                 )
@@ -40596,15 +43038,13 @@ class SessionState:
             "revise the approach or Todo ordering when the evidence supports it. Reused evidence is not new progress."
         )
         rows.append("</dynamic-agent-loop-state>")
-        return trim("\n".join(rows), 1400)
+        return trim("\n".join(rows), 3000)
 
     def _single_agent_todo_alignment_prompt_block(self, for_role: str = "") -> str:
         """Expose canonical Todo facts without selecting the model's next action.
 
-        Single and plan+single do not consume adaptive Agent Loop strategy
-        guidance. They still need an explicit status-commit contract, otherwise
-        removing the old phase/next-action block also removes the only reminder
-        that observable progress must be written back to TodoWrite.
+        Single and plan+single also receive evidence recovery when needed.
+        This block keeps the normal explicit status-commit contract.
         """
         if self._is_multi_agent_mode():
             return ""
@@ -40628,7 +43068,7 @@ class SessionState:
             canonical_rows = []
         canonical_text = "\n".join(
             f"- [{str(row.get('status', 'pending')).lower()}] "
-            f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
+            f"({row.get('short_id') or '-'}) id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
             f"{trim(str(row.get('content', '') or ''), 360)}"
             for row in canonical_rows[:40]
             if str(row.get("content", "") or "").strip()
@@ -40656,17 +43096,48 @@ class SessionState:
         rows = [r for r in (tool_results or []) if isinstance(r, dict)]
         if not rows:
             return False
-        read_rows = [
+        bookkeeping = {"TodoWrite", "TodoWriteRescue", "tool_memory", "compress", "task_list", "task_get", "read_from_blackboard"}
+
+        def is_read(row: dict) -> bool:
+            name = canonicalize_tool_name(str(row.get("name", "") or ""))
+            if name == "read_file":
+                return True
+            if name in {"bash", "worktree_run"}:
+                args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
+                try:
+                    operation, _declared = self._bash_operation_from_args(args)
+                    return self._bash_looks_like_file_read(str(args.get("command", "") or ""), operation)
+                except Exception:
+                    return False
+            return False
+
+        # read_file and bash file reads both count. Bookkeeping tools (TodoWrite,
+        # tool_memory, compress, ...) neither count nor reset, so a TodoWrite
+        # between two identical reads no longer hides the loop.
+        considered = [
             r for r in rows
-            if str(r.get("name", "") or "") == "read_file" and bool(r.get("ok", False))
+            if canonicalize_tool_name(str(r.get("name", "") or "")) not in bookkeeping
         ]
-        if not read_rows or len(read_rows) != len(rows):
-            if any(bool(r.get("ok", False)) and str(r.get("name", "") or "") != "read_file" for r in rows):
+        read_rows = [r for r in considered if bool(r.get("ok", False)) and is_read(r)]
+        if not read_rows or len(read_rows) != len(considered):
+            if any(bool(r.get("ok", False)) and not is_read(r) for r in considered):
                 self._reset_read_file_loop_tracking(role)
             return False
         role_key = self._sanitize_agent_role(role) or "single"
         state = self.read_file_loop_state.get(role_key, {}) if isinstance(getattr(self, "read_file_loop_state", {}), dict) else {}
-        signatures = [self._read_file_signature_from_args(r.get("args", {})) for r in read_rows]
+        signatures = []
+        for r in read_rows:
+            args = r.get("args", {}) if isinstance(r.get("args"), dict) else {}
+            if canonicalize_tool_name(str(r.get("name", "") or "")) == "read_file":
+                signatures.append(self._read_file_signature_from_args(args))
+            else:
+                # Key a bash read by the files it touched, not its exact text,
+                # so `cat a.py` and `sed -n '1,200p' a.py` count as the same file.
+                try:
+                    targets = self._bash_file_read_targets(str(args.get("command", "") or ""))
+                except Exception:
+                    targets = []
+                signatures.append("bash-read:" + "|".join(sorted(targets)) if targets else "")
         signatures = [s for s in signatures if s]
         if not signatures:
             return False
@@ -40717,13 +43188,70 @@ class SessionState:
                 )
             },
         )
+        # Previously this guidance only reached the UI. The model must see it:
+        # list what is already available so the next move is reuse or work,
+        # not another read of the same lines.
+        try:
+            self._inject_read_context_strategy_note(role_key)
+        except Exception:
+            pass
         # Give the next round a clean counter while retaining recent signatures for diagnostics.
         state["read_only_rounds"] = 0
         state["repeat_rounds"] = 0
         self.read_file_loop_state[role_key] = state
         return True
 
+    def _inject_read_context_strategy_note(self, role: str = "") -> str:
+        """Tell the model which reads it already has, and where.
+
+        Rows come from long-content memory: path, line ranges still visible in
+        this role's context, and the tool_call_id that carries them. The note
+        uses the existing <read-context-strategy> marker, which the runtime
+        already purges at step boundaries.
+        """
+        role_key = self._sanitize_agent_role(role)
+        context_role = "" if role_key in {"", "single"} else role_key
+        rows: list[str] = []
+        store = getattr(self, "long_content_memory", {}) if isinstance(getattr(self, "long_content_memory", {}), dict) else {}
+        for memory in sorted(
+            (m for m in store.values() if isinstance(m, dict)),
+            key=lambda m: float(m.get("updated_at", 0.0) or 0.0),
+            reverse=True,
+        )[:8]:
+            path = str(memory.get("source_path", "") or "")
+            if not path:
+                continue
+            visible = self._visible_read_ranges(memory, context_role) or []
+            spans = ",".join(f"{a}-{b}" for a, b in sorted(set(visible))[:6])
+            carrier = ""
+            if visible:
+                a, b = sorted(visible)[0]
+                carrier = self._visible_read_carrier(memory, a, b, context_role)
+            status = f"visible lines {spans}" + (f" in tool_call_id={carrier}" if carrier else "") if spans else "read earlier, no longer in context"
+            rows.append(f"- {trim(path, 200)}: {status}")
+        if not rows:
+            return ""
+        note = (
+            "<read-context-strategy>\n"
+            "You have re-read the same sources several times. These reads are already available:\n"
+            + "\n".join(rows)
+            + "\nUse the visible text in those earlier tool results. Read again only lines that are not listed, "
+            "or pass fresh=true when you need to verify a change. Otherwise continue with the work itself.\n"
+            "</read-context-strategy>"
+        )
+        # The runtime-control envelope keeps this guidance out of UI projection
+        # and exports as user input; the model still receives it.
+        message = self._runtime_control_message(
+            note, control_tag="read-context-strategy", ui_visible=False,
+        )
+        if context_role:
+            self._append_agent_context_message(context_role, message)
+        else:
+            self.messages.append(message)
+        return note
+
     def _maybe_record_tool_memory_after_result(self, name: str, args: dict | None, output: str, role: str = "") -> None:
+        output = self._evidence_body(output)
         tool = canonicalize_tool_name(name)
         if not tool or tool == "read_file":
             return
@@ -40796,7 +43324,13 @@ class SessionState:
                 if isinstance(row, dict) and str(row.get("path", "") or "").strip()
             ]
             read_targets = list(dict.fromkeys(
-                observed_paths + self._bash_file_read_targets(command_text)
+                observed_paths
+                + self._bash_file_read_targets(
+                    command_text,
+                    operation=self._bash_operation_from_args(src_args)[0]
+                    if self._bash_operation_from_args(src_args)[1]
+                    else "",
+                )
             ))
             result_probe = {
                 "name": tool,
@@ -40818,9 +43352,13 @@ class SessionState:
                 "validation"
                 if negative_assertion
                 else (
-                    "file_read"
-                    if source_observations
-                    else self._tool_memory_evidence_kind(tool, src_args, text, ok)
+                    self._bash_operation_evidence_kind(self._bash_operation_from_args(src_args)[0])
+                    if self._bash_operation_from_args(src_args)[1]
+                    else (
+                        "file_read"
+                        if source_observations
+                        else self._tool_memory_evidence_kind(tool, src_args, text, ok)
+                    )
                 )
             )
             self._record_tool_memory(
@@ -40881,7 +43419,9 @@ class SessionState:
     def _maybe_inject_tool_strategy_intervention(self, tool_results: list[dict], role: str = "") -> bool:
         rows = [r for r in (tool_results or []) if isinstance(r, dict)]
         if rows:
-            self._update_agent_loop_progress_state(rows, role=role)
+            progress = self._update_agent_loop_progress_state(rows, role=role)
+            if self._advance_evidence_loop_recovery(progress, role):
+                return True
         if self._maybe_inject_read_file_strategy_intervention(tool_results, role=role):
             return True
         if not rows:
@@ -41006,12 +43546,21 @@ class SessionState:
         This is the important part of preventing read_file loops under compact:
         the model can compare several recently read files at once instead of
         losing the previous file every time a new read succeeds.
+
+        Pins are limited by a total character budget per tier, not a
+        per-message cutoff. A per-message cutoff lower than read_file's own
+        output cap meant a normal 50k read could never be pinned.
         """
         keep: set[int] = set()
         seen: set[str] = set()
         budget = self._read_context_budget()
-        max_chars = int(budget.get("pin_chars", READ_FILE_COMPACT_PIN_MAX_CHARS) or READ_FILE_COMPACT_PIN_MAX_CHARS)
         max_distinct = int(budget.get("pin_distinct", READ_FILE_COMPACT_PIN_DISTINCT) or READ_FILE_COMPACT_PIN_DISTINCT)
+        try:
+            tier = int(budget.get("tier", 0) or 0)
+        except Exception:
+            tier = 0
+        total_budget = int(READ_FILE_PIN_TOTAL_CHARS[min(max(tier, 0), len(READ_FILE_PIN_TOTAL_CHARS) - 1)])
+        spent = 0
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             if not isinstance(msg, dict) or msg.get("role") != "tool":
@@ -41022,17 +43571,61 @@ class SessionState:
             content = msg.get("content", "")
             if not isinstance(content, str) or not content.strip():
                 continue
-            if content.startswith("[cleared by microcompact]") or content.startswith("[read_file cached"):
+            if content.startswith(READ_RESULT_PLACEHOLDER_PREFIXES):
                 continue
-            if len(content) > max_chars:
+            # A short "reused/unchanged" marker carries no body. Leave the slot
+            # for the older message that holds the actual text.
+            if content.startswith("[read_file reused") and "unchanged" in content.split("\n", 1)[0]:
                 continue
             sig = self._read_file_signature_from_args(args)
             if sig in seen:
                 continue
+            if spent + len(content) > total_budget and keep:
+                continue
             seen.add(sig)
             keep.add(id(msg))
-            if len(seen) >= max_distinct:
+            spent += len(content)
+            if len(seen) >= max_distinct or spent >= total_budget:
                 break
+        return keep
+
+    def _is_file_read_tool_message(self, messages: list[dict], index: int, msg: dict) -> bool:
+        """True for read_file results and bash results that read files."""
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            return False
+        name, args = self._tool_message_name_args(messages, index, msg)
+        tool = canonicalize_tool_name(name)
+        if tool == "read_file":
+            return True
+        if tool in {"bash", "worktree_run"} and isinstance(args, dict):
+            try:
+                command = str(args.get("command", "") or "")
+                operation, _declared = self._bash_operation_from_args(args)
+                return bool(command) and self._bash_looks_like_file_read(command, operation)
+            except Exception:
+                return False
+        return False
+
+    def _microcompact_protected_ids(
+        self, messages: list[dict], *, preserve_reads: bool = False,
+    ) -> set[int]:
+        """Message ids microcompact must leave intact.
+
+        - Results the model has not seen yet (``_unseen``). Compaction runs
+          before the next model call, so a batch of reads could otherwise be
+          replaced before the model ever read them.
+        - Pinned recent reads, within the character budget.
+        - At tier 0 (``preserve_reads``), every file-read result.
+        """
+        keep: set[int] = set()
+        for index, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            if msg.get("_unseen"):
+                keep.add(id(msg))
+            elif preserve_reads and self._is_file_read_tool_message(messages, index, msg):
+                keep.add(id(msg))
+        keep |= self._read_file_pinned_tool_message_ids(messages)
         return keep
 
     def _tool_memory_pinned_tool_message_ids(self, messages: list[dict]) -> set[int]:
@@ -41237,15 +43830,18 @@ class SessionState:
         )
         return "\n".join(rows)
 
-    def _microcompact(self, keep_recent: int = 3):
+    def _microcompact(self, keep_recent: int = 3, *, preserve_reads: bool = False):
         """Replace old tool results with compact placeholders to save tokens.
 
         Handles both OpenAI-style (role=tool) and Anthropic-style (tool_result blocks)
         messages. Keeps the most recent `keep_recent` tool interactions intact.
+        Results the model has not seen, pinned reads, and (with
+        ``preserve_reads`` at tier 0) every file read are never replaced.
         """
         # Phase 1: OpenAI-style role=tool messages
         tool_messages = [m for m in self.messages if m.get("role") == "tool"]
         pinned_read_ids = self._tool_memory_pinned_tool_message_ids(self.messages)
+        pinned_read_ids |= self._microcompact_protected_ids(self.messages, preserve_reads=preserve_reads)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
             keep_ids = {id(x) for x in kept} | pinned_read_ids
@@ -41285,10 +43881,13 @@ class SessionState:
                 if changed:
                     msg["content"] = new_content
 
-    def _microcompact_agent_messages(self, messages: list[dict], keep_recent: int = 3):
+    def _microcompact_agent_messages(
+        self, messages: list[dict], keep_recent: int = 3, *, preserve_reads: bool = False,
+    ):
         """Apply microcompact to an agent-specific message list (e.g. agent_messages filtered by role)."""
         tool_messages = [m for m in messages if m.get("role") == "tool"]
         pinned_read_ids = self._tool_memory_pinned_tool_message_ids(messages)
+        pinned_read_ids |= self._microcompact_protected_ids(messages, preserve_reads=preserve_reads)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
             keep_ids = {id(x) for x in kept} | pinned_read_ids
@@ -46125,6 +48724,7 @@ body{padding:18px}
                 observations.append({
                     "id": observation_id,
                     "source_tool": trim(str(item.get("source_tool", "reader") or "reader"), 40),
+                    "operation": trim(str(item.get("operation", "") or ""), 80),
                     "agent_role": trim(str(item.get("agent_role", "single") or "single"), 40),
                     "locator": trim(str(item.get("locator", "") or ""), 500),
                     "ranges": ranges,
@@ -46179,6 +48779,18 @@ body{padding:18px}
                 "seen_segments": seen_segments,
                 "observed_segments": observed_segments,
                 "read_ranges": read_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                # Which tool message showed which lines. read_ranges says what
+                # was ever read; this says where the text was, so a range is
+                # only "already in context" while that message keeps its body.
+                "visible_reads": [
+                    {
+                        "start": max(1, int(item.get("start", 1) or 1)),
+                        "end": max(1, int(item.get("end", 1) or 1)),
+                        "tool_call_id": trim(str(item.get("tool_call_id", "") or ""), 120),
+                    }
+                    for item in (value.get("visible_reads", []) or [])[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+                    if isinstance(item, dict) and str(item.get("tool_call_id", "") or "").strip()
+                ],
                 "observations": observations[-LONG_CONTENT_OBSERVATION_MAX:],
                 "observation_count": max(
                     len(observations),
@@ -46586,7 +49198,12 @@ body{padding:18px}
         return [seg for _score, seg in ranked[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]]
 
     def _update_long_content_retrieval_plan(self, memory: dict, *, information_gain: float = 0.0) -> dict:
-        """Choose the next evidence action from current gaps and coverage."""
+        """Choose the next evidence action from current gaps and coverage.
+
+        This is deliberately adaptive: a repeated read records low gain but
+        does not block it.  The controller simply recommends a more useful
+        query/window or a semantic refresh based on what is still unknown.
+        """
         objective = self._long_content_objective()
         frontier = self._long_content_select_frontier(memory, query=objective)
         next_ids = [str(seg.get("id", "")) for seg in frontier if str(seg.get("id", ""))]
@@ -46715,16 +49332,32 @@ body{padding:18px}
             end = min(len(lines), start + limit - 1)
         else:
             return ""
-        if self._long_content_range_is_covered(memory, start, end):
-            body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
-            return self._clip_read_file_output(
-                f"[read_file reused path={rel} lines={start}-{end} coverage="
-                f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
-                self._read_file_max_chars(src.get("max_chars")),
-            )
+        visible = self._visible_read_ranges(memory, getattr(_READ_DISPATCH_CONTEXT, "read_role", ""))
+        if visible is not None:
+            # Tracked reads: only lines the model can still see count as
+            # covered. Compacted messages no longer hold their text, so those
+            # lines come back instead of being silently dropped from the delta.
+            cover_source = [[a, b] for a, b in visible]
+            fully_visible = self._ranges_cover(cover_source, start, end)
+            if fully_visible:
+                carrier = self._visible_read_carrier(memory, start, end, getattr(_READ_DISPATCH_CONTEXT, "read_role", ""))
+                return (
+                    f"[read_file reused path={rel} lines={start}-{end} unchanged already_in_context"
+                    f"{(' tool_call_id=' + carrier) if carrier else ''}; "
+                    "the text is in your earlier tool result. Pass fresh=true to re-emit]"
+                )
+        else:
+            cover_source = list(memory.get("read_ranges", []) or []) if isinstance(memory, dict) else []
+            if self._long_content_range_is_covered(memory, start, end):
+                body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
+                return self._clip_read_file_output(
+                    f"[read_file reused path={rel} lines={start}-{end} coverage="
+                    f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
+                    self._read_file_max_chars(src.get("max_chars")),
+                )
         # Compute uncovered intervals against the union of remembered ranges.
         covered = []
-        for item in memory.get("read_ranges", []) if isinstance(memory, dict) else []:
+        for item in cover_source:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 try:
                     covered.append((max(start, int(item[0])), min(end, int(item[1]))))
@@ -46762,124 +49395,56 @@ body{padding:18px}
         )
 
     def _long_content_search_index(self, memory: dict, lines: list[str]) -> dict:
-        """Build or reuse a bounded inverted index for a source version."""
-        content_id = str(memory.get("content_id", "") or "")
-        source_version = str(memory.get("source_sha256", "") or content_id)
-        cache_key = f"{content_id}:{source_version}:{len(lines)}"
-        cache = getattr(self, "_long_content_search_index_cache", {})
-        if not isinstance(cache, dict):
-            cache = {}
-            self._long_content_search_index_cache = cache
-        elif not hasattr(self, "_long_content_search_index_cache"):
-            self._long_content_search_index_cache = cache
-        cached = cache.get(cache_key)
-        if isinstance(cached, dict) and isinstance(cached.get("postings"), dict):
-            return cached
-        postings: dict[str, list[int]] = {}
-        max_terms = 60_000
-        max_postings = 480
-        for line_no, raw_line in enumerate(lines, 1):
-            text = str(raw_line or "").casefold()
-            if not text.strip():
-                continue
-            tokens = re.findall(
-                r"[a-z0-9_][a-z0-9_.:/-]{1,}|[\u4e00-\u9fff]{2,}",
-                text,
-                flags=re.I,
-            )
-            terms: set[str] = set(tokens)
-            for token in tokens:
-                if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 4:
-                    terms.update(token[idx : idx + 2] for idx in range(len(token) - 1))
-            for term in terms:
-                if len(term) < 2 or term.isdigit():
-                    continue
-                bucket = postings.get(term)
-                if bucket is None:
-                    if len(postings) >= max_terms:
-                        if not (term.isalpha() or "_" in term or any(ch.isalpha() for ch in term)):
-                            continue
-                    bucket = []
-                    postings[term] = bucket
-                if len(bucket) < max_postings:
-                    bucket.append(line_no)
-        result = {
-            "content_id": content_id,
-            "source_version": source_version,
-            "line_count": len(lines),
-            "postings": postings,
-            "created_at": now_ts(),
-        }
-        cache[cache_key] = result
-        if len(cache) > 6:
-            oldest = sorted(cache.items(), key=lambda item: float(item[1].get("created_at", 0.0) or 0.0))
-            for key, _value in oldest[:-6]:
-                cache.pop(key, None)
-        return result
+        version = str(memory.get('source_sha256') or memory.get('content_id'))
+        controller = self._evidence_controller()
+        controller.index(version, lines)
+        cache = getattr(self, '_long_content_search_index_cache', {})
+        cache[version] = {'version': version, 'line_count': len(lines)}
+        self._long_content_search_index_cache = dict(list(cache.items())[-6:])
+        return cache[version]
 
-    def _render_indexed_long_content_search(
-        self,
-        rel: str,
-        lines: list[str],
-        memory: dict,
-        *,
-        query: object = "",
-        context: object = None,
-        max_chars: object = None,
-    ) -> str:
-        """Answer a plain-text search from the source-version index."""
-        needle = str(query or "").strip()
+
+    def _render_indexed_long_content_search(self, rel: str, lines: list[str], memory: dict, *, query: object = '', context: object = None, max_chars: object = None, ranked: bool = False, offset: object = None) -> str:
+        needle = str(query or '').strip()
         if not needle:
-            return ""
-        terms = self._cached_query_terms(needle.casefold())
-        if not terms:
-            return ""
-        index = self._long_content_search_index(memory, lines)
-        postings = index.get("postings", {}) if isinstance(index, dict) else {}
-        candidate_scores: Counter[int] = Counter()
-        for term in terms:
-            for line_no in postings.get(term, []) if isinstance(postings, dict) else []:
-                candidate_scores[int(line_no)] += 1
-        if not candidate_scores:
-            return f"[read_file search path={rel} query={needle!r} matches=0 indexed=true]\n(no matches)"
-        low_needle = needle.casefold()
-        ranked: list[tuple[int, int]] = []
-        for line_no, score in candidate_scores.items():
-            if 1 <= line_no <= len(lines):
-                line_low = str(lines[line_no - 1] or "").casefold()
-                ranked.append((int(score) + (3 if low_needle in line_low else 0), line_no))
-        ranked.sort(key=lambda row: (-row[0], row[1]))
-        match_lines = [line_no for _score, line_no in ranked[:READ_FILE_SEARCH_MAX_MATCHES]]
-        if not match_lines:
-            return f"[read_file search path={rel} query={needle!r} matches=0 indexed=true]\n(no matches)"
+            return 'Error: query is required for source search.'
+        version = self._long_content_search_index(memory, lines)['version']
+        result = self._evidence_controller().search(version, needle, ranked=ranked, offset=self._read_file_int_arg(offset, 0, 0, len(lines)))
         ctx = self._read_file_int_arg(context, 6, 0, 80)
-        ranges: list[tuple[int, int]] = []
-        for line_no in sorted(match_lines):
-            start = max(1, line_no - ctx)
-            end = min(len(lines), line_no + ctx)
-            if ranges and start <= ranges[-1][1] + 1:
-                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
-            else:
-                ranges.append((start, end))
-        out = [
-            f"[read_file search path={rel} query={needle!r} matches_returned={len(match_lines)} "
-            f"windows={len(ranges)} total_lines={len(lines)} indexed=true]"
-        ]
-        for start, end in ranges:
-            out.append(f"\n@@ lines {start}-{end} @@")
-            for line_no in range(start, end + 1):
-                out.append(f"{line_no:>6}: {lines[line_no - 1]}")
-        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
+        matches = result['matches']
+        if not matches:
+            return f'[read_file search path={rel} query={needle!r} matches=0 indexed=true method={result["method"]}]\nNo match in this search scope; try mode="evidence" with related terms or inspect structure. Do not infer that a parameter is absent from every source.'
+        # Preserve relevance order so a late decisive hit cannot be clipped by
+        # earlier low-scoring hits. Overlapping lines are emitted only once.
+        ranges = [(n - ctx, n + ctx) for _score, n in matches]
+        detail = f'query={needle!r} indexed=true method={result["method"]} partial={str(result["partial"]).lower()}'
+        if result['partial']:
+            detail += f' next_search_offset={matches[-1][1]}'
+        return self._render_evidence_windows(
+            rel,
+            lines,
+            ranges,
+            label='evidence' if ranked else 'search',
+            max_chars=max_chars,
+            detail=detail,
+        )
+
 
     def _maybe_enrich_long_content_semantic(
         self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None,
-        *, allow_pending: bool = False,
+        *, allow_pending: bool = False, prior_status: str | None = None,
     ) -> None:
         """Best-effort, bounded semantic understanding for a source version.
 
         ``semantic_status`` and refresh counters are persisted, making calls
         version-scoped rather than segment-scoped. Any provider, timeout, or
         JSON failure leaves the deterministic cards intact.
+
+        Runs on the session's single enrichment worker.  Results are merged
+        into the entry currently stored under the card's ``content_id``,
+        because reads rebuild ``long_content_memory`` while the model call is
+        in flight.  ``prior_status`` is the status the starter replaced with
+        ``pending``; a skipped call (``LLMGateBusy``) restores it.
         """
         if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
             return
@@ -46918,14 +49483,34 @@ body{padding:18px}
             memory["semantic_retry_at"] = now_ts() + 60.0
             self._schedule_persist()
             return
+        # Restored when the call is skipped because the session is busy.
+        if prior_status is None:
+            prior_status = status
+        prior_status = str(prior_status or "").strip().lower()
+        if prior_status == "pending":
+            prior_status = ""
+        prior_attempts = int(memory.get("semantic_attempts", 0) or 0)
+        # Carried into every write-back: the entry stored when the call ends
+        # may have been rebuilt from a copy taken before this increment.
+        attempts = prior_attempts + 1
         memory["semantic_status"] = "pending"
-        memory["semantic_attempts"] = int(memory.get("semantic_attempts", 0) or 0) + 1
+        memory["semantic_attempts"] = attempts
         memory["semantic_started_at"] = now_ts()
+        content_id = str(memory.get("content_id", "") or "")
         prompt = self._long_content_semantic_input(memory, lines, touched_segments)
+        # What the model sees.  Reads merged while the call is in flight stay
+        # "not yet incorporated", so they can trigger a later refresh.
+        baseline = {
+            "semantic_last_coverage": float(memory.get("coverage", 0.0) or 0.0),
+            "semantic_last_seen_count": len(memory.get("seen_segments", []) or []),
+            "semantic_last_observation_count": int(memory.get("observation_count", 0) or 0),
+        }
         if not prompt.strip():
-            memory["semantic_status"] = "failed"
-            memory["semantic_retry_at"] = now_ts() + 60.0
-            self._schedule_persist()
+            self._merge_long_content_semantic_result(
+                content_id,
+                memory,
+                {"semantic_status": "failed", "semantic_retry_at": now_ts() + 60.0, "semantic_attempts": attempts},
+            )
             return
         box: dict[str, object] = {}
         def _runner():
@@ -46947,6 +49532,9 @@ body{padding:18px}
                     max_tokens=int(LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS),
                     temperature=0.1,
                     think=False,
+                    auxiliary=True,
+                    label="semantic_enrichment",
+                    request_timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS + 2.0,
                 )
             except Exception as exc:
                 box["error"] = exc
@@ -46954,10 +49542,37 @@ body{padding:18px}
         worker.start()
         worker.join(timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS)
         if worker.is_alive():
-            memory["semantic_status"] = "failed"
-            memory["semantic_error"] = "timeout"
-            memory["semantic_retry_at"] = now_ts() + 60.0
-            self._schedule_persist()
+            self._mark_llm_worker_abandoned(worker)
+            # The socket timeout is the join timeout + 2s, so the request
+            # ends shortly.  Wait for it here (this thread is the session's
+            # single enrichment worker) so no second request can start while
+            # this one is still in flight.
+            worker.join(timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS + 4.0)
+            if worker.is_alive() or "response" not in box:
+                self._merge_long_content_semantic_result(
+                    content_id,
+                    memory,
+                    {
+                        "semantic_status": "failed",
+                        "semantic_error": "timeout",
+                        "semantic_retry_at": now_ts() + 60.0,
+                        "semantic_attempts": attempts,
+                    },
+                )
+                return
+        if isinstance(box.get("error"), LLMGateBusy):
+            # Skipped, not failed: no free slot or endpoint cooldown.  Keep
+            # the prior status so the next read can try again.
+            self._merge_long_content_semantic_result(
+                content_id,
+                memory,
+                {
+                    "semantic_status": prior_status,
+                    "semantic_attempts": prior_attempts,
+                    "semantic_started_at": 0.0,
+                    "semantic_refresh_due": True,
+                },
+            )
             return
         response = box.get("response", {})
         raw = response.get("content", "") if isinstance(response, dict) else response
@@ -46965,41 +49580,84 @@ body{padding:18px}
             extract_json_object_from_text(str(raw or ""), {})
         )
         if not semantic or not (semantic.get("summary") or semantic.get("key_points")):
-            memory["semantic_status"] = "failed"
-            memory["semantic_error"] = trim(str(box.get("error", "invalid JSON") or "invalid JSON"), 180)
-            memory["semantic_retry_at"] = now_ts() + 60.0
-            self._schedule_persist()
+            self._merge_long_content_semantic_result(
+                content_id,
+                memory,
+                {
+                    "semantic_status": "failed",
+                    "semantic_error": trim(str(box.get("error", "invalid JSON") or "invalid JSON"), 180),
+                    "semantic_retry_at": now_ts() + 60.0,
+                    "semantic_attempts": attempts,
+                },
+            )
             return
-        memory["semantic"] = semantic
-        memory["semantic_status"] = "ready"
-        if int(memory.get("semantic_attempts", 0) or 0) > 1:
-            memory["semantic_refreshes"] = int(memory.get("semantic_refreshes", 0) or 0) + 1
-        memory["semantic_version"] = str(memory.get("source_sha256", "") or memory.get("content_id", ""))[:120]
-        memory["semantic_updated_at"] = now_ts()
-        memory["semantic_last_coverage"] = float(memory.get("coverage", 0.0) or 0.0)
-        memory["semantic_last_seen_count"] = len(memory.get("seen_segments", []) or [])
-        memory["semantic_last_observation_count"] = int(memory.get("observation_count", 0) or 0)
-        memory["objective_signature"] = objective_sig or str(memory.get("objective_signature", "") or "")
-        memory["objective_text"] = objective
-        memory["objective_gaps"] = list(semantic.get("open_questions", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS]
-        memory["objective_covered"] = list(semantic.get("covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED]
         next_ids = {
             str(x).strip() for x in (semantic.get("next_segments", []) or []) if str(x).strip()
         }
-        unread = {
-            str(seg.get("id", "")).strip()
-            for seg in (memory.get("segments", []) or [])
-            if isinstance(seg, dict) and str(seg.get("id", "")).strip()
-            and str(seg.get("id", "")) not in set(memory.get("seen_segments", []) or [])
-        }
-        memory["semantic_next_segments"] = list(next_ids & unread)[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]
-        memory["semantic_retry_at"] = 0.0
-        memory["semantic_started_at"] = 0.0
-        memory.pop("semantic_error", None)
-        memory["updated_at"] = now_ts()
-        self.long_content_memory[memory["content_id"]] = self._normalize_long_content_memory(
-            self.long_content_memory
-        ).get(memory["content_id"], memory)
+
+        def _ready(current: dict) -> dict:
+            # Suggested next segments are filtered against the entry as it is
+            # now; the refresh baselines are what the model actually saw.
+            seen = set(current.get("seen_segments", []) or [])
+            unread = {
+                str(seg.get("id", "")).strip()
+                for seg in (current.get("segments", []) or [])
+                if isinstance(seg, dict) and str(seg.get("id", "")).strip()
+                and str(seg.get("id", "")) not in seen
+            }
+            fields = {
+                "semantic": semantic,
+                "semantic_status": "ready",
+                "semantic_version": str(current.get("source_sha256", "") or current.get("content_id", ""))[:120],
+                "semantic_updated_at": now_ts(),
+                **baseline,
+                "objective_signature": objective_sig or str(current.get("objective_signature", "") or ""),
+                "objective_text": objective,
+                "objective_gaps": list(semantic.get("open_questions", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS],
+                "objective_covered": list(semantic.get("covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED],
+                "semantic_next_segments": list(next_ids & unread)[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS],
+                "semantic_retry_at": 0.0,
+                "semantic_started_at": 0.0,
+                "semantic_error": None,
+                "semantic_attempts": attempts,
+            }
+            if attempts > 1:
+                fields["semantic_refreshes"] = int(current.get("semantic_refreshes", 0) or 0) + 1
+            return fields
+
+        self._merge_long_content_semantic_result(content_id, memory, _ready)
+
+    def _merge_long_content_semantic_result(self, content_id: str, memory: dict, fields) -> None:
+        """Write enrichment fields into the entry stored now under ``content_id``.
+
+        ``_merge_long_content_observation`` rebuilds ``long_content_memory``
+        on every read, so the dict the worker started with may be stale; the
+        current entry is re-read under ``self.lock`` and merged.  ``fields`` is
+        a dict or a callable taking the current entry and returning one; a
+        value of ``None`` removes the key.  A card invalidated by an edit while
+        the call was in flight keeps its tombstone.
+        """
+        lock = getattr(self, "lock", None)
+        with lock if lock is not None else contextlib.nullcontext():
+            if content_id:
+                registry = getattr(self, "long_content_memory", None)
+                current = registry.get(content_id) if isinstance(registry, dict) else None
+                if not isinstance(current, dict):
+                    # The card was evicted while the call was running.
+                    return
+            else:
+                current = memory
+            if bool(current.get("stale", False)):
+                return
+            updates = fields(current) if callable(fields) else dict(fields or {})
+            # In place, so a caller still holding this entry sees the result
+            # and writing that entry back cannot undo it.
+            for key, value in updates.items():
+                if value is None:
+                    current.pop(key, None)
+                else:
+                    current[key] = value
+            current["updated_at"] = now_ts()
         self._schedule_persist()
 
     def _start_long_content_semantic_enrichment(
@@ -47009,11 +49667,15 @@ body{padding:18px}
 
         A tiny join window lets very fast/local providers complete inline (and
         keeps deterministic callers observable), while normal network/model
-        latency continues in the background.  The source card is marked
-        ``pending`` before spawning so adjacent segment reads cannot fan out
-        duplicate completions.
+        latency continues in the background.  At most one enrichment runs per
+        session: while ``self._semantic_enrichment_worker`` is alive new reads
+        only leave ``semantic_refresh_due`` set for a later read.  A ``failed``
+        card waits for ``semantic_retry_at``.
         """
         if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
+            return
+        previous = getattr(self, "_semantic_enrichment_worker", None)
+        if previous is not None and previous.is_alive():
             return
         status = str(memory.get("semantic_status", "") or "").strip().lower()
         if status == "disabled":
@@ -47022,6 +49684,12 @@ body{padding:18px}
             started = float(memory.get("semantic_started_at", 0.0) or 0.0)
             if started and now_ts() - started <= max(30.0, LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS * 3):
                 return
+            # No worker is alive, so this pending mark is left over from a
+            # restart or a dead thread; retry it like a failed card.
+            status = "failed"
+            memory["semantic_retry_at"] = 0.0
+        if status == "failed" and float(memory.get("semantic_retry_at", 0.0) or 0.0) > now_ts():
+            return
         if status == "ready":
             refreshes = int(memory.get("semantic_refreshes", 0) or 0)
             if refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES or not bool(memory.get("semantic_refresh_due", False)):
@@ -47034,9 +49702,10 @@ body{padding:18px}
         worker = threading.Thread(
             target=self._maybe_enrich_long_content_semantic,
             args=(memory, rel, lines, touched_segments),
-            kwargs={"allow_pending": True},
+            kwargs={"allow_pending": True, "prior_status": status},
             daemon=True,
         )
+        self._semantic_enrichment_worker = worker
         worker.start()
         # Never make read_file wait for the model; only harvest a very fast
         # response so unit/local mock providers remain deterministic.
@@ -47115,7 +49784,7 @@ body{padding:18px}
         registry = getattr(self, "long_content_memory", {})
         if not isinstance(registry, dict):
             registry = {}
-            self.long_content_memory = registry
+        self.long_content_memory = registry
         old = registry.get(content_id, {}) if isinstance(registry, dict) else {}
         if old and not force and not bool(old.get("stale", False)) and int(old.get("total_lines", 0) or 0) == len(lines):
             # Same content may be reachable through an upload alias, IDE
@@ -47197,6 +49866,7 @@ body{padding:18px}
         source_tool: str = "reader",
         role: str = "",
         locator: str = "",
+        operation: str = "",
         excerpts: list[str] | None = None,
         matched_lines: int = 0,
         confidence: float = 1.0,
@@ -47311,6 +49981,7 @@ body{padding:18px}
         objective_sig = self._long_content_objective_signature(self._long_content_objective())
         observation_basis = json_dumps({
             "tool": tool_name,
+            "operation": trim(str(operation or ""), 80),
             "locator": trim(str(locator or ""), 500),
             "ranges": clean_ranges,
             "evidence": bounded_evidence,
@@ -47326,6 +49997,7 @@ body{padding:18px}
             observations.append({
                 "id": observation_id,
                 "source_tool": tool_name,
+                "operation": trim(str(operation or ""), 80),
                 "agent_role": role_key,
                 "locator": trim(str(locator or ""), 500),
                 "ranges": [[a, b] for a, b in clean_ranges[:LONG_CONTENT_OBSERVATION_MAX_RANGES]],
@@ -47371,91 +50043,151 @@ body{padding:18px}
         lines: list[str],
         args: dict,
         output: str,
-        role: str = "",
+        role: str = '',
+        *,
+        tool_call_id: str = '',
+        read_range: tuple[int, int] | None = None,
     ) -> None:
-        try:
-            memory = self._ensure_long_content_memory(rel, fp, lines)
-            if not memory:
-                return
-            if str(output or "").lstrip().startswith("[read_file reused"):
-                return
-            raw_mode = str((args or {}).get("mode", "") or "auto").lower()
-            mode = raw_mode
-            # ``read_file`` resolves auto to a concrete strategy before
-            # rendering. Mirror that resolution while recording evidence so
-            # default calls (line/offset/query/target) participate in range
-            # reuse instead of being mistaken for outline-only reads.
-            if mode == "auto":
-                if str((args or {}).get("segment_id", "") or "").strip():
-                    mode = "segment"
-                elif str((args or {}).get("target", "") or "").strip():
-                    mode = "symbol"
-                elif str((args or {}).get("query", "") or "").strip():
-                    mode = "search"
-                elif (
-                    (args or {}).get("line") not in (None, "")
-                    or (args or {}).get("offset") not in (None, "")
-                    or (args or {}).get("limit") not in (None, "")
-                ):
-                    mode = "window"
-                else:
-                    mode = "overview"
-            # Structure/overview establishes navigation only.  Do not treat the
-            # line ranges printed in the outline as semantically read; otherwise
-            # one cheap overview would falsely report 100% comprehension.
-            if mode in {"overview", "structure"} and not str((args or {}).get("segment_id", "") or "").strip():
-                memory["outline_ready"] = True
-                memory["updated_at"] = now_ts()
-                self.long_content_memory[memory["content_id"]] = memory
-                self._schedule_persist()
-                return
-            observed_ranges: list[tuple[int, int]] = []
-            for output_line in str(output or "").splitlines():
-                marker = output_line.strip()
-                if not (marker.startswith("[read_file") or marker.startswith("@@ lines")):
-                    continue
-                # Delta responses carry the requested span for navigation and
-                # an explicit uncovered span for coverage accounting.  Only
-                # the latter is new evidence; recording the whole requested
-                # window would falsely claim that overlapping lines were read.
-                uncovered = re.search(r"\buncovered_lines\s*=\s*([0-9]+(?:\s*-\s*[0-9]+)?(?:\s*,\s*[0-9]+(?:\s*-\s*[0-9]+)?)*)", marker, re.I)
-                if uncovered:
-                    for part in str(uncovered.group(1) or "").split(","):
-                        nums = re.findall(r"\d+", part)
-                        if nums:
-                            a, b = int(nums[0]), int(nums[-1])
-                            observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
-                    continue
-                window_marker = re.search(r"^@@\s*lines\s+(\d+)(?:\s*-\s*(\d+))?", marker, re.I)
-                if window_marker:
-                    a = int(window_marker.group(1))
-                    b = int(window_marker.group(2) or window_marker.group(1))
-                    observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
-                    continue
-                for match in re.finditer(r"(?:^|\s)(?:lines?|L)\s*=\s*(\d+)(?:\s*-\s*(\d+))?", marker, re.I):
-                    a, b = int(match.group(1)), int(match.group(2) or match.group(1))
-                    observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
-            if mode == "full" and not observed_ranges:
-                full_text = "\n".join(lines)
-                offset = self._read_file_int_arg((args or {}).get("offset", 0), 0, 0, max(0, len(full_text)))
-                cap = self._read_file_max_chars((args or {}).get("max_chars"))
-                end_char = min(len(full_text), offset + cap)
-                start_line = full_text.count("\n", 0, offset) + 1
-                end_line = full_text.count("\n", 0, end_char) + 1
-                observed_ranges.append((start_line, min(len(lines), max(start_line, end_line))))
-            if observed_ranges:
-                self._merge_long_content_observation(
-                    rel,
-                    fp,
-                    lines,
-                    observed_ranges,
-                    source_tool="read_file",
-                    role=role,
-                    locator=self._read_file_signature_from_args({**dict(args or {}), "path": rel}),
-                    confidence=1.0,
-                )
-        except Exception:
+        memory = self._ensure_long_content_memory(rel, fp, lines)
+        if not memory:
             return
+        # Verify each rendered, numbered line against the exact source. A range
+        # header, structure card or truncated row is never evidence of coverage.
+        actual = []
+        for row in self._evidence_body(output).splitlines():
+            match = re.match(r'^\s*(\d+): (.*)$', row)
+            if match:
+                n = int(match.group(1))
+                if 1 <= n <= len(lines) and match.group(2) == lines[n - 1]:
+                    actual.append(n)
+        if not actual and read_range:
+            # Small-file and symbol reads render source text without line
+            # numbers. The caller knows the exact range; accept it only if the
+            # rendered body really contains those source lines.
+            try:
+                lo = max(1, int(read_range[0]))
+                hi = min(len(lines), int(read_range[1]))
+            except Exception:
+                lo, hi = 1, 0
+            body = self._evidence_body(output)
+            if lo <= hi and "\n".join(lines[lo - 1:hi]).strip() and "\n".join(lines[lo - 1:hi]) in body:
+                actual.extend(range(lo, hi + 1))
+        mode = str(args.get('mode') or 'auto')
+        if mode == 'full':
+            body = self._evidence_body(output)
+            if body.startswith('[read_file full'):
+                body = body.partition('\n')[2]
+            body = body.split('\n[read_file clipped', 1)[0]
+            source = '\n'.join(lines)
+            start = self._read_file_int_arg(args.get('offset'), 0, 0, len(source))
+            end = start + len(body)
+            if source[start:end] == body:
+                cursor = 0
+                for n, value in enumerate(lines, 1):
+                    if cursor >= start and cursor + len(value) <= end:
+                        actual.append(n)
+                    cursor += len(value) + 1
+        if not actual:
+            return
+        ranges = []
+        for n in sorted(set(actual)):
+            if ranges and n == ranges[-1][1] + 1:
+                ranges[-1][1] = n
+            else:
+                ranges.append([n, n])
+        merged = self._merge_long_content_observation(rel, fp, lines, ranges, source_tool='read_file', role=role,
+                                                     locator=self._read_file_signature_from_args({**args, 'path': rel}), confidence=1.0)
+        self._record_visible_read(merged, ranges, tool_call_id)
+
+    def _record_visible_read(self, memory: dict | None, ranges: list, tool_call_id: str) -> None:
+        """Remember which tool message carries which source lines."""
+        call_id = trim(str(tool_call_id or "").strip(), 120)
+        if not call_id or not isinstance(memory, dict) or not ranges:
+            return
+        content_id = str(memory.get("content_id", "") or "")
+        store = getattr(self, "long_content_memory", None)
+        target = store.get(content_id) if isinstance(store, dict) and content_id else None
+        if not isinstance(target, dict):
+            target = memory
+        rows = [row for row in (target.get("visible_reads", []) or []) if isinstance(row, dict)]
+        for start, end in ranges:
+            rows.append({"start": int(start), "end": int(end), "tool_call_id": call_id})
+        target["visible_reads"] = rows[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+
+    @staticmethod
+    def _ranges_cover(ranges: list, start: int, end: int) -> bool:
+        """True when the union of [a, b] ranges covers every line in start..end."""
+        spans = []
+        for item in ranges or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    spans.append((int(item[0]), int(item[1])))
+                except Exception:
+                    continue
+        cursor = start
+        for a, b in sorted(spans):
+            if a > cursor:
+                break
+            cursor = max(cursor, b + 1)
+            if cursor > end:
+                return True
+        return cursor > end
+
+    def _visible_read_carrier(self, memory: dict, start: int, end: int, role: str = "") -> str:
+        """tool_call_id of a still-visible message that covers start..end, if one does."""
+        visible_ids = self._tool_call_ids_visible_in_context(role)
+        for row in reversed([r for r in (memory.get("visible_reads", []) or []) if isinstance(r, dict)]):
+            call_id = str(row.get("tool_call_id", "") or "")
+            try:
+                if call_id in visible_ids and int(row.get("start", 0)) <= start and int(row.get("end", 0)) >= end:
+                    return call_id
+            except Exception:
+                continue
+        return ""
+
+    def _tool_call_ids_visible_in_context(self, role: str = "") -> set[str]:
+        """tool_call_ids whose result is still in the role's context, uncompacted.
+
+        This is the ground truth for "already in context": a remembered read
+        only counts while the model can still see the message that carried it.
+        """
+        role_key = self._sanitize_agent_role(role)
+        try:
+            messages = self._agent_context(role_key) if role_key else list(getattr(self, "messages", []) or [])
+        except Exception:
+            messages = list(getattr(self, "messages", []) or [])
+        visible: set[str] = set()
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            call_id = str(msg.get("tool_call_id", "") or "")
+            content = msg.get("content", "")
+            if not call_id or not isinstance(content, str) or not content.strip():
+                continue
+            if content.startswith(READ_RESULT_PLACEHOLDER_PREFIXES):
+                continue
+            visible.add(call_id)
+        return visible
+
+    def _visible_read_ranges(self, memory: dict, role: str = "") -> list[tuple[int, int]] | None:
+        """Ranges whose carrying message is still visible, or None for legacy memory.
+
+        None means no read was ever tracked by tool_call_id. Callers then keep
+        the historical behaviour based on read_ranges.
+        """
+        rows = [row for row in (memory.get("visible_reads", []) or []) if isinstance(row, dict)] if isinstance(memory, dict) else []
+        if not rows:
+            return None
+        visible_ids = self._tool_call_ids_visible_in_context(role)
+        out: list[tuple[int, int]] = []
+        for row in rows:
+            if str(row.get("tool_call_id", "") or "") in visible_ids:
+                try:
+                    out.append((int(row.get("start", 1)), int(row.get("end", 1))))
+                except Exception:
+                    continue
+        return out
+
 
     def _invalidate_long_content_memory_path(self, rel: str, reason: str = "source changed") -> int:
         """Drop cards for a changed source while keeping unrelated memories intact."""
@@ -47555,7 +50287,9 @@ body{padding:18px}
                     trim(str(x), 150) for x in (observation.get("excerpts", []) or [])[:3] if str(x).strip()
                 )
                 parts.append(
-                    f"  verified_observation tool={observation.get('source_tool','reader')} refs={refs}: {evidence}"
+                    f"  verified_observation tool={observation.get('source_tool','reader')}"
+                    + (f" operation={observation.get('operation')}" if observation.get("operation") else "")
+                    + f" refs={refs}: {evidence}"
                 )
             semantic = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
             if str(row.get("semantic_status", "") or "").lower() == "ready" and semantic:
@@ -47584,86 +50318,51 @@ body{padding:18px}
 
     def _render_long_content_structure(self, rel: str, fp: Path, lines: list[str], *, max_chars: object = None) -> str:
         memory = self._ensure_long_content_memory(rel, fp, lines)
-        if not memory:
-            return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
-        cards = memory.get("cards", []) if isinstance(memory.get("cards", []), list) else []
-        out = [
-            f"[read_file structure path={rel} content_id={memory.get('content_id','')} "
-            f"type={memory.get('content_type','text')} lines={len(lines)} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]",
-            "Structure is persisted as compact cards. Use mode='segment' with segment_id or query to continue reading one section.",
-        ]
-        outline = str(memory.get("outline", "") or "").strip()
-        if outline:
-            out.append("\nOutline:\n" + outline)
-        if cards:
-            out.append("\nCards:")
-            for card in cards[:24]:
-                if not isinstance(card, dict):
-                    continue
-                out.append(
-                    f"- {card.get('id','')} {card.get('title','')} :: "
-                    f"{trim(card.get('text',''), 220)} [{','.join(card.get('evidence', [])[:2])}]"
-                )
-        out.append(f"\nFocused read: read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
-        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
+        objective = self._long_content_objective()
+        segments = memory.get('segments', [])
+        frontier = self._long_content_select_frontier(memory, query=objective)
+        rows = [f'[read_file structure path={rel} content_id={memory.get("content_id")} lines={len(lines)}]',
+                'Navigation only: indexed sections are not verified facts or read coverage.']
+        if objective:
+            # Query raw indexed source rather than trusting the first card lines.
+            rows.append(self._render_indexed_long_content_search(rel, lines, memory, query=objective, ranked=True, context=3,
+                        max_chars=min(5000, self._read_file_max_chars(max_chars) // 2)))
+        rows.append('Objective-guided retrieval frontier:')
+        selected = frontier + [s for s in segments if s not in frontier]
+        for seg in selected[:24]:
+            rows.append(f'{seg["id"]} L{seg["start_line"]}-{seg["end_line"]} {seg["title"]}')
+        if len(segments) > 24:
+            rows.append(f'{len(segments) - 24} further sections remain searchable across the complete source.')
+        rows.append('Use mode="evidence" query="<question>" for ranked excerpts, search for literal values, or segment with an id.')
+        return self._clip_read_file_output('\n'.join(rows), self._read_file_max_chars(max_chars))
 
-    def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = "", query: object = "", max_chars: object = None) -> str:
+
+    def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = '', query: object = '', max_chars: object = None) -> str:
         memory = self._ensure_long_content_memory(rel, fp, lines)
-        if not memory:
-            return self._render_window_text_read(rel, lines, max_chars=max_chars)
-        wanted_id = str(segment_id or "").strip()
-        wanted_query = str(query or "").strip().lower()
-        segments = memory.get("segments", []) if isinstance(memory.get("segments", []), list) else []
-        match = None
-        for seg in segments:
-            if not isinstance(seg, dict):
-                continue
-            if wanted_id and str(seg.get("id", "")) == wanted_id:
-                match = seg
-                break
-            if wanted_query and wanted_query in (str(seg.get("title", "")) + " " + str(seg.get("summary", ""))).lower():
-                match = seg
-                break
-        if match is None:
-            return (
-                f"[read_file segment path={rel} matches=0]\n"
-                "Use mode='structure' first, then provide segment_id (for example s0001) or a narrow query."
-            )
-        start = max(1, int(match.get("start_line", 1) or 1))
-        end = min(len(lines), int(match.get("end_line", start) or start))
-        context = 8
-        body_start, body_end = max(1, start - context), min(len(lines), end + context)
-        body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(body_start, body_end + 1))
-        seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
-        seen.add(str(match.get("id", "")))
-        memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
-        ranges: list[list[int]] = []
-        for item in memory.get("read_ranges", []) or []:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                try:
-                    ranges.append([max(1, int(item[0])), min(len(lines), max(int(item[0]), int(item[1])))])
-                except Exception:
-                    continue
-        ranges.append([body_start, body_end])
-        merged: list[list[int]] = []
-        for a, b in sorted(ranges):
-            if merged and a <= merged[-1][1] + 1:
-                merged[-1][1] = max(merged[-1][1], b)
-            else:
-                merged.append([a, b])
-        memory["read_ranges"] = merged[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
-        covered_lines = sum(max(0, int(b) - int(a) + 1) for a, b in merged)
-        memory["coverage"] = round(min(1.0, covered_lines / max(1, len(lines))), 4)
-        match["status"] = "read"
-        match["last_seen"] = now_ts()
-        memory["updated_at"] = now_ts()
-        self.long_content_memory[memory["content_id"]] = memory
-        return self._clip_read_file_output(
-            f"[read_file segment path={rel} segment_id={match.get('id')} title={match.get('title','')} "
-            f"lines={start}-{end} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
-            f"Card: {match.get('summary','')}\nEvidence window:\n{body}",
-            self._read_file_max_chars(max_chars),
+        wanted = str(segment_id or '').strip()
+        if query and not wanted:
+            return self._render_indexed_long_content_search(rel, lines, memory, query=query, max_chars=max_chars, ranked=True)
+        match = next((s for s in memory.get('segments', []) if s['id'] == wanted), None)
+        if not match:
+            return f'[read_file segment path={rel} matches=0]\nUse structure or mode="evidence" query="<question>".'
+        out = self._render_evidence_windows(
+            rel,
+            lines,
+            [(match['start_line'] - 8, match['end_line'] + 8)],
+            label='segment',
+            max_chars=max_chars,
+            detail=f"segment_id={wanted} title={match.get('title', '')}"
         )
+        marker = "\n@@ lines "
+        if marker in out:
+            head, tail = out.split(marker, 1)
+            out = (
+                f"{head}\nCard: {trim(str(match.get('summary', '') or ''), 900)}\n"
+                f"Evidence window:{marker}{tail}"
+            )
+        self._mark_long_content_read(rel, fp, lines, {'mode': 'segment', 'segment_id': wanted}, out)
+        return out
+
 
     def _render_text_overview(
         self,
@@ -47721,7 +50420,8 @@ body{padding:18px}
         if not is_code:
             out.append("- For long logs or command output, start with mode=\"search\" for the error, warning, filename, or keyword.")
         # Every text source has the same source identity, evidence ranges and
-        # search index. Larger sources additionally expose section navigation.
+        # search index.  Larger sources additionally expose section navigation
+        # and semantic frontier hints; size changes detail, not architecture.
         try:
             memory = self._ensure_long_content_memory(rel, fp, lines)
             if memory:
@@ -47731,23 +50431,24 @@ body{padding:18px}
                 )
                 if memory.get("scale") == "long":
                     out.append(
-                        f"segments={len(memory.get('segments', []) or [])}; use structure/segment for navigation."
+                        f"segments={len(memory.get('segments', []) or [])}; "
+                        "use structure/segment for objective-guided navigation."
                     )
-                    objective = self._long_content_objective()
-                    frontier = self._long_content_select_frontier(memory, query=objective)
-                    if objective or frontier:
-                        out.append("\nObjective-guided retrieval frontier:")
-                        if objective:
-                            out.append(f"- objective: {trim(objective, 420)}")
-                        for seg in frontier[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]:
-                            out.append(
-                                f"- segment={seg.get('id')} lines={seg.get('start_line', 0)}-{seg.get('end_line', 0)} "
-                                f"title={trim(str(seg.get('title', '') or ''), 140)}"
-                            )
+                objective = self._long_content_objective()
+                frontier = self._long_content_select_frontier(memory, query=objective)
+                if memory.get("scale") == "long" and (objective or frontier):
+                    out.append("\nObjective-guided retrieval frontier:")
+                    if objective:
+                        out.append(f"- objective: {trim(objective, 420)}")
+                    for seg in frontier[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]:
                         out.append(
-                            f"- read_file path=\"{rel}\" mode=\"segment\" "
-                            f"segment_id=\"{frontier[0].get('id') if frontier else 's0001'}\""
+                            f"- segment={seg.get('id')} lines={seg.get('start_line', 0)}-{seg.get('end_line', 0)} "
+                            f"title={trim(str(seg.get('title', '') or ''), 140)}"
                         )
+                    out.append(
+                        f"- read_file path=\"{rel}\" mode=\"segment\" "
+                        f"segment_id=\"{frontier[0].get('id') if frontier else 's0001'}\""
+                    )
         except Exception:
             pass
         return self._clip_read_file_output("\n".join(out), cap)
@@ -48818,6 +51519,7 @@ body{padding:18px}
             client.model = model_override
         client.thinking_stream = False
         client.timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
+        client.request_gate = self._ensure_llm_gate()
         client.set_telemetry(
             getattr(self, "telemetry_callback", None),
             context_provider=lambda: {
@@ -48865,6 +51567,7 @@ body{padding:18px}
             f"Snapshot:\n{json_dumps(snapshot, indent=2)}"
         )
         box: dict[str, object] = {}
+        join_timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
 
         def _runner():
             try:
@@ -48876,6 +51579,12 @@ body{padding:18px}
                     temperature=float(self.arbiter_temperature),
                     think=False,
                     stream_thinking=False,
+                    # Auxiliary: no HTTP retries, never waits out an endpoint
+                    # cooldown, and the socket gives up shortly after the
+                    # join below does.
+                    auxiliary=True,
+                    label="arbiter",
+                    request_timeout=join_timeout + 2.0,
                 )
                 box["rsp"] = rsp
             except Exception as exc:
@@ -48883,10 +51592,13 @@ body{padding:18px}
 
         thread = threading.Thread(target=_runner, daemon=True)
         thread.start()
-        thread.join(timeout=max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS)))
+        thread.join(timeout=join_timeout)
         if thread.is_alive():
+            self._mark_llm_worker_abandoned(thread)
             return {"status": "ARBITER_TIMEOUT", "reasoning": "arbiter timeout", "raw": ""}
         err = box.get("error")
+        if isinstance(err, LLMGateBusy):
+            return {"status": "ARBITER_SKIPPED", "reasoning": trim(str(err), 220), "raw": ""}
         if isinstance(err, Exception):
             return {"status": "ARBITER_ERROR", "reasoning": trim(str(err), 220), "raw": ""}
         rsp = box.get("rsp") if isinstance(box.get("rsp"), dict) else {}
@@ -49828,6 +52540,9 @@ body{padding:18px}
                     system=self._inject_runtime_environment_context("/no_think\nAnalyze task dimensions. One line output only."),
                     max_tokens=40,
                     think=False,
+                    auxiliary=True,
+                    label="complexity_classify",
+                    request_timeout=7.0,
                 )
                 answer = str(rsp.get("content", "") or "").strip().upper()
                 # Parse dimension scores
@@ -49863,6 +52578,8 @@ body{padding:18px}
         t = threading.Thread(target=_classify, daemon=True)
         t.start()
         t.join(timeout=5.0)
+        if t.is_alive():
+            self._mark_llm_worker_abandoned(t)
         return result_box[0]
 
     def _infer_task_profile(self, goal: str) -> dict:
@@ -50393,6 +53110,7 @@ body{padding:18px}
         client.timeout = AUTO_TITLE_MODEL_TIMEOUT_SECONDS
         client.thinking_stream = False
         client.response_stream = False
+        client.request_gate = self._ensure_llm_gate()
         client.set_telemetry(
             getattr(self, "telemetry_callback", None),
             context_provider=lambda: {"session_id": self.id},
@@ -50509,6 +53227,10 @@ body{padding:18px}
                     think=False,
                     stream_thinking=False,
                     response_stream=False,
+                    # Busy slots skip to the local fallback title below.
+                    auxiliary=True,
+                    label="auto_title",
+                    request_timeout=AUTO_TITLE_MODEL_TIMEOUT_SECONDS,
                 )
                 raw_content = response.get("content", "") if isinstance(response, dict) else response
                 candidate = self._normalize_auto_title(str(raw_content or ""))
@@ -50567,6 +53289,11 @@ body{padding:18px}
         if not goal or self._is_title_continuation_text(goal):
             return False
         goal_digest = self._auto_title_goal_digest(goal)
+        # Let the dedicated title request produce the first visible name when
+        # enabled.  A synchronous fallback before that request completes makes
+        # the UI emit two rename events for one user message.
+        if AUTO_TITLE_MODEL_REFINE:
+            return self._schedule_auto_title_model_refine(goal, goal_digest, trigger)
         quick_changed = False
         quick_old = ""
         quick_title = ""
@@ -50804,12 +53531,17 @@ body{padding:18px}
             finally:
                 done.set()
 
-        threading.Thread(target=worker, daemon=True).start()
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
         try:
             while True:
                 if done.wait(poll_interval):
                     break
                 if self.cancel_requested:
+                    # The worker keeps its HTTP request (and gate slot) until
+                    # the socket returns; flag it so monitoring shows it as
+                    # abandoned rather than live work.
+                    self._mark_llm_worker_abandoned(worker_thread)
                     raise OllamaError("interrupted by user", status=499)
                 try:
                     self.run_last_heartbeat = now_ts()
@@ -50905,6 +53637,18 @@ body{padding:18px}
                 effort = floor
         return clamp_effort(effort, ceiling=ceiling)
 
+    @staticmethod
+    def _mark_tool_messages_seen(messages: object) -> None:
+        """Clear ``_unseen`` on every tool message the model just received.
+
+        The request list may be a filtered copy, but it holds the same dicts as
+        the stored contexts, so clearing the flag here clears it in the stored
+        contexts too.
+        """
+        for msg in messages if isinstance(messages, list) else []:
+            if isinstance(msg, dict) and msg.get("_unseen"):
+                msg.pop("_unseen", None)
+
     def _chat_with_same_model_retry(
         self,
         messages: list[dict],
@@ -50922,7 +53666,13 @@ body{padding:18px}
         media_inputs: list[dict] | None = None,
         effort: str = "",
         coordination: bool = False,
+        priority: str = "main",
+        label: str = "main",
     ) -> dict:
+        # ``priority``/``label`` go to the session gate: the agent loop stays
+        # "main"; subagents and teammates pass their own class so they queue
+        # behind it.
+        gate_kwargs = {"priority": str(priority or "main"), "label": str(label or priority or "main")}
         retry_budget = max(0, int(retries or 0))
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
         last_exc: OllamaError | None = None
@@ -51042,6 +53792,21 @@ body{padding:18px}
 
         for attempt in range(1, retry_budget + 2):
             try:
+                self._record_flow_node(
+                    "model_call",
+                    {
+                        "context_label": trim(str(context_label or "agent"), 120),
+                        "attempt": int(attempt),
+                        "tool_count": len(tools or []),
+                        "prompt_tokens_estimate": int(estimated_prompt_tokens or 0),
+                    },
+                    role=context_role_hint or getattr(self, "active_agent_role", ""),
+                    metadata={
+                        "attempt": int(attempt),
+                        "retry_budget": int(retry_budget),
+                        "context_label": trim(str(context_label or "agent"), 120),
+                    },
+                )
                 if visible_response_stream:
                     self._clear_live_response()
                     self._begin_live_response(
@@ -51076,6 +53841,7 @@ body{padding:18px}
                         cancel_check=lambda: bool(self.cancel_requested),
                         on_http_retry=_emit_http_retry,
                         effort=resolved_effort,
+                        **gate_kwargs,
                     ),
                     progress_label=f"{context_label} model call",
                 )
@@ -51086,6 +53852,7 @@ body{padding:18px}
                     estimated_prompt_tokens=estimated_prompt_tokens,
                     context_label=context_label,
                 )
+                self._mark_tool_messages_seen(messages)
                 return response
             except OllamaError as exc:
                 if visible_response_stream:
@@ -51198,6 +53965,7 @@ body{padding:18px}
                                 media_inputs=None,
                                 cancel_check=lambda: bool(self.cancel_requested),
                                 on_http_retry=_emit_http_retry,
+                                **gate_kwargs,
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
@@ -51208,6 +53976,7 @@ body{padding:18px}
                             estimated_prompt_tokens=fallback_estimated_prompt_tokens,
                             context_label=f"{context_label}:no-media",
                         )
+                        self._mark_tool_messages_seen(messages)
                         return response
                     except OllamaError:
                         if visible_response_stream:
@@ -53119,34 +55888,14 @@ body{padding:18px}
             f"for the next page, keep mode=\"full\" and set offset={end}.",
         )
 
-    def _render_window_text_read(
-        self,
-        rel: str,
-        lines: list[str],
-        *,
-        limit: int | None = None,
-        offset: int | None = None,
-        line: object = None,
-        context: object = None,
-        max_chars: object = None,
-    ) -> str:
-        total = len(lines)
-        if total <= 0:
-            return f"[read_file window path={rel} lines=0]\n[end_of_file]"
+    def _render_window_text_read(self, rel: str, lines: list[str], *, limit: int | None = None, offset: int | None = None, line: object = None, context: object = None, max_chars: int | None = None) -> str:
         ctx = self._read_file_int_arg(context, 60, 0, 2000)
-        default_limit = ctx * 2 + 1 if line not in (None, "") else LONG_OUTPUT_READ_PAGE_LINES
-        requested_limit = self._read_file_int_arg(limit, default_limit, 1, 4000)
-        line_val = self._read_file_int_arg(line, 0, 0, max(1, total)) if line not in (None, "") else 0
-        if line_val > 0:
-            start = max(0, line_val - ctx - 1)
-        else:
-            start = self._read_file_int_arg(offset, 0, 0, max(0, total))
-        end = min(total, start + requested_limit)
-        if start >= total:
-            return f"[read_file window path={rel} lines=0 of {total} start={start + 1}]\n[end_of_file]"
-        body = "\n".join(lines[start:end])
-        header = f"[read_file window path={rel} lines={start + 1}-{end} of {total}]\n"
-        return header + self._clip_read_file_output(body, self._read_file_max_chars(max_chars))
+        start = max(1, int(line) - ctx) if line not in (None, '') else self._read_file_int_arg(offset, 0, 0, len(lines)) + 1
+        count = self._read_file_int_arg(limit, 2 * ctx + 1 if line not in (None, '') else LONG_OUTPUT_READ_PAGE_LINES, 1, 4000)
+        if start > len(lines):
+            return f'[read_file window path={rel} lines=0]\n[end_of_file]'
+        return self._render_evidence_windows(rel, lines, [(start, start + count - 1)], max_chars=max_chars)
+
 
     def _render_search_text_read(
         self,
@@ -53304,7 +56053,7 @@ body{padding:18px}
             except Exception:
                 file_size = 0
             mode_text = str(mode or "auto").strip().lower() or "auto"
-            if mode_text not in {"auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"}:
+            if mode_text not in {"auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "evidence", "directory"}:
                 mode_text = "auto"
             if mode_text == "auto":
                 if str(target or "").strip():
@@ -53313,7 +56062,7 @@ body{padding:18px}
                     mode_text = "search"
                 elif line not in (None, "") or offset not in (None, "") or limit is not None:
                     mode_text = "window"
-                elif total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
+                elif total_lines >= LARGE_FILE_AUTO_PAGE_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
                     mode_text = "structure"
             if mode_text == "directory":
                 return f"Error: path is a file, not a directory: {rel}"
@@ -53352,7 +56101,7 @@ body{padding:18px}
                         self.long_content_memory[memory.get("content_id", "")] = memory
                         self._schedule_persist()
                         return delta
-            if mode_text == "search" and memory and not bool(regex):
+            if mode_text in {"search", "evidence"} and memory and not bool(regex):
                 indexed = self._render_indexed_long_content_search(
                     rel,
                     lines,
@@ -53360,6 +56109,7 @@ body{padding:18px}
                     query=query or target,
                     context=context,
                     max_chars=max_chars,
+                    ranked=mode_text == "evidence",
                 )
                 if indexed:
                     return indexed
@@ -53371,7 +56121,7 @@ body{padding:18px}
                 return self._render_long_content_segment(rel, fp, lines, segment_id=segment_id or target, query=query, max_chars=max_chars)
             if mode_text == "full":
                 return self._render_full_text_read(rel, lines, offset=offset, max_chars=max_chars)
-            if mode_text == "search":
+            if mode_text in {"search", "evidence"}:
                 return self._render_search_text_read(
                     rel,
                     lines,
@@ -53416,6 +56166,11 @@ body{padding:18px}
             return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
+
+    def _render_compact_evidence_read(self, rel: str, lines: list[str], text: str, memory: dict) -> str:
+        return self._render_evidence_windows(rel, lines, [(1, len(lines))], label='compact',
+                                             max_chars=READ_FILE_DEFAULT_MAX_CHARS, detail='complete_source_requested=true')
+
 
     def _run_read_media(self, fp: Path, rel: str, media_type: str) -> str:
         """Read a media file and return description or inject into multimodal context."""
@@ -53491,6 +56246,13 @@ body{padding:18px}
     ) -> str:
         text = str(output or "")
         tool_name = canonicalize_tool_name(name)
+        meta = self._peek_tool_result_meta()
+        if meta.get("cache_hit") and meta.get("evidence_id"):
+            eid = str(meta["evidence_id"])
+            return (f"[cached observation; source versions unchanged; no new evidence]\n"
+                    f"{self._tool_result_compact_output(text, max_chars=1000)}\n"
+                    f"Exact complete result: tool_memory mode='trace' id='{eid}'. "
+                    "Use the existing evidence to answer the current question before repeating this observation.")
         if tool_name == "read_file":
             req = (args or {}).get("max_chars") if isinstance(args, dict) else None
             requested = self._read_file_max_chars(req, default=READ_FILE_DEFAULT_MAX_CHARS)
@@ -53661,6 +56423,35 @@ body{padding:18px}
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
 
+    @staticmethod
+    def _edit_result_snippet(before_text: str, after_text: str, context: int = 8, max_lines: int = 80) -> tuple[str, tuple[int, int]]:
+        """The changed region of an edit, as numbered lines of the new text.
+
+        The region is found by trimming the common prefix and suffix, then
+        padded by ``context`` lines on each side and capped at ``max_lines``.
+        """
+        before = str(before_text or "").splitlines()
+        after = str(after_text or "").splitlines()
+        if not after or before == after:
+            return "", (0, 0)
+        prefix = 0
+        while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < min(len(before), len(after)) - prefix
+            and before[len(before) - 1 - suffix] == after[len(after) - 1 - suffix]
+        ):
+            suffix += 1
+        changed_start = prefix + 1
+        changed_end = max(changed_start, len(after) - suffix)
+        lo = max(1, changed_start - context)
+        hi = min(len(after), changed_end + context)
+        if hi - lo + 1 > max_lines:
+            hi = lo + max_lines - 1
+        body = "\n".join(f"{n}: {after[n - 1]}" for n in range(lo, hi + 1))
+        return body, (lo, hi)
+
     def _edit_mismatch_diagnostic(self, content: str, old_text: str) -> str:
         """为 edit_file 匹配失败提供诊断信息"""
         lines = content.splitlines()
@@ -53767,34 +56558,62 @@ body{padding:18px}
         }
         return json_dumps(payload, indent=2)
 
-    def run_subagent(self, prompt: str, agent_type: str = "Explore") -> str:
+    def run_subagent(
+        self,
+        prompt: str,
+        agent_type: str = "Explore",
+        *,
+        priority: str = "subagent",
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """Run a bounded tool-using subagent.
+
+        ``priority`` is the session-gate class of its model calls
+        (``subagent``, or ``teammate`` for ``_spawn_teammate`` workers).
+        ``cancel_event`` is checked before every round; without one, the
+        cancel flag of the timed ``task`` tool running on this thread is
+        used, so a timed-out subagent stops on its next round.
+        """
+        cancel_token = cancel_event if isinstance(cancel_event, threading.Event) else self._current_tool_cancel_event()
+        gate_priority = str(priority or "subagent")
         subtools = [
-            tool_def("bash", "Run command.", {"command": {"type": "string"}}, ["command"]),
+            tool_def(
+                "bash",
+                "Execute a shell command. For a special read/perception task, optionally provide operation using the bash provenance codes (text_read/text_search/document_extract/ocr/media_metadata/media_extract/custom_extract/validation/build_test/process_control/network/execute); prefer read_file for exact ordinary source reads.",
+                {
+                    "command": {"type": "string"},
+                    "operation": {"type": "string", "description": "Optional caller-supplied provenance/recognition marker; known markers receive specialized memory handling."},
+                    "recognition_code": {"type": "string"},
+                },
+                ["command"],
+            ),
             tool_def(
                 "read_file",
                 (
-                    "Read files or directories with structure-aware modes. "
+                    "Preferred tool for reading files or directories with structure-aware, source-addressable modes. "
                     "Examples: large.py + func_42 -> mode='symbol' target='func_42'; "
                     "app.py line 240 -> mode='window' line=240 context=5; "
                     "run.txt E123 -> mode='search' query='E123'. "
                     "Use mode='symbol', 'search', or 'window' for focused reads; use mode='full' only when needed. "
-                    "Successful reads are remembered in the tool-memory registry."
+                    "Successful reads receive immutable evidence and are remembered in the tool-memory registry."
                 ),
                 {
                     "path": {"type": "string"},
                     "mode": {
                         "type": "string",
-                        "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
-                        "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                        "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "evidence", "directory"],
+                        "description": "Reading strategy. Use structure/overview for a bounded source map, segment for a remembered section, symbol with target for a function/class, search/evidence with query for text and ranked citations, and window with line/context for a line range. Avoid full for large logs when a query is known.",
                     },
                     "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
-                    "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
+                    "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure'."},
+                    "query": {"type": "string", "description": "Search text or regex for mode='search' or mode='evidence'; can also be used when target is unknown."},
                     "line": {"type": "integer", "description": "1-based center line for mode='window'."},
                     "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
                     "regex": {"type": "boolean", "description": "Treat query as a regular expression in mode='search'."},
                     "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
                     "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
                     "offset": {"type": "integer", "description": "0-based character offset for mode='full'; legacy 0-based line/entry offset for mode='window' or mode='directory'. Prefer mode='window' with line/context for line-oriented reads."},
+                    "fresh": {"type": "boolean", "description": "Force an exact source reread instead of reusing verified long-content memory."},
                 },
                 ["path"],
             ),
@@ -53810,6 +56629,10 @@ body{padding:18px}
         last_text = ""
         pinned_selection = self._active_runtime_selection()
         for _ in range(20):
+            if cancel_token is not None and cancel_token.is_set():
+                # The caller timed out (or stopped us); do not start another
+                # model round for a result nobody will read.
+                return last_text or "(subagent cancelled)"
             try:
                 hard_skills = self._loaded_skills_context_block(for_role=str(agent_type or "subagent"), max_chars=ADMIN_MAX_APP_CAPSULE_CHARS)
                 sub_system = f"You are a focused subagent. {model_language_instruction(self.ui_language)}"
@@ -53823,6 +56646,8 @@ body{padding:18px}
                     pinned_selection=pinned_selection,
                     context_label="subagent",
                     retries=MODEL_OUTPUT_RETRY_TIMES,
+                    priority=gate_priority,
+                    label=gate_priority,
                 )
             except OllamaError as exc:
                 return f"Error: {exc}"
@@ -53897,7 +56722,11 @@ body{padding:18px}
 
         def worker():
             try:
-                result = self.run_subagent(f"Teammate={name}, role={role}\n{prompt}", agent_type="general-purpose")
+                result = self.run_subagent(
+                    f"Teammate={name}, role={role}\n{prompt}",
+                    agent_type="general-purpose",
+                    priority="teammate",
+                )
                 self.bus.send(name, "lead", f"[{name}] {result}", "message")
                 status = "idle"
             except Exception as exc:
@@ -56194,6 +59023,10 @@ body{padding:18px}
             media_inputs_round=None,
         )
         safe_step = step if isinstance(step, dict) else {}
+        if safe_step.get("stop_due_to_loop"):
+            self._enter_evidence_loop_paused_state(role)
+            return {"executed": True, "queue_active": True, "stop_run": True,
+                    "stop_due_to_loop": True, "interrupted": False, "role": role}
         self._blackboard_update_from_worker_step(role, safe_step)
         plan_step_advanced = self._post_execution_plan_step_check(queue_args, safe_step)
         board_after = self._ensure_blackboard()
@@ -62215,7 +65048,11 @@ body{padding:18px}
             if name in {"read_file", "write_file", "edit_file"}:
                 _add(args.get("path", "") or args.get("file_path", ""))
             elif name in {"bash", "worktree_run"}:
-                for path in self._bash_file_read_targets(str(args.get("command", "") or ""))[:6]:
+                operation, declared = self._bash_operation_from_args(args)
+                for path in self._bash_file_read_targets(
+                    str(args.get("command", "") or ""),
+                    operation=operation if declared else "",
+                )[:6]:
                     _add(path)
         path_inference = self._plan_step_quality_path_inference(plan_step, paths)
         for path in path_inference.get("candidate_paths", []) if isinstance(path_inference, dict) else []:
@@ -62885,6 +65722,7 @@ body{padding:18px}
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state = {}
+        self._loop_stop_requested = {}
         self.agent_loop_progress_state = {}
         self._readonly_bash_cache = {}
         self.rounds_without_todo = 0
@@ -63168,6 +66006,20 @@ body{padding:18px}
             self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-transition")
         except Exception:
             pass
+        self._record_flow_node(
+            "plan_step_transition",
+            {
+                "from": previous_focus,
+                "to": new_focus,
+                "actor": trim(str(actor or ""), 40),
+                "evidence": trim(str(evidence or ""), 600),
+            },
+            role=actor,
+            metadata={
+                "from_focus_id": str(previous_focus.get("id", "") or ""),
+                "to_focus_id": str(new_focus.get("id", "") or ""),
+            },
+        )
         return True
 
     def _post_execution_plan_step_check(self, route: dict, worker_step: dict) -> bool:
@@ -63601,9 +66453,44 @@ body{padding:18px}
             # (generic subtasks like "design" or "analyze" don't need tool evidence)
         return unverified
 
+    def _subtask_acceptance_evidence_signature(
+        self, step_id: str, completed_rows: list[dict], failures: list[str], bb: dict
+    ) -> str:
+        """Fingerprint of what the acceptance check would look at for a step."""
+        step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        step_entries = step_files_raw.get(step_id, []) if step_id else []
+        files = [
+            f"{entry.get('op', '?')}:{entry.get('path', '?')}"
+            for entry in (step_entries[-15:] if isinstance(step_entries, list) else [])
+            if isinstance(entry, dict)
+        ]
+        exec_logs = bb.get("execution_logs", [])
+        logs = [
+            trim(str(log.get("content", "") or ""), 200)
+            for log in (exec_logs[-8:] if isinstance(exec_logs, list) else [])
+            if isinstance(log, dict)
+        ]
+        material = {
+            "step": step_id,
+            "completed": sorted(
+                str(row.get("subtask_id", "") or row.get("id", "") or row.get("content", "") or "")
+                for row in completed_rows
+                if isinstance(row, dict)
+            ),
+            "failures": sorted(str(item) for item in failures),
+            "files": files,
+            "logs": logs,
+        }
+        return hashlib.sha1(json_dumps(material).encode("utf-8", errors="replace")).hexdigest()[:20]
+
     def _inject_rework_if_needed(self, plan_step: dict, worker_step: dict):
-        """When subtasks are marked completed but acceptance fails, inject rework instruction.
-        Prevents the system from getting stuck or silently skipping unfinished work."""
+        """Hint once when completed subtasks fail the acceptance check.
+
+        The verdict is advisory: rows keep their status (the agent reopens
+        them through TodoWrite ``rework_completed`` if it agrees), the model
+        check runs at most once per 30s per step, and the same evidence
+        signature is hinted at most once.
+        """
         try:
             step_id = str(plan_step.get("id", "") or "")
             if not step_id:
@@ -63616,73 +66503,72 @@ body{padding:18px}
             failures = self._verify_subtasks_acceptance(completed_rows, step_id, bb)
             if not failures:
                 return
-            # LLM-based acceptance check: semantic analysis over heuristics
-            llm_verdict = self._llm_verify_subtask_acceptance(plan_step, completed_rows, bb)
-            if llm_verdict.get("all_passed", False):
+            signature = self._subtask_acceptance_evidence_signature(step_id, completed_rows, failures, bb)
+            hinted = getattr(self, "_rework_hint_signatures", None)
+            if not isinstance(hinted, dict):
+                hinted = {}
+                self._rework_hint_signatures = hinted
+            if hinted.get(step_id) == signature:
                 return
-            rework_items = llm_verdict.get("rework_items", failures)
-            if not rework_items:
-                return
-            # Rate-limit rework injection
+            # Rate limit before the model call, not after it.
             _rework_key = f"_rework_injected_{step_id}"
             _last_rework = getattr(self, _rework_key, 0.0)
             if float(now_ts()) - float(_last_rework) < 30.0:
                 return
             setattr(self, _rework_key, float(now_ts()))
+            # LLM-based acceptance check: semantic analysis over heuristics
+            llm_verdict = self._llm_verify_subtask_acceptance(plan_step, completed_rows, bb)
+            if not llm_verdict.get("available", True):
+                # Skipped (no free slot) or unreadable: nothing to hint, and
+                # the signature stays open for the next check.
+                return
+            if llm_verdict.get("all_passed", False):
+                hinted[step_id] = signature
+                return
+            rework_items = [
+                str(item) for item in (llm_verdict.get("rework_items") or failures) if str(item).strip()
+            ]
+            if not rework_items:
+                return
             step_label = trim(str(plan_step.get("content", "") or ""), 80)
             rework_text = (
                 f"<step-rework>\n"
-                f"Step \"{step_label}\" acceptance check FAILED. "
-                f"The following subtasks were marked completed but did not pass verification:\n"
+                f"Step \"{step_label}\" acceptance check found possible gaps in subtasks "
+                f"that are marked completed:\n"
             )
             for i, item in enumerate(rework_items[:5]):
                 rework_text += f"  {i+1}. {trim(str(item), 120)}\n"
             rework_text += (
-                "\nACTION REQUIRED: Fix these issues NOW before the step can advance.\n"
+                "\nVerify these before the step can advance:\n"
                 "- For missing files: create them with write_file\n"
                 "- For failed tests/builds: run the command again and fix errors\n"
                 "- For unverified installs: re-run the install command\n"
-                "After fixing, update TodoWrite to reflect the corrected state.\n"
+                "If a completed subtask really needs more work, reopen it with TodoWrite "
+                "update_mode='rework_completed'; otherwise keep its status.\n"
                 "</step-rework>"
             )
-            # Revert false "completed" status back to in_progress
-            _snap = self.todo.snapshot()
-            _modified = False
-            for row in _snap:
-                if not isinstance(row, dict):
-                    continue
-                if str(row.get("parent_step_id", "") or "") != step_id:
-                    continue
-                if str(row.get("status", "")).lower() != "completed":
-                    continue
-                rc = str(row.get("content", "") or "").strip().lower()
-                for fail in rework_items:
-                    fail_lower = str(fail).lower()
-                    if rc and (rc[:20] in fail_lower or any(w in fail_lower for w in rc.split()[:3] if len(w) > 3)):
-                        row["status"] = "in_progress"
-                        _modified = True
-                        break
-            if _modified:
-                try:
-                    self.todo.update(_snap)
-                except Exception:
-                    pass
+            # Advisory only: Todo statuses are never changed here.
             target_roles: tuple[str, ...] = ()
             if self._is_multi_agent_mode():
                 active_role = str(bb.get("active_agent", "") or "developer")
                 if active_role:
                     target_roles = (active_role,)
-            self._append_plan_guidance_bubble(
+            if self._append_plan_guidance_bubble(
                 rework_text,
                 target_roles=target_roles,
                 summary=f"step rework: {len(rework_items)} items failed acceptance",
-            )
+            ):
+                hinted[step_id] = signature
         except Exception:
             pass
 
     def _llm_verify_subtask_acceptance(self, plan_step: dict, completed_subtasks: list[dict], bb: dict) -> dict:
         """Use LLM semantic analysis to verify if subtasks are truly completed.
-        Returns {"all_passed": bool, "rework_items": list[str]}."""
+
+        Returns {"available": bool, "all_passed": bool, "rework_items": list[str]}.
+        ``available`` is False when the call was skipped (no free in-session
+        slot), failed, or returned no readable JSON verdict.
+        """
         try:
             step_id = str(plan_step.get("id", "") or "")
             step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
@@ -63720,20 +66606,26 @@ body{padding:18px}
                 system=self._inject_runtime_environment_context("You are a strict QA reviewer. Verify task completion against evidence. Reply ONLY valid JSON."),
                 max_tokens=300,
                 think=False,
+                auxiliary=True,
+                label="acceptance_verify",
+                request_timeout=ACCEPTANCE_VERIFY_TIMEOUT_SECONDS,
             )
-            import json
-            text = str(resp.get("text", "") or "").strip()
-            if "{" in text:
-                json_str = text[text.index("{"):text.rindex("}") + 1]
-                result = json.loads(json_str)
-                if isinstance(result, dict):
-                    return {
-                        "all_passed": bool(result.get("all_passed", False)),
-                        "rework_items": list(result.get("rework_items", [])),
-                    }
+            # chat() returns the answer under "content"; "text" is accepted
+            # for older/custom clients.
+            text = str((resp or {}).get("content", "") or (resp or {}).get("text", "") or "").strip()
+            result = extract_json_object_from_text(text, {})
+            if isinstance(result, dict) and "all_passed" in result:
+                items = result.get("rework_items", [])
+                return {
+                    "available": True,
+                    "all_passed": bool(result.get("all_passed", False)),
+                    "rework_items": [
+                        trim(str(item), 200) for item in (items if isinstance(items, list) else []) if str(item).strip()
+                    ][:8],
+                }
         except Exception:
             pass
-        return {"all_passed": False, "rework_items": []}
+        return {"available": False, "all_passed": False, "rework_items": []}
 
     def _acceptance_semantic_judge(
         self,
@@ -64505,6 +67397,8 @@ body{padding:18px}
                 max_tokens=900,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(response.get("content", "") or response.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -64536,6 +67430,17 @@ body{padding:18px}
                 "evidence": [trim(str(item or ""), 700) for item in review_evidence[:20] if str(item or "").strip()],
             }
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # Multi-step plan edits have no deterministic approval rule:
+                # a skipped review stays fail-closed, but is reported as a skip.
+                return {
+                    "available": False,
+                    "approved": False,
+                    "skipped": True,
+                    "skip_reason": skip,
+                    "reason": self._todo_llm_skip_text(skip, "plan-step review", exc),
+                }
             return {"available": False, "approved": False, "reason": f"plan-step review unavailable: {trim(str(exc), 240)}"}
 
     def _record_plan_step_revision(
@@ -64870,6 +67775,8 @@ body{padding:18px}
                 max_tokens=420,
                 temperature=0.1,
                 think=False,
+                label="todo_intent",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             payload = extract_json_object_from_text(
                 str(response.get("content", "") or response.get("text", "") or ""),
@@ -64890,7 +67797,12 @@ body{padding:18px}
                 "reason": trim(str(payload.get("reason", "") or ""), 900),
                 "parent_content": parent_content or content,
             }
-        except Exception:
+        except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict (budget used up, no slot, or timeout): treat the
+                # row as ambiguous so it stays a worker subtask.
+                return self._todo_llm_skipped_intent(skip, exc)
             # A provider that cannot support this optional classifier must not
             # lose a legitimate child Todo; the conservative fallback is to keep it.
             return {}
@@ -64969,6 +67881,8 @@ body{padding:18px}
                 max_tokens=360,
                 temperature=0.1,
                 think=False,
+                label="todo_intent",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             payload = extract_json_object_from_text(
                 str(response.get("content", "") or response.get("text", "") or ""),
@@ -64998,8 +67912,33 @@ body{padding:18px}
                 "existing_id": existing_id,
                 "reason": trim(str(payload.get("reason", "") or ""), 900),
             }
-        except Exception:
+        except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict: ambiguous, so the merge keeps its own identity
+                # matching (later dedupe decides whether the row is new).
+                return self._todo_llm_skipped_intent(skip, exc)
             return {}
+
+    @staticmethod
+    def _todo_llm_skipped_intent(skip: str, exc: object) -> dict:
+        """Intent result of a TodoWrite classifier that got no model verdict."""
+        return {
+            "intent": "ambiguous",
+            "confidence": "low",
+            "skipped": True,
+            "skip_reason": skip,
+            "reason": trim(f"intent classification skipped ({skip}): {exc}", 300),
+        }
+
+    @staticmethod
+    def _todo_llm_skip_text(skip: str, what: str, exc: object) -> str:
+        label = {
+            "budget": "TodoWrite model-call budget exhausted",
+            "busy": "no free model slot (busy) or endpoint cooldown",
+            "timeout": "model request timed out",
+        }.get(skip, skip)
+        return trim(f"{what} skipped ({skip}: {label}): {exc}", 300)
 
     def _plan_worker_row_is_foreign_plan_step(
         self,
@@ -65433,6 +68372,11 @@ body{padding:18px}
         review = step_reviews.get(stable_id, {}) if isinstance(step_reviews.get(stable_id), dict) else {}
         if not review or str(review.get("evidence_signature", "") or "") != signature:
             return {}, candidates
+        # Only a real verdict is reusable.  A review that was unavailable
+        # (timeout, provider error, skipped call) must not pin the subtask's
+        # completion state for the rest of this evidence signature.
+        if not bool(review.get("available", False)):
+            return {}, candidates
         return dict(review), candidates
 
     def _record_plan_subtask_semantic_review(
@@ -65553,6 +68497,8 @@ body{padding:18px}
                 max_tokens=360,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -65598,6 +68544,16 @@ body{padding:18px}
                     "raw": trim(raw, 1200),
                 })
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # Skipped (model-call budget used up, no free slot, or a
+                # timeout): nothing is recorded, so a later request reviews
+                # this evidence afresh.  The completion stays unproven.
+                review["reason"] = self._todo_llm_skip_text(skip, "semantic subtask review", exc)
+                review["skipped"] = True
+                review["skip_reason"] = skip
+                review["ts"] = float(now_ts())
+                return review
             review["reason"] = trim(f"semantic subtask review unavailable: {exc}", 300)
         review["ts"] = float(now_ts())
         self._record_plan_subtask_semantic_review(
@@ -66767,7 +69723,108 @@ body{padding:18px}
         route_kind = self._todo_route_kind(role=role)
         return bool(self._todo_route_rows(route_kind, role=role))
 
+    @staticmethod
+    def _todo_text_dedupe_key(text: object) -> str:
+        """Normalize Todo text for duplicate detection.
+
+        Removes the (tN) display tag, status checkboxes, bullets, punctuation
+        and whitespace. An "N.M" substep prefix is kept, so 1.1 and 1.2 never
+        collapse into one row.
+        """
+        _status, body, _sid = split_todo_status_text_with_id(text)
+        body = str(body or text or "")
+        prefix = ""
+        match = re.match(r"^\s*(\d+\.\d+)\b", body)
+        if match:
+            prefix = match.group(1) + ":"
+            body = body[match.end():]
+        body = re.sub(r"^\s*(?:[-*•>]+\s*)+", "", body)
+        body = re.sub(r"[\s\W_]+", "", body.casefold(), flags=re.UNICODE)
+        return prefix + body
+
+    @staticmethod
+    def _todo_substep_numbers_conflict(incoming: dict | None, candidate: dict | None) -> bool:
+        """True when both rows carry different "N.M" numbers.
+
+        Substep numbers are identities: 1.3 is never a rewording of 1.1, even
+        when the remaining text scores as similar.
+        """
+        def number(row: dict | None) -> str:
+            match = re.match(r"^\s*(\d+\.\d+)\b", str((row or {}).get("content", "") or ""))
+            return match.group(1) if match else ""
+
+        a, b = number(incoming), number(candidate)
+        return bool(a and b and a != b)
+
+    def _todo_text_is_duplicate(self, incoming: object, existing: object) -> bool:
+        """Same objective in other words: equal keys, or one contains the other.
+
+        Containment needs a 0.85 length ratio, so a short generic row cannot
+        swallow a longer, different one.
+        """
+        a = self._todo_text_dedupe_key(incoming)
+        b = self._todo_text_dedupe_key(existing)
+        if not a or not b:
+            return False
+        a_num = a.split(":", 1)[0] if re.match(r"^\d+\.\d+:", a) else ""
+        b_num = b.split(":", 1)[0] if re.match(r"^\d+\.\d+:", b) else ""
+        if a_num and b_num and a_num != b_num:
+            return False
+        if a == b:
+            return True
+        short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+        return short in long_ and len(short) / max(1, len(long_)) >= 0.85
+
+    def _todo_signal_rows_for_existing(self, items: list[dict], role: str = "") -> list[dict]:
+        """Keep only text-derived rows that update an existing row's status.
+
+        Assistant prose often repeats or paraphrases a Todo list. Such text is
+        never a request to add work. Unmatched rows are dropped, so prose can
+        no longer create the duplicate rows users saw appearing from nowhere.
+        """
+        existing = [
+            dict(row) for row in self.todo.snapshot()
+            if isinstance(row, dict) and self._todo_row_kind(row) != "system"
+        ]
+        if not existing:
+            return []
+        kept: list[dict] = []
+        used: set[int] = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            sid = normalize_todo_short_id(item.get("short_id", ""))
+            target = -1
+            for index, row in enumerate(existing):
+                if index in used:
+                    continue
+                if sid and normalize_todo_short_id(row.get("short_id", "")) == sid:
+                    target = index
+                    break
+            if target < 0 and str(item.get("content", "") or "").strip():
+                for index, row in enumerate(existing):
+                    if index in used:
+                        continue
+                    if self._todo_text_is_duplicate(item.get("content", ""), row.get("content", "")):
+                        target = index
+                        break
+            if target < 0:
+                continue
+            used.add(target)
+            prior = existing[target]
+            row = {
+                "content": prior.get("content", ""),
+                "status": item.get("status", prior.get("status", "pending")),
+                "short_id": prior.get("short_id", ""),
+            }
+            for field in ("subtask_id", "key", "parent_step_id", "owner", "root_group_id", "external_subtask_id"):
+                if prior.get(field):
+                    row[field] = prior[field]
+            kept.append(row)
+        return kept
+
     def _merge_todo_signal_rows(self, items: list[dict], role: str = "", board: dict | None = None) -> str:
+        items = self._todo_signal_rows_for_existing(items, role=role)
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         role_key = self._sanitize_agent_role(role)
         route_kind = self._todo_route_kind(role=role_key, board=bb)
@@ -66975,6 +70032,8 @@ body{padding:18px}
                 max_tokens=360,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(response.get("content", "") or response.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -66994,6 +70053,19 @@ body{padding:18px}
                 ],
             }
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict: the caller applies the deterministic revision
+                # rule (_todo_revision_fallback_review) instead.
+                return {
+                    "available": False,
+                    "approved": False,
+                    "skipped": True,
+                    "skip_reason": skip,
+                    "confidence": "low",
+                    "reason": self._todo_llm_skip_text(skip, "semantic audit", exc),
+                    "unsupported_changes": [],
+                }
             return {
                 "available": False,
                 "approved": False,
@@ -67027,6 +70099,56 @@ body{padding:18px}
         )
         sequence_score = difflib.SequenceMatcher(None, left_text.lower(), right_text.lower()).ratio()
         return max(token_score, sequence_score) >= float(minimum)
+
+    def _plan_worker_revision_effective_rows(
+        self,
+        existing_rows: list[dict],
+        proposed_rows: list[dict],
+        *,
+        mode: str,
+    ) -> list[dict]:
+        """Step-local tree a rolling revision would commit, for the fallback rule.
+
+        Mirrors the revise merge in ``_merge_plan_worker_todo_items``:
+        completed rows the proposal does not reopen are kept (only
+        ``rework_completed`` may reopen one), and the existing acceptance row
+        is kept when the proposal carries none.
+        """
+        existing = [dict(row) for row in (existing_rows or []) if isinstance(row, dict)]
+        rework = str(mode or "").strip().lower() == "rework_completed"
+        completed = [
+            row for row in existing
+            if self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed"
+        ]
+        reopened: set[int] = set()
+        rows: list[dict] = []
+        for incoming in proposed_rows or []:
+            if not isinstance(incoming, dict):
+                continue
+            ids = self._todo_revision_row_ids(incoming)
+            text_key = self._todo_revision_text_key(incoming)
+            prior_index = next(
+                (
+                    index for index, prior in enumerate(completed)
+                    if (ids & self._todo_revision_row_ids(prior))
+                    or (text_key and text_key == self._todo_revision_text_key(prior))
+                ),
+                -1,
+            )
+            if prior_index < 0:
+                rows.append(dict(incoming))
+                continue
+            if rework and self._normalize_todo_status_value(incoming.get("status", ""), "pending") != "completed":
+                reopened.add(prior_index)
+                rows.append(dict(incoming))
+        effective = [row for index, row in enumerate(completed) if index not in reopened] + rows
+        if not any(self._is_plan_step_acceptance_subtask(row.get("content", "")) for row in effective):
+            acceptance = [
+                row for row in existing
+                if self._is_plan_step_acceptance_subtask(row.get("content", ""))
+            ]
+            effective.extend(acceptance[-1:])
+        return effective
 
     def _review_plan_worker_revision(
         self,
@@ -67130,6 +70252,14 @@ body{padding:18px}
             after_open=after_open,
             evidence=matched,
         )
+        if bool(semantic_audit.get("skipped", False)):
+            # No model verdict (budget, busy or timeout): decide with the
+            # deterministic rule against the tree this merge would commit.
+            semantic_audit = self._todo_revision_fallback_review(
+                existing_rows,
+                self._plan_worker_revision_effective_rows(existing_rows, proposed_rows, mode=mode),
+                skipped_review=semantic_audit,
+            )
         if not bool(semantic_audit.get("available", False)):
             return {
                 "ok": False,
@@ -67155,6 +70285,7 @@ body{padding:18px}
         return {
             "ok": True,
             "structural": True,
+            "fallback": bool(semantic_audit.get("fallback", False)),
             "reason": trim(
                 str(semantic_audit.get("reason", "runtime evidence and semantic audit accepted the rolling subplan revision") or ""),
                 600,
@@ -67460,6 +70591,8 @@ body{padding:18px}
                 max_tokens=1000,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(response.get("content", "") or response.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -67505,6 +70638,19 @@ body{padding:18px}
                 "evidence": review_evidence,
             }
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict: the caller applies the deterministic revision
+                # rule (_todo_revision_fallback_review) instead.
+                return {
+                    "available": False,
+                    "approved": False,
+                    "skipped": True,
+                    "skip_reason": skip,
+                    "confidence": "low",
+                    "completion_risk": "high",
+                    "reason": self._todo_llm_skip_text(skip, "Todo-tree semantic review", exc),
+                }
             return {
                 "available": False,
                 "approved": False,
@@ -67555,6 +70701,146 @@ body{padding:18px}
             },
         )
 
+    def _todo_status_update_evidence_text(self, evidence: object, reason: object = "") -> str:
+        """Evidence a status_update payload attaches to the rows it reports on.
+
+        Payload-level ``revision_evidence``/``evidence`` (or, without any, the
+        ``reason``) no longer turns a status_update into a revision; it is
+        recorded on the matched rows like per-row evidence.
+        """
+        refs = self._plan_worker_revision_references(evidence)
+        text = "; ".join(refs) if refs else str(reason or "").strip()
+        return trim(text, 300)
+
+    def _todo_status_update_result(self, result: object, omitted: int) -> str:
+        """Add one line saying a status_update preserved the rows it omitted."""
+        text = str(result or "")
+        if (
+            omitted <= 0
+            or not text
+            or text == self.todo.no_changes_text()
+            or text.startswith("Error:")
+            or text.lstrip().lower().startswith("control[")
+        ):
+            return text
+        return (
+            f"{text}\nSTATUS UPDATE: {omitted} omitted row(s) were preserved; "
+            "use update_mode='revise_open' to remove or replace rows."
+        )
+
+    @staticmethod
+    def _todo_revision_text_key(row: dict | None) -> str:
+        """Normalized row text used by the deterministic revision fallback."""
+        content = str((row or {}).get("content", "") or "")
+        text = normalize_work_text(content) or content
+        return re.sub(r"\s+", " ", text).strip().casefold()
+
+    @staticmethod
+    def _todo_revision_row_ids(row: dict | None) -> set[str]:
+        """Every id a Todo row carries (canonical and provider aliases)."""
+        item = row if isinstance(row, dict) else {}
+        values: set[str] = set()
+        for field in (
+            "subtask_id", "external_subtask_id", "key", "id", "external_id",
+            "todo_id", "task_id", "item_id", "row_id",
+        ):
+            value = trim(str(item.get(field, "") or "").strip(), 120)
+            if value and not value.startswith("bb:"):
+                values.add(value.casefold())
+        return values
+
+    def _todo_revision_fallback_review(
+        self,
+        current_rows: list[dict],
+        proposed_rows: list[dict],
+        *,
+        skipped_review: dict | None = None,
+        max_rows: int = TODO_REVISION_FALLBACK_MAX_ROWS,
+    ) -> dict:
+        """Deterministic decision for a Todo revision whose model audit was skipped.
+
+        Used only when the reviewer returned no verdict because the TodoWrite
+        model-call budget was exhausted, no in-session slot was free, or the
+        request timed out.  An explicit model approve/reject stays
+        authoritative, and invalid JSON or other errors stay fail-closed.
+
+        The revision is approved only when all three conditions hold:
+        (1) no completed row is removed or downgraded, (2) every removed open
+        row has a counterpart in the proposal by id or identical normalized
+        text, and (3) the proposal has at most ``max_rows`` rows.
+        """
+        current = [row for row in (current_rows or []) if isinstance(row, dict)]
+        proposed = [row for row in (proposed_rows or []) if isinstance(row, dict)]
+        proposed_ids: dict[str, dict] = {}
+        proposed_texts: dict[str, dict] = {}
+        for row in proposed:
+            for value in self._todo_revision_row_ids(row):
+                proposed_ids.setdefault(value, row)
+            text_key = self._todo_revision_text_key(row)
+            if text_key:
+                proposed_texts.setdefault(text_key, row)
+
+        def _counterpart(row: dict) -> dict | None:
+            for value in self._todo_revision_row_ids(row):
+                if value in proposed_ids:
+                    return proposed_ids[value]
+            text_key = self._todo_revision_text_key(row)
+            return proposed_texts.get(text_key) if text_key else None
+
+        completed_lost: list[str] = []
+        open_unmapped: list[str] = []
+        for row in current:
+            label = trim(str(row.get("content", "") or "").strip(), 160)
+            match = _counterpart(row)
+            if self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed":
+                if match is None:
+                    completed_lost.append(f"{label} (removed)")
+                elif self._normalize_todo_status_value(match.get("status", ""), "pending") != "completed":
+                    completed_lost.append(f"{label} (downgraded)")
+            elif match is None:
+                open_unmapped.append(label)
+        failures: list[str] = []
+        if completed_lost:
+            failures.append(
+                "(1) completed rows must not be removed or downgraded: " + "; ".join(completed_lost[:8])
+            )
+        if open_unmapped:
+            failures.append(
+                "(2) removed open rows need a counterpart in the proposal by id or identical text: "
+                + "; ".join(open_unmapped[:8])
+            )
+        limit = max(1, int(max_rows or TODO_REVISION_FALLBACK_MAX_ROWS))
+        if len(proposed) > limit:
+            failures.append(f"(3) the proposal has {len(proposed)} rows; at most {limit} are allowed")
+        skipped = skipped_review if isinstance(skipped_review, dict) else {}
+        skip = trim(str(skipped.get("skip_reason", "") or "unavailable"), 24)
+        prefix = f"semantic review skipped ({skip}); deterministic fallback "
+        if failures:
+            reason = prefix + "rejected the revision: " + " | ".join(failures)
+        else:
+            reason = prefix + (
+                "approved: no completed row was removed or downgraded, every removed open row "
+                f"has a counterpart, and the proposal has {len(proposed)} rows"
+            )
+        return {
+            "available": True,
+            "approved": not failures,
+            "decision": "approve" if not failures else "reject",
+            "fallback": True,
+            "skipped": True,
+            "skip_reason": skip,
+            "confidence": "low",
+            "completion_risk": "low" if not failures else "high",
+            "reason": trim(reason, 1200),
+            "failed_conditions": failures,
+            "removed_objectives": [value for value in open_unmapped[:40] if value],
+            "replacement_mapping": [],
+            "requirement_coverage": [],
+            "evidence": [],
+            # The failed conditions are already listed in ``reason``.
+            "unsupported_changes": [],
+        }
+
     def _root_todo_material_changes(self, existing_rows: list[dict], proposed_rows: list[dict]) -> tuple[list[str], list[str], list[str]]:
         before_open = [
             str(row.get("content", "") or "").strip()
@@ -67604,8 +70890,14 @@ body{padding:18px}
         mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
         if mode not in {"status_update", "revise_open", "rework_completed"}:
             mode = "status_update"
-        if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
-            mode = "revise_open"
+        # Only an explicit revise_open/rework_completed revises the tree.  A
+        # status_update that carries reason/evidence stays a merge; the
+        # evidence is attached to the matched rows it reports on.
+        status_evidence = (
+            self._todo_status_update_evidence_text(revision_evidence, revision_reason)
+            if mode == "status_update"
+            else ""
+        )
 
         normalized: list[dict] = []
         passthrough: list[dict] = []
@@ -67618,6 +70910,14 @@ body{padding:18px}
                 continue
             if role_key in {"manager", "explorer", "developer", "reviewer"}:
                 row["owner"] = role_key
+            if self._bind_todo_row_reference(row, existing_scope):
+                # Resolved by id: no classifier call, and an id-only row keeps
+                # the canonical text.
+                row["subtask_id"] = self._stable_root_todo_id(row)
+                normalized.append(row)
+                continue
+            if not str(row.get("content", "") or "").strip():
+                continue
             root_intent = (
                 self._classify_root_todo_intent(row, existing_scope, board=bb)
                 if mode == "status_update"
@@ -67670,6 +70970,8 @@ body{padding:18px}
                         ).casefold()
                         if candidate_group != incoming_group:
                             continue
+                        if self._todo_substep_numbers_conflict(incoming, candidate):
+                            continue
                         incoming_for_score = {
                             key: value
                             for key, value in incoming.items()
@@ -67700,12 +71002,30 @@ body{padding:18px}
                 for candidate_id, candidate, candidate_index in existing_entries:
                     if candidate_id in used:
                         continue
+                    if self._todo_substep_numbers_conflict(incoming, candidate):
+                        continue
                     score = self._plan_worker_todo_match_score(incoming, candidate)
                     if score >= 0.64:
                         scored.append((score, candidate_id, candidate, candidate_index))
                 scored.sort(key=lambda value: value[0], reverse=True)
                 if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
                     _score, identity, prior, prior_index = scored[0]
+            if prior is None:
+                # Last line of defence against duplicate rows: the same objective
+                # reworded (punctuation, bullets, status words, (tN) tag) inside
+                # the same group updates the open row instead of appending.
+                incoming_group = trim(str(incoming.get("root_group_id", "") or "").strip(), 120).casefold()
+                for candidate_id, candidate, candidate_index in existing_entries:
+                    if candidate_id in used:
+                        continue
+                    candidate_group = trim(str(candidate.get("root_group_id", "") or "").strip(), 120).casefold()
+                    if candidate_group != incoming_group:
+                        continue
+                    if self._normalize_todo_status_value(candidate.get("status", ""), "pending") == "completed":
+                        continue
+                    if self._todo_text_is_duplicate(incoming.get("content", ""), candidate.get("content", "")):
+                        identity, prior, prior_index = candidate_id, candidate, candidate_index
+                        break
             if isinstance(prior, dict):
                 used.add(identity)
                 incoming["subtask_id"] = prior.get("subtask_id", "") or self._stable_root_todo_id(prior)
@@ -67730,6 +71050,21 @@ body{padding:18px}
 
         if mode == "status_update":
             merged_scope = [dict(row) for row in existing_scope]
+            matched_existing = [
+                (incoming, prior, prior_index)
+                for incoming, _identity, prior, prior_index in matched
+                if isinstance(prior, dict) and prior_index >= 0
+            ]
+            # Payload-level evidence reports on the rows this update moves
+            # (or on the only row it names); it never revises the tree.
+            evidence_targets = {
+                prior_index
+                for incoming, prior, prior_index in matched_existing
+                if self._normalize_todo_status_value(incoming.get("status", ""), "pending")
+                != self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            }
+            if not evidence_targets and len(matched_existing) == 1:
+                evidence_targets = {matched_existing[0][2]}
             for incoming, _identity, prior, prior_index in matched:
                 if isinstance(prior, dict) and prior_index >= 0:
                     merged = dict(prior)
@@ -67744,12 +71079,20 @@ body{padding:18px}
                     for meta_key in ("evidence", "evidence_binding", "evidence_ids", "completed_at", "completed_by", "started_at"):
                         if incoming.get(meta_key) not in (None, "", []):
                             merged[meta_key] = incoming.get(meta_key)
+                    if (
+                        status_evidence
+                        and prior_index in evidence_targets
+                        and prior_status != "completed"
+                        and incoming.get("evidence") in (None, "", [])
+                    ):
+                        merged["evidence"] = status_evidence
                     # Status updates cannot silently abbreviate or redirect an
                     # objective. Structural text changes belong to revise_open.
                     merged_scope[prior_index] = merged
                 else:
                     incoming["created_at"] = float(incoming.get("created_at", 0.0) or now_ts())
                     merged_scope.append(incoming)
+            omitted = len(existing_scope) - len({prior_index for _incoming, _prior, prior_index in matched_existing})
             state_lock = getattr(self, "lock", None)
             if state_lock is not None:
                 state_lock.acquire()
@@ -67757,10 +71100,11 @@ body{padding:18px}
                 valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
                 if not valid:
                     return self._emit_stale_todo_write_discarded(stale_reason)
-                return self.todo.update(preserved_rows + passthrough + merged_scope)
+                result = self.todo.update(preserved_rows + passthrough + merged_scope)
             finally:
                 if state_lock is not None:
                     state_lock.release()
+            return self._todo_status_update_result(result, omitted)
 
         reason = trim(str(revision_reason or "").strip(), 1200)
         if not (normalize_work_text(reason) or reason).strip():
@@ -67808,6 +71152,14 @@ body{padding:18px}
             removed_objectives=removed,
             evidence=evidence,
         )
+        if bool(review.get("skipped", False)):
+            # No model verdict (budget, busy or timeout): decide with the
+            # deterministic rule.  Invalid JSON and errors are not skips.
+            review = self._todo_revision_fallback_review(
+                existing_scope,
+                proposed_scope,
+                skipped_review=review,
+            )
         if not bool(review.get("available", False)) or not bool(review.get("approved", False)):
             self._append_root_todo_revision_audit(
                 actor=role_key, status="rejected", mode=mode, reason=reason,
@@ -67834,6 +71186,11 @@ body{padding:18px}
             actor=role_key, status="accepted", mode=mode, reason=reason,
             review=review, before_open=before_open, after_open=after_open, board=bb,
         )
+        if bool(review.get("fallback", False)):
+            return (
+                f"{result}\nTODO TREE REVISION: accepted by the deterministic fallback rule "
+                f"(semantic review skipped). Reason: {review.get('reason', reason)}"
+            )
         return (
             f"{result}\nTODO TREE REVISION: accepted after independent LLM coverage/risk review. "
             f"Reason: {review.get('reason', reason)}"
@@ -68032,8 +71389,16 @@ body{padding:18px}
         mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
         if mode not in {"status_update", "revise_open", "rework_completed"}:
             mode = "status_update"
-        if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
-            mode = "revise_open"
+        # Only an explicit revise_open/rework_completed revises the subplan.  A
+        # status_update that carries reason/evidence stays a status merge; the
+        # evidence is attached to the matched rows it reports on.
+        status_evidence = (
+            self._todo_status_update_evidence_text(revision_evidence, revision_reason)
+            if mode == "status_update"
+            else ""
+        )
+        status_update_omitted = 0
+        revision_fallback = False
 
         completion_audit_warnings: list[str] = []
 
@@ -68204,11 +71569,36 @@ body{padding:18px}
                 )
             patched_by_id = {key: dict(value) for key, value in existing_by_id.items()}
             order = [self._stable_plan_worker_subtask_id(step_id, row) for row in target_rows]
+            matched_existing = [
+                (incoming, subtask_id, prior)
+                for incoming in incoming_worker_rows
+                for subtask_id, prior in (_existing_match(incoming),)
+                if subtask_id and isinstance(prior, dict)
+            ]
+            # Payload-level evidence reports on the rows this update moves (or
+            # on the only row it names); it never revises the subplan.
+            evidence_targets = {
+                subtask_id
+                for incoming, subtask_id, prior in matched_existing
+                if self._normalize_todo_status_value(incoming.get("status", ""), "pending")
+                != self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            }
+            if not evidence_targets and len(matched_existing) == 1:
+                evidence_targets = {matched_existing[0][1]}
             for incoming in incoming_worker_rows:
                 subtask_id, prior = _existing_match(incoming)
                 if not subtask_id or not isinstance(prior, dict):
                     continue
                 prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                # Completed history keeps its own evidence; a payload-level
+                # note never overwrites it.
+                if (
+                    status_evidence
+                    and subtask_id in evidence_targets
+                    and prior_status != "completed"
+                    and not incoming.get("evidence")
+                ):
+                    incoming["evidence"] = status_evidence
                 incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
                 if prior_status == "completed" and incoming_status != "completed":
                     incoming_status = "completed"
@@ -68267,12 +71657,18 @@ body{padding:18px}
                     if binding:
                         merged["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
                         merged["evidence_binding"] = binding
+                elif status_evidence and subtask_id in evidence_targets and prior_status != "completed":
+                    # Evidence for an open row is a note only; it proves nothing.
+                    merged["evidence"] = trim(str(incoming.get("evidence", "") or ""), 300)
                 merged["updated_at"] = float(now_ts())
                 merged["owner"] = _resolved_row_owner(prior, incoming)
                 merged["parent_step_id"] = step_id
                 merged["subtask_id"] = subtask_id
                 patched_by_id[subtask_id] = merged
             current_step_rows = [patched_by_id[key] for key in order if key in patched_by_id]
+            status_update_omitted = len({key for key in order if key}) - len(
+                {subtask_id for _incoming, subtask_id, _prior in matched_existing}
+            )
         else:
             review = self._review_plan_worker_revision(
                 active_step,
@@ -68285,6 +71681,7 @@ body{padding:18px}
                 board=bb,
             )
             refs = self._plan_worker_revision_references(revision_evidence)
+            revision_fallback = bool(review.get("fallback", False))
             if not bool(review.get("ok", False)):
                 self._append_plan_worker_revision_audit(
                     step_id=step_id,
@@ -68394,7 +71791,13 @@ body{padding:18px}
                 step_id=step_id,
                 actor=role_key,
                 status="accepted",
-                reason=revision_reason,
+                # A deterministic fallback approval records its own reason
+                # (which conditions held) next to the proposer's.
+                reason=(
+                    f"{revision_reason} | {review.get('reason', '')}"
+                    if revision_fallback
+                    else revision_reason
+                ),
                 evidence_refs=refs,
                 evidence_ids=list(review.get("evidence_ids", []) or []),
                 before_open=list(review.get("before_open", []) or []),
@@ -68484,11 +71887,18 @@ body{padding:18px}
         # just produced (numbering, statuses, the single acceptance gate) rather
         # than guessing. This is what keeps subsequent TodoWrite calls aligned to
         # the canonical N.M scheme instead of inventing a parallel set.
+        if mode == "status_update":
+            result = self._todo_status_update_result(result, status_update_omitted)
         canonical = self._render_plan_worker_todo_canonical(step_id, current_step_rows)
         if canonical:
             revision_note = ""
             if mode in {"revise_open", "rework_completed"} and target_rows:
-                revision_note = "\nROLLING SUBPLAN REVISION: accepted after current-step evidence audit."
+                revision_note = (
+                    "\nROLLING SUBPLAN REVISION: accepted by the deterministic fallback rule "
+                    "(semantic audit skipped)."
+                    if revision_fallback
+                    else "\nROLLING SUBPLAN REVISION: accepted after current-step evidence audit."
+                )
             audit_note = ""
             if completion_audit_warnings:
                 unique_open = list(dict.fromkeys(value for value in completion_audit_warnings if value))[:4]
@@ -76307,7 +79717,10 @@ body{padding:18px}
                 self._blackboard_set_status("CODING")
         elif name in {"bash", "worktree_run", "check_background"}:
             cmd = trim(str(args.get("command", "") or "").strip(), 180)
+            operation, operation_declared = self._bash_operation_from_args(args)
             line = f"{name} {cmd}".strip()
+            if operation_declared:
+                line = f"{line}\noperation={operation}".strip()
             if output:
                 line = f"{line}\n{output}".strip()
             if item.get("exit_code") is not None:
@@ -76342,7 +79755,10 @@ body{padding:18px}
                     command=str(args.get("command", "") or ""),
                     tier="long",
                 )
-            bash_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
+            bash_paths = self._bash_file_read_targets(
+                str(args.get("command", "") or ""),
+                operation=operation if operation_declared else "",
+            )
             if bash_paths and ok:
                 self._blackboard_append_memory(
                     "file_read",
@@ -76485,7 +79901,12 @@ body{padding:18px}
             }
             if name in {"bash", "worktree_run"}:
                 file_paths = list(dict.fromkeys(
-                    self._bash_file_read_targets(str(args.get("command", "") or ""))
+                    self._bash_file_read_targets(
+                        str(args.get("command", "") or ""),
+                        operation=self._bash_operation_from_args(args)[0]
+                        if self._bash_operation_from_args(args)[1]
+                        else "",
+                    )
                     + list(changed_paths)
                 ))
             for value in file_paths[:8]:
@@ -76572,7 +79993,9 @@ body{padding:18px}
                     limit=12,
                 )
                 if parsed_rows:
-                    merged = self._merge_todo_signal_rows(parsed_rows, role=role_key, board=board)
+                    # Same per-TodoWrite model-call budget as the tool itself.
+                    with todo_llm_budget_scope(limit=TODO_LLM_CALL_BUDGET):
+                        merged = self._merge_todo_signal_rows(parsed_rows, role=role_key, board=board)
                     if merged != self.todo.no_changes_text():
                         self._emit(
                             "status",
@@ -77475,7 +80898,9 @@ body{padding:18px}
                 "arguments": {
                     "items": items,
                     "in_progress_index": 0,
-                    "revision_reason": "runtime compatibility fallback after bounded thinking-only recovery",
+                    # Plain status_update: a bootstrap seeds an empty tree and
+                    # must never enter the audited revision path.
+                    "update_mode": "status_update",
                 },
             },
         }
@@ -77763,6 +81188,10 @@ body{padding:18px}
         row["agent_role"] = role_key
         if "ts" not in row:
             row["ts"] = now_ts()
+        if row.get("role") == "tool":
+            # Cleared after the next successful model call; until then
+            # microcompact must not replace this result.
+            row["_unseen"] = True
         # Write to unified agent_messages with tier-aware trim
         # Skip exact duplicates from the last 6 same-role messages (e.g. user re-submits after interrupt)
         content = str(row.get("content", "") or "")
@@ -77781,6 +81210,9 @@ body{padding:18px}
             self.agent_messages = self.agent_messages[-am_limit:]
         if mirror_to_global:
             mirror = dict(row)
+            # The global mirror is a copy that no role request carries, so it
+            # would never be marked seen; protection applies to the role copy.
+            mirror.pop("_unseen", None)
             if "tool_calls" in mirror and isinstance(mirror.get("tool_calls"), list):
                 mirror["tool_calls"] = [
                     {
@@ -78282,6 +81714,9 @@ body{padding:18px}
             base = base + plan_todo_note + " "
         if todo_contract_note:
             base = base + todo_contract_note + " "
+        role_todo_ids_note = self._role_todo_ids_prompt_block(role_key)
+        if role_todo_ids_note:
+            base = base + role_todo_ids_note + " "
         if agent_loop_note:
             base = base + agent_loop_note + " "
         mcp_note = self._mcp_prompt_block()
@@ -78439,6 +81874,37 @@ body{padding:18px}
                 },
                 mirror_to_global=False,
             )
+
+    def _role_todo_ids_prompt_block(self, role: str = "", max_rows: int = 24) -> str:
+        """Current Todo rows with their short ids for a multi-agent role.
+
+        Single-agent prompts already carry the alignment block. Without ids,
+        worker roles could only refer to a row by its text, which turned every
+        rewording into a duplicate row.
+        """
+        try:
+            rows = [
+                dict(row) for row in self.todo.snapshot()
+                if isinstance(row, dict) and self._todo_row_kind(row) != "system"
+                and str(row.get("content", "") or "").strip()
+            ]
+        except Exception:
+            rows = []
+        role_key = self._sanitize_agent_role(role)
+        if role_key in {"explorer", "developer", "reviewer"}:
+            own = [row for row in rows if str(row.get("owner", "") or "") in {"", role_key}]
+            rows = own or rows
+        if not rows:
+            return ""
+        lines = [
+            f"- [{str(row.get('status', 'pending')).lower()}] ({row.get('short_id') or '-'}) "
+            f"{trim(str(row.get('content', '') or ''), 220)}"
+            for row in rows[:max_rows]
+        ]
+        return (
+            "CURRENT TODO ROWS (update a row by sending its id, e.g. {\"id\": \"t3\", \"status\": \"completed\"}; "
+            "rows without an id are treated as new):\n" + "\n".join(lines)
+        )
 
     def _todo_payload_items(
         self,
@@ -78901,9 +82367,25 @@ body{padding:18px}
             )
             or ""
         ).strip()
-        parsed_status, parsed_content = split_todo_status_text(content)
+        parsed_status, parsed_content, tagged_short_id = split_todo_status_text_with_id(content)
         content = trim(normalize_work_text(parsed_content or content) or (parsed_content or content), 500)
-        if not content:
+        # A short id ("t3") may arrive as a field or as the "(t3)" tag the model
+        # copied from render(); either way it addresses an existing row.
+        ref_short_id = ""
+        for id_key in ("short_id", "id", "todo_id", "row_id", "item_id", "task_id"):
+            ref_short_id = normalize_todo_short_id(raw.get(id_key, ""))
+            if ref_short_id:
+                break
+        ref_short_id = ref_short_id or tagged_short_id
+        # An id-only row ({"id": "rt:...", "status": ...}) is a valid status
+        # update for the row it names; do not drop it for lacking text.
+        ref_subtask_id = ""
+        for id_key in ("id", "todo_id", "row_id", "item_id", "task_id", "subtask_id"):
+            value = trim(str(raw.get(id_key, "") or "").strip(), 120)
+            if value.startswith("rt:"):
+                ref_subtask_id = value
+                break
+        if not content and not ref_short_id and not ref_subtask_id:
             return {}
         raw_status_value = raw.get("status", raw.get("state", raw.get("phase", "")))
         if raw_status_value in (None, ""):
@@ -78943,9 +82425,13 @@ body{padding:18px}
             "row_id", "rowId", "id",
         ):
             alias = trim(str(raw.get(alias_key, "") or "").strip(), 120)
-            if alias:
+            # A short display id or our own rt: id names a canonical row; it is
+            # resolved by the merge path, not stored as a provider id.
+            if alias and not normalize_todo_short_id(alias) and not alias.startswith("rt:"):
                 row["external_subtask_id"] = alias
                 break
+            if alias.startswith("rt:") and not row.get("_ref_subtask_id"):
+                row["_ref_subtask_id"] = alias
         for meta_key in (
             "activeForm", "active_form", "subtask_id", "created_at", "updated_at", "started_at",
             "completed_at", "completed_by", "evidence", "evidence_binding", "evidence_ids",
@@ -78956,7 +82442,62 @@ body{padding:18px}
         for source_key in ("proof", "evidence_ref", "evidence_refs"):
             if not row.get("evidence") and raw.get(source_key) not in (None, ""):
                 row["evidence"] = raw.get(source_key)
+        if ref_short_id:
+            row["_ref_short_id"] = ref_short_id
+        # A subtask_id that arrives together with content keeps the historical
+        # identity path (status merge only). Only an id-only row, or an rt: id
+        # given in an id-style field, is bound by reference.
+        if ref_subtask_id and (not content or str(raw.get("subtask_id", "") or "").strip() != ref_subtask_id):
+            row["_ref_subtask_id"] = ref_subtask_id
         return row
+
+    def _bind_todo_row_reference(self, row: dict, existing_rows: list[dict]) -> bool:
+        """Point an incoming row at the existing row its id names.
+
+        The model receives "(t3)" in render() output and "id=rt:..." in the
+        alignment block. Resolving those ids first, before any text or model
+        matching, is what keeps a reworded or id-only update from becoming a
+        new row. Returns True when the row was bound to an existing one.
+        """
+        short_ref = normalize_todo_short_id(row.pop("_ref_short_id", ""))
+        rt_ref = str(row.pop("_ref_subtask_id", "") or "").strip()
+        if not short_ref and not rt_ref:
+            return False
+        prior = None
+        for candidate in existing_rows or []:
+            if not isinstance(candidate, dict):
+                continue
+            if short_ref and normalize_todo_short_id(candidate.get("short_id", "")) == short_ref:
+                prior = candidate
+                break
+            if rt_ref and str(candidate.get("subtask_id", "") or "") == rt_ref:
+                prior = candidate
+                break
+        if prior is None:
+            return False
+        prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+        prior_content = str(prior.get("content", "") or "")
+        incoming_content = str(row.get("content", "") or "").strip()
+        if (
+            incoming_content
+            and prior_status != "completed"
+            and incoming_content != prior_content
+        ):
+            # An explicit id makes the content edit unambiguous.
+            row["_root_model_content_update"] = True
+        else:
+            row["content"] = prior_content
+        if prior.get("subtask_id"):
+            row["subtask_id"] = prior["subtask_id"]
+        row.pop("external_subtask_id", None)
+        if prior.get("external_subtask_id"):
+            row["external_subtask_id"] = prior["external_subtask_id"]
+        if prior.get("short_id"):
+            row["short_id"] = prior["short_id"]
+        for field in ("root_group_id", "key"):
+            if prior.get(field) and not row.get(field):
+                row[field] = prior[field]
+        return True
 
     def _todo_write_rescue(self, args: dict, role: str = "") -> str:
         """Compatibility wrapper over the canonical TodoWrite dispatcher."""
@@ -79030,7 +82571,12 @@ body{padding:18px}
             return self._plan_control_feedback("todo_no_progress", self._todo_no_progress_instruction())
         before = self._todo_material_signature(self.todo.snapshot())
         plan_before = self._todo_material_signature(self._ensure_blackboard().get("project_todos", []))
-        result = self._dispatch_todo_update_inner(args, role=role, resume=resume)
+        # Every model call this TodoWrite makes on this thread (intent,
+        # audit, review and acceptance helpers) shares one budget; once it is
+        # used up the helpers fall back to their deterministic rules.  The
+        # step-skill evaluator runs on its own thread and is not counted.
+        with todo_llm_budget_scope(limit=TODO_LLM_CALL_BUDGET):
+            result = self._dispatch_todo_update_inner(args, role=role, resume=resume)
         if key != self._todo_progress_guard_key(role):
             counts.pop(key, None)
             return result
@@ -79045,9 +82591,41 @@ body{padding:18px}
             if len(counts) > 40:
                 counts.pop(next(iter(counts)))
             return self._plan_control_feedback(
-                "todo_no_progress", f"{self._todo_no_progress_instruction()}\n\n{result}",
+                "todo_no_progress",
+                f"{self._todo_no_progress_instruction()}\n\n{self._todo_rejection_next_step(result)}",
             )
-        return result
+        return self._todo_rejection_next_step(result)
+
+    def _todo_rejection_next_step(self, result: object) -> str:
+        """Append one concrete next step to a rejected Todo revision.
+
+        A bare "rejected" made models resubmit the same revision in new words.
+        Naming the current row and the id-based update form gives the model a
+        move that makes progress instead.
+        """
+        text = str(result or "")
+        if not any(
+            marker in text
+            for marker in ("Control[preserve_todo_tree]", "preserve_current_subplan", "plan_update_rejected")
+        ):
+            return text
+        current = next(
+            (
+                row for row in self.todo.snapshot()
+                if isinstance(row, dict) and str(row.get("status", "")) == "in_progress"
+            ),
+            None,
+        )
+        target = (
+            f"({current.get('short_id')}) {trim(str(current.get('content', '') or ''), 160)}"
+            if current and current.get("short_id")
+            else "the current in_progress item"
+        )
+        return (
+            f"{text}\n\nNext step: do not resubmit this revision. Execute {target} with a work or "
+            "evidence tool. To change one row later, send only that row with its id (for example "
+            '{"id": "t3", "status": "completed"}); rows without an id are treated as new.'
+        )
 
     def _dispatch_todo_update_inner(self, args: dict, *, role: str = "", resume: bool = False) -> str:
         """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
@@ -80531,20 +84109,61 @@ body{padding:18px}
 
     def _clear_tool_result_meta(self) -> None:
         try:
-            self._tool_result_local.meta = {}
+            local = getattr(self, "_tool_result_local", None)
+            if local is None:
+                local = threading.local()
+                self._tool_result_local = local
+            local.meta = {}
         except Exception:
             pass
 
     def _set_tool_result_meta(self, **values) -> None:
         try:
             clean = {str(key): value for key, value in values.items() if value is not None}
-            self._tool_result_local.meta = clean
+            local = getattr(self, "_tool_result_local", None)
+            if local is None:
+                local = threading.local()
+                self._tool_result_local = local
+            local.meta = clean
         except Exception:
             pass
 
+    def _current_tool_cancel_event(self) -> threading.Event | None:
+        """Cancel flag of the timed tool running on this thread, if any.
+
+        ``_dispatch_tool`` sets it when a pooled tool outlives its timeout;
+        long-running tools (the ``task`` subagent) poll it cooperatively.
+        """
+        event = getattr(_TOOL_CANCEL_LOCAL, "event", None)
+        return event if isinstance(event, threading.Event) else None
+
+    def _run_tool_with_cancel_event(self, cancel_event: threading.Event, name: str, args: dict, role_key: str, tool_call_id: str) -> str:
+        """Pool-thread entry for timed tools: expose ``cancel_event`` to the tool.
+
+        ``cancel_event.finished`` / ``cancel_event.orphaned`` are only changed
+        under ``_TOOL_ORPHAN_LOCK`` so the orphan counter cannot miss a
+        decrement when the timeout races with the tool returning.
+        """
+        previous = getattr(_TOOL_CANCEL_LOCAL, "event", None)
+        _TOOL_CANCEL_LOCAL.event = cancel_event
+        try:
+            return self._dispatch_tool_inner(name, args, role_key, tool_call_id)
+        finally:
+            _TOOL_CANCEL_LOCAL.event = previous
+            with _TOOL_ORPHAN_LOCK:
+                cancel_event.finished = True
+                if getattr(cancel_event, "orphaned", False):
+                    # The caller already returned the timeout result; this
+                    # thread was an orphan until now.
+                    self.tool_orphan_threads = max(0, int(getattr(self, "tool_orphan_threads", 0) or 0) - 1)
+
     def _peek_tool_result_meta(self) -> dict:
         try:
-            raw = getattr(self._tool_result_local, "meta", {})
+            local = getattr(self, "_tool_result_local", None)
+            if local is None:
+                local = threading.local()
+                self._tool_result_local = local
+            raw = getattr(local, "meta", {})
             return dict(raw) if isinstance(raw, dict) else {}
         except Exception:
             return {}
@@ -80615,14 +84234,22 @@ body{padding:18px}
             "ok": self._tool_result_ok(tool_name, output, meta),
         }
         if tool_name in {"bash", "worktree_run", "check_background"}:
+            operation, declared = self._bash_operation_from_args(item_args)
+            if declared or meta.get("operation"):
+                item["operation"] = str(meta.get("operation", operation) or operation)
+                item["operation_declared"] = bool(meta.get("operation_declared", declared))
             exit_code = self._effective_shell_exit_code(output, meta.get("exit_code"))
             if exit_code is not None:
                 item["exit_code"] = int(exit_code)
             if meta.get("shell_exit_code") is not None:
                 item["shell_exit_code"] = int(meta.get("shell_exit_code"))
-        for key in ("duration_ms", "changed_files", "error"):
+        for key in ("duration_ms", "changed_files", "error", "evidence_id", "evidence_digest", "source_versions", "cache_hit"):
             if meta.get(key) not in (None, "", []):
                 item[key] = meta.get(key)
+        if not item.get("evidence_id"):
+            match = re.search(r"\[evidence_ref id=([a-f0-9]{24})\b", str(output or ""))
+            if match:
+                item["evidence_id"] = match.group(1)
         item = self._annotate_negative_search_assertion(item)
         self._update_shell_failure_guidance(tool_name, item, meta)
         return self._annotate_tool_control_feedback(item)
@@ -80665,14 +84292,45 @@ body{padding:18px}
         if resume_alias and "resume" not in args and "continue" not in args and "resume_existing" not in args:
             args = {**args, "resume": True}
         if name == "agent_web_search" and not bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)):
-            return "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable)."
+            return self._trace_tool_result(
+                name,
+                args,
+                "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable).",
+                "",
+            )
         role_key = self._sanitize_agent_role(agent_role)
+        args = dict(args)
+        # Read bookkeeping (visible_reads) needs the id of the tool message
+        # that will carry this result. Tools run serially within a session.
+        _READ_DISPATCH_CONTEXT.tool_call_id = str(tool_call_id or "")
+        flow_context = self._flow_context(role_key, tool_call_id)
+        # Main agent loops emit a visible tool_start first. Subagent and
+        # programmatic callers may not; create the graph node only when no
+        # visible start node already exists for this call.
+        if not flow_context.get("tool_start_evidence_id"):
+            flow_context["tool_start_evidence_id"] = self._record_flow_node(
+                "tool_start",
+                {"name": name, "args": self._flow_safe_args(args)},
+                role=role_key,
+                metadata={**flow_context, "tool_call_id": tool_call_id},
+                parent_ids=[flow_context.get("parent_evidence_id", "")],
+            )
+        args["_flow_context"] = flow_context
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
-            return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
+            out = self._trace_tool_result(
+                name,
+                args,
+                f"Error: tool '{name}' is not allowed for agent role '{role_key}'",
+                role_key,
+            )
+            self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+            return out
         role_guard = self._guard_role_shell_mutation(role_key, name, args)
         if role_guard:
             self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=role_guard)
-            return role_guard
+            out = self._trace_tool_result(name, args, role_guard, role_key)
+            self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+            return out
         try:
             # Shell-backed tools have their own timeout/state mechanism; keep
             # them on this thread so structured outcome metadata is not lost at
@@ -80695,25 +84353,38 @@ body{padding:18px}
                 or self._is_mcp_tool_name(name)
             ):
                 out = self._dispatch_tool_inner(name, args, role_key, tool_call_id)
+                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
             if timeout <= 0:
                 out = self._dispatch_tool_inner(name, args, role_key, tool_call_id)
+                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
-            future = pool.submit(self._dispatch_tool_inner, name, args, role_key, tool_call_id)
+            cancel_event = threading.Event()
+            future = pool.submit(self._run_tool_with_cancel_event, cancel_event, name, args, role_key, tool_call_id)
             try:
                 out = future.result(timeout=timeout)
+                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 pool.shutdown(wait=True)
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             except concurrent.futures.TimeoutError:
                 future.cancel()
+                # The tool thread may keep running.  Ask it to stop at its
+                # next check (the task subagent exits on its next round) and
+                # count it as an orphan until it actually returns.
+                cancel_event.set()
+                with _TOOL_ORPHAN_LOCK:
+                    if future.running() and not getattr(cancel_event, "finished", False):
+                        cancel_event.orphaned = True
+                        self.tool_orphan_threads = int(getattr(self, "tool_orphan_threads", 0) or 0) + 1
+                        self.tool_orphan_threads_total = int(getattr(self, "tool_orphan_threads_total", 0) or 0) + 1
                 pool.shutdown(wait=False, cancel_futures=True)
                 if name == "agent_web_search":
                     self._agent_web_search_emit(
@@ -80732,6 +84403,7 @@ body{padding:18px}
                     "summary": f"tool '{name}' timed out after {timeout}s",
                 })
                 out = f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
+                out = self._trace_tool_result(name, args, out, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started, status="timeout")
                 return out
@@ -80745,6 +84417,7 @@ body{padding:18px}
                 "traceback": trim(tb_lines, 2000),
             })
             out = f"Error: {type(exc).__name__}: {trim(str(exc), 500)}"
+            out = self._trace_tool_result(name, args, out, role_key)
             self._maybe_record_tool_memory_after_result(name, args, out, role_key)
             self._record_tool_telemetry(name, out, telemetry_started)
             return out
@@ -80854,7 +84527,15 @@ body{padding:18px}
             return ""
         if re.search(r"(?:^|[;&|]\s*)(?:rm|mv|cp|touch|chmod|chown|mkdir|rmdir|sed\s+-i|perl\s+-i)\b", raw, re.I):
             return ""
-        if any(token in raw for token in (">", "$(", "`")):
+        # Discarding stderr or stdout (2>/dev/null, 2>&1, >/dev/null) writes no
+        # file, so it must not disable the cache. Any other redirection, including
+        # >> and &>, still does.
+        probe = re.sub(
+            r"(?:(?<=\s)|^)(?:2>/dev/null|1>/dev/null|>/dev/null|2>&1)(?=\s|$|[;&|])",
+            " ",
+            raw,
+        )
+        if any(token in probe for token in (">", "$(", "`")):
             return ""
         targets = self._bash_file_read_targets(raw)
         if not targets:
@@ -80937,6 +84618,7 @@ body{padding:18px}
             self._emit("status", {"summary": f"calling MCP tool {name}"})
             return mgr.call(name, args if isinstance(args, dict) else {})
         if name == "bash":
+            operation, operation_declared = self._bash_operation_from_args(args)
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
                 self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=guard_error)
@@ -80968,6 +84650,9 @@ body{padding:18px}
             self._set_tool_result_meta(
                 exit_code=effective_exit,
                 shell_exit_code=meta.get("exit_code"),
+                operation=operation,
+                operation_declared=operation_declared,
+                cache_hit=bool(meta.get("cache_hit", False)),
                 duration_ms=meta.get("duration_ms"),
                 changed_files=list(meta.get("changed_files", []) or []),
                 error=str(meta.get("error", "") or ""),
@@ -81020,6 +84705,8 @@ body{padding:18px}
                 "command",
                 {
                     "name": "bash",
+                    "operation": operation,
+                    "operation_declared": operation_declared,
                     "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "command": meta["command"],
                     "effective_command": meta.get("effective_command", meta["command"]),
@@ -81090,21 +84777,28 @@ body{padding:18px}
                     source_lines = None
                     source_text = None
                     source_fp = None
-            out = self._run_read(
-                rel,
-                args.get("limit"),
-                args.get("offset"),
-                mode=args.get("mode"),
-                target=args.get("target"),
-                query=args.get("query"),
-                line=args.get("line"),
-                context=args.get("context"),
-                regex=args.get("regex"),
-                max_chars=args.get("max_chars"),
-                segment_id=args.get("segment_id"),
-                fresh=args.get("fresh", False),
-                _source_lines=source_lines,
-            )
+            # The reuse/delta checks inside _run_read need to know whose
+            # context counts as "already visible". Tools run serially within a
+            # session, so an attribute is enough here.
+            _READ_DISPATCH_CONTEXT.read_role = role_key
+            try:
+                out = self._run_read(
+                    rel,
+                    args.get("limit"),
+                    args.get("offset"),
+                    mode=args.get("mode"),
+                    target=args.get("target"),
+                    query=args.get("query"),
+                    line=args.get("line"),
+                    context=args.get("context"),
+                    regex=args.get("regex"),
+                    max_chars=args.get("max_chars"),
+                    segment_id=args.get("segment_id"),
+                    fresh=args.get("fresh", False),
+                    _source_lines=source_lines,
+                )
+            finally:
+                _READ_DISPATCH_CONTEXT.read_role = ""
             coordinator = getattr(self, "collaboration_write_coordinator", None)
             if coordinator is not None and not str(out).startswith("Error"):
                 try:
@@ -81124,8 +84818,24 @@ body{padding:18px}
                 source_fp=source_fp,
             )
             try:
-                if source_lines is not None and not str(out).startswith("Error"):
-                    self._mark_long_content_read(rel, fp, source_lines, args, out, role=role_key)
+                if (
+                    source_lines is not None
+                    and not str(out).startswith("Error")
+                    and "already_in_context" not in str(out).split("\n", 1)[0]
+                ):
+                    # Small whole-file reads render raw text without line
+                    # numbers; tell the recorder which lines the body holds.
+                    whole_file_range = (
+                        (1, len(source_lines))
+                        if source_lines and str(args.get("mode", "") or "auto").strip().lower() in {"", "auto"}
+                        and args.get("offset") in (None, "") and args.get("limit") in (None, "")
+                        and args.get("line") in (None, "") and not args.get("target") and not args.get("query")
+                        else None
+                    )
+                    self._mark_long_content_read(
+                        rel, fp, source_lines, args, out, role=role_key,
+                        tool_call_id=tool_call_id, read_range=whole_file_range,
+                    )
             except Exception:
                 pass
             limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
@@ -81344,6 +85054,20 @@ body{padding:18px}
                     self._emit("status", {"summary": summary})
                     out = f"{out}\n{summary}"
                 after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+                # Return the edited region with line numbers and record it as a
+                # fresh read. A bare "Edited x" made the model re-read the file
+                # to confirm the change, or to plan the next edit nearby.
+                try:
+                    snippet, span = self._edit_result_snippet(before_text, after_text)
+                    if snippet:
+                        out = f"{out}\n[edited region lines={span[0]}-{span[1]}]\n{snippet}"
+                        after_lines = after_text.splitlines()
+                        self._mark_long_content_read(
+                            rel, fp, after_lines, {"mode": "window", "path": rel}, snippet, role=role_key,
+                            tool_call_id=getattr(_READ_DISPATCH_CONTEXT, "tool_call_id", ""),
+                        )
+                except Exception:
+                    pass
                 diff, added, deleted = make_unified_diff(rel, before_text, after_text)
                 numbered = make_numbered_diff(before_text, after_text)
                 numbered_text = render_numbered_diff_text(numbered)
@@ -81718,6 +85442,7 @@ body{padding:18px}
         if name == "worktree_status":
             return self.worktrees.status(args["name"])
         if name == "worktree_run":
+            operation, operation_declared = self._bash_operation_from_args(args)
             wt_path = self.worktrees.resolve_path(args["name"])
             if wt_path is None:
                 return f"Error: unknown worktree '{args['name']}'"
@@ -81730,6 +85455,8 @@ body{padding:18px}
             self._set_tool_result_meta(
                 exit_code=effective_exit,
                 shell_exit_code=meta.get("exit_code"),
+                operation=operation,
+                operation_declared=operation_declared,
                 duration_ms=meta.get("duration_ms"),
                 changed_files=list(meta.get("changed_files", []) or []),
                 error=str(meta.get("error", "") or ""),
@@ -81740,6 +85467,8 @@ body{padding:18px}
                 "command",
                 {
                     "name": "worktree_run",
+                    "operation": operation,
+                    "operation_declared": operation_declared,
                     "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "worktree": args["name"],
                     "command": meta["command"],
@@ -82484,6 +86213,9 @@ body{padding:18px}
                         reset_agent_contexts=True,
                     )
                 self.run_generation = int(self.run_generation) + 1
+                # Requests still in flight from the previous run become
+                # orphaned and stop counting against this run's slots.
+                self._sync_llm_gate_generation()
                 clean_goal = submitted_text
                 self._refresh_runtime_code_reference(clean_goal or content)
                 _user_msg_ts = now_ts()
@@ -82754,6 +86486,9 @@ body{padding:18px}
         role_key = self._sanitize_agent_role(role)
         if not role_key:
             return {"status": "skip", "reason": "invalid-role"}
+        if bool(getattr(self, "_loop_stop_requested", {}).get(role_key)):
+            self._enter_evidence_loop_paused_state(role_key)
+            return {"status": "paused", "role": role_key, "stop_due_to_loop": True}
         ctx = self._agent_context(role_key)
         if not ctx:
             return {"status": "skip", "reason": "empty-context", "role": role_key}
@@ -83014,6 +86749,7 @@ body{padding:18px}
             "role": role_key,
             "stop_due_to_finish": bool(stop_due_to_finish),
             "stop_due_to_ask_user": bool(stop_due_to_ask_user),
+            "stop_due_to_loop": bool(getattr(self, "_loop_stop_requested", {}).get(role_key)),
             "tool_results": tool_results,
         }
 
@@ -83602,6 +87338,9 @@ body{padding:18px}
                 pinned_selection=pinned_selection,
                 media_inputs_round=role_media_inputs,
             )
+            if isinstance(step, dict) and step.get("stop_due_to_loop"):
+                self._enter_evidence_loop_paused_state(role)
+                break
             self._blackboard_update_from_worker_step(role, step)
             if self._consume_ask_user_pause():
                 self._enter_ask_user_paused_state(role)
@@ -83927,6 +87666,9 @@ body{padding:18px}
                 media_inputs_round=role_media_inputs,
             )
             safe_step = step if isinstance(step, dict) else {}
+            if safe_step.get("stop_due_to_loop"):
+                self._enter_evidence_loop_paused_state(role)
+                break
             self._blackboard_update_from_worker_step(role, safe_step)
             board_after = self._ensure_blackboard()
             board_after_fp = self._watchdog_state_fingerprint(board_after)
@@ -88252,6 +91994,7 @@ body{padding:18px}
                             "SKIP_SHORT",
                             "ARBITER_TIMEOUT",
                             "ARBITER_ERROR",
+                            "ARBITER_SKIPPED",
                         }
                         if arbiter_status == "USER_INPUT_REQUIRED":
                             arbiter_planning_rounds = 0
@@ -88985,6 +92728,9 @@ body{padding:18px}
                     }
                     if result_item.get("exit_code") is not None:
                         tool_message["exit_code"] = int(result_item.get("exit_code"))
+                    # Not yet seen by the model: protected from microcompact
+                    # until the next successful model call.
+                    tool_message["_unseen"] = True
                     self.messages.append(tool_message)
                     single_round_tool_results.append(result_item)
                     is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
@@ -89225,6 +92971,8 @@ body{padding:18px}
                         single_round_tool_results,
                         role=single_role,
                     )
+                if self._enter_evidence_loop_paused_state(single_role):
+                    break
                 if stop_due_to_hard_break:
                     note = (
                         "Execution paused after repeated tool/recovery failures. "
@@ -89649,7 +93397,7 @@ body{padding:18px}
         except Exception as exc:
             self._emit("error", {"summary": f"agent error: {exc}", "trace": traceback.format_exc()})
         finally:
-            if self.todo.has_open_items() and not self.cancel_requested:
+            if self.todo.has_open_items() and not self.cancel_requested and not getattr(self, "_loop_stop_requested", {}):
                 _last = self._latest_agent_assistant_text(single_role, min_ts=self._latest_user_message_ts()) or ""
                 if self._looks_like_conclusive_reply(_last):
                     self._resolve_finish_request(
@@ -89661,7 +93409,8 @@ body{padding:18px}
             # marked active. User input arriving during this tail window stays in
             # pending_user_inputs and is requeued below instead of being lost.
             try:
-                self._generate_run_completion_summary()
+                if not getattr(self, "_loop_stop_requested", {}):
+                    self._generate_run_completion_summary()
             except Exception:
                 pass
             requeued_pending_inputs: list[dict] = []
@@ -89922,7 +93671,11 @@ body{padding:18px}
                     and getattr(self, "_snapshot_cache_lite_key", None) == cache_key
                     and not bool(cached.get("degraded", False))
                 ):
-                    return dict(cached)
+                    # Gate state is not part of the cache key; patch the live
+                    # value into the returned copy.
+                    hit = dict(cached)
+                    hit["llm_concurrency"] = self._llm_concurrency_snapshot()
+                    return hit
             msg_window = 120 if lite else 200
             op_feed_window = 80 if lite else 240
             upload_window = 12 if lite else 40
@@ -90530,6 +94283,9 @@ body{padding:18px}
                 "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
                 "user_profile_capsule_meta": dict(getattr(self, "user_profile_capsule_meta", {}) or {}),
                 "auto_task_level_ceiling": self._auto_task_level_ceiling_value(),
+                "session_llm_concurrency": normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 "read_context_budget": self._read_context_budget(),
                 "read_context_registry_count": len(getattr(self, "read_context_registry", {}) or {}),
                 "tool_memory_budget": self._tool_memory_budget(),
@@ -90591,6 +94347,9 @@ body{padding:18px}
                 "teammates": list(self.teammates.values()),
                 "activity": self.activity[-activity_window:],
                 "operations": operations_view,
+                # Live gate state (small, bounded); counted by the lite byte
+                # budget below.  Cache hits re-read it above.
+                "llm_concurrency": self._llm_concurrency_snapshot(),
             }
             if lite:
                 snapshot_payload = _apply_lite_snapshot_bounds(snapshot_payload)
@@ -90641,6 +94400,9 @@ body{padding:18px}
             cached["degraded_reason"] = trim(reason, 220)
             if uploads_view and not cached.get("uploads"):
                 cached["uploads"] = uploads_view
+            # The gate has its own lock, so the live value is readable even
+            # while the session lock is busy.
+            cached["llm_concurrency"] = self._llm_concurrency_snapshot()
             return cached
         return {
             "id": self.id,
@@ -90672,6 +94434,7 @@ body{padding:18px}
             "teammates": [],
             "activity": [],
             "operations": [],
+            "llm_concurrency": self._llm_concurrency_snapshot(),
         }
 
     def snapshot_safe(self, include_model_catalog: bool = False, lite: bool = False, lock_timeout: float = 0.4) -> dict:
@@ -91083,6 +94846,7 @@ class SessionManager:
         kernel_registry=None,
         kernel_runtime=None,
         skills_snapshot: SkillStore | None = None,
+        session_llm_concurrency: int | None = None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -91135,6 +94899,7 @@ class SessionManager:
             fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        self.session_llm_concurrency = normalize_session_llm_concurrency(session_llm_concurrency)
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
         self.l2_todo_policy = normalize_l2_todo_policy(
             l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
@@ -91318,6 +95083,9 @@ class SessionManager:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "session_llm_concurrency": normalize_session_llm_concurrency(
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+            ),
             "l2_todo_policy": normalize_l2_todo_policy(
                 getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
             ),
@@ -91408,6 +95176,12 @@ class SessionManager:
                 raw_auto_task_level_ceiling
                 if raw_auto_task_level_ceiling is not None
                 else getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            )
+            raw_session_llm_concurrency = extract_session_llm_concurrency_setting(raw)
+            self.session_llm_concurrency = normalize_session_llm_concurrency(
+                raw_session_llm_concurrency
+                if raw_session_llm_concurrency is not None
+                else getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
             )
             cfg_l2_todo_policy = extract_l2_todo_policy_setting(raw)
             if cfg_l2_todo_policy is not None:
@@ -91563,6 +95337,10 @@ class SessionManager:
         sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
             getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
         )
+        set_session_llm_concurrency_on_runtime(
+            sess,
+            getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
+        )
         sess.l2_todo_policy = normalize_l2_todo_policy(
             getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
         )
@@ -91629,6 +95407,13 @@ class SessionManager:
                 sess,
                 "auto_task_level_ceiling",
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
+            )
+        )
+        self.session_llm_concurrency = normalize_session_llm_concurrency(
+            getattr(
+                sess,
+                "session_llm_concurrency",
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
             )
         )
         self.l2_todo_policy = normalize_l2_todo_policy(
@@ -91837,6 +95622,9 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
@@ -92568,6 +96356,9 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
@@ -93265,6 +97056,9 @@ class SessionManager:
             cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
             if cfg_auto_task_level_ceiling is not None:
                 self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+            cfg_session_llm_concurrency = extract_session_llm_concurrency_setting(cfg)
+            if cfg_session_llm_concurrency is not None:
+                self.session_llm_concurrency = normalize_session_llm_concurrency(cfg_session_llm_concurrency)
             cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
             if cfg_l2_todo_policy is not None:
                 self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
@@ -93827,6 +97621,8 @@ body[data-ui-style="trad"] button,body[data-ui-style="trad"] a{border-radius:10p
 .stat .v{font-size:1.25rem;font-weight:700}
 .stat.compact .v{font-size:1.05rem}
 .stat.model .v{font-size:.94rem;line-height:1.25;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.stat.model .llm-conc{margin-top:4px;font-size:.74rem;line-height:1.25;color:var(--muted);cursor:help;font-variant-numeric:tabular-nums}
+.stat.model .llm-conc.busy{color:#b45309}
 main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) minmax(300px,360px);justify-content:center;gap:12px;height:74vh;min-height:620px;max-height:74vh}
 .panel{background:var(--card);backdrop-filter:blur(8px);border:1px solid #fff;box-shadow:0 10px 28px rgba(14,30,62,.08);border-radius:16px;padding:12px;display:flex;flex-direction:column;min-height:0;min-width:0;height:100%}
 body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-shadow:0 6px 18px rgba(14,30,62,.05);border-color:#dfe7f2}
@@ -94343,8 +98139,10 @@ const APP_STORE={view:'sessions',scope:'personal',personal:[],shared:[],catalog:
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
-const SNAPSHOT_DELAY_VISIBLE_MS=300;
-const SNAPSHOT_DELAY_HIDDEN_MS=2400;
+const SNAPSHOT_DELAY_RUNNING_MS=260;
+const SNAPSHOT_DELAY_IDLE_MS=1200;
+const SNAPSHOT_DELAY_VISIBLE_MS=SNAPSHOT_DELAY_IDLE_MS;
+const SNAPSHOT_DELAY_HIDDEN_MS=3000;
 const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
 const SESSION_BOOT_LIMIT=120;
@@ -94474,7 +98272,7 @@ const I18N={
     upload_pick_file:'Choose files',
     upload_drop_release:'Drop to upload',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'Files',sec_catalog:'Catalog',
-    stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_global_tasks:'Global Tasks',stat_daily_sessions:'Daily Sessions',stat_model:'Model',
+    stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_global_tasks:'Global Tasks',stat_daily_sessions:'Daily Sessions',stat_model:'Model',stat_llm_concurrency:'Model concurrency',stat_llm_peak:'Peak',stat_llm_queued:'Queued',stat_llm_orphaned:'Orphaned',stat_llm_abandoned:'Abandoned',stat_llm_no_requests:'No model requests in flight',
     no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_current_subtasks:'No subtasks for the current plan step yet',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_files:'No files',no_catalog:'No catalog',no_uploads:'No uploads',
     running:'running',idle:'idle',submitting:'Submitting',accepted:'Accepted',starting:'Starting',queued:'Queued',checking:'Checking',submit_failed:'Submit failed',open:'open',completed:'completed',blocked:'blocked',
     status_pending:'PENDING',status_in_progress:'IN PROGRESS',status_completed:'COMPLETED',status_blocked:'BLOCKED',status_deleted:'DELETED',
@@ -94513,7 +98311,7 @@ const I18N={
     upload_pick_file:'选择文件',
     upload_drop_release:'释放以上传文件',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'文件',sec_catalog:'Catalog',
-    stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_global_tasks:'全局任务',stat_daily_sessions:'每日会话',stat_model:'模型',
+    stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_global_tasks:'全局任务',stat_daily_sessions:'每日会话',stat_model:'模型',stat_llm_concurrency:'模型并发',stat_llm_peak:'峰值',stat_llm_queued:'排队',stat_llm_orphaned:'孤儿',stat_llm_abandoned:'已放弃',stat_llm_no_requests:'当前没有在途的模型请求',
     no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_current_subtasks:'当前计划步骤尚未生成子任务',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_files:'暂无文件',no_catalog:'暂无目录',no_uploads:'暂无上传',
     running:'运行中',idle:'空闲',submitting:'正在提交',accepted:'已接收',starting:'正在启动',queued:'排队中',checking:'正在确认',submit_failed:'提交失败',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待处理',status_in_progress:'进行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已删除',
@@ -94552,7 +98350,7 @@ const I18N={
     upload_pick_file:'選擇檔案',
     upload_drop_release:'釋放以上傳檔案',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'檔案',sec_catalog:'Catalog',
-    stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_global_tasks:'全域任務',stat_daily_sessions:'每日會話',stat_model:'模型',
+    stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_global_tasks:'全域任務',stat_daily_sessions:'每日會話',stat_model:'模型',stat_llm_concurrency:'模型並行',stat_llm_peak:'峰值',stat_llm_queued:'排隊',stat_llm_orphaned:'孤兒',stat_llm_abandoned:'已放棄',stat_llm_no_requests:'目前沒有進行中的模型請求',
     no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_current_subtasks:'目前計劃步驟尚未產生子任務',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_files:'尚無檔案',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
     running:'執行中',idle:'閒置',submitting:'正在提交',accepted:'已接收',starting:'正在啟動',queued:'排隊中',checking:'正在確認',submit_failed:'提交失敗',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待處理',status_in_progress:'進行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已刪除',
@@ -94591,7 +98389,7 @@ const I18N={
     upload_pick_file:'ファイルを選択',
     upload_drop_release:'ドロップしてアップロード',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'ファイル',sec_catalog:'Catalog',
-    stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_global_tasks:'タスク',stat_daily_sessions:'日次セッション',stat_model:'モデル',
+    stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_global_tasks:'タスク',stat_daily_sessions:'日次セッション',stat_model:'モデル',stat_llm_concurrency:'モデル並列',stat_llm_peak:'ピーク',stat_llm_queued:'待機',stat_llm_orphaned:'孤立',stat_llm_abandoned:'放棄',stat_llm_no_requests:'実行中のモデルリクエストはありません',
     no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_current_subtasks:'現在の計画ステップにはまだサブタスクがありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_files:'ファイルなし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
     running:'実行中',idle:'待機中',submitting:'送信中',accepted:'受付済み',starting:'起動中',queued:'待機列',checking:'確認中',submit_failed:'送信失敗',open:'未完了',completed:'完了',blocked:'ブロック',
     status_pending:'未着手',status_in_progress:'進行中',status_completed:'完了',status_blocked:'ブロック',status_deleted:'削除済み',
@@ -94751,7 +98549,7 @@ async function api(path,opt={}){const o=(opt&&typeof opt==='object')?{...opt}:{}
 function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;' }[c]))}
 function showError(msg){const el=E('errorBox');if(!msg){el.classList.add('hidden');el.textContent='';return}el.textContent=msg;el.classList.remove('hidden')}
 function nearBottom(el,threshold=24){const t=Math.max(0,Number(threshold)||24);return (el.scrollHeight-el.scrollTop-el.clientHeight)<=t}
-function snapshotDelayMs(){return document.visibilityState==='hidden'?SNAPSHOT_DELAY_HIDDEN_MS:SNAPSHOT_DELAY_VISIBLE_MS}
+function snapshotDelayMs(){if(document.visibilityState==='hidden')return SNAPSHOT_DELAY_HIDDEN_MS;return S.snap?.running?SNAPSHOT_DELAY_RUNNING_MS:SNAPSHOT_DELAY_VISIBLE_MS}
 function sessionPollDelayMs(){return document.visibilityState==='hidden'?SESSION_POLL_HIDDEN_MS:SESSION_POLL_VISIBLE_MS}
 function applyStaticUiClass(){document.documentElement.classList.toggle('ui-static',!!(S.staticMode&&S.frozen))}
 function shouldFreezeAfterRender(){return !!(S.staticMode&&S.bootRendered&&(document.visibilityState==='hidden'))}
@@ -95311,6 +99109,7 @@ function onRuntimeEvent(evt){
   if(seqState.gap)return{handled:true,needsSnapshot:true};
   const typ=String(evt.type||'');
   if(typ==='render_frame'){_renderBridgeEnqueue(evt.data||{});return{handled:true,needsSnapshot:false}}
+  if(typ==='llm_concurrency'){const sid=String(evt.session_id||'');if(S.snap&&typeof S.snap==='object'&&(!sid||sid===String(S.activeId||''))){S.snap.llm_concurrency=(evt.data&&typeof evt.data==='object')?evt.data:{};renderLlmConcurrencyStat()}return{handled:true,needsSnapshot:false}}
   if(typ==='render_bridge'){const d=evt.data||{};const summary=String(d?.summary||'').trim();if(summary){_renderBridgeShow();_renderBridgeUpdateMeta(summary,true);_renderBridgeHideLater(30000)}return{handled:true,needsSnapshot:false}}
   if(typ==='compact'){scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);const reason=parseCompactReason(evt.data||{});if(reason==='auto'||reason.startsWith('truncation-rescue')){const pct=Number(evt.data?.context_left_percent_before);const left=Number(evt.data?.context_left_before);const limit=Number(evt.data?.context_limit_before);const pctTxt=Number.isFinite(pct)?pct.toFixed(1):'-';const leftTxt=Number.isFinite(left)&&Number.isFinite(limit)?`${left}/${limit}`:'-';showCompactToast(`${t('compact_auto')}：${pctTxt}% left (${leftTxt}) · delta-sync`)}_deltaAppendActivity(typ,evt.data||{},Number(evt?.ts||Date.now()/1000));return{handled:true,needsSnapshot:false}}
   return _deltaApplyRuntimeEvent(evt);
@@ -95358,7 +99157,9 @@ function mergeSessionRows(base,incoming,opt={}){const current=Array.isArray(base
 function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{},rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]),append=!!opt.append,offset=Math.max(0,Number(payload.offset||0)||0);if(!append&&offset===0&&opt.reset){S.sessions=[];S.sessionById.clear();S.sessionNextOffset=0}S.sessions=mergeSessionRows(S.sessions,rows,{append});const revision=Number(payload.catalog_revision);if(Number.isFinite(revision))S.sessionCatalogRevision=revision;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=rows.length?total:Math.max(S.sessions.length,rows.length);const next=offset+rows.length;S.sessionNextOffset=append?Math.max(Number(S.sessionNextOffset||0),next):next;const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'shell_timeout_mode'))S.config.shell_timeout_mode=String(cfg.shell_timeout_mode||'auto');if(Object.prototype.hasOwnProperty.call(cfg,'shell_async_handoff_seconds'))S.config.shell_async_handoff_seconds=cfg.shell_async_handoff_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
-function renderStats(){const sessions=Math.max(Number(S.sessionTotal||0),S.sessions.length);const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
+function renderStats(){const sessions=Math.max(Number(S.sessionTotal||0),S.sessions.length);const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div><div class=\"llm-conc\" id=\"llmConcurrencyStat\" hidden></div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats');renderLlmConcurrencyStat()}
+function _llmConcurrencyView(raw){if(!raw||typeof raw!=='object'||!Number.isFinite(Number(raw.limit))||Number(raw.limit)<=0)return null;const n=(v)=>Math.max(0,Math.round(Number(v)||0));const rows=(Array.isArray(raw.requests)?raw.requests:[]).slice(0,16).map(r=>({label:String(r?.label||r?.priority||'model'),role:String(r?.role||''),seconds:Math.max(0,Math.round(Number(r?.elapsed_seconds??r?.elapsed??0)||0)),abandoned:!!r?.abandoned,orphaned:!!r?.orphaned}));return{limit:n(raw.limit),inFlight:n(raw.in_flight),peak:n(raw.peak),queued:n(raw.queued),orphaned:n(raw.orphaned_in_flight),rows:rows}}
+function renderLlmConcurrencyStat(){const el=E('llmConcurrencyStat');if(!el)return;const v=_llmConcurrencyView(S.snap?.llm_concurrency);if(!v){if(!el.hidden){el.hidden=true;el.textContent='';el.removeAttribute('title')}return}const parts=[`${t('stat_llm_concurrency')} ${v.inFlight}/${v.limit}`,`${t('stat_llm_peak')} ${v.peak}`,`${t('stat_llm_queued')} ${v.queued}`];if(v.orphaned>0)parts.push(`${t('stat_llm_orphaned')} ${v.orphaned}`);const tip=v.rows.length?v.rows.map(r=>{const flags=[r.abandoned?t('stat_llm_abandoned'):'',r.orphaned?t('stat_llm_orphaned'):''].filter(Boolean).join(', ');return `${r.label}${r.role?' · '+r.role:''} · ${r.seconds}s${flags?' ('+flags+')':''}`}).join('\\n'):t('stat_llm_no_requests');el.hidden=false;setTextIfChanged(el,parts.join(' · '));if(el.getAttribute('title')!==tip)el.setAttribute('title',tip);el.classList.toggle('busy',v.queued>0||v.inFlight>=v.limit)}
 function renderSessions(){
   const host=E('sessionList');
   if(!host)return;
@@ -98805,6 +102606,7 @@ async function refreshSnapshot(opt={}){
     }
     S.lastDeltaTs=Date.now();
     if(_syncActiveSessionSummaryFromSnapshot()){const sessSig=sessionsSignature(S.sessions);if(sessSig!==S.lastSessionsSig){S.lastSessionsSig=sessSig;renderSessions();renderStats()}}
+    renderLlmConcurrencyStat();
     const cat=S.snap?.llm_model_catalog;
     const hasCat=!!(
       cat&&(
@@ -98989,6 +102791,7 @@ async function selectSession(id,opt={}){
   _chatVirtResetScrollState(E('chat'));
   applyStaticUiClass();
   renderSessions();
+  renderLlmConcurrencyStat();
   ensurePreviewState(id);
   bindEvents(id);
   _deltaStartWatchdog();
@@ -100282,7 +104085,7 @@ const ADMIN_CONFIG_I18N_ROWS=[
 ['Skills Studio','Skills Studio','Skills Studio','Skills Studio','Skills Studio'],['RAG admin','RAG 管理服务','RAG 管理服務','RAG 管理','RAG admin'],['Code library admin','代码库管理服务','程式碼庫管理服務','コードライブラリ管理','Code library admin'],['Programming IDE','编程 IDE','程式設計 IDE','プログラミング IDE','Programming IDE'],['IDE password login','IDE 密码登录','IDE 密碼登入','IDE パスワードログイン','IDE password login'],['MCP service','MCP 服务','MCP 服務','MCP サービス','MCP service'],['LAN collaboration','LAN 协作','LAN 協作','LAN コラボレーション','LAN collaboration'],
 ['Collaboration TLS certificate','协作 TLS 证书','協作 TLS 憑證','コラボレーション TLS 証明書','Collaboration TLS certificate'],['Collaboration TLS private key','协作 TLS 私钥','協作 TLS 私鑰','コラボレーション TLS 秘密鍵','Collaboration TLS private key'],['Trusted HTTPS reverse proxy','可信 HTTPS 反向代理','可信任 HTTPS 反向代理','信頼済み HTTPS リバースプロキシ','Trusted HTTPS reverse proxy'],['Trusted LAN HTTP mode','可信 LAN HTTP 模式','可信任 LAN HTTP 模式','信頼済み LAN HTTP モード','Trusted LAN HTTP mode'],
 ['External WebUI mode','外部 WebUI 模式','外部 WebUI 模式','外部 WebUI モード','External WebUI mode'],['Export built-in WebUI on start','启动时导出内置 WebUI','啟動時匯出內建 WebUI','起動時に内蔵 WebUI をエクスポート','Export built-in WebUI on start'],['Overwrite WebUI export','覆盖 WebUI 导出','覆蓋 WebUI 匯出','WebUI エクスポートを上書き','Overwrite WebUI export'],['UI language','界面语言','介面語言','表示言語','UI language'],['Chat UI style','聊天界面样式','聊天介面樣式','チャット UI スタイル','Chat UI style'],['Upload list','上传列表','上傳清單','アップロード一覧','Upload list'],['Download offline JS libraries','下载离线 JS 库','下載離線 JS 程式庫','オフライン JS ライブラリをダウンロード','Download offline JS libraries'],
-['Read context policy','上下文读取策略','上下文讀取策略','コンテキスト読取ポリシー','Read context policy'],['Tool memory policy','工具记忆策略','工具記憶策略','ツールメモリポリシー','Tool memory policy'],['Web search','网页搜索','網頁搜尋','Web 検索','Web search'],['User memory mode','用户记忆模式','使用者記憶模式','ユーザーメモリモード','User memory mode'],['Auto task level ceiling','自动任务等级上限','自動任務等級上限','自動タスクレベル上限','Auto task level ceiling'],['Level-2 Todo policy','二级 Todo 策略','二級 Todo 策略','レベル 2 Todo ポリシー','Level-2 Todo policy'],['Daily sessions per user','每用户每日会话数','每位使用者每日工作階段數','ユーザーごとの日次セッション数','Daily sessions per user'],
+['Read context policy','上下文读取策略','上下文讀取策略','コンテキスト読取ポリシー','Read context policy'],['Tool memory policy','工具记忆策略','工具記憶策略','ツールメモリポリシー','Tool memory policy'],['Web search','网页搜索','網頁搜尋','Web 検索','Web search'],['User memory mode','用户记忆模式','使用者記憶模式','ユーザーメモリモード','User memory mode'],['Auto task level ceiling','自动任务等级上限','自動任務等級上限','自動タスクレベル上限','Auto task level ceiling'],['In-session model request concurrency','会话内模型请求并发数','工作階段內模型請求並行數','セッション内モデルリクエスト同時実行数','In-session model request concurrency'],['Level-2 Todo policy','二级 Todo 策略','二級 Todo 策略','レベル 2 Todo ポリシー','Level-2 Todo policy'],['Daily sessions per user','每用户每日会话数','每位使用者每日工作階段數','ユーザーごとの日次セッション数','Daily sessions per user'],
 ['Ollama base URL','Ollama 基础 URL','Ollama 基礎 URL','Ollama ベース URL','Ollama base URL'],['Default model','默认模型','預設模型','既定モデル','Default model'],['Automatic model recovery','自动模型恢复','自動模型復原','モデルの自動復旧','Automatic model recovery'],['Arbiter enabled','启用仲裁器','啟用仲裁器','アービターを有効化','Arbiter enabled'],['Arbiter model override','仲裁器模型覆盖','仲裁器模型覆蓋','アービターモデル上書き','Arbiter model override'],['Arbiter timeout (seconds)','仲裁器超时（秒）','仲裁器逾時（秒）','アービタータイムアウト（秒）','Arbiter timeout (seconds)'],['Arbiter max tokens','仲裁器最大 Token','仲裁器最大 Token','アービター最大 Token','Arbiter max tokens'],['Arbiter temperature','仲裁器温度','仲裁器溫度','アービター温度','Arbiter temperature'],['Agent execution mode','Agent 执行模式','Agent 執行模式','Agent 実行モード','Agent execution mode'],['Max output tokens','最大输出 Token','最大輸出 Token','最大出力 Token','Max output tokens'],['Global concurrent tasks','全局并发任务数','全域並行任務數','グローバル同時タスク数','Global concurrent tasks'],['Concurrent tasks per user','每用户并发任务数','每位使用者並行任務數','ユーザーごとの同時タスク数','Concurrent tasks per user'],['Use filenames as RAG entities','将文件名用作 RAG 实体','將檔名用作 RAG 實體','ファイル名を RAG エンティティとして使用','Use filenames as RAG entities']
 ];
 const adminDynamicRow=(source,ja,en,cn=source,tw=cn)=>[source,cn,tw,ja,en];
@@ -110809,6 +114612,8 @@ class UserMemoryStore:
                 system=system_prompt,
                 max_tokens=400,
                 think=False,
+                priority="app",
+                label="preference_distill",
             )
             raw = str((rsp or {}).get("content", "") or "").strip()
         except Exception:
@@ -112233,6 +116038,8 @@ class RAGIngestionService:
                 think=False,
                 stream_thinking=False,
                 media_inputs=selected,
+                priority="app",
+                label="rag_multimodal",
             )
             payload = parse_json_object(str(rsp.get("content", "") or ""), {})
             summary = trim(str(payload.get("summary", "") or rsp.get("content", "") or ""), 2400)
@@ -114097,10 +117904,27 @@ function renderStats(){
     ['Tasks',S.tasks?.length||0,'async import queue'],
     ['Communities',Object.keys(stats.communities||{}).length||0,'graph communities'],
   ];
-  E('statsGrid').innerHTML=cards.map(([label,val,meta])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(val)}</div><div class="stat-meta">${esc(meta)}</div></div>`).join('');
+  const conc=sessionLlmConcurrencyCard();
+  E('statsGrid').innerHTML=cards.map(([label,val,meta])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(val)}</div><div class="stat-meta">${esc(meta)}</div></div>`).join('')+(conc?`<div class="stat-card" title="${esc(conc.tip)}"><div class="stat-label">Model Concurrency</div><div class="stat-value">${esc(conc.value)}</div><div class="stat-meta">${esc(conc.meta)}</div></div>`:'');
+}
+function sessionLlmConcurrencyCard(){
+  // In-session model request concurrency of the selected session, as of the
+  // last config refresh (this page has no event stream).
+  const sessions=Array.isArray(S.config?.sessions)?S.config.sessions:[];
+  const sid=selectedSession()||String(S.config?.default_session_id||'');
+  const row=sessions.find(s=>String(s?.id||'')===sid);
+  const c=(row&&typeof row.llm_concurrency==='object'&&row.llm_concurrency)?row.llm_concurrency:null;
+  if(!c||!(Number(c.limit)>0))return null;
+  const n=v=>Math.max(0,Math.round(Number(v)||0));
+  const meta=[`peak ${n(c.peak)}`,`queued ${n(c.queued)}`];
+  if(n(c.orphaned_in_flight)>0)meta.push(`orphaned ${n(c.orphaned_in_flight)}`);
+  const reqs=Array.isArray(c.requests)?c.requests.slice(0,16):[];
+  const tip=reqs.length?reqs.map(r=>{const flags=[r?.abandoned?'abandoned':'',r?.orphaned?'orphaned':''].filter(Boolean).join(', ');return `${String(r?.label||r?.priority||'model')}${r?.role?' · '+String(r.role):''} · ${n(r?.elapsed_seconds)}s${flags?' ('+flags+')':''}`}).join('\\n'):'No model requests in flight';
+  return {value:`${n(c.in_flight)}/${n(c.limit)}`,meta:`${meta.join(' · ')} · ${String(row.title||row.id||'')}`,tip};
 }
 function renderSessions(){
   const sel=E('sessionSelect'); if(!sel) return;
+  if(!sel._llmConcBound){sel._llmConcBound=true;sel.addEventListener('change',()=>renderStats())}
   const sessions=Array.isArray(S.config?.sessions)?S.config.sessions:[];
   const current=selectedSession()||String(S.config?.default_session_id||'');
   sel.innerHTML=`<option value="">(none)</option>`+sessions.map(s=>`<option value="${esc(s.id)}" ${String(s.id)===current?'selected':''}>${esc(s.title||s.id)} · ${esc(s.id)}</option>`).join('');
@@ -116959,7 +120783,7 @@ function resetAgentSessionUI(sessionId=''){if(S.agentEventRaf){cancelAnimationFr
 function namedAgentClipboardFile(file,index=0){if(!(file instanceof File))return null;if(String(file.name||'').trim())return file;const mime=String(file.type||'').toLowerCase(),ext=({'image/png':'png','image/jpeg':'jpg','image/webp':'webp','application/pdf':'pdf','text/plain':'txt','text/markdown':'md'}[mime]||mime.split('/').pop()||'bin').replace(/[^a-z0-9]+/g,'')||'bin';try{return new File([file],`clipboard_${Date.now()}_${index+1}.${ext}`,{type:file.type||'',lastModified:Date.now()})}catch{return file}}
 function agentClipboardFiles(event){const data=event?.clipboardData;if(!data)return[];const files=[],seen=new Set(),push=(raw,index)=>{const file=namedAgentClipboardFile(raw,index);if(!file)return;const key=`${file.name}:${file.type}:${file.size}`;if(seen.has(key))return;seen.add(key);files.push(file)};[...(data.files||[])].forEach(push);[...(data.items||[])].forEach((item,index)=>{if(item?.kind==='file')push(item.getAsFile?.(),index)});return files}
 async function uploadAgentAttachments(files){const list=[...(files||[])].map(namedAgentClipboardFile).filter(Boolean);if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
-async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);const actions=document.createElement('span');actions.className='agent-model-actions';const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
+async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);const actions=document.createElement('span');actions.className='agent-model-actions';const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
 async function compactAgentContext(button){if(S.agentState?.running)return toast('Stop the active run before compacting context.','warning');if(!confirm('Compact this session context now?'))return;button.disabled=true;button.textContent='...';try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/compact`,{method:'POST',body:'{}'});S.agentState=Object.assign({},S.agentState||{},out);E('menuPopup').classList.add('is-hidden');renderAgentContextHud(S.agentState);toast('Context compacted.','success');S.agentPollRequested=true;scheduleAgentPoll(80)}finally{button.disabled=false;button.textContent='Compact'}}
 async function applyAgentModel(selection,label){const popup=E('menuPopup');popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu','prompt-budget-menu');popup.style.transform='';popup.style.bottom='auto';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify({selection})});toast(out.queued?out.note||'Model switch queued.':`Model switched to ${label||selection}.`,out.queued?'warning':'success');scheduleAgentPoll(80)}
 async function showLlmConfigModal(){
@@ -117040,7 +120864,7 @@ function renderAgentState(state){
 const renderAgentStateBase=renderAgentState;
 renderAgentState=function(state){if(state.title)applyIdeSessionTitleEvent({session_id:S.activeSession,session_title:state.title,title_origin:state.title_origin,title_revision:state.title_revision,workspace_id:S.sessions.find(row=>String(row?.id||'')===String(S.activeSession||''))?.workspace_id});S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
 function scheduleAgentEventFrame(){if(S.agentEventRaf)return;const flush=()=>{S.agentEventRaf=0;if(S.agentFileRefresh.size)scheduleWorkspaceRefresh(120);S.agentPollRequested=true;scheduleAgentPoll(40)};if(document.hidden){S.agentEventRaf=setTimeout(flush,500)}else S.agentEventRaf=setTimeout(flush,120)}
-function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(data.session_title)applyIdeSessionTitleEvent(data,event);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello')scheduleAgentEventFrame()}
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(data.session_title)applyIdeSessionTitleEvent(data,event);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello'&&type!=='llm_concurrency')scheduleAgentEventFrame()}
 function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
 function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,seq=S.sessionSwitchSeq,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`),current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq&&S.agentEvents===source;S.agentEvents=source;source.onopen=()=>{if(!current())return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(!current())return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(!current())return source.close();S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
 function mergeAgentWindow(base,incoming,keyFn,limit){const map=new Map();for(const row of Array.isArray(base)?base:[]){const key=keyFn(row);if(key)map.set(key,row)}for(const row of Array.isArray(incoming)?incoming:[]){const key=keyFn(row);if(key)map.set(key,{...(map.get(key)||{}),...row})}return [...map.values()].sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)||Number(a.seq||0)-Number(b.seq||0)).slice(-limit)}
@@ -117197,6 +121021,34 @@ function bindUI(){
 function initIconFallback(){if(!document.fonts||typeof document.fonts.load!=='function')return;let settled=false;const timeout=setTimeout(()=>{settled=true},2500);document.fonts.load('12px codicon').then(fonts=>{if(settled||!fonts||!fonts.length)return;clearTimeout(timeout);document.body.classList.remove('icons-fallback')}).catch(()=>{})}
 function debounce(fn,delay){let timer;return(...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay)}}
 async function startWorkbench(){E('authGate').classList.add('is-hidden');E('ideShell').classList.remove('is-hidden');if(window.innerWidth<=820){S.primaryVisible=false;S.secondaryVisible=false;E('ideShell').classList.add('primary-hidden','secondary-hidden')}configureCommands();bindUI();setStatus('Loading sessions...');const libraryTask=Promise.all([initMonaco(),initTerminalLibrary()]),workbenchTask=api('/api/ide/v2/workbench/state').catch(error=>{logOutput(`State restore failed: ${error.message}`);return{ok:false,state:{}}});await refreshConfig({lite:true});const savedWorkbench=await workbenchTask,restoredSession=workbenchSessionFromState(savedWorkbench.state||{});if(restoredSession)S.activeSession=restoredSession;renderSessions();resetAgentSessionUI(S.activeSession);const bootSession=S.activeSession,bootSessionSeq=S.sessionSwitchSeq;updateStatusBar();updateAgentContext();connectAgentEvents();scheduleAgentPoll(40);if(S.collaborationMode){renderCollaborationSnapshot();connectCollaborationEvents();startCollaborationPresenceHeartbeat()}if(!S.capabilities.processes)toast(S.capabilities.process_denial_reason||'Process features are disabled for this connection.','warning',8000);setStatus(S.collaborationMode?'Collaboration ready':'Ready');libraryTask.then(()=>restoreWorkbenchState(savedWorkbench,{restoreSession:false,expectedSession:bootSession,expectedSeq:bootSessionSeq})).then(()=>{updateStatusBar();updateAgentContext()}).catch(error=>logOutput(`Workbench restore: ${error.message}`));scheduleIdeDeferredBootstrap();setTimeout(checkIdeKernelUpdateNotice,500)}
+function showAgentModelOptionSettings(option, anchor){const popup=E('menuPopup');if(!popup)return;const caps=option?.capabilities||{};const supports=option?.reasoning_supported===true||caps.reasoning_supported===true;popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${escapeHtml(option?.label||option?.model||'Model settings')}</strong><small>Runtime settings</small></div><label class="model-setting-row">Effort<select id="ideModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="ideModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="ideModelThinking" type="checkbox" ${option?.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="ideModelResponse" type="checkbox" ${option?.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="ideModelSettingsBack" class="agent-model-compact" type="button">Back</button><button id="ideModelSettingsSave" class="agent-model-config" type="button" title="Save model settings" aria-label="Save model settings"><span class="codicon codicon-save"></span></button></div>`;const rect=(anchor||E('agentModelBtn')).getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';const effort=E('ideModelEffort'),maxEffort=E('ideModelMaxEffort');if(effort)effort.value=String(option?.effort||'');if(maxEffort)maxEffort.value=String(option?.max_effort||'');E('ideModelSettingsBack').onclick=event=>{event.stopPropagation();showAgentModelMenu(anchor||E('agentModelBtn')).catch(showError)};E('ideModelSettingsSave').onclick=async event=>{event.stopPropagation();const payload={selection:option.selection,effort:String(effort?.value||''),max_effort:String(maxEffort?.value||''),thinking_stream:!!E('ideModelThinking')?.checked,response_stream:!!E('ideModelResponse')?.checked};try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify(payload)});S.agentModelCatalog=out;popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu');toast(out.queued?out.note||'Model settings queued.':'Model settings saved.','success');scheduleAgentPoll(80)}catch(error){showError(error.message||String(error))}}}
+showAgentModelMenu=(async function showAgentModelMenuWithSettings(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const summary=document.createElement('div');summary.className='agent-model-summary';summary.textContent=`${catalog.options?.length||0} models`;popup.appendChild(summary);for(const option of catalog.options||[]){const row=document.createElement('div');row.className='agent-model-option';const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label','Model settings');settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=event=>{event.stopPropagation();showAgentModelOptionSettings(option,anchor)};row.append(button,settings);popup.appendChild(row)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}});
+showAgentModelMenu=async function showAgentModelMenuWithSettingsAndActions(anchor){
+  const popup=E('menuPopup');
+  if(!popup||!anchor)return;
+  popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');
+  const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';
+  popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';
+  try{
+    const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;
+    popup.innerHTML='';
+    const summary=document.createElement('div');summary.className='agent-model-summary';
+    const context=document.createElement('span');context.className='agent-model-context';
+    const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';
+    const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);
+    const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);
+    const actions=document.createElement('span');actions.className='agent-model-actions';
+    const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};
+    const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);
+    const options=Array.isArray(catalog.options)?catalog.options:[];let visibleLimit=80;
+    const search=document.createElement('input');search.type='search';search.className='agent-model-search';search.placeholder='Search models';search.setAttribute('aria-label','Search models');search.autocomplete='off';popup.appendChild(search);
+    const list=document.createElement('div');list.className='agent-model-list';popup.appendChild(list);
+    const renderList=()=>{const query=String(search.value||'').trim().toLowerCase();const filtered=query?options.filter(option=>[option.label,option.model,option.provider,option.selection].join(' ').toLowerCase().includes(query)):options;list.innerHTML='';const shown=filtered.slice(0,visibleLimit);for(const option of shown){const row=document.createElement('div');row.className='agent-model-option';const button=document.createElement('button');button.type='button';button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label',`Model settings for ${option.label||option.model||option.selection}`);settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=event=>{event.stopPropagation();showAgentModelOptionSettings(option,anchor)};row.append(button,settings);list.appendChild(row)}if(!shown.length)list.innerHTML='<div class="agent-model-summary">No matching models.</div>';if(filtered.length>shown.length){const more=document.createElement('button');more.type='button';more.className='agent-model-more';more.textContent=`Show ${filtered.length-shown.length} more`;more.onclick=event=>{event.stopPropagation();visibleLimit+=80;renderList()};list.appendChild(more)}};
+    search.oninput=()=>{visibleLimit=80;renderList()};renderList();
+  }catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}
+};
+{const style=document.createElement('style');style.textContent='.agent-model-option{display:flex;align-items:center;gap:4px;min-width:0}.agent-model-option>button:first-child{flex:1;min-width:0}.model-setting-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;color:#ccc;font-size:11px}.model-setting-row select{min-width:140px;padding:3px 5px;border:1px solid #4f4f4f;background:#252525;color:#ddd}.model-setting-check{display:flex;align-items:center;gap:7px;padding:5px 10px;color:#ccc;font-size:11px}.model-setting-check input{accent-color:#3794ff}';document.head.appendChild(style)}
+{const style=document.createElement('style');style.textContent='.agent-model-search{display:block;width:calc(100% - 16px);margin:6px 8px;padding:5px 7px;border:1px solid #4f4f4f;border-radius:4px;background:#252525;color:#ddd;font-size:11px;box-sizing:border-box}.agent-model-search::placeholder{color:#888}.agent-model-list{min-height:0}.agent-model-more{width:100%;text-align:center;color:#9cdcfe!important}.agent-model-option .agent-model-config{flex:0 0 28px;width:28px;padding:4px!important}';document.head.appendChild(style)}
 window.addEventListener('pagehide',stopCollaborationPresenceHeartbeat);
 window.addEventListener('DOMContentLoaded',async()=>{initIconFallback();try{if(await authenticate())await startWorkbench()}catch(error){showError(error)}});
 """
@@ -119135,6 +122987,70 @@ ADMIN_SKILLS_REVIEW_JS = r'''const A={token:sessionStorage.getItem('cc_admin_tok
 
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.
+def _ide_toolchain_cache_key() -> tuple[str, str, str, str]:
+    """Return the portable environment inputs used by toolchain discovery."""
+    return (
+        str(sys.platform or ""),
+        str(os.environ.get("PATH", "") or ""),
+        str(os.environ.get("PATHEXT", "") or ""),
+        str(sys.executable or ""),
+    )
+
+
+def _probe_ide_toolchains() -> list[dict]:
+    """Probe local toolchains once without invoking a shell or scanning twice."""
+    specs = [
+        ("python3", ["python3", "python"], "Install Python from https://www.python.org/downloads/ or your OS package manager."),
+        ("node", ["node"], "Install Node.js LTS from https://nodejs.org/ or use your package manager."),
+        ("npm", ["npm"], "Install Node.js LTS; npm is included with standard Node.js installers."),
+        ("go", ["go"], "Install Go from https://go.dev/dl/."),
+        ("rust", ["rustc", "cargo"], "Install Rust with rustup from https://rustup.rs/."),
+        ("java", ["java", "javac"], "Install a JDK such as Temurin, Microsoft Build of OpenJDK, or Oracle JDK."),
+        ("c_cpp", ["clang", "gcc", "make"], "Install Xcode Command Line Tools, build-essential, MSYS2, or Visual Studio Build Tools."),
+        ("git", ["git"], "Install Git from https://git-scm.com/downloads."),
+    ]
+    rows: list[dict] = []
+    for name, commands, hint in specs:
+        found: dict[str, str] = {}
+        for command in commands:
+            path = shutil.which(command)
+            if path:
+                found[command] = path
+        rows.append(
+            {
+                "name": name,
+                "available": bool(found),
+                "required_commands": commands,
+                "found": found,
+                "install_hint": "" if found else hint,
+            }
+        )
+    try:
+        debugpy_spec = importlib.util.find_spec("debugpy")
+    except Exception:
+        debugpy_spec = None
+    rows.append(
+        {
+            "name": "python-debug",
+            "available": debugpy_spec is not None,
+            "required_commands": [],
+            "found": {"debugpy": str(getattr(debugpy_spec, "origin", "") or "installed")} if debugpy_spec else {},
+            "install_hint": "Optional: install debugpy for full IDE adapter support. The built-in pdb compatibility debugger remains available without it.",
+        }
+    )
+    return rows
+
+
+def _refresh_ide_toolchains_in_background(cache_key: tuple[str, str, str, str]) -> None:
+    try:
+        rows = _probe_ide_toolchains()
+        with _IDE_TOOLCHAIN_CACHE_LOCK:
+            _IDE_TOOLCHAIN_CACHE[cache_key] = (time.monotonic(), rows)
+    finally:
+        with _IDE_TOOLCHAIN_CACHE_LOCK:
+            _IDE_TOOLCHAIN_REFRESHING.discard(cache_key)
+
+
 class AppContext:
     def _llm_config_revision(self, config: dict | None) -> str:
         try:
@@ -119550,6 +123466,7 @@ class AppContext:
         shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
         shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         liquid_kernel_startup_policy: str = "inherit",
+        session_llm_concurrency: int | None = None,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -119593,6 +123510,7 @@ class AppContext:
             fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        self.session_llm_concurrency = normalize_session_llm_concurrency(session_llm_concurrency)
         # The AppContext loads its base config below.  Keep an explicit
         # constructor value authoritative, and resolve the file value only
         # after ``self.default_llm_config`` exists.
@@ -122735,43 +126653,33 @@ document.addEventListener('DOMContentLoaded', function(){{
         }
 
     def ide_toolchains(self) -> list[dict]:
-        specs = [
-            ("python3", ["python3", "python"], "Install Python from https://www.python.org/downloads/ or your OS package manager."),
-            ("node", ["node"], "Install Node.js LTS from https://nodejs.org/ or use your package manager."),
-            ("npm", ["npm"], "Install Node.js LTS; npm is included with standard Node.js installers."),
-            ("go", ["go"], "Install Go from https://go.dev/dl/."),
-            ("rust", ["rustc", "cargo"], "Install Rust with rustup from https://rustup.rs/."),
-            ("java", ["java", "javac"], "Install a JDK such as Temurin, Microsoft Build of OpenJDK, or Oracle JDK."),
-            ("c_cpp", ["clang", "gcc", "make"], "Install Xcode Command Line Tools, build-essential, MSYS2, or Visual Studio Build Tools."),
-            ("git", ["git"], "Install Git from https://git-scm.com/downloads."),
-        ]
-        rows: list[dict] = []
-        for name, commands, hint in specs:
-            found: dict[str, str] = {}
-            for command in commands:
-                path = shutil.which(command)
-                if path:
-                    found[command] = path
-            rows.append(
-                {
-                    "name": name,
-                    "available": bool(found),
-                    "required_commands": commands,
-                    "found": found,
-                    "install_hint": "" if found else hint,
-                }
-            )
-        debugpy_spec = importlib.util.find_spec("debugpy")
-        rows.append(
-            {
-                "name": "python-debug",
-                "available": debugpy_spec is not None,
-                "required_commands": [],
-                "found": {"debugpy": str(getattr(debugpy_spec, "origin", "") or "installed")} if debugpy_spec else {},
-                "install_hint": "Optional: install debugpy for full IDE adapter support. The built-in pdb compatibility debugger remains available without it.",
-            }
-        )
-        return rows
+        cache_key = _ide_toolchain_cache_key()
+        now = time.monotonic()
+        with _IDE_TOOLCHAIN_CACHE_LOCK:
+            cached = _IDE_TOOLCHAIN_CACHE.get(cache_key)
+            if cached is not None:
+                cached_at, rows = cached
+                if now - cached_at < IDE_TOOLCHAIN_CACHE_TTL_SECONDS:
+                    return copy.deepcopy(rows)
+                if cache_key not in _IDE_TOOLCHAIN_REFRESHING:
+                    _IDE_TOOLCHAIN_REFRESHING.add(cache_key)
+                    threading.Thread(
+                        target=_refresh_ide_toolchains_in_background,
+                        args=(cache_key,),
+                        name="ide-toolchain-refresh",
+                        daemon=True,
+                    ).start()
+                # Stale data is preferable to blocking the IDE config request
+                # on PATH scans. The next request observes the refreshed copy.
+                return copy.deepcopy(rows)
+
+        # There is no usable first result yet. Probe once so the initial IDE
+        # view remains truthful; all subsequent requests are served from the
+        # cross-session cache or refreshed asynchronously after expiry.
+        rows = _probe_ide_toolchains()
+        with _IDE_TOOLCHAIN_CACHE_LOCK:
+            _IDE_TOOLCHAIN_CACHE[cache_key] = (time.monotonic(), rows)
+        return copy.deepcopy(rows)
 
     def _ide_state_path(self, user_id: str) -> Path:
         uid = str(user_id or "")
@@ -125607,6 +129515,16 @@ document.addEventListener('DOMContentLoaded', function(){{
             return None
         return max(sessions, key=lambda s: float(getattr(s, "updated_at", 0.0) or 0.0))
 
+    @staticmethod
+    def _session_row_llm_concurrency(session: object) -> dict:
+        """Live in-session model concurrency for library admin session rows."""
+        if not isinstance(session, SessionState):
+            return {}
+        try:
+            return session._llm_concurrency_snapshot()
+        except Exception:
+            return {}
+
     def _resolve_session_for_user(self, user_id: str, session_id: str = "") -> SessionState | None:
         sid = str(session_id or "").strip()
         mgr = self.manager_for_user(user_id)
@@ -125704,6 +129622,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "id": s.id,
                         "title": s.title,
                         "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                        "llm_concurrency": self._session_row_llm_concurrency(s),
                     }
                     for s in mgr.sessions.values()
                 ),
@@ -126278,6 +130197,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                     temperature=0.0,
                     think=False,
                     stream_thinking=False,
+                    priority="app",
+                    label="rag_evaluate",
                 )
                 parsed = self._rag_parse_evaluation((response or {}).get("content", ""), batch)
                 if not parsed.get("evaluations"):
@@ -126299,7 +130220,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         if isinstance(session, SessionState) and hasattr(getattr(session, "ollama", None), "chat") and evaluations:
             prompt = "Synthesize only from these independent evidence evaluations. Do not use conversation history or outside knowledge. Cite exact citations. Return JSON with answer, answerability, uncertainties.\n\n" + json_dumps({"query": query, "evaluations": evaluations}, indent=2)
             try:
-                response = session.ollama.chat([{"role": "user", "content": prompt}], system="/no_think\nYou are a stateless grounded answer synthesizer.", max_tokens=1200, temperature=0.0, think=False, stream_thinking=False)
+                response = session.ollama.chat([{"role": "user", "content": prompt}], system="/no_think\nYou are a stateless grounded answer synthesizer.", max_tokens=1200, temperature=0.0, think=False, stream_thinking=False, priority="app", label="rag_synthesize")
                 raw = str((response or {}).get("content", "") or "").strip()
                 try:
                     parsed_answer = json.loads(raw)
@@ -126368,6 +130289,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 temperature=0.0,
                 think=False,
                 stream_thinking=False,
+                priority="app",
+                label="rag_synthesize",
             )
             return trim(str(rsp.get("content", "") or ""), 6000)
         except Exception:
@@ -126426,6 +130349,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                     system=system_prompt,
                     max_tokens=120,
                     think=False,
+                    priority="app",
+                    label="rag_translate",
                 )
                 translated = str((rsp or {}).get("content", "") or "").strip()
             except Exception:
@@ -126781,6 +130706,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "id": s.id,
                         "title": s.title,
                         "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                        "llm_concurrency": self._session_row_llm_concurrency(s),
                     }
                     for s in mgr.sessions.values()
                 ),
@@ -128544,6 +132470,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 kernel_registry=self.liquid_kernel.registry,
                 kernel_runtime=self.liquid_kernel.runtime,
                 skills_snapshot=self.skills_store,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
             )
             mgr.read_context_policy = normalize_read_context_policy(
                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -128553,6 +132482,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             )
             mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            )
+            mgr.session_llm_concurrency = normalize_session_llm_concurrency(
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
             )
             mgr.single_no_plan_todo_enabled = bool(
                 getattr(self, "single_no_plan_todo_enabled", False)
@@ -128600,6 +132532,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "read_context_policy": normalize_read_context_policy(source.read_context_policy),
                 "tool_memory_policy": normalize_tool_memory_policy(source.tool_memory_policy),
                 "auto_task_level_ceiling": normalize_auto_task_level_ceiling(source.auto_task_level_ceiling),
+                "session_llm_concurrency": normalize_session_llm_concurrency(
+                    getattr(source, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 "l2_todo_policy": normalize_l2_todo_policy(source.l2_todo_policy),
                 "single_no_plan_todo_enabled": bool(source.single_no_plan_todo_enabled),
                 "single_no_plan_todo_prompt": str(source.single_no_plan_todo_prompt or ""),
@@ -128898,6 +132833,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 collaboration_context=public_context,
                 collaboration_context_provider=lambda p=principal: self.collaboration.snapshot(p),
                 collaboration_write_coordinator=coordinator,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
             )
             mgr.read_context_policy = normalize_read_context_policy(
                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -129053,6 +132991,9 @@ document.addEventListener('DOMContentLoaded', function(){{
         cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+        cfg_session_llm_concurrency = extract_session_llm_concurrency_setting(cfg)
+        if cfg_session_llm_concurrency is not None:
+            self.session_llm_concurrency = normalize_session_llm_concurrency(cfg_session_llm_concurrency)
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
         if cfg_l2_todo_policy is not None:
             self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
@@ -129110,6 +133051,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                     getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                 )
+                mgr.session_llm_concurrency = normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                )
                 mgr.l2_todo_policy = normalize_l2_todo_policy(
                     getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
                 )
@@ -129132,6 +133076,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                     )
                     sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    )
+                    # Live admin change: resize the running session's gate too.
+                    set_session_llm_concurrency_on_runtime(
+                        sess,
+                        getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
                     )
                     sess.l2_todo_policy = normalize_l2_todo_policy(
                         getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
@@ -130282,6 +134231,10 @@ class TelemetryStore:
         tool_duration = [float(x["duration_ms"]) for x in tool_call_rows if x.get("duration_ms") is not None]
         models = aggregate_dimension(db_rows, "model", "llm_call")
         tools = aggregate_dimension(db_rows, "name", "tool_call")
+        # llm_call rows are named by their source (main, semantic_enrichment,
+        # arbiter, ...; older rows say "chat").  This is a breakdown only: the
+        # llm totals above count every llm_call row whatever its name.
+        llm_sources = aggregate_dimension(db_rows, "name", "llm_call")
 
         users_map: dict[str, list[dict]] = {}
         apps_map: dict[str, list[dict]] = {}
@@ -130416,7 +134369,7 @@ class TelemetryStore:
                 "usage_covered_calls": covered_calls, "llm_calls": len(llm_rows),
                 "coverage_rate": covered_calls / len(llm_rows) if llm_rows else 0.0,
             },
-            "series": series, "tools": tools, "models": models, "apps": apps, "users": users,
+            "series": series, "tools": tools, "models": models, "llm_sources": llm_sources, "apps": apps, "users": users,
             "statuses": [{"kind": kind, "status": status, "count": count} for (kind, status), count in sorted(statuses.items())],
             "coverage": {
                 "user_identified_events": sum(1 for x in db_rows if x.get("user_hash")) / total_events if total_events else 0.0,
@@ -131771,6 +135724,9 @@ class Handler(BaseHTTPRequestHandler):
                         "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                             getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                         ),
+                        "session_llm_concurrency": normalize_session_llm_concurrency(
+                            getattr(mgr, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                        ),
                         "user_memory_mode": normalize_user_memory_mode(
                             getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
                         ),
@@ -131846,6 +135802,9 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                         getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    ),
+                    "session_llm_concurrency": normalize_session_llm_concurrency(
+                        getattr(mgr, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
                     ),
                     "user_memory_mode": normalize_user_memory_mode(
                         getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
@@ -133509,6 +137468,13 @@ class SkillsHandler(BaseHTTPRequestHandler):
                             mgr,
                             "auto_task_level_ceiling",
                             DEFAULT_AUTO_TASK_LEVEL_CEILING,
+                        )
+                    ),
+                    "session_llm_concurrency": normalize_session_llm_concurrency(
+                        getattr(
+                            mgr,
+                            "session_llm_concurrency",
+                            DEFAULT_SESSION_LLM_CONCURRENCY,
                         )
                     ),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
@@ -137322,7 +141288,7 @@ def main():
             "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout, "
             "shell_timeout_mode, shell_async_handoff_seconds, "
             "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling, "
-            "l2_todo_policy (force|auto|off) and "
+            "session_llm_concurrency, l2_todo_policy (force|auto|off) and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
             "max_daily_sessions_per_ip / session_daily_limit; shell aliases: "
             "shell_timeout / bash_timeout / command_timeout)."
@@ -137405,6 +141371,20 @@ def main():
             "Manual task-level overrides and manual plan-mode preference are not capped. "
             "Also configurable via config keys auto_task_level_ceiling/task_level_ceiling/"
             "max_auto_task_level/complexity_ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--session-llm-concurrency",
+        "--session_llm_concurrency",
+        dest="session_llm_concurrency",
+        default=None,
+        type=int,
+        help=(
+            "Maximum model requests one session may have in flight at once "
+            f"({SESSION_LLM_CONCURRENCY_MIN}-{SESSION_LLM_CONCURRENCY_MAX}, default "
+            f"{DEFAULT_SESSION_LLM_CONCURRENCY}; env AGENT_SESSION_LLM_CONCURRENCY sets the default). "
+            "Applies inside each session only; other sessions and users are not limited by it. "
+            "Also configurable via config keys session_llm_concurrency/llm_concurrency_per_session."
         ),
     )
     parser.add_argument(
@@ -137627,6 +141607,7 @@ def main():
     resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
+    resolved_session_llm_concurrency = DEFAULT_SESSION_LLM_CONCURRENCY
     resolved_l2_todo_policy = DEFAULT_L2_TODO_POLICY
     resolved_single_no_plan_todo_enabled = False
     resolved_single_no_plan_todo_prompt = ""
@@ -137689,6 +141670,9 @@ def main():
             external_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(external_config)
             if external_auto_task_level_ceiling is not None:
                 resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(external_auto_task_level_ceiling)
+            external_session_llm_concurrency = extract_session_llm_concurrency_setting(external_config)
+            if external_session_llm_concurrency is not None:
+                resolved_session_llm_concurrency = normalize_session_llm_concurrency(external_session_llm_concurrency)
             external_l2_todo_policy = extract_l2_todo_policy_setting(external_config)
             if external_l2_todo_policy is not None:
                 resolved_l2_todo_policy = normalize_l2_todo_policy(external_l2_todo_policy)
@@ -137745,6 +141729,9 @@ def main():
     web_ui_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(web_ui_config)
     if web_ui_auto_task_level_ceiling is not None:
         resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(web_ui_auto_task_level_ceiling)
+    web_ui_session_llm_concurrency = extract_session_llm_concurrency_setting(web_ui_config)
+    if web_ui_session_llm_concurrency is not None:
+        resolved_session_llm_concurrency = normalize_session_llm_concurrency(web_ui_session_llm_concurrency)
     web_ui_l2_todo_policy = extract_l2_todo_policy_setting(web_ui_config)
     if web_ui_l2_todo_policy is not None:
         resolved_l2_todo_policy = normalize_l2_todo_policy(web_ui_l2_todo_policy)
@@ -137810,6 +141797,10 @@ def main():
             getattr(args, "auto_task_level_ceiling", "")
         )
     resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(resolved_auto_task_level_ceiling)
+    cli_session_llm_concurrency = getattr(args, "session_llm_concurrency", None)
+    if cli_session_llm_concurrency is not None and str(cli_session_llm_concurrency).strip():
+        resolved_session_llm_concurrency = normalize_session_llm_concurrency(cli_session_llm_concurrency)
+    resolved_session_llm_concurrency = normalize_session_llm_concurrency(resolved_session_llm_concurrency)
     cli_l2_todo_policy = str(getattr(args, "l2_todo_policy", "") or "").strip()
     if cli_l2_todo_policy:
         resolved_l2_todo_policy = normalize_l2_todo_policy(cli_l2_todo_policy)
@@ -137960,6 +141951,10 @@ def main():
         + ". To allow more complex automatic plans, start with "
         "--auto-task-level-ceiling 3, 4, or 5; use --auto-task-level-ceiling 0 to remove the cap. "
         "Manual Level and Plan settings are never capped."
+    )
+    print(
+        f"[web-agent] session_llm_concurrency={int(resolved_session_llm_concurrency)} "
+        "(model requests in flight per session; other sessions are not affected)"
     )
     requested_live_input_delay_write = int(args.live_input_delay_write if args.live_input_delay_write is not None else LIVE_INPUT_DELAY_WRITE_ROUNDS)
     resolved_live_input_delay_write = max(0, min(20, requested_live_input_delay_write))
@@ -138190,6 +142185,7 @@ def main():
         web_search_enabled=resolved_web_search_enabled,
         shell_timeout_mode=resolved_shell_timeout_mode,
         shell_async_handoff_seconds=resolved_shell_async_handoff_seconds,
+        session_llm_concurrency=resolved_session_llm_concurrency,
         web_search_setting_locked=web_search_setting_locked,
         user_memory_mode=resolved_user_memory_mode,
         user_memory_setting_locked=user_memory_setting_locked,
@@ -138236,6 +142232,7 @@ def main():
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    app.session_llm_concurrency = resolved_session_llm_concurrency
     if _l2_todo_cli_explicit or _l2_todo_admin_explicit:
         app.l2_todo_policy = normalize_l2_todo_policy(resolved_l2_todo_policy)
     app.web_search_enabled = bool(resolved_web_search_enabled)
@@ -138260,6 +142257,7 @@ def main():
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    app.session_llm_concurrency = resolved_session_llm_concurrency
     if bool(web_search_setting_locked):
         app.web_search_enabled = bool(resolved_web_search_enabled)
     app.web_search_setting_locked = bool(web_search_setting_locked)
@@ -138276,6 +142274,7 @@ def main():
         _mgr.read_context_policy = resolved_read_context_policy
         _mgr.tool_memory_policy = resolved_tool_memory_policy
         _mgr.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+        _mgr.session_llm_concurrency = resolved_session_llm_concurrency
         _mgr.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
         _mgr.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
         _mgr.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
@@ -138290,6 +142289,7 @@ def main():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
             _sess.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+            set_session_llm_concurrency_on_runtime(_sess, resolved_session_llm_concurrency)
             _sess.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
             _sess.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
             _sess.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
@@ -138364,6 +142364,7 @@ def main():
         "tool_memory_policy": str(resolved_tool_memory_policy),
         "user_memory_mode": str(resolved_user_memory_mode),
         "auto_task_level_ceiling": int(resolved_auto_task_level_ceiling),
+        "session_llm_concurrency": int(resolved_session_llm_concurrency),
         "l2_todo_policy": normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy)),
         "single_no_plan_todo_enabled": bool(resolved_single_no_plan_todo_enabled),
         "single_no_plan_todo_prompt": str(resolved_single_no_plan_todo_prompt or ""),
@@ -138743,6 +142744,10 @@ def main():
         + ". To allow more complex automatic plans, start with "
         "--auto-task-level-ceiling 3, 4, or 5; use --auto-task-level-ceiling 0 to remove the cap. "
         "Manual Level and Plan settings are never capped."
+    )
+    print(
+        f"[web-agent] session_llm_concurrency={int(resolved_session_llm_concurrency)} "
+        "(model requests in flight per session; other sessions are not affected)"
     )
     print(f"[web-agent] max_rounds={resolved_max_rounds}")
     print(
