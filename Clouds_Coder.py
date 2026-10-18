@@ -4646,6 +4646,23 @@ READ_FILE_LOOP_THRESHOLD = 6
 READ_FILE_LOOP_DISTINCT_SOFT_LIMIT = 5
 READ_FILE_COMPACT_PIN_DISTINCT = 8
 READ_FILE_COMPACT_PIN_MAX_CHARS = 12_000
+# Total characters of recent distinct read_file results kept intact by
+# microcompact, per context tier (0 = no pressure ... 3 = heavy pressure).
+READ_FILE_PIN_TOTAL_CHARS = (60_000, 30_000, 12_000, 4_000)
+# Per-thread dispatch context for read bookkeeping. Teammate and subagent
+# threads dispatch tools concurrently with the main loop, so the current
+# tool_call_id and read role must not be shared instance attributes.
+_READ_DISPATCH_CONTEXT = threading.local()
+# Content that replaced a tool result during compaction. A message that starts
+# with one of these no longer carries the original body.
+READ_RESULT_PLACEHOLDER_PREFIXES = (
+    "[read_file cached",
+    "[tool_memory cached",
+    "[cleared by microcompact",
+    "[Previous:",
+    "[file_buffer:",
+    "[tool output",
+)
 READ_CONTEXT_REGISTRY_MAX = 80
 READ_CONTEXT_PROMPT_MAX_ITEMS = 14
 READ_CONTEXT_PROMPT_MAX_CHARS = 5_000
@@ -4774,6 +4791,25 @@ LONG_CONTENT_DATA_EXTS = {
     ".xsd", ".xsl",
 }
 DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
+# In-session model request concurrency: how many model HTTP requests one
+# session may have in flight at once (main loop, sub-agents, teammates and
+# auxiliary background calls share the budget).  Sessions never share a gate;
+# max_user / max_user_sessions and the session scheduler are unaffected.
+SESSION_LLM_CONCURRENCY_MIN = 1
+SESSION_LLM_CONCURRENCY_MAX = 16
+SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT = 2
+
+
+def _session_llm_concurrency_env_default() -> int:
+    raw = str(os.getenv("AGENT_SESSION_LLM_CONCURRENCY", "") or "").strip()
+    try:
+        value = int(float(raw)) if raw else SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT
+    except Exception:
+        value = SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT
+    return max(SESSION_LLM_CONCURRENCY_MIN, min(SESSION_LLM_CONCURRENCY_MAX, value))
+
+
+DEFAULT_SESSION_LLM_CONCURRENCY = _session_llm_concurrency_env_default()
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 # Normal debugging often needs several corrected tool attempts before any
 # observable state changes. Keep this separate from the fused fault/error caps.
@@ -4933,6 +4969,11 @@ _TOOL_TIMEOUT_MAP = {
     "compress": 30,
 }
 _DEFAULT_TOOL_TIMEOUT = 90
+# Cooperative cancel flag for a timed tool's pool thread (see
+# SessionState._run_tool_with_cancel_event) and the lock guarding the
+# per-session orphan-thread counters.
+_TOOL_CANCEL_LOCAL = threading.local()
+_TOOL_ORPHAN_LOCK = threading.Lock()
 CONVERSATION_VISIBLE_TOOL_EVENTS = {
     "agent_web_search",
     "query_code_library",
@@ -5075,6 +5116,7 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<fault-prefill>",
     "<single-no-plan-todo-bootstrap>",
     "<single-no-plan-todo-bootstrap-retry>",
+    "<read-context-strategy>",
 )
 # These blocks are runtime plumbing rather than user-visible conversation.  Keep
 # user-facing structured controls such as live-user-adjustment and
@@ -5321,6 +5363,12 @@ SKILL_AUTOLOAD_SCORE_THRESHOLD = 8.0
 SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD = 0.72
 SKILL_RUNTIME_EVALUATION_TTL_SECONDS = max(1.0, float(os.getenv("AGENT_SKILL_EVALUATION_TTL_SECONDS", "600")))
 SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS = max(0.1, float(os.getenv("AGENT_SKILL_EVALUATION_TIMEOUT_SECONDS", "8")))
+# Socket timeout for the advisory completed-subtask acceptance check.  It runs
+# synchronously on the agent thread, so the socket timeout is its only bound.
+ACCEPTANCE_VERIFY_TIMEOUT_SECONDS = max(
+    2.0,
+    min(60.0, float(str(os.getenv("AGENT_ACCEPTANCE_VERIFY_TIMEOUT_SECONDS", "15") or "15"))),
+)
 SKILL_RUNTIME_UNLOAD_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, float(os.getenv("AGENT_SKILL_UNLOAD_CONFIDENCE", "0.80"))))
 SKILL_RUNTIME_KEY_TOOL_INTERVAL = 12
 SKILL_RUNTIME_EVENTS_MAX = 160
@@ -7569,6 +7617,50 @@ def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
         for key in keys:
             if key in section:
                 return normalize_auto_task_level_ceiling(section.get(key))
+    return None
+
+
+def normalize_session_llm_concurrency(value: object, default: int = DEFAULT_SESSION_LLM_CONCURRENCY) -> int:
+    """Normalize the in-session model request concurrency to 1-16.
+
+    Missing or unparsable values use ``default``; numeric values outside the
+    range are clamped rather than rejected so a typo cannot disable the gate.
+    """
+    try:
+        fallback = int(default)
+    except Exception:
+        fallback = SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT
+    fallback = max(SESSION_LLM_CONCURRENCY_MIN, min(SESSION_LLM_CONCURRENCY_MAX, fallback))
+    try:
+        if value is None or isinstance(value, bool):
+            raw = fallback
+        else:
+            text = str(value).strip()
+            raw = int(float(text)) if text else fallback
+    except Exception:
+        raw = fallback
+    return max(SESSION_LLM_CONCURRENCY_MIN, min(SESSION_LLM_CONCURRENCY_MAX, int(raw)))
+
+
+def extract_session_llm_concurrency_setting(raw: object) -> int | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = (
+        "session_llm_concurrency",
+        "sessionLlmConcurrency",
+        "llm_concurrency_per_session",
+        "llmConcurrencyPerSession",
+    )
+    for key in keys:
+        if key in raw:
+            return normalize_session_llm_concurrency(raw.get(key))
+    for section_key in ("startup", "runtime", "classification", "manager", "agent", "limits"):
+        section = raw.get(section_key)
+        if not isinstance(section, dict):
+            continue
+        for key in keys:
+            if key in section:
+                return normalize_session_llm_concurrency(section.get(key))
     return None
 
 
@@ -11855,15 +11947,58 @@ def _map_todo_status_token(token: str) -> str:
     }.get(raw, "")
 
 
+# Short display ids ("t3") let the model address an existing Todo row.
+# TodoManager assigns them in first-appearance order and render() prints them
+# as "[ ] (t3) content"; the parsers strip a leading "(tN)" tag again and
+# return it as an id hint, so an echoed row updates its original instead of
+# becoming a new row whose text is "(t3) ...".
+_TODO_SHORT_ID_RE = re.compile(r"^t([1-9][0-9]{0,4})$", re.IGNORECASE)
+_TODO_SHORT_ID_TAG_RE = re.compile(r"^[(（]\s*(t[1-9][0-9]{0,4})\s*[)）]\s*", re.IGNORECASE)
+
+
+def normalize_todo_short_id(value: object) -> str:
+    """Return the canonical short id ("t3") or "" when value is not one."""
+    match = _TODO_SHORT_ID_RE.match(str(value or "").strip())
+    return f"t{int(match.group(1))}" if match else ""
+
+
+def strip_todo_short_id_tag(text: object) -> tuple[str, str]:
+    """Split a leading "(tN)" display tag off Todo text: (short_id, rest)."""
+    raw = str(text or "")
+    match = _TODO_SHORT_ID_TAG_RE.match(raw.lstrip())
+    if not match:
+        return "", raw
+    return normalize_todo_short_id(match.group(1)), raw.lstrip()[match.end():]
+
+
 def split_todo_status_text(text: object) -> tuple[str, str]:
+    status, content, _short_id = split_todo_status_text_with_id(text)
+    return status, content
+
+
+def split_todo_status_text_with_id(text: object) -> tuple[str, str, str]:
+    """Like split_todo_status_text, also returning a stripped "(tN)" id hint."""
     probe = normalize_embedded_newlines(text).strip()
     if not probe:
-        return "", ""
+        return "", "", ""
     status = ""
+    short_id = ""
     marker_prefix = r"(?:[-*•>]+\s*)?"
     for _ in range(4):
         before = probe
         probe = re.sub(r"^\s+", "", probe)
+        tag_id, tagged_rest = strip_todo_short_id_tag(re.sub(rf"^{marker_prefix}", "", probe))
+        if tag_id:
+            short_id = short_id or tag_id
+            probe = tagged_rest.strip()
+            continue
+        if short_id:
+            # Canonical tool results also show the opaque id after (tN).
+            # That metadata is not part of the editable task description.
+            canonical_tag = re.match(r"^id=(?:rt:|pst:)\S+\s*", probe)
+            if canonical_tag:
+                probe = probe[canonical_tag.end():].strip()
+                continue
         matched = False
         for row_status, pattern in (
             (
@@ -11912,7 +12047,7 @@ def split_todo_status_text(text: object) -> tuple[str, str]:
             continue
         if probe == before:
             break
-    return status, probe.strip()
+    return status, probe.strip(), short_id
 
 
 def extract_todo_rows_from_text(
@@ -11944,7 +12079,18 @@ def extract_todo_rows_from_text(
                 variants.append(candidate)
         matched = False
         for candidate in variants:
-            status, content = split_todo_status_text(candidate)
+            status, content, short_id = split_todo_status_text_with_id(candidate)
+            if status and short_id and not content:
+                # "[x] (t3)": an id-only status line for an existing row.
+                row = {"content": "", "status": status, "short_id": short_id}
+                if parent_step_id:
+                    row["parent_step_id"] = parent_step_id
+                identity = (status, f"id:{short_id}", parent_step_id)
+                if identity not in seen:
+                    seen.add(identity)
+                    out.append(row)
+                matched = True
+                break
             if not status or not content:
                 continue
             cleaned = normalize_work_text(content, status) or content
@@ -11966,6 +12112,8 @@ def extract_todo_rows_from_text(
             }:
                 continue
             row = {"content": cleaned, "status": status}
+            if short_id:
+                row["short_id"] = short_id
             if parent_step_id:
                 row["parent_step_id"] = parent_step_id
             identity = (
@@ -16137,6 +16285,7 @@ def _admin_config_schema() -> list[dict]:
         row("web_search_enabled", "runtime", "Web search", "tri_state", "inherit", true_flag="--enable-web-search", false_flag="--disable-web-search", choices=["inherit", "enabled", "disabled"]),
         row("user_memory_mode", "runtime", "User memory mode", "enum", "weak", "--user-memory", choices=["off", "weak", "on"]),
         row("auto_task_level_ceiling", "runtime", "Auto task level ceiling", "integer", DEFAULT_AUTO_TASK_LEVEL_CEILING, "--auto_task_level_ceiling", minimum=0, maximum=5),
+        row("session_llm_concurrency", "runtime", "In-session model request concurrency", "integer", DEFAULT_SESSION_LLM_CONCURRENCY, "--session-llm-concurrency", minimum=SESSION_LLM_CONCURRENCY_MIN, maximum=SESSION_LLM_CONCURRENCY_MAX),
         row(
             "l2_todo_policy",
             "runtime",
@@ -17536,6 +17685,9 @@ class TodoManager:
             ):
                 if meta_key in raw and raw.get(meta_key) not in (None, ""):
                     row[meta_key] = raw.get(meta_key)
+            short_id = normalize_todo_short_id(raw.get("short_id", ""))
+            if short_id:
+                row["short_id"] = short_id
             if status == "completed" and not row.get("completed_at"):
                 row["completed_at"] = float(now_ts())
             if status == "in_progress" and not row.get("started_at"):
@@ -17545,21 +17697,83 @@ class TodoManager:
             validated.append(row)
         if len(validated) > 40:
             raise ValueError("max 40 todos")
+        self._assign_short_ids(validated)
         if validated and not any(x["status"] == "in_progress" for x in validated):
             for row in validated:
                 if row["status"] == "pending":
                     row["status"] = "in_progress"
-                    row["activeForm"] = row.get("activeForm") or self._default_active_form(
+                    row["activeForm"] = self._default_active_form(
                         "in_progress",
                         row["content"],
                         owner=row.get("owner", ""),
                     )
+                    row.setdefault("started_at", float(now_ts()))
                     break
         with self.lock:
             if self.items == validated:
                 return self.no_changes_text()
             self.items = validated
         return self.render()
+
+    def _assign_short_ids(self, rows: list[dict]) -> None:
+        """Give every row a stable display id ("t3") the model can echo back.
+
+        Rows keep the id the merge path carried over. New rows take the next
+        number above any id seen so far, so a number is never reused while the
+        tree exists and an old reference can't silently land on another row.
+        """
+        with self.lock:
+            highest = int(getattr(self, "_short_id_high_water", 0) or 0)
+            current = list(self.items)
+        # Merge paths sometimes rebuild a row instead of copying the prior dict;
+        # inherit the id from the same row identity so the number stays put.
+        inherited: dict[tuple, str] = {}
+        for row in current:
+            sid = normalize_todo_short_id(row.get("short_id", ""))
+            if not sid:
+                continue
+            for ident in self._short_id_identities(row):
+                inherited.setdefault(ident, sid)
+        for row in current + rows:
+            sid = normalize_todo_short_id(row.get("short_id", ""))
+            if sid:
+                highest = max(highest, int(sid[1:]))
+        taken: set[str] = set()
+        for row in rows:
+            sid = normalize_todo_short_id(row.get("short_id", ""))
+            if not sid:
+                for ident in self._short_id_identities(row):
+                    candidate = inherited.get(ident, "")
+                    if candidate and candidate not in taken:
+                        sid = candidate
+                        break
+            if sid and sid not in taken:
+                row["short_id"] = sid
+                taken.add(sid)
+                continue
+            highest += 1
+            row["short_id"] = f"t{highest}"
+            taken.add(row["short_id"])
+        with self.lock:
+            self._short_id_high_water = highest
+
+    @staticmethod
+    def _short_id_identities(row: dict) -> list[tuple]:
+        """Identities that mean "the same row" across a rebuild, strongest first."""
+        out: list[tuple] = []
+        for field in ("subtask_id", "key", "external_subtask_id"):
+            value = str(row.get(field, "") or "").strip()
+            if value:
+                out.append((field, value))
+        content = re.sub(r"\s+", " ", str(row.get("content", "") or "").strip().casefold())
+        if content:
+            out.append((
+                "content",
+                content,
+                str(row.get("owner", "") or ""),
+                str(row.get("parent_step_id", "") or ""),
+            ))
+        return out
 
     def has_open_items(self) -> bool:
         with self.lock:
@@ -17578,7 +17792,9 @@ class TodoManager:
             suffix = (
                 f" <- {item['activeForm']}" if item["status"] == "in_progress" else ""
             )
-            lines.append(f"{marker} {item['content']}{suffix}")
+            # The short id lets the model address this row in the next TodoWrite.
+            id_tag = f"({item['short_id']}) " if item.get("short_id") else ""
+            lines.append(f"{marker} {id_tag}{item['content']}{suffix}")
         done = sum(1 for x in items if x["status"] == "completed")
         lines.append(f"\n{self._text('todo_footer', done=done, total=len(items))}")
         return "\n".join(lines)
@@ -26315,6 +26531,443 @@ class OllamaError(RuntimeError):
         self.retryable = retryable
         self.transient = transient
 
+
+# Wake-up order for blocking model requests inside one session.  Lower rank is
+# served first; requests of the same class are served first-come first-served.
+SESSION_LLM_PRIORITY_RANKS = {"main": 0, "subagent": 1, "teammate": 2, "app": 3}
+SESSION_LLM_GATE_POLL_SECONDS = 0.25
+SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS = 16
+# Gate changes are pushed to the WebUI as one coalesced transient
+# ``llm_concurrency`` event per session per interval (trailing timer).
+SESSION_LLM_CONCURRENCY_PUSH_INTERVAL_SECONDS = 1.0
+# Model calls a single TodoWrite may make (intent, audit and review helpers
+# included) before the caller has to fall back to deterministic rules.
+TODO_LLM_CALL_BUDGET = 5
+TODO_LLM_TIMEOUT_FACTORY_DEFAULT = 15.0
+# Largest proposed tree the deterministic revision fallback may approve; it
+# matches TodoManager's hard 40-row cap.
+TODO_REVISION_FALLBACK_MAX_ROWS = 40
+
+
+def _todo_llm_timeout_env_default() -> float:
+    raw = str(os.getenv("AGENT_TODO_LLM_TIMEOUT_SECONDS", "") or "").strip()
+    try:
+        value = float(raw) if raw else TODO_LLM_TIMEOUT_FACTORY_DEFAULT
+    except Exception:
+        value = TODO_LLM_TIMEOUT_FACTORY_DEFAULT
+    if not math.isfinite(value):
+        value = TODO_LLM_TIMEOUT_FACTORY_DEFAULT
+    return max(2.0, min(120.0, value))
+
+
+# Socket timeout of model calls made inside a TodoWrite budget scope.  They run
+# synchronously on the agent thread, so a timeout is treated like a skip and
+# the caller applies its deterministic fallback instead of waiting.
+TODO_LLM_TIMEOUT_SECONDS = _todo_llm_timeout_env_default()
+
+
+class LLMGateBusy(RuntimeError):
+    """An auxiliary model request was skipped instead of waiting.
+
+    Raised before any HTTP request is sent when no in-session slot is free,
+    when the shared endpoint cooldown is active, or when too many orphaned
+    requests from earlier runs are still in flight.  Callers treat it as
+    "skip this time": no failure is recorded and nothing is cached.
+    """
+
+
+class TodoLLMBudgetExhausted(LLMGateBusy):
+    """The per-TodoWrite model-call budget on this thread is used up."""
+
+
+_TODO_LLM_BUDGET_LOCAL = threading.local()
+
+
+@contextlib.contextmanager
+def todo_llm_budget_scope(limit: int = TODO_LLM_CALL_BUDGET):
+    """Cap model calls made on this thread while the scope is active.
+
+    ``OllamaClient.chat()`` counts every non-probe call made inside the scope
+    and raises ``TodoLLMBudgetExhausted`` once ``limit`` calls were made.
+    Nested scopes reuse the outer counter, so helper layers cannot grant
+    themselves extra calls.  Outside any scope calls are unlimited.  Yields
+    the live counter dict ``{"limit", "used", "denied"}``.
+    """
+    state = getattr(_TODO_LLM_BUDGET_LOCAL, "state", None)
+    if isinstance(state, dict):
+        yield state
+        return
+    try:
+        cap = max(0, int(limit))
+    except Exception:
+        cap = TODO_LLM_CALL_BUDGET
+    state = {"limit": cap, "used": 0, "denied": 0}
+    _TODO_LLM_BUDGET_LOCAL.state = state
+    try:
+        yield state
+    finally:
+        _TODO_LLM_BUDGET_LOCAL.state = None
+
+
+def _consume_todo_llm_budget() -> None:
+    state = getattr(_TODO_LLM_BUDGET_LOCAL, "state", None)
+    if not isinstance(state, dict):
+        return
+    if int(state.get("used", 0) or 0) >= int(state.get("limit", 0) or 0):
+        state["denied"] = int(state.get("denied", 0) or 0) + 1
+        raise TodoLLMBudgetExhausted(
+            f"TodoWrite model-call budget exhausted ({int(state.get('limit', 0) or 0)} calls)"
+        )
+    state["used"] = int(state.get("used", 0) or 0) + 1
+
+
+def todo_llm_budget_active() -> bool:
+    """True while this thread is inside a ``todo_llm_budget_scope``."""
+    return isinstance(getattr(_TODO_LLM_BUDGET_LOCAL, "state", None), dict)
+
+
+def todo_llm_skip_reason(exc: BaseException | None) -> str:
+    """Why a TodoWrite helper's model call produced no verdict.
+
+    Returns ``"budget"`` (TodoWrite call budget used up), ``"busy"`` (no
+    in-session slot or an active endpoint cooldown), ``"timeout"`` (socket or
+    HTTP timeout), or ``""`` for any other failure.  Only the first three are
+    skips that may use a deterministic fallback; everything else, such as
+    invalid JSON or a provider error, keeps the caller's fail-closed path.
+    """
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TodoLLMBudgetExhausted):
+            return "budget"
+        if isinstance(current, LLMGateBusy):
+            return "busy"
+        if isinstance(current, (TimeoutError, socket.timeout)):
+            return "timeout"
+        if int(getattr(current, "status", 0) or 0) in {408, 504}:
+            return "timeout"
+        current = current.__cause__ or current.__context__
+    text = str(exc or "").lower()
+    if "timed out" in text or "timeout" in text:
+        return "timeout"
+    return ""
+
+
+class SessionLLMGate:
+    """Per-session counting gate for in-flight model HTTP requests.
+
+    * Blocking requests wait by priority (main > subagent > teammate > app) and
+      first-come first-served within a class; a lower class never takes a
+      slot while a higher class is queued.
+    * Auxiliary requests never wait: they may hold at most ``max(0, limit-1)``
+      slots (with limit 1 they only run when the session is idle), are refused
+      while any blocking request is queued, and are refused once orphaned
+      requests reach ``limit``.  Refusals raise ``LLMGateBusy``.
+    * Every request records the run generation it started in.  After
+      ``set_generation`` moves on, leftovers from earlier runs are ``orphaned``:
+      they stay visible but no longer count against the limit.
+    * ``abandoned`` entries (the caller stopped waiting) keep counting until
+      their thread really finishes and releases the slot.
+    * ``on_change(snapshot)`` is always invoked outside the gate lock.
+
+    Counters ``total``, ``peak``, ``queued_waits``, ``skipped_busy``,
+    ``abandoned`` and ``orphaned`` are cumulative; ``snapshot()`` also reports
+    the live in-flight/queued/abandoned/orphaned counts.
+    """
+
+    def __init__(self, limit: int = DEFAULT_SESSION_LLM_CONCURRENCY, *, generation: int = 0, on_change=None):
+        self._cond = threading.Condition(threading.Lock())
+        self.limit = normalize_session_llm_concurrency(limit)
+        try:
+            self.generation = int(generation or 0)
+        except Exception:
+            self.generation = 0
+        self.on_change = on_change
+        self.role_provider = None
+        self._seq = 0
+        self._in_flight: dict[str, dict] = {}
+        self._waiters: list[dict] = []
+        self.total = 0
+        self.peak = 0
+        self.peak_in_flight = 0
+        self.queued_waits = 0
+        self.skipped_busy = 0
+        self.abandoned = 0
+        self.orphaned = 0
+
+    @staticmethod
+    def _priority_name(priority: object) -> str:
+        name = str(priority or "main").strip().lower()
+        return name if name in SESSION_LLM_PRIORITY_RANKS else "main"
+
+    def _counts_locked(self) -> tuple[int, int, int]:
+        active = orphaned = aux_active = 0
+        for entry in self._in_flight.values():
+            if entry.get("orphaned"):
+                orphaned += 1
+                continue
+            active += 1
+            if entry.get("auxiliary"):
+                aux_active += 1
+        return active, orphaned, aux_active
+
+    def _admit_locked(self, *, priority: str, auxiliary: bool, label: str, role: str) -> str:
+        self._seq += 1
+        ticket = f"llm{self._seq}"
+        self._in_flight[ticket] = {
+            "id": ticket,
+            "priority": priority,
+            "label": trim(str(label or ""), 80),
+            "role": trim(str(role or ""), 80),
+            "auxiliary": bool(auxiliary),
+            "run_generation": int(self.generation),
+            "started_at": now_ts(),
+            "started_mono": time.monotonic(),
+            "thread_ident": threading.get_ident(),
+            "abandoned": False,
+            "orphaned": False,
+        }
+        self.total += 1
+        active, _orphaned, _aux = self._counts_locked()
+        self.peak = max(self.peak, active)
+        self.peak_in_flight = max(self.peak_in_flight, len(self._in_flight))
+        return ticket
+
+    def _aux_allowed_locked(self) -> bool:
+        active, orphaned, aux_active = self._counts_locked()
+        if orphaned >= self.limit:
+            return False
+        if self._waiters:
+            return False
+        if active >= self.limit:
+            return False
+        return aux_active < max(0, self.limit - 1) or active == 0
+
+    def _held_by_current_thread_locked(self) -> bool:
+        ident = threading.get_ident()
+        return any(entry.get("thread_ident") == ident for entry in self._in_flight.values())
+
+    def _notify_change(self) -> None:
+        callback = self.on_change
+        if not callable(callback):
+            return
+        try:
+            callback(self.snapshot())
+        except Exception:
+            pass
+
+    def acquire(
+        self,
+        *,
+        priority: str = "main",
+        auxiliary: bool = False,
+        label: str = "",
+        role: str = "",
+        cancel_check=None,
+    ) -> str:
+        """Take a slot and return its ticket for ``release``.
+
+        Auxiliary requests raise ``LLMGateBusy`` instead of waiting.  A waiting
+        blocking request polls ``cancel_check`` every 0.25s and raises the
+        client's usual ``OllamaError("interrupted by user", status=499)``.
+        """
+        prio = self._priority_name(priority)
+        role_text = str(role or "")
+        if not role_text and callable(self.role_provider):
+            try:
+                role_text = str(self.role_provider() or "")
+            except Exception:
+                role_text = ""
+        if auxiliary:
+            with self._cond:
+                if self._aux_allowed_locked():
+                    ticket = self._admit_locked(priority=prio, auxiliary=True, label=label, role=role_text)
+                    admitted = True
+                else:
+                    self.skipped_busy += 1
+                    admitted = False
+            self._notify_change()
+            if not admitted:
+                raise LLMGateBusy(f"in-session model slot busy (limit {self.limit}); auxiliary request skipped")
+            return ticket
+        with self._cond:
+            active, _orphaned, _aux = self._counts_locked()
+            if self._held_by_current_thread_locked() or (not self._waiters and active < self.limit):
+                # A thread that already holds a slot is never made to wait for
+                # itself; that would deadlock the session at limit 1.
+                ticket = self._admit_locked(priority=prio, auxiliary=False, label=label, role=role_text)
+                queued = False
+            else:
+                self._seq += 1
+                waiter = {
+                    "key": (SESSION_LLM_PRIORITY_RANKS[prio], self._seq),
+                    "priority": prio,
+                    "label": trim(str(label or ""), 80),
+                    "queued_mono": time.monotonic(),
+                }
+                self._waiters.append(waiter)
+                self.queued_waits += 1
+                queued = True
+        if not queued:
+            self._notify_change()
+            return ticket
+        self._notify_change()
+        ticket = ""
+        try:
+            while True:
+                with self._cond:
+                    head = min(self._waiters, key=lambda row: row["key"]) if self._waiters else None
+                    active, _orphaned, _aux = self._counts_locked()
+                    if head is waiter and active < self.limit:
+                        self._waiters.remove(waiter)
+                        ticket = self._admit_locked(priority=prio, auxiliary=False, label=label, role=role_text)
+                        # Another slot may still be free for the next waiter.
+                        self._cond.notify_all()
+                        break
+                    self._cond.wait(SESSION_LLM_GATE_POLL_SECONDS)
+                if cancel_check is not None:
+                    # Called outside the gate lock: the callback may take
+                    # session locks of its own.
+                    try:
+                        if cancel_check():
+                            raise OllamaError("interrupted by user", status=499)
+                    except OllamaError:
+                        raise
+                    except Exception:
+                        pass
+        finally:
+            if not ticket:
+                with self._cond:
+                    if waiter in self._waiters:
+                        self._waiters.remove(waiter)
+                    self._cond.notify_all()
+            self._notify_change()
+        return ticket
+
+    def release(self, ticket: str) -> None:
+        if not ticket:
+            return
+        with self._cond:
+            removed = self._in_flight.pop(str(ticket), None)
+            self._cond.notify_all()
+        if removed is not None:
+            self._notify_change()
+
+    def note_skipped(self) -> None:
+        """Count an auxiliary request skipped by the caller before acquiring."""
+        with self._cond:
+            self.skipped_busy += 1
+        self._notify_change()
+
+    def set_limit(self, n: object) -> int:
+        limit = normalize_session_llm_concurrency(n, default=self.limit)
+        with self._cond:
+            changed = limit != self.limit
+            self.limit = limit
+            self._cond.notify_all()
+        if changed:
+            self._notify_change()
+        return limit
+
+    def set_generation(self, n: object) -> int:
+        try:
+            generation = int(n or 0)
+        except Exception:
+            return int(self.generation)
+        newly_orphaned = 0
+        with self._cond:
+            if generation != self.generation:
+                self.generation = generation
+                for entry in self._in_flight.values():
+                    if not entry.get("orphaned") and int(entry.get("run_generation", 0) or 0) != generation:
+                        entry["orphaned"] = True
+                        newly_orphaned += 1
+                self.orphaned += newly_orphaned
+                self._cond.notify_all()
+                changed = True
+            else:
+                changed = False
+        if changed:
+            self._notify_change()
+        return generation
+
+    def mark_abandoned(self, thread_ident: int | None = None) -> int:
+        """Flag in-flight requests whose caller stopped waiting.
+
+        ``thread_ident`` selects the worker thread that owns the request;
+        ``None`` flags every request currently in flight.  Abandoned requests
+        keep their slot until the thread finishes.  Returns how many entries
+        were newly flagged.
+        """
+        marked = 0
+        with self._cond:
+            for entry in self._in_flight.values():
+                if entry.get("abandoned"):
+                    continue
+                if thread_ident is not None and entry.get("thread_ident") != thread_ident:
+                    continue
+                entry["abandoned"] = True
+                marked += 1
+            self.abandoned += marked
+        if marked:
+            self._notify_change()
+        return marked
+
+    def snapshot(self) -> dict:
+        now_mono = time.monotonic()
+        with self._cond:
+            active, orphaned, aux_active = self._counts_locked()
+            entries = sorted(self._in_flight.values(), key=lambda row: float(row.get("started_mono", 0.0) or 0.0))
+            requests = [
+                {
+                    "id": row.get("id", ""),
+                    "priority": row.get("priority", "main"),
+                    "label": row.get("label", ""),
+                    "role": row.get("role", ""),
+                    "auxiliary": bool(row.get("auxiliary")),
+                    "run_generation": int(row.get("run_generation", 0) or 0),
+                    "started_at": float(row.get("started_at", 0.0) or 0.0),
+                    "elapsed": round(max(0.0, now_mono - float(row.get("started_mono", now_mono) or now_mono)), 3),
+                    "thread_ident": row.get("thread_ident"),
+                    "abandoned": bool(row.get("abandoned")),
+                    "orphaned": bool(row.get("orphaned")),
+                }
+                for row in entries[:SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS]
+            ]
+            return {
+                "limit": int(self.limit),
+                "generation": int(self.generation),
+                "in_flight": int(active),
+                "in_flight_total": len(self._in_flight),
+                "auxiliary_in_flight": int(aux_active),
+                "queued": len(self._waiters),
+                "abandoned_in_flight": sum(1 for row in self._in_flight.values() if row.get("abandoned")),
+                "orphaned_in_flight": int(orphaned),
+                "total": int(self.total),
+                "peak": int(self.peak),
+                "peak_in_flight": int(self.peak_in_flight),
+                "queued_waits": int(self.queued_waits),
+                "skipped_busy": int(self.skipped_busy),
+                "abandoned": int(self.abandoned),
+                "orphaned": int(self.orphaned),
+                "requests": requests,
+            }
+
+
+_SESSION_LLM_GATE_INIT_LOCK = threading.Lock()
+
+
+def set_session_llm_concurrency_on_runtime(target: object, value: object) -> int:
+    """Store a normalized concurrency on a session or manager and resize its gate."""
+    limit = normalize_session_llm_concurrency(value)
+    setattr(target, "session_llm_concurrency", limit)
+    gate = getattr(target, "llm_gate", None)
+    if isinstance(gate, SessionLLMGate):
+        gate.set_limit(limit)
+    return limit
+
+
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
     _retry_lock = threading.RLock()
@@ -26357,6 +27010,81 @@ class OllamaClient:
         self.telemetry_callback = None
         self.telemetry_context_provider = None
         self.telemetry_name = "chat"
+        # Optional per-session SessionLLMGate; SessionState attaches it.
+        self.request_gate = None
+        # Per-call request overrides (socket timeout, auxiliary marker) are
+        # thread-local so one thread's short timeout never leaks into another.
+        self._request_timeout_override = threading.local()
+
+    def _request_local(self) -> threading.local:
+        local = getattr(self, "_request_timeout_override", None)
+        if not isinstance(local, threading.local):
+            with self._retry_lock:
+                local = getattr(self, "_request_timeout_override", None)
+                if not isinstance(local, threading.local):
+                    local = threading.local()
+                    self._request_timeout_override = local
+        return local
+
+    def _effective_request_timeout(self) -> float:
+        """Socket timeout for the request being sent on this thread.
+
+        ``chat(request_timeout=...)`` sets a thread-local override for one
+        call; everything else keeps using ``self.timeout``.
+        """
+        local = getattr(self, "_request_timeout_override", None)
+        override = getattr(local, "timeout", None) if local is not None else None
+        if override is not None:
+            return override
+        return self.timeout
+
+    @staticmethod
+    def _normalize_request_timeout_override(value: object) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            seconds = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(seconds) or seconds <= 0:
+            return None
+        return max(0.1, min(float(MAX_TIMEOUT_SECONDS), seconds))
+
+    def _auxiliary_request_active(self) -> bool:
+        local = getattr(self, "_request_timeout_override", None)
+        return bool(getattr(local, "auxiliary", False)) if local is not None else False
+
+    def _raise_if_auxiliary_cooldown(self, cooldown: float, url: str) -> None:
+        # Auxiliary calls never wait out a shared endpoint cooldown; the
+        # pre-check in chat() covers the common case, this covers a cooldown
+        # set by another thread after that check.
+        if cooldown > 0 and self._auxiliary_request_active():
+            raise LLMGateBusy(
+                f"endpoint cooldown active ({round(cooldown, 1)}s) for {trim(str(url or ''), 160)}; auxiliary request skipped"
+            )
+
+    def _chat_request_url(self) -> str:
+        """URL ``_chat_impl`` sends to first, for cooldown-key computation."""
+        provider = (self.provider or "ollama").lower()
+        endpoint = str(self.endpoint or "").strip()
+        if is_openai_compat_provider(provider):
+            return endpoint or complete_chat_endpoint(self.base_url)
+        if provider == "anthropic":
+            if endpoint:
+                return endpoint
+            base = str(self.base_url or "").strip().rstrip("/")
+            return f"{base}/v1/messages" if base else "https://api.anthropic.com/v1/messages"
+        if provider == "custom_http":
+            return endpoint
+        # Native Ollama: /v1/chat/completions and the /api/chat fallback share
+        # the host, so both map to the same cooldown key.
+        return f"{self.base_url}/v1/chat/completions"
+
+    def _chat_cooldown_remaining(self) -> float:
+        url = self._chat_request_url()
+        if not url:
+            return 0.0
+        return self._cooldown_remaining(self._http_retry_key(url))
 
     def set_telemetry(self, callback=None, context_provider=None, name: str = "chat") -> None:
         self.telemetry_callback = callback
@@ -26422,6 +27150,7 @@ class OllamaClient:
         probe_mode: bool = False,
         provider_snapshot: str = "",
         model_snapshot: str = "",
+        label: str = "",
     ) -> None:
         callback = getattr(self, "telemetry_callback", None)
         if not callable(callback):
@@ -26436,9 +27165,16 @@ class OllamaClient:
             except Exception:
                 context = {}
         usage = self._usage_tokens(response)
+        # The llm_call name says where the call came from: probes stay
+        # capability_probe, labeled calls use their label (the agent loop
+        # passes "main"), unlabeled calls keep the client's telemetry_name.
+        if probe_mode:
+            call_name = "capability_probe"
+        else:
+            call_name = trim(str(label or "").strip(), 80) or str(getattr(self, "telemetry_name", "chat") or "chat")
         fields = {
             **context,
-            "name": "capability_probe" if probe_mode else str(getattr(self, "telemetry_name", "chat") or "chat"),
+            "name": call_name,
             "status": status,
             "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
             "provider": str(provider_snapshot or self.provider or ""),
@@ -26758,9 +27494,9 @@ class OllamaClient:
     def clear_global_probe_cache(cls):
         cls._probe_cache.clear()
 
-    def _post_json(self, path: str, payload: dict) -> dict:
+    def _post_json(self, path: str, payload: dict, *, max_attempts: int | None = None) -> dict:
         url = f"{self.base_url}{path}"
-        return self._post_json_url_with_retries(url, payload)
+        return self._post_json_url_with_retries(url, payload, max_attempts=max_attempts)
 
     def _post_json_url(self, url: str, payload: dict, headers: dict | None = None) -> dict:
         req_headers = {"Content-Type": "application/json"}
@@ -26773,7 +27509,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self._effective_request_timeout()) as resp:
                 body = resp.read().decode("utf-8")
                 return json.loads(body) if body else {}
         except HTTPError as exc:
@@ -26807,6 +27543,7 @@ class OllamaClient:
         for attempt in range(0, retry_budget + 1):
             cooldown = self._cooldown_remaining(key)
             if cooldown > 0:
+                self._raise_if_auxiliary_cooldown(cooldown, url)
                 if on_retry:
                     try:
                         on_retry(
@@ -26868,7 +27605,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self._effective_request_timeout()) as resp:
                 while True:
                     if cancel_check is not None:
                         try:
@@ -26915,6 +27652,7 @@ class OllamaClient:
         for attempt in range(0, retry_budget + 1):
             cooldown = self._cooldown_remaining(key)
             if cooldown > 0:
+                self._raise_if_auxiliary_cooldown(cooldown, url)
                 if on_retry:
                     try:
                         on_retry(
@@ -26976,7 +27714,7 @@ class OllamaClient:
             method="POST",
         )
         try:
-            with urlopen(req, timeout=self.timeout) as resp:
+            with urlopen(req, timeout=self._effective_request_timeout()) as resp:
                 ctype = str(resp.headers.get("Content-Type", "") or "").strip()
                 body = resp.read()
                 return body, ctype
@@ -28033,6 +28771,8 @@ class OllamaClient:
                     )
                     return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
                 raise
+            except LLMGateBusy:
+                raise
             except Exception as exc:
                 raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
         payload["stream"] = False
@@ -28167,7 +28907,7 @@ class OllamaClient:
                     on_retry=on_http_retry,
                 )
                 return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
-            except OllamaError:
+            except (OllamaError, LLMGateBusy):
                 raise
             except Exception as exc:
                 raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
@@ -28489,6 +29229,7 @@ class OllamaClient:
         think: bool = False,
         on_thinking_chunk=None,
         on_content_delta=None,
+        max_attempts: int | None = None,
     ) -> dict:
         effective_max = max_tokens
         if tools:
@@ -28521,6 +29262,7 @@ class OllamaClient:
             f"{self.base_url}/api/chat",
             payload,
             headers={"Content-Type": "application/json"},
+            max_attempts=max_attempts,
         ):
             row = str(row_line or "").strip()
             if not row:
@@ -28600,6 +29342,8 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         effort: str = "",
+        auxiliary: bool = False,
+        no_http_retry: bool = False,
     ) -> dict:
         provider = (self.provider or "ollama").lower()
         # Resolve provider-neutral effort into native reasoning mutations once.
@@ -28625,7 +29369,10 @@ class OllamaClient:
             tools = None
             stream_thinking = False
             response_stream = False
-        http_retry_attempts = 0 if probe_mode else None
+        # Probes, auxiliary calls and calls inside a TodoWrite budget scope
+        # (no_http_retry) never retry, so they never write or wait on the
+        # shared endpoint cooldown that the main loop also uses.
+        http_retry_attempts = 0 if (probe_mode or auxiliary or no_http_retry) else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
         # Some providers require all system messages at the beginning (or merged into one)
@@ -28694,10 +29441,14 @@ class OllamaClient:
                     think=bool(think),
                     on_thinking_chunk=on_thinking_chunk,
                     on_content_delta=on_content_delta if response_stream else None,
+                    max_attempts=http_retry_attempts,
                 )
             except OllamaError:
                 if response_stream:
                     raise
+        # Only pass the retry budget when one is set, so the default call
+        # shape of ``_post_json(path, payload)`` is unchanged for main calls.
+        ollama_retry_kwargs = {} if http_retry_attempts is None else {"max_attempts": http_retry_attempts}
         openai_payload = {
             "model": self.model,
             "messages": req_messages,
@@ -28715,7 +29466,7 @@ class OllamaClient:
                     cancel_check=cancel_check,
                 )
                 return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
-            raw = self._post_json("/v1/chat/completions", openai_payload)
+            raw = self._post_json("/v1/chat/completions", openai_payload, **ollama_retry_kwargs)
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
             return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
         except OllamaError as exc:
@@ -28746,7 +29497,7 @@ class OllamaClient:
             native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools
-        raw = self._post_json("/api/chat", native_payload)
+        raw = self._post_json("/api/chat", native_payload, **ollama_retry_kwargs)
         msg = raw.get("message", {})
         if not isinstance(msg, dict):
             msg = {}
@@ -28793,13 +29544,85 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         effort: str = "",
+        priority: str = "main",
+        auxiliary: bool = False,
+        label: str = "",
+        request_timeout: float | None = None,
     ) -> dict:
+        """Send one model request.
+
+        ``priority`` orders waiting requests in the session gate, ``auxiliary``
+        makes the request non-blocking (``LLMGateBusy`` instead of waiting) and
+        disables HTTP retries, ``label`` names the in-flight entry and the
+        ``llm_call`` telemetry row (unlabeled calls keep the client's
+        ``telemetry_name``), and ``request_timeout`` is a socket timeout for
+        this call only.  Skipped
+        requests (``LLMGateBusy``) emit no ``llm_call`` telemetry because no
+        request was sent.
+
+        Inside a ``todo_llm_budget_scope`` (a TodoWrite transaction on this
+        thread) every call is counted against the budget and, unless the
+        caller says otherwise, uses ``TODO_LLM_TIMEOUT_SECONDS`` and the label
+        ``todo_audit``.  Such calls stay blocking ``main`` requests but never
+        retry over HTTP and never wait out an endpoint cooldown, so a slow or
+        throttled reviewer cannot stall the agent loop; the TodoWrite helpers
+        fall back to their deterministic rules instead.
+        """
+        auxiliary = bool(auxiliary) and not probe_mode
+        todo_scope = (not probe_mode) and todo_llm_budget_active()
+        # (a) Per-TodoWrite budget; capability probes are not counted.
+        if not probe_mode:
+            _consume_todo_llm_budget()
+        gate = None if probe_mode else getattr(self, "request_gate", None)
+        if todo_scope and not label:
+            label = "todo_audit"
+        entry_label = str(label or getattr(self, "telemetry_name", "") or "chat")
+        # (b) Auxiliary requests (and TodoWrite-scope requests, which have a
+        # deterministic fallback) never wait out the shared endpoint cooldown.
+        if auxiliary or todo_scope:
+            cooldown = self._chat_cooldown_remaining()
+            if cooldown > 0:
+                if gate is not None:
+                    try:
+                        gate.note_skipped()
+                    except Exception:
+                        pass
+                raise LLMGateBusy(
+                    f"endpoint cooldown active ({round(cooldown, 1)}s); "
+                    + ("TodoWrite review request skipped" if todo_scope and not auxiliary else "auxiliary request skipped")
+                )
+        local = self._request_local()
+        prev_timeout = getattr(local, "timeout", None)
+        prev_auxiliary = getattr(local, "auxiliary", False)
+        timeout_override = self._normalize_request_timeout_override(request_timeout)
+        if todo_scope and timeout_override is None:
+            timeout_override = self._normalize_request_timeout_override(TODO_LLM_TIMEOUT_SECONDS)
+        # (c) In-session slot. Blocking callers wait by priority; auxiliary
+        # callers get LLMGateBusy when no slot is free.
+        ticket = ""
+        if gate is not None:
+            ticket = gate.acquire(
+                priority=priority,
+                auxiliary=auxiliary,
+                label=entry_label,
+                cancel_check=cancel_check,
+            )
+        # Measured after the slot is granted so duration_ms keeps meaning
+        # request time rather than queue time.
         started = time.monotonic()
         provider_snapshot = str(self.provider or "")
         model_snapshot = str(self.model or "")
         response: dict | None = None
         status = "error"
+        emit_telemetry = True
         try:
+            # (d) Per-call socket timeout for this thread only.
+            if timeout_override is not None:
+                local.timeout = timeout_override
+            # The retry helpers read this flag to skip (LLMGateBusy) instead
+            # of waiting when another thread set a cooldown after (b).
+            local.auxiliary = auxiliary or todo_scope
+            # (e)
             response = self._chat_impl(
                 messages,
                 tools=tools,
@@ -28817,21 +29640,43 @@ class OllamaClient:
                 cancel_check=cancel_check,
                 on_http_retry=on_http_retry,
                 effort=effort,
+                auxiliary=auxiliary,
+                **({"no_http_retry": True} if todo_scope else {}),
             )
             status = "success"
             return response
+        except LLMGateBusy:
+            # A cooldown set by another thread after the pre-check: the
+            # auxiliary request was skipped, not failed.
+            emit_telemetry = False
+            if gate is not None:
+                try:
+                    gate.note_skipped()
+                except Exception:
+                    pass
+            raise
         except Exception as exc:
             status = self._operation_status_from_exception(exc)
             raise
         finally:
-            self._emit_chat_telemetry(
-                response,
-                started,
-                status,
-                probe_mode=probe_mode,
-                provider_snapshot=provider_snapshot,
-                model_snapshot=model_snapshot,
-            )
+            # (f) Clear the override and free the slot before telemetry I/O.
+            local.timeout = prev_timeout
+            local.auxiliary = prev_auxiliary
+            if ticket and gate is not None:
+                try:
+                    gate.release(ticket)
+                except Exception:
+                    pass
+            if emit_telemetry:
+                self._emit_chat_telemetry(
+                    response,
+                    started,
+                    status,
+                    probe_mode=probe_mode,
+                    provider_snapshot=provider_snapshot,
+                    model_snapshot=model_snapshot,
+                    label=label,
+                )
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -29003,7 +29848,11 @@ TOOLS = [
             "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
             "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
             "Use 'rework_completed' only when failure/reviewer evidence requires reopening completed work. "
-            "Preferred items are objects with content/status/owner/parent_step_id/subtask_id."
+            "Preferred items are objects with content/status/owner/parent_step_id/subtask_id. "
+            "Every row is listed with a short id such as (t3): to update or reword an existing row, include its id "
+            "(e.g. {\"id\": \"t3\", \"status\": \"completed\"}). Preserve ids of retained rows in revisions; "
+            "omit an id only for genuinely new work. Unknown or out-of-scope ids reject the update. "
+            "A partial update selecting in_progress moves that owner's active cursor."
         ),
         {
             "items": {"type": "array", "items": {}},
@@ -29045,7 +29894,7 @@ TOOLS = [
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Inspect existing canonical rows first and choose reuse/update, independent add, or evidence-backed removal. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Inspect existing canonical rows first and choose reuse/update, independent add, or evidence-backed removal. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id; include a row's short id (e.g. \"id\": \"t3\") to update it, since rows without an id are treated as new. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -30940,6 +31789,7 @@ class SessionState:
         kernel_runtime=None,
         skills_snapshot: SkillStore | None = None,
         defer_initial_persist: bool = False,
+        session_llm_concurrency: int | None = None,
     ):
         self.id = session_id
         self.title = title
@@ -31072,6 +31922,10 @@ class SessionState:
         # structured outcome metadata (notably the real shell exit code) is
         # carried alongside it in thread-local state for the orchestrator.
         self._tool_result_local = threading.local()
+        # Pooled tool threads still running after their timeout result was
+        # returned (live gauge) and how many ever were (cumulative).
+        self.tool_orphan_threads = 0
+        self.tool_orphan_threads_total = 0
         self._application_snapshot_integrity_lock = threading.RLock()
         self.single_advance_prompt_enhance = False
         cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
@@ -31197,6 +32051,17 @@ class SessionState:
         self.runtime_task_level_floor = 0
         self.runtime_task_level_ceiling = 0  # 0 = no ceiling; set from plan risk on approval
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        # One in-session model request gate, shared by self.ollama and the
+        # derived arbiter/auto-title clients.
+        self.session_llm_concurrency = normalize_session_llm_concurrency(session_llm_concurrency)
+        # Coalesced WebUI push of gate state; enabled once restore is done.
+        self._llm_concurrency_push_lock = threading.Lock()
+        self._llm_concurrency_push_timer: threading.Timer | None = None
+        self._llm_concurrency_push_dirty = False
+        self._llm_concurrency_last_push_mono = 0.0
+        self._llm_concurrency_push_ready = False
+        self.llm_gate: SessionLLMGate | None = None
+        self._ensure_llm_gate()
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(default_llm_config or {})
         self.l2_todo_policy = normalize_l2_todo_policy(
             l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
@@ -31420,9 +32285,168 @@ class SessionState:
         self.blackboard = self._new_blackboard("")
         self._init_llm_profiles(default_llm_config or {})
         self._load_if_exists()
+        # Gate changes seen while restoring were only recorded; from here on
+        # they are pushed to the WebUI (see _on_llm_gate_change).
+        self._llm_concurrency_push_ready = True
 
     def _sanitize_profile_id(self, raw: str) -> str:
         return sanitize_profile_id(raw)
+
+    def _ensure_llm_gate(self) -> SessionLLMGate:
+        """Return this session's model request gate, creating it lazily.
+
+        Sessions built with ``SessionState.__new__`` (tests, restores) get a
+        gate on first use.  The gate is (re)attached to ``self.ollama`` so a
+        rebuilt client keeps the same per-session limit.
+        """
+        gate = getattr(self, "llm_gate", None)
+        if not isinstance(gate, SessionLLMGate):
+            with _SESSION_LLM_GATE_INIT_LOCK:
+                gate = getattr(self, "llm_gate", None)
+                if not isinstance(gate, SessionLLMGate):
+                    try:
+                        generation = int(getattr(self, "run_generation", 0) or 0)
+                    except Exception:
+                        generation = 0
+                    gate = SessionLLMGate(
+                        normalize_session_llm_concurrency(getattr(self, "session_llm_concurrency", None)),
+                        generation=generation,
+                    )
+                    gate.role_provider = lambda: str(getattr(self, "active_agent_role", "") or "")
+                    # Called outside the gate lock; only schedules a push.
+                    gate.on_change = self._on_llm_gate_change
+                    self.llm_gate = gate
+        client = getattr(self, "ollama", None)
+        if isinstance(client, OllamaClient) and getattr(client, "request_gate", None) is not gate:
+            client.request_gate = gate
+        return gate
+
+    def set_session_llm_concurrency(self, value: object) -> int:
+        """Set the in-session model concurrency and resize the live gate."""
+        limit = normalize_session_llm_concurrency(value)
+        self.session_llm_concurrency = limit
+        self._ensure_llm_gate().set_limit(limit)
+        return limit
+
+    def _sync_llm_gate_generation(self) -> None:
+        try:
+            self._ensure_llm_gate().set_generation(int(getattr(self, "run_generation", 0) or 0))
+        except Exception:
+            pass
+
+    def _mark_llm_worker_abandoned(self, worker: threading.Thread | None) -> int:
+        """Flag the in-flight model requests of a worker its caller gave up on.
+
+        Used where a caller joins a model-call thread with a timeout (or the
+        user cancels) and returns while the thread is still alive.  The slot
+        stays occupied until the request really ends; this only makes it
+        visible as ``abandoned``.  Never raises.
+        """
+        gate = getattr(self, "llm_gate", None)
+        if gate is None or worker is None:
+            return 0
+        try:
+            return int(gate.mark_abandoned(worker.ident) or 0)
+        except Exception:
+            return 0
+
+    def _llm_concurrency_snapshot(self) -> dict:
+        """Live in-session model concurrency for snapshots and WebUI pushes.
+
+        ``SessionLLMGate.snapshot()`` counters plus the tool orphan gauges,
+        with at most ``SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS`` compact request
+        rows.  Read on every call (never served from a snapshot cache); returns
+        ``{}`` when the session has no gate yet.  Never raises.
+        """
+        gate = getattr(self, "llm_gate", None)
+        if not isinstance(gate, SessionLLMGate):
+            return {}
+        try:
+            data = gate.snapshot()
+        except Exception:
+            return {}
+        rows: list[dict] = []
+        for row in list(data.get("requests", []) or [])[:SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS]:
+            if not isinstance(row, dict):
+                continue
+            rows.append(
+                {
+                    "id": str(row.get("id", "") or ""),
+                    "priority": str(row.get("priority", "main") or "main"),
+                    "label": str(row.get("label", "") or ""),
+                    "role": str(row.get("role", "") or ""),
+                    "elapsed_seconds": round(float(row.get("elapsed", 0.0) or 0.0), 1),
+                    "abandoned": bool(row.get("abandoned")),
+                    "orphaned": bool(row.get("orphaned")),
+                }
+            )
+        data["requests"] = rows
+        data["tool_orphan_threads"] = max(0, int(getattr(self, "tool_orphan_threads", 0) or 0))
+        data["tool_orphan_threads_total"] = max(0, int(getattr(self, "tool_orphan_threads_total", 0) or 0))
+        return data
+
+    def _on_llm_gate_change(self, _snapshot: dict | None = None) -> None:
+        """Gate ``on_change`` hook: schedule a coalesced ``llm_concurrency`` push.
+
+        Runs on whichever thread changed the gate (outside the gate lock) and
+        never emits from there, because that thread may be restoring the
+        session or hold ``self.lock``.  A daemon timer sends at most one
+        transient event per ``SESSION_LLM_CONCURRENCY_PUSH_INTERVAL_SECONDS``
+        and always reads the latest gate state, so the last change in a burst
+        is never lost.
+        """
+        if not bool(getattr(self, "_llm_concurrency_push_ready", False)):
+            return
+        lock = getattr(self, "_llm_concurrency_push_lock", None)
+        if lock is None:
+            with _SESSION_LLM_GATE_INIT_LOCK:
+                lock = getattr(self, "_llm_concurrency_push_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._llm_concurrency_push_lock = lock
+        with lock:
+            self._llm_concurrency_push_dirty = True
+            if getattr(self, "_llm_concurrency_push_timer", None) is not None:
+                # A push is pending or being sent; it (or its trailing
+                # follow-up) will carry the newest state.
+                return
+            self._start_llm_concurrency_push_timer_locked()
+
+    def _start_llm_concurrency_push_timer_locked(self) -> None:
+        last = float(getattr(self, "_llm_concurrency_last_push_mono", 0.0) or 0.0)
+        delay = 0.0
+        if last > 0.0:
+            delay = max(0.0, SESSION_LLM_CONCURRENCY_PUSH_INTERVAL_SECONDS - (time.monotonic() - last))
+        timer = threading.Timer(delay, self._flush_llm_concurrency_push)
+        timer.daemon = True
+        self._llm_concurrency_push_timer = timer
+        try:
+            timer.start()
+        except Exception:
+            self._llm_concurrency_push_timer = None
+
+    def _flush_llm_concurrency_push(self) -> None:
+        lock = getattr(self, "_llm_concurrency_push_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._llm_concurrency_push_dirty = False
+            self._llm_concurrency_last_push_mono = time.monotonic()
+        try:
+            payload = self._llm_concurrency_snapshot()
+            if payload:
+                # Transient only: _emit would fill the 500-row operations log.
+                self._emit_transient("llm_concurrency", payload, heartbeat=False)
+        except Exception:
+            pass
+        finally:
+            # The timer slot stays taken until the push is sent, so a busy
+            # session lock never stacks up timer threads.  Changes that came
+            # in meanwhile get exactly one trailing push.
+            with lock:
+                self._llm_concurrency_push_timer = None
+                if bool(getattr(self, "_llm_concurrency_push_dirty", False)):
+                    self._start_llm_concurrency_push_timer_locked()
 
     def _profile_cache_key(self, profile: dict | None = None, model_override: str = "") -> str:
         row = profile if isinstance(profile, dict) else dict(self.model_profiles.get(self.active_profile_id, {}))
@@ -32171,6 +33195,7 @@ class SessionState:
         # client must not promote them to profile-level defaults, otherwise a
         # later model switch would inherit the previous model's settings.
         self.ollama.apply_profile(row)
+        self._ensure_llm_gate()
         self.thinking = False
 
     def _profile_is_runnable(self, profile: dict) -> bool:
@@ -32588,6 +33613,9 @@ class SessionState:
         cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(profile)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+        cfg_session_llm_concurrency = extract_session_llm_concurrency_setting(profile)
+        if cfg_session_llm_concurrency is not None:
+            self.set_session_llm_concurrency(cfg_session_llm_concurrency)
         self.updated_at = now_ts()
         self._persist()
         self._emit(
@@ -33004,6 +34032,12 @@ class SessionState:
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
                     )
                 )
+                self.set_session_llm_concurrency(
+                    raw.get(
+                        "session_llm_concurrency",
+                        getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
+                    )
+                )
                 if "l2_todo_policy" in raw:
                     self.l2_todo_policy = normalize_l2_todo_policy(
                         raw.get("l2_todo_policy"),
@@ -33254,6 +34288,7 @@ class SessionState:
                         )
                     self.user_bubble_log = clean_bubbles[-MAX_USER_BUBBLE_LOG:]
                 self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
+                self._sync_llm_gate_generation()
                 self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
                 self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
                 if self.current_phase == self._startup_phase("auto-title"):
@@ -33772,6 +34807,9 @@ class SessionState:
             "runtime_task_level_ceiling": int(self.runtime_task_level_ceiling or 0),
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            ),
+            "session_llm_concurrency": normalize_session_llm_concurrency(
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
             ),
             "l2_todo_policy": normalize_l2_todo_policy(
                 getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
@@ -34940,12 +35978,15 @@ class SessionState:
                 pass
         return out
 
-    def _emit_transient(self, kind: str, data: dict):
-        try:
-            if bool(getattr(self, "running", False)):
-                self.run_last_heartbeat = now_ts()
-        except Exception:
-            pass
+    def _emit_transient(self, kind: str, data: dict, *, heartbeat: bool = True):
+        # ``heartbeat=False`` is for monitoring pushes that can come from
+        # background threads; they must not make a stalled run look alive.
+        if heartbeat:
+            try:
+                if bool(getattr(self, "running", False)):
+                    self.run_last_heartbeat = now_ts()
+            except Exception:
+                pass
         payload = self._event_payload_with_agent_role(kind, data)
         event = {
             "id": make_id("evt"),
@@ -35829,6 +36870,10 @@ class SessionState:
                 response_box["response"] = client.chat(
                     [{"role": "user", "content": json_dumps(payload, ensure_ascii=False)}],
                     system=system, max_tokens=2200, temperature=0.0, think=False, stream_thinking=False,
+                    auxiliary=True, label="step_skill_eval",
+                    # Socket timeout follows the join below, so an abandoned
+                    # request ends within seconds instead of after 600s.
+                    request_timeout=SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS + 2.0,
                 )
             except Exception as exc:
                 response_box["error"] = exc
@@ -35837,6 +36882,7 @@ class SessionState:
         worker.start()
         worker.join(timeout=SKILL_RUNTIME_EVALUATION_TIMEOUT_SECONDS)
         if worker.is_alive():
+            self._mark_llm_worker_abandoned(worker)
             raise TimeoutError("step skill evaluation timed out")
         if "error" in response_box:
             raise response_box["error"]
@@ -36028,6 +37074,13 @@ class SessionState:
                 state["keep_intents"] = {}
                 state["model_unloads"] = {}
             evaluation_trigger = "session-resume" if restarted else ("step-start" if new_step else "focus-changed" if changed else ",".join(state["pending_triggers"]) or trigger or "ttl-expired")
+            # Restored when the evaluator is skipped because the session's
+            # model slots are busy: a skip must not count as an evaluation.
+            prior_evaluation = {
+                key: state[key]
+                for key in ("focus_signature", "last_evaluation_at", "evaluation_status", "evaluation_error", "evaluation_id")
+            }
+            prior_pending_triggers = list(state["pending_triggers"])
             state.update(
                 step_id=focus["step_id"], step_epoch=focus["step_epoch"], focus_signature=signature,
                 evaluation_id=uuid.uuid4().hex, last_evaluation_at=float(now_ts()), last_evaluation_trigger=evaluation_trigger,
@@ -36060,6 +37113,26 @@ class SessionState:
                 if signature != self._step_skill_focus_signature() or latest["revision"] != state["revision"]:
                     raise ValueError("execution focus or model skill intent changed during evaluation")
                 return self._apply_step_skill_evaluation(result, payload=payload, evaluation_id=state["evaluation_id"])
+            except LLMGateBusy as exc:
+                # No free in-session slot: skip without recording a failure.
+                # Undo the bookkeeping written before the call so the focus is
+                # still "unevaluated", and queue a recheck for the next round.
+                board = self._ensure_blackboard()
+                latest = self._normalize_step_skill_state(board.get("step_skill_state"))
+                latest.update(prior_evaluation)
+                for queued in prior_pending_triggers:
+                    if queued not in latest["pending_triggers"]:
+                        latest["pending_triggers"].append(queued)
+                board["step_skill_state"] = latest
+                self.blackboard = board
+                self._step_skill_restore_pending = restarted
+                # One real trigger name: evaluation_trigger may be several
+                # pending triggers joined by commas (restored above).
+                self._queue_step_skill_recheck(
+                    trigger or (prior_pending_triggers[-1] if prior_pending_triggers else evaluation_trigger)
+                )
+                latest = self._normalize_step_skill_state(self._ensure_blackboard().get("step_skill_state"))
+                return {"status": "skipped", "skipped": True, "reason": "llm_gate_busy", "error": str(exc), "state": latest}
             except Exception as exc:
                 board = self._ensure_blackboard()
                 latest = self._normalize_step_skill_state(board.get("step_skill_state"))
@@ -37918,15 +38991,17 @@ class SessionState:
             if tier >= 2:
                 self._compact_shared_context(tier)
         elif role_key:
+            # Tier 0 has no context pressure: keep file reads intact so the
+            # model is not forced to read the same file again.
             if role_key == "manager":
-                self._microcompact_agent_messages(self.manager_context, keep_recent=3)
+                self._microcompact_agent_messages(self.manager_context, keep_recent=3, preserve_reads=True)
             else:
-                self._microcompact_agent_messages(self._agent_context(role_key), keep_recent=3)
+                self._microcompact_agent_messages(self._agent_context(role_key), keep_recent=3, preserve_reads=True)
         elif tier >= 1:
             keep = max(1, 3 - tier)
             self._microcompact(keep_recent=keep)
         else:
-            self._microcompact()
+            self._microcompact(preserve_reads=True)
         # Tier 2+: compact agent contexts proactively
         if tier >= 2 and not role_key:
             self._compact_agent_contexts(tier)
@@ -39579,9 +40654,47 @@ class SessionState:
             units.append(current)
         return units
 
+    def _expand_shell_root_variables(self, raw: str) -> list[str]:
+        """Concrete paths a ``$SESSION_ROOT/...`` style token can name.
+
+        The system prompt tells the model to address files through these
+        variables, so a bash read written that way must count as a read.
+        - Locally, SESSION_ROOT is files_root and WORKSPACE_ROOT is root.
+        - The docker sandbox mounts the session files at /workspace.
+        - Remote mode uses the process home for both.
+        Every candidate is still confined to files_root by the caller.
+        """
+        match = re.match(r"^\$(?:\{(\w+)\}|(\w+))(.*)$", raw)
+        if not match:
+            if raw.startswith("/workspace/"):
+                files_root = getattr(self, "files_root", None)
+                return [str(Path(files_root) / raw[len("/workspace/"):])] if files_root else []
+            return [raw]
+        name = match.group(1) or match.group(2)
+        rest = match.group(3) or ""
+        files_root = getattr(self, "files_root", None)
+        session_root = getattr(self, "root", None)
+        roots: list[object] = []
+        if name in {"SESSION_ROOT", "SESSION_FILES_ROOT"}:
+            roots = [files_root]
+        elif name == "WORKSPACE_ROOT":
+            roots = [session_root, files_root]
+        out = []
+        for root in roots:
+            if root:
+                out.append(str(root) + rest)
+        return out
+
     def _shell_candidate_rel_path(self, token: object, cwd: Path | None = None) -> str:
         """Resolve one explicit shell token to a session-local file path."""
         raw = str(token or "").strip()
+        if raw.startswith(("$SESSION_ROOT", "${SESSION_ROOT}", "$WORKSPACE_ROOT", "${WORKSPACE_ROOT}",
+                           "$SESSION_FILES_ROOT", "${SESSION_FILES_ROOT}", "/workspace/")):
+            for expanded in self._expand_shell_root_variables(raw):
+                resolved = self._shell_candidate_rel_path(expanded, cwd)
+                if resolved:
+                    return resolved
+            return ""
         if not raw or raw in {"-", ".", ".."} or raw.startswith(("$", "http://", "https://")):
             return ""
         raw = raw[1:] if raw.startswith("@") and len(raw) > 1 else raw
@@ -39990,6 +41103,36 @@ class SessionState:
             "confidence": confidence,
         }
 
+    @staticmethod
+    def _shell_command_line_range(command: str, total_lines: int) -> tuple[int, int] | None:
+        """Exact 1-based line range of a single-file sed/head/tail read, if stated.
+
+        Only the simple forms are recognised: one command, optionally followed
+        by a stderr/stdout discard. Pipelines and other cases return None and
+        keep output alignment as the only evidence.
+        """
+        raw = re.sub(r"\s+", " ", str(command or "").strip())
+        raw = re.sub(r"\s(?:2>/dev/null|1>/dev/null|>/dev/null|2>&1)\s*$", "", raw)
+        if not raw or any(ch in raw for ch in "|;&`") or "$(" in raw:
+            return None
+        if total_lines <= 0:
+            return None
+        match = re.match(r"^sed -n ['\"]?(\d+)(?:,(\d+))?p['\"]? \S+$", raw)
+        if match:
+            lo = int(match.group(1))
+            hi = int(match.group(2) or match.group(1))
+            lo, hi = max(1, lo), min(total_lines, hi)
+            return (lo, hi) if lo <= hi else None
+        match = re.match(r"^head (?:-n ?(\d+)|-(\d+)) \S+$", raw)
+        if match:
+            count = int(match.group(1) or match.group(2))
+            return (1, min(total_lines, count)) if count > 0 else None
+        match = re.match(r"^tail (?:-n ?(\d+)|-(\d+)) \S+$", raw)
+        if match:
+            count = int(match.group(1) or match.group(2))
+            return (max(1, total_lines - count + 1), total_lines) if count > 0 else None
+        return None
+
     def _ingest_shell_read_observations(
         self,
         source_tool: str,
@@ -40044,6 +41187,16 @@ class SessionState:
                     ),
                 )
                 ranges = aligned.get("ranges", []) if isinstance(aligned, dict) else []
+                # Output alignment skips blank and very short lines, which left
+                # holes in an otherwise complete `sed -n 'X,Yp'` / head / tail
+                # read. The command states its exact range; use it when the
+                # output really contains those source lines.
+                explicit = self._shell_command_line_range(command, len(lines))
+                if explicit:
+                    lo, hi = explicit
+                    expected = "\n".join(lines[lo - 1:hi]).strip()
+                    if expected and expected in text:
+                        ranges = [[lo, hi]]
                 if not ranges:
                     continue
                 memory = self._merge_long_content_observation(
@@ -40060,6 +41213,12 @@ class SessionState:
                     confidence=float(aligned.get("confidence", 0.0) or 0.0),
                 )
                 if memory:
+                    # A bash read counts as much as read_file. Record which message
+                    # carries the lines; read_file's reuse/delta checks consult
+                    # this same long-content memory, so a later read_file of these
+                    # lines sees them. (The read-context registry is not written
+                    # here: it would duplicate the bash entry in tool_memory search.)
+                    self._record_visible_read(memory, ranges, getattr(_READ_DISPATCH_CONTEXT, "tool_call_id", ""))
                     observations.append({
                         "path": rel,
                         "ranges": ranges,
@@ -40977,6 +42136,25 @@ class SessionState:
                 "hot_recent=" + " | ".join(hot_bits)
                 + " ; these are recent tool results also likely still present in raw conversation context."
             )
+        # Per-path visible line ranges, computed once. Each row can then say
+        # which lines of the source are still readable in context, instead of
+        # implying "already read" after compaction removed the text.
+        try:
+            visible_by_path: dict[str, str] = {}
+            store = getattr(self, "long_content_memory", {}) if isinstance(getattr(self, "long_content_memory", {}), dict) else {}
+            prompt_role = "" if not for_role or self._sanitize_agent_role(for_role) in {"", "single"} else for_role
+            for memory in store.values():
+                if not isinstance(memory, dict):
+                    continue
+                spans = self._visible_read_ranges(memory, prompt_role)
+                if spans is None:
+                    continue
+                label = ",".join(f"{a}-{b}" for a, b in sorted(set(spans))[:4])
+                for source_path in [memory.get("source_path", "")] + list(memory.get("source_paths", []) or []):
+                    if source_path:
+                        visible_by_path[str(source_path)] = label
+        except Exception:
+            visible_by_path = {}
         for entry in selected:
             status = str(entry.get("status", "active") or "active")
             tool = str(entry.get("source_tool", "") or "")
@@ -40984,6 +42162,9 @@ class SessionState:
             path = str(entry.get("target_path", entry.get("path", "")) or "")
             cmd = str(entry.get("command", "") or "")
             locator = f"path={path}" if path else (f"command={trim(cmd, 140)}" if cmd else "target=-")
+            if path and path in visible_by_path:
+                spans = visible_by_path[path]
+                locator += f" lines={spans} in_context=yes" if spans else " in_context=no"
             cache = str(entry.get("cache_path", "") or "")
             buffer_ref = str(entry.get("buffer_ref", "") or "")
             temp_output_path = str(entry.get("temp_output_path", "") or "")
@@ -41524,6 +42705,11 @@ class SessionState:
         text = str(output or "")
         text = re.sub(r"^\[bash cached command=.*?source_versions_unchanged=true\]\n", "", text, count=1, flags=re.S)
         text = re.sub(r"\n\[evidence_ref id=[a-f0-9]{24}[^\n]*\]$", "", text)
+        # A reused/delta/window header changes on every read (coverage, ranges),
+        # which made an identical body look like fresh evidence. Hash the body
+        # only. An "unchanged" marker has no body: it hashes to the same value
+        # each time, so repeats of it count as reuse rather than progress.
+        text = re.sub(r"^\[read_file (?:reused|delta|window|cached)[^\n]*\]\n?", "", text, count=1)
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
     def _update_agent_loop_progress_state(self, tool_results: list[dict], role: str = "") -> dict:
@@ -41847,7 +43033,7 @@ class SessionState:
                 "CURRENT CANONICAL TODO ROWS (inspect before any update):\n"
                 + "\n".join(
                     f"- [{str(row.get('status', 'pending')).lower()}] "
-                    f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 80)} "
+                    f"({row.get('short_id') or '-'}) id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 80)} "
                     f"{trim(str(row.get('content', '') or ''), 180)}"
                     for row in canonical_rows[:24]
                 )
@@ -41892,7 +43078,7 @@ class SessionState:
             canonical_rows = []
         canonical_text = "\n".join(
             f"- [{str(row.get('status', 'pending')).lower()}] "
-            f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
+            f"({row.get('short_id') or '-'}) id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
             f"{trim(str(row.get('content', '') or ''), 360)}"
             for row in canonical_rows[:40]
             if str(row.get("content", "") or "").strip()
@@ -41913,24 +43099,55 @@ class SessionState:
                     "</single-todo-alignment-state>",
                 ]
             ),
-            1500,
+            24000,
         )
 
     def _maybe_inject_read_file_strategy_intervention(self, tool_results: list[dict], role: str = "") -> bool:
         rows = [r for r in (tool_results or []) if isinstance(r, dict)]
         if not rows:
             return False
-        read_rows = [
+        bookkeeping = {"TodoWrite", "TodoWriteRescue", "tool_memory", "compress", "task_list", "task_get", "read_from_blackboard"}
+
+        def is_read(row: dict) -> bool:
+            name = canonicalize_tool_name(str(row.get("name", "") or ""))
+            if name == "read_file":
+                return True
+            if name in {"bash", "worktree_run"}:
+                args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
+                try:
+                    operation, _declared = self._bash_operation_from_args(args)
+                    return self._bash_looks_like_file_read(str(args.get("command", "") or ""), operation)
+                except Exception:
+                    return False
+            return False
+
+        # read_file and bash file reads both count. Bookkeeping tools (TodoWrite,
+        # tool_memory, compress, ...) neither count nor reset, so a TodoWrite
+        # between two identical reads no longer hides the loop.
+        considered = [
             r for r in rows
-            if str(r.get("name", "") or "") == "read_file" and bool(r.get("ok", False))
+            if canonicalize_tool_name(str(r.get("name", "") or "")) not in bookkeeping
         ]
-        if not read_rows or len(read_rows) != len(rows):
-            if any(bool(r.get("ok", False)) and str(r.get("name", "") or "") != "read_file" for r in rows):
+        read_rows = [r for r in considered if bool(r.get("ok", False)) and is_read(r)]
+        if not read_rows or len(read_rows) != len(considered):
+            if any(bool(r.get("ok", False)) and not is_read(r) for r in considered):
                 self._reset_read_file_loop_tracking(role)
             return False
         role_key = self._sanitize_agent_role(role) or "single"
         state = self.read_file_loop_state.get(role_key, {}) if isinstance(getattr(self, "read_file_loop_state", {}), dict) else {}
-        signatures = [self._read_file_signature_from_args(r.get("args", {})) for r in read_rows]
+        signatures = []
+        for r in read_rows:
+            args = r.get("args", {}) if isinstance(r.get("args"), dict) else {}
+            if canonicalize_tool_name(str(r.get("name", "") or "")) == "read_file":
+                signatures.append(self._read_file_signature_from_args(args))
+            else:
+                # Key a bash read by the files it touched, not its exact text,
+                # so `cat a.py` and `sed -n '1,200p' a.py` count as the same file.
+                try:
+                    targets = self._bash_file_read_targets(str(args.get("command", "") or ""))
+                except Exception:
+                    targets = []
+                signatures.append("bash-read:" + "|".join(sorted(targets)) if targets else "")
         signatures = [s for s in signatures if s]
         if not signatures:
             return False
@@ -41981,11 +43198,67 @@ class SessionState:
                 )
             },
         )
+        # Previously this guidance only reached the UI. The model must see it:
+        # list what is already available so the next move is reuse or work,
+        # not another read of the same lines.
+        try:
+            self._inject_read_context_strategy_note(role_key)
+        except Exception:
+            pass
         # Give the next round a clean counter while retaining recent signatures for diagnostics.
         state["read_only_rounds"] = 0
         state["repeat_rounds"] = 0
         self.read_file_loop_state[role_key] = state
         return True
+
+    def _inject_read_context_strategy_note(self, role: str = "") -> str:
+        """Tell the model which reads it already has, and where.
+
+        Rows come from long-content memory: path, line ranges still visible in
+        this role's context, and the tool_call_id that carries them. The note
+        uses the existing <read-context-strategy> marker, which the runtime
+        already purges at step boundaries.
+        """
+        role_key = self._sanitize_agent_role(role)
+        context_role = "" if role_key in {"", "single"} else role_key
+        rows: list[str] = []
+        store = getattr(self, "long_content_memory", {}) if isinstance(getattr(self, "long_content_memory", {}), dict) else {}
+        for memory in sorted(
+            (m for m in store.values() if isinstance(m, dict)),
+            key=lambda m: float(m.get("updated_at", 0.0) or 0.0),
+            reverse=True,
+        )[:8]:
+            path = str(memory.get("source_path", "") or "")
+            if not path:
+                continue
+            visible = self._visible_read_ranges(memory, context_role) or []
+            spans = ",".join(f"{a}-{b}" for a, b in sorted(set(visible))[:6])
+            carrier = ""
+            if visible:
+                a, b = sorted(visible)[0]
+                carrier = self._visible_read_carrier(memory, a, b, context_role)
+            status = f"visible lines {spans}" + (f" in tool_call_id={carrier}" if carrier else "") if spans else "read earlier, no longer in context"
+            rows.append(f"- {trim(path, 200)}: {status}")
+        if not rows:
+            return ""
+        note = (
+            "<read-context-strategy>\n"
+            "You have re-read the same sources several times. These reads are already available:\n"
+            + "\n".join(rows)
+            + "\nUse the visible text in those earlier tool results. Read again only lines that are not listed, "
+            "or pass fresh=true when you need to verify a change. Otherwise continue with the work itself.\n"
+            "</read-context-strategy>"
+        )
+        # The runtime-control envelope keeps this guidance out of UI projection
+        # and exports as user input; the model still receives it.
+        message = self._runtime_control_message(
+            note, control_tag="read-context-strategy", ui_visible=False,
+        )
+        if context_role:
+            self._append_agent_context_message(context_role, message)
+        else:
+            self.messages.append(message)
+        return note
 
     def _maybe_record_tool_memory_after_result(self, name: str, args: dict | None, output: str, role: str = "") -> None:
         output = self._evidence_body(output)
@@ -42283,12 +43556,21 @@ class SessionState:
         This is the important part of preventing read_file loops under compact:
         the model can compare several recently read files at once instead of
         losing the previous file every time a new read succeeds.
+
+        Pins are limited by a total character budget per tier, not a
+        per-message cutoff. A per-message cutoff lower than read_file's own
+        output cap meant a normal 50k read could never be pinned.
         """
         keep: set[int] = set()
         seen: set[str] = set()
         budget = self._read_context_budget()
-        max_chars = int(budget.get("pin_chars", READ_FILE_COMPACT_PIN_MAX_CHARS) or READ_FILE_COMPACT_PIN_MAX_CHARS)
         max_distinct = int(budget.get("pin_distinct", READ_FILE_COMPACT_PIN_DISTINCT) or READ_FILE_COMPACT_PIN_DISTINCT)
+        try:
+            tier = int(budget.get("tier", 0) or 0)
+        except Exception:
+            tier = 0
+        total_budget = int(READ_FILE_PIN_TOTAL_CHARS[min(max(tier, 0), len(READ_FILE_PIN_TOTAL_CHARS) - 1)])
+        spent = 0
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             if not isinstance(msg, dict) or msg.get("role") != "tool":
@@ -42299,17 +43581,61 @@ class SessionState:
             content = msg.get("content", "")
             if not isinstance(content, str) or not content.strip():
                 continue
-            if content.startswith("[cleared by microcompact]") or content.startswith("[read_file cached"):
+            if content.startswith(READ_RESULT_PLACEHOLDER_PREFIXES):
                 continue
-            if len(content) > max_chars:
+            # A short "reused/unchanged" marker carries no body. Leave the slot
+            # for the older message that holds the actual text.
+            if content.startswith("[read_file reused") and "unchanged" in content.split("\n", 1)[0]:
                 continue
             sig = self._read_file_signature_from_args(args)
             if sig in seen:
                 continue
+            if spent + len(content) > total_budget and keep:
+                continue
             seen.add(sig)
             keep.add(id(msg))
-            if len(seen) >= max_distinct:
+            spent += len(content)
+            if len(seen) >= max_distinct or spent >= total_budget:
                 break
+        return keep
+
+    def _is_file_read_tool_message(self, messages: list[dict], index: int, msg: dict) -> bool:
+        """True for read_file results and bash results that read files."""
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            return False
+        name, args = self._tool_message_name_args(messages, index, msg)
+        tool = canonicalize_tool_name(name)
+        if tool == "read_file":
+            return True
+        if tool in {"bash", "worktree_run"} and isinstance(args, dict):
+            try:
+                command = str(args.get("command", "") or "")
+                operation, _declared = self._bash_operation_from_args(args)
+                return bool(command) and self._bash_looks_like_file_read(command, operation)
+            except Exception:
+                return False
+        return False
+
+    def _microcompact_protected_ids(
+        self, messages: list[dict], *, preserve_reads: bool = False,
+    ) -> set[int]:
+        """Message ids microcompact must leave intact.
+
+        - Results the model has not seen yet (``_unseen``). Compaction runs
+          before the next model call, so a batch of reads could otherwise be
+          replaced before the model ever read them.
+        - Pinned recent reads, within the character budget.
+        - At tier 0 (``preserve_reads``), every file-read result.
+        """
+        keep: set[int] = set()
+        for index, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            if msg.get("_unseen"):
+                keep.add(id(msg))
+            elif preserve_reads and self._is_file_read_tool_message(messages, index, msg):
+                keep.add(id(msg))
+        keep |= self._read_file_pinned_tool_message_ids(messages)
         return keep
 
     def _tool_memory_pinned_tool_message_ids(self, messages: list[dict]) -> set[int]:
@@ -42514,15 +43840,18 @@ class SessionState:
         )
         return "\n".join(rows)
 
-    def _microcompact(self, keep_recent: int = 3):
+    def _microcompact(self, keep_recent: int = 3, *, preserve_reads: bool = False):
         """Replace old tool results with compact placeholders to save tokens.
 
         Handles both OpenAI-style (role=tool) and Anthropic-style (tool_result blocks)
         messages. Keeps the most recent `keep_recent` tool interactions intact.
+        Results the model has not seen, pinned reads, and (with
+        ``preserve_reads`` at tier 0) every file read are never replaced.
         """
         # Phase 1: OpenAI-style role=tool messages
         tool_messages = [m for m in self.messages if m.get("role") == "tool"]
         pinned_read_ids = self._tool_memory_pinned_tool_message_ids(self.messages)
+        pinned_read_ids |= self._microcompact_protected_ids(self.messages, preserve_reads=preserve_reads)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
             keep_ids = {id(x) for x in kept} | pinned_read_ids
@@ -42562,10 +43891,13 @@ class SessionState:
                 if changed:
                     msg["content"] = new_content
 
-    def _microcompact_agent_messages(self, messages: list[dict], keep_recent: int = 3):
+    def _microcompact_agent_messages(
+        self, messages: list[dict], keep_recent: int = 3, *, preserve_reads: bool = False,
+    ):
         """Apply microcompact to an agent-specific message list (e.g. agent_messages filtered by role)."""
         tool_messages = [m for m in messages if m.get("role") == "tool"]
         pinned_read_ids = self._tool_memory_pinned_tool_message_ids(messages)
+        pinned_read_ids |= self._microcompact_protected_ids(messages, preserve_reads=preserve_reads)
         if len(tool_messages) > keep_recent:
             kept = tool_messages[-keep_recent:]
             keep_ids = {id(x) for x in kept} | pinned_read_ids
@@ -47457,6 +48789,18 @@ body{padding:18px}
                 "seen_segments": seen_segments,
                 "observed_segments": observed_segments,
                 "read_ranges": read_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                # Which tool message showed which lines. read_ranges says what
+                # was ever read; this says where the text was, so a range is
+                # only "already in context" while that message keeps its body.
+                "visible_reads": [
+                    {
+                        "start": max(1, int(item.get("start", 1) or 1)),
+                        "end": max(1, int(item.get("end", 1) or 1)),
+                        "tool_call_id": trim(str(item.get("tool_call_id", "") or ""), 120),
+                    }
+                    for item in (value.get("visible_reads", []) or [])[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+                    if isinstance(item, dict) and str(item.get("tool_call_id", "") or "").strip()
+                ],
                 "observations": observations[-LONG_CONTENT_OBSERVATION_MAX:],
                 "observation_count": max(
                     len(observations),
@@ -47998,16 +49342,32 @@ body{padding:18px}
             end = min(len(lines), start + limit - 1)
         else:
             return ""
-        if self._long_content_range_is_covered(memory, start, end):
-            body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
-            return self._clip_read_file_output(
-                f"[read_file reused path={rel} lines={start}-{end} coverage="
-                f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
-                self._read_file_max_chars(src.get("max_chars")),
-            )
+        visible = self._visible_read_ranges(memory, getattr(_READ_DISPATCH_CONTEXT, "read_role", ""))
+        if visible is not None:
+            # Tracked reads: only lines the model can still see count as
+            # covered. Compacted messages no longer hold their text, so those
+            # lines come back instead of being silently dropped from the delta.
+            cover_source = [[a, b] for a, b in visible]
+            fully_visible = self._ranges_cover(cover_source, start, end)
+            if fully_visible:
+                carrier = self._visible_read_carrier(memory, start, end, getattr(_READ_DISPATCH_CONTEXT, "read_role", ""))
+                return (
+                    f"[read_file reused path={rel} lines={start}-{end} unchanged already_in_context"
+                    f"{(' tool_call_id=' + carrier) if carrier else ''}; "
+                    "the text is in your earlier tool result. Pass fresh=true to re-emit]"
+                )
+        else:
+            cover_source = list(memory.get("read_ranges", []) or []) if isinstance(memory, dict) else []
+            if self._long_content_range_is_covered(memory, start, end):
+                body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
+                return self._clip_read_file_output(
+                    f"[read_file reused path={rel} lines={start}-{end} coverage="
+                    f"{float(memory.get('coverage', 0.0) or 0.0):.0%}]\n{body}",
+                    self._read_file_max_chars(src.get("max_chars")),
+                )
         # Compute uncovered intervals against the union of remembered ranges.
         covered = []
-        for item in memory.get("read_ranges", []) if isinstance(memory, dict) else []:
+        for item in cover_source:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 try:
                     covered.append((max(start, int(item[0])), min(end, int(item[1]))))
@@ -48082,13 +49442,19 @@ body{padding:18px}
 
     def _maybe_enrich_long_content_semantic(
         self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None,
-        *, allow_pending: bool = False,
+        *, allow_pending: bool = False, prior_status: str | None = None,
     ) -> None:
         """Best-effort, bounded semantic understanding for a source version.
 
         ``semantic_status`` and refresh counters are persisted, making calls
         version-scoped rather than segment-scoped. Any provider, timeout, or
         JSON failure leaves the deterministic cards intact.
+
+        Runs on the session's single enrichment worker.  Results are merged
+        into the entry currently stored under the card's ``content_id``,
+        because reads rebuild ``long_content_memory`` while the model call is
+        in flight.  ``prior_status`` is the status the starter replaced with
+        ``pending``; a skipped call (``LLMGateBusy``) restores it.
         """
         if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
             return
@@ -48127,14 +49493,34 @@ body{padding:18px}
             memory["semantic_retry_at"] = now_ts() + 60.0
             self._schedule_persist()
             return
+        # Restored when the call is skipped because the session is busy.
+        if prior_status is None:
+            prior_status = status
+        prior_status = str(prior_status or "").strip().lower()
+        if prior_status == "pending":
+            prior_status = ""
+        prior_attempts = int(memory.get("semantic_attempts", 0) or 0)
+        # Carried into every write-back: the entry stored when the call ends
+        # may have been rebuilt from a copy taken before this increment.
+        attempts = prior_attempts + 1
         memory["semantic_status"] = "pending"
-        memory["semantic_attempts"] = int(memory.get("semantic_attempts", 0) or 0) + 1
+        memory["semantic_attempts"] = attempts
         memory["semantic_started_at"] = now_ts()
+        content_id = str(memory.get("content_id", "") or "")
         prompt = self._long_content_semantic_input(memory, lines, touched_segments)
+        # What the model sees.  Reads merged while the call is in flight stay
+        # "not yet incorporated", so they can trigger a later refresh.
+        baseline = {
+            "semantic_last_coverage": float(memory.get("coverage", 0.0) or 0.0),
+            "semantic_last_seen_count": len(memory.get("seen_segments", []) or []),
+            "semantic_last_observation_count": int(memory.get("observation_count", 0) or 0),
+        }
         if not prompt.strip():
-            memory["semantic_status"] = "failed"
-            memory["semantic_retry_at"] = now_ts() + 60.0
-            self._schedule_persist()
+            self._merge_long_content_semantic_result(
+                content_id,
+                memory,
+                {"semantic_status": "failed", "semantic_retry_at": now_ts() + 60.0, "semantic_attempts": attempts},
+            )
             return
         box: dict[str, object] = {}
         def _runner():
@@ -48156,6 +49542,9 @@ body{padding:18px}
                     max_tokens=int(LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS),
                     temperature=0.1,
                     think=False,
+                    auxiliary=True,
+                    label="semantic_enrichment",
+                    request_timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS + 2.0,
                 )
             except Exception as exc:
                 box["error"] = exc
@@ -48163,10 +49552,37 @@ body{padding:18px}
         worker.start()
         worker.join(timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS)
         if worker.is_alive():
-            memory["semantic_status"] = "failed"
-            memory["semantic_error"] = "timeout"
-            memory["semantic_retry_at"] = now_ts() + 60.0
-            self._schedule_persist()
+            self._mark_llm_worker_abandoned(worker)
+            # The socket timeout is the join timeout + 2s, so the request
+            # ends shortly.  Wait for it here (this thread is the session's
+            # single enrichment worker) so no second request can start while
+            # this one is still in flight.
+            worker.join(timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS + 4.0)
+            if worker.is_alive() or "response" not in box:
+                self._merge_long_content_semantic_result(
+                    content_id,
+                    memory,
+                    {
+                        "semantic_status": "failed",
+                        "semantic_error": "timeout",
+                        "semantic_retry_at": now_ts() + 60.0,
+                        "semantic_attempts": attempts,
+                    },
+                )
+                return
+        if isinstance(box.get("error"), LLMGateBusy):
+            # Skipped, not failed: no free slot or endpoint cooldown.  Keep
+            # the prior status so the next read can try again.
+            self._merge_long_content_semantic_result(
+                content_id,
+                memory,
+                {
+                    "semantic_status": prior_status,
+                    "semantic_attempts": prior_attempts,
+                    "semantic_started_at": 0.0,
+                    "semantic_refresh_due": True,
+                },
+            )
             return
         response = box.get("response", {})
         raw = response.get("content", "") if isinstance(response, dict) else response
@@ -48174,41 +49590,84 @@ body{padding:18px}
             extract_json_object_from_text(str(raw or ""), {})
         )
         if not semantic or not (semantic.get("summary") or semantic.get("key_points")):
-            memory["semantic_status"] = "failed"
-            memory["semantic_error"] = trim(str(box.get("error", "invalid JSON") or "invalid JSON"), 180)
-            memory["semantic_retry_at"] = now_ts() + 60.0
-            self._schedule_persist()
+            self._merge_long_content_semantic_result(
+                content_id,
+                memory,
+                {
+                    "semantic_status": "failed",
+                    "semantic_error": trim(str(box.get("error", "invalid JSON") or "invalid JSON"), 180),
+                    "semantic_retry_at": now_ts() + 60.0,
+                    "semantic_attempts": attempts,
+                },
+            )
             return
-        memory["semantic"] = semantic
-        memory["semantic_status"] = "ready"
-        if int(memory.get("semantic_attempts", 0) or 0) > 1:
-            memory["semantic_refreshes"] = int(memory.get("semantic_refreshes", 0) or 0) + 1
-        memory["semantic_version"] = str(memory.get("source_sha256", "") or memory.get("content_id", ""))[:120]
-        memory["semantic_updated_at"] = now_ts()
-        memory["semantic_last_coverage"] = float(memory.get("coverage", 0.0) or 0.0)
-        memory["semantic_last_seen_count"] = len(memory.get("seen_segments", []) or [])
-        memory["semantic_last_observation_count"] = int(memory.get("observation_count", 0) or 0)
-        memory["objective_signature"] = objective_sig or str(memory.get("objective_signature", "") or "")
-        memory["objective_text"] = objective
-        memory["objective_gaps"] = list(semantic.get("open_questions", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS]
-        memory["objective_covered"] = list(semantic.get("covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED]
         next_ids = {
             str(x).strip() for x in (semantic.get("next_segments", []) or []) if str(x).strip()
         }
-        unread = {
-            str(seg.get("id", "")).strip()
-            for seg in (memory.get("segments", []) or [])
-            if isinstance(seg, dict) and str(seg.get("id", "")).strip()
-            and str(seg.get("id", "")) not in set(memory.get("seen_segments", []) or [])
-        }
-        memory["semantic_next_segments"] = list(next_ids & unread)[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]
-        memory["semantic_retry_at"] = 0.0
-        memory["semantic_started_at"] = 0.0
-        memory.pop("semantic_error", None)
-        memory["updated_at"] = now_ts()
-        self.long_content_memory[memory["content_id"]] = self._normalize_long_content_memory(
-            self.long_content_memory
-        ).get(memory["content_id"], memory)
+
+        def _ready(current: dict) -> dict:
+            # Suggested next segments are filtered against the entry as it is
+            # now; the refresh baselines are what the model actually saw.
+            seen = set(current.get("seen_segments", []) or [])
+            unread = {
+                str(seg.get("id", "")).strip()
+                for seg in (current.get("segments", []) or [])
+                if isinstance(seg, dict) and str(seg.get("id", "")).strip()
+                and str(seg.get("id", "")) not in seen
+            }
+            fields = {
+                "semantic": semantic,
+                "semantic_status": "ready",
+                "semantic_version": str(current.get("source_sha256", "") or current.get("content_id", ""))[:120],
+                "semantic_updated_at": now_ts(),
+                **baseline,
+                "objective_signature": objective_sig or str(current.get("objective_signature", "") or ""),
+                "objective_text": objective,
+                "objective_gaps": list(semantic.get("open_questions", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS],
+                "objective_covered": list(semantic.get("covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED],
+                "semantic_next_segments": list(next_ids & unread)[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS],
+                "semantic_retry_at": 0.0,
+                "semantic_started_at": 0.0,
+                "semantic_error": None,
+                "semantic_attempts": attempts,
+            }
+            if attempts > 1:
+                fields["semantic_refreshes"] = int(current.get("semantic_refreshes", 0) or 0) + 1
+            return fields
+
+        self._merge_long_content_semantic_result(content_id, memory, _ready)
+
+    def _merge_long_content_semantic_result(self, content_id: str, memory: dict, fields) -> None:
+        """Write enrichment fields into the entry stored now under ``content_id``.
+
+        ``_merge_long_content_observation`` rebuilds ``long_content_memory``
+        on every read, so the dict the worker started with may be stale; the
+        current entry is re-read under ``self.lock`` and merged.  ``fields`` is
+        a dict or a callable taking the current entry and returning one; a
+        value of ``None`` removes the key.  A card invalidated by an edit while
+        the call was in flight keeps its tombstone.
+        """
+        lock = getattr(self, "lock", None)
+        with lock if lock is not None else contextlib.nullcontext():
+            if content_id:
+                registry = getattr(self, "long_content_memory", None)
+                current = registry.get(content_id) if isinstance(registry, dict) else None
+                if not isinstance(current, dict):
+                    # The card was evicted while the call was running.
+                    return
+            else:
+                current = memory
+            if bool(current.get("stale", False)):
+                return
+            updates = fields(current) if callable(fields) else dict(fields or {})
+            # In place, so a caller still holding this entry sees the result
+            # and writing that entry back cannot undo it.
+            for key, value in updates.items():
+                if value is None:
+                    current.pop(key, None)
+                else:
+                    current[key] = value
+            current["updated_at"] = now_ts()
         self._schedule_persist()
 
     def _start_long_content_semantic_enrichment(
@@ -48218,11 +49677,15 @@ body{padding:18px}
 
         A tiny join window lets very fast/local providers complete inline (and
         keeps deterministic callers observable), while normal network/model
-        latency continues in the background.  The source card is marked
-        ``pending`` before spawning so adjacent segment reads cannot fan out
-        duplicate completions.
+        latency continues in the background.  At most one enrichment runs per
+        session: while ``self._semantic_enrichment_worker`` is alive new reads
+        only leave ``semantic_refresh_due`` set for a later read.  A ``failed``
+        card waits for ``semantic_retry_at``.
         """
         if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
+            return
+        previous = getattr(self, "_semantic_enrichment_worker", None)
+        if previous is not None and previous.is_alive():
             return
         status = str(memory.get("semantic_status", "") or "").strip().lower()
         if status == "disabled":
@@ -48231,6 +49694,12 @@ body{padding:18px}
             started = float(memory.get("semantic_started_at", 0.0) or 0.0)
             if started and now_ts() - started <= max(30.0, LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS * 3):
                 return
+            # No worker is alive, so this pending mark is left over from a
+            # restart or a dead thread; retry it like a failed card.
+            status = "failed"
+            memory["semantic_retry_at"] = 0.0
+        if status == "failed" and float(memory.get("semantic_retry_at", 0.0) or 0.0) > now_ts():
+            return
         if status == "ready":
             refreshes = int(memory.get("semantic_refreshes", 0) or 0)
             if refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES or not bool(memory.get("semantic_refresh_due", False)):
@@ -48243,9 +49712,10 @@ body{padding:18px}
         worker = threading.Thread(
             target=self._maybe_enrich_long_content_semantic,
             args=(memory, rel, lines, touched_segments),
-            kwargs={"allow_pending": True},
+            kwargs={"allow_pending": True, "prior_status": status},
             daemon=True,
         )
+        self._semantic_enrichment_worker = worker
         worker.start()
         # Never make read_file wait for the model; only harvest a very fast
         # response so unit/local mock providers remain deterministic.
@@ -48576,7 +50046,18 @@ body{padding:18px}
             self._start_long_content_semantic_enrichment(memory, rel, lines, touched)
         return memory
 
-    def _mark_long_content_read(self, rel: str, fp: Path, lines: list[str], args: dict, output: str, role: str = '') -> None:
+    def _mark_long_content_read(
+        self,
+        rel: str,
+        fp: Path,
+        lines: list[str],
+        args: dict,
+        output: str,
+        role: str = '',
+        *,
+        tool_call_id: str = '',
+        read_range: tuple[int, int] | None = None,
+    ) -> None:
         memory = self._ensure_long_content_memory(rel, fp, lines)
         if not memory:
             return
@@ -48589,6 +50070,18 @@ body{padding:18px}
                 n = int(match.group(1))
                 if 1 <= n <= len(lines) and match.group(2) == lines[n - 1]:
                     actual.append(n)
+        if not actual and read_range:
+            # Small-file and symbol reads render source text without line
+            # numbers. The caller knows the exact range; accept it only if the
+            # rendered body really contains those source lines.
+            try:
+                lo = max(1, int(read_range[0]))
+                hi = min(len(lines), int(read_range[1]))
+            except Exception:
+                lo, hi = 1, 0
+            body = self._evidence_body(output)
+            if lo <= hi and "\n".join(lines[lo - 1:hi]).strip() and "\n".join(lines[lo - 1:hi]) in body:
+                actual.extend(range(lo, hi + 1))
         mode = str(args.get('mode') or 'auto')
         if mode == 'full':
             body = self._evidence_body(output)
@@ -48612,8 +50105,98 @@ body{padding:18px}
                 ranges[-1][1] = n
             else:
                 ranges.append([n, n])
-        self._merge_long_content_observation(rel, fp, lines, ranges, source_tool='read_file', role=role,
-                                            locator=self._read_file_signature_from_args({**args, 'path': rel}), confidence=1.0)
+        merged = self._merge_long_content_observation(rel, fp, lines, ranges, source_tool='read_file', role=role,
+                                                     locator=self._read_file_signature_from_args({**args, 'path': rel}), confidence=1.0)
+        self._record_visible_read(merged, ranges, tool_call_id)
+
+    def _record_visible_read(self, memory: dict | None, ranges: list, tool_call_id: str) -> None:
+        """Remember which tool message carries which source lines."""
+        call_id = trim(str(tool_call_id or "").strip(), 120)
+        if not call_id or not isinstance(memory, dict) or not ranges:
+            return
+        content_id = str(memory.get("content_id", "") or "")
+        store = getattr(self, "long_content_memory", None)
+        target = store.get(content_id) if isinstance(store, dict) and content_id else None
+        if not isinstance(target, dict):
+            target = memory
+        rows = [row for row in (target.get("visible_reads", []) or []) if isinstance(row, dict)]
+        for start, end in ranges:
+            rows.append({"start": int(start), "end": int(end), "tool_call_id": call_id})
+        target["visible_reads"] = rows[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+
+    @staticmethod
+    def _ranges_cover(ranges: list, start: int, end: int) -> bool:
+        """True when the union of [a, b] ranges covers every line in start..end."""
+        spans = []
+        for item in ranges or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    spans.append((int(item[0]), int(item[1])))
+                except Exception:
+                    continue
+        cursor = start
+        for a, b in sorted(spans):
+            if a > cursor:
+                break
+            cursor = max(cursor, b + 1)
+            if cursor > end:
+                return True
+        return cursor > end
+
+    def _visible_read_carrier(self, memory: dict, start: int, end: int, role: str = "") -> str:
+        """tool_call_id of a still-visible message that covers start..end, if one does."""
+        visible_ids = self._tool_call_ids_visible_in_context(role)
+        for row in reversed([r for r in (memory.get("visible_reads", []) or []) if isinstance(r, dict)]):
+            call_id = str(row.get("tool_call_id", "") or "")
+            try:
+                if call_id in visible_ids and int(row.get("start", 0)) <= start and int(row.get("end", 0)) >= end:
+                    return call_id
+            except Exception:
+                continue
+        return ""
+
+    def _tool_call_ids_visible_in_context(self, role: str = "") -> set[str]:
+        """tool_call_ids whose result is still in the role's context, uncompacted.
+
+        This is the ground truth for "already in context": a remembered read
+        only counts while the model can still see the message that carried it.
+        """
+        role_key = self._sanitize_agent_role(role)
+        try:
+            messages = self._agent_context(role_key) if role_key else list(getattr(self, "messages", []) or [])
+        except Exception:
+            messages = list(getattr(self, "messages", []) or [])
+        visible: set[str] = set()
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            call_id = str(msg.get("tool_call_id", "") or "")
+            content = msg.get("content", "")
+            if not call_id or not isinstance(content, str) or not content.strip():
+                continue
+            if content.startswith(READ_RESULT_PLACEHOLDER_PREFIXES):
+                continue
+            visible.add(call_id)
+        return visible
+
+    def _visible_read_ranges(self, memory: dict, role: str = "") -> list[tuple[int, int]] | None:
+        """Ranges whose carrying message is still visible, or None for legacy memory.
+
+        None means no read was ever tracked by tool_call_id. Callers then keep
+        the historical behaviour based on read_ranges.
+        """
+        rows = [row for row in (memory.get("visible_reads", []) or []) if isinstance(row, dict)] if isinstance(memory, dict) else []
+        if not rows:
+            return None
+        visible_ids = self._tool_call_ids_visible_in_context(role)
+        out: list[tuple[int, int]] = []
+        for row in rows:
+            if str(row.get("tool_call_id", "") or "") in visible_ids:
+                try:
+                    out.append((int(row.get("start", 1)), int(row.get("end", 1))))
+                except Exception:
+                    continue
+        return out
 
 
     def _invalidate_long_content_memory_path(self, rel: str, reason: str = "source changed") -> int:
@@ -49946,6 +51529,7 @@ body{padding:18px}
             client.model = model_override
         client.thinking_stream = False
         client.timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
+        client.request_gate = self._ensure_llm_gate()
         client.set_telemetry(
             getattr(self, "telemetry_callback", None),
             context_provider=lambda: {
@@ -49993,6 +51577,7 @@ body{padding:18px}
             f"Snapshot:\n{json_dumps(snapshot, indent=2)}"
         )
         box: dict[str, object] = {}
+        join_timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
 
         def _runner():
             try:
@@ -50004,6 +51589,12 @@ body{padding:18px}
                     temperature=float(self.arbiter_temperature),
                     think=False,
                     stream_thinking=False,
+                    # Auxiliary: no HTTP retries, never waits out an endpoint
+                    # cooldown, and the socket gives up shortly after the
+                    # join below does.
+                    auxiliary=True,
+                    label="arbiter",
+                    request_timeout=join_timeout + 2.0,
                 )
                 box["rsp"] = rsp
             except Exception as exc:
@@ -50011,10 +51602,13 @@ body{padding:18px}
 
         thread = threading.Thread(target=_runner, daemon=True)
         thread.start()
-        thread.join(timeout=max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS)))
+        thread.join(timeout=join_timeout)
         if thread.is_alive():
+            self._mark_llm_worker_abandoned(thread)
             return {"status": "ARBITER_TIMEOUT", "reasoning": "arbiter timeout", "raw": ""}
         err = box.get("error")
+        if isinstance(err, LLMGateBusy):
+            return {"status": "ARBITER_SKIPPED", "reasoning": trim(str(err), 220), "raw": ""}
         if isinstance(err, Exception):
             return {"status": "ARBITER_ERROR", "reasoning": trim(str(err), 220), "raw": ""}
         rsp = box.get("rsp") if isinstance(box.get("rsp"), dict) else {}
@@ -50956,6 +52550,9 @@ body{padding:18px}
                     system=self._inject_runtime_environment_context("/no_think\nAnalyze task dimensions. One line output only."),
                     max_tokens=40,
                     think=False,
+                    auxiliary=True,
+                    label="complexity_classify",
+                    request_timeout=7.0,
                 )
                 answer = str(rsp.get("content", "") or "").strip().upper()
                 # Parse dimension scores
@@ -50991,6 +52588,8 @@ body{padding:18px}
         t = threading.Thread(target=_classify, daemon=True)
         t.start()
         t.join(timeout=5.0)
+        if t.is_alive():
+            self._mark_llm_worker_abandoned(t)
         return result_box[0]
 
     def _infer_task_profile(self, goal: str) -> dict:
@@ -51521,6 +53120,7 @@ body{padding:18px}
         client.timeout = AUTO_TITLE_MODEL_TIMEOUT_SECONDS
         client.thinking_stream = False
         client.response_stream = False
+        client.request_gate = self._ensure_llm_gate()
         client.set_telemetry(
             getattr(self, "telemetry_callback", None),
             context_provider=lambda: {"session_id": self.id},
@@ -51637,6 +53237,10 @@ body{padding:18px}
                     think=False,
                     stream_thinking=False,
                     response_stream=False,
+                    # Busy slots skip to the local fallback title below.
+                    auxiliary=True,
+                    label="auto_title",
+                    request_timeout=AUTO_TITLE_MODEL_TIMEOUT_SECONDS,
                 )
                 raw_content = response.get("content", "") if isinstance(response, dict) else response
                 candidate = self._normalize_auto_title(str(raw_content or ""))
@@ -51937,12 +53541,17 @@ body{padding:18px}
             finally:
                 done.set()
 
-        threading.Thread(target=worker, daemon=True).start()
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
         try:
             while True:
                 if done.wait(poll_interval):
                     break
                 if self.cancel_requested:
+                    # The worker keeps its HTTP request (and gate slot) until
+                    # the socket returns; flag it so monitoring shows it as
+                    # abandoned rather than live work.
+                    self._mark_llm_worker_abandoned(worker_thread)
                     raise OllamaError("interrupted by user", status=499)
                 try:
                     self.run_last_heartbeat = now_ts()
@@ -52038,6 +53647,18 @@ body{padding:18px}
                 effort = floor
         return clamp_effort(effort, ceiling=ceiling)
 
+    @staticmethod
+    def _mark_tool_messages_seen(messages: object) -> None:
+        """Clear ``_unseen`` on every tool message the model just received.
+
+        The request list may be a filtered copy, but it holds the same dicts as
+        the stored contexts, so clearing the flag here clears it in the stored
+        contexts too.
+        """
+        for msg in messages if isinstance(messages, list) else []:
+            if isinstance(msg, dict) and msg.get("_unseen"):
+                msg.pop("_unseen", None)
+
     def _chat_with_same_model_retry(
         self,
         messages: list[dict],
@@ -52055,7 +53676,13 @@ body{padding:18px}
         media_inputs: list[dict] | None = None,
         effort: str = "",
         coordination: bool = False,
+        priority: str = "main",
+        label: str = "main",
     ) -> dict:
+        # ``priority``/``label`` go to the session gate: the agent loop stays
+        # "main"; subagents and teammates pass their own class so they queue
+        # behind it.
+        gate_kwargs = {"priority": str(priority or "main"), "label": str(label or priority or "main")}
         retry_budget = max(0, int(retries or 0))
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
         last_exc: OllamaError | None = None
@@ -52116,7 +53743,8 @@ body{padding:18px}
                 self._emit("status", {"summary": f"liquid kernel hook degraded: {trim(str(exc), 160)}"})
         if tools is not None:
             guarded_tools = self._filter_todo_progress_tools(tools, role=context_role_hint)
-            if len(guarded_tools) != len(tools):
+            todo_counts = getattr(self, "_todowrite_step_counter", {})
+            if todo_counts.get(self._todo_progress_guard_key(context_role_hint), 0) >= 2:
                 system = f"{system}\n\n{self._todo_no_progress_instruction()}"
                 if canonicalize_tool_name(tool_choice) in {"TodoWrite", "TodoWriteRescue"}:
                     tool_choice = ""
@@ -52224,6 +53852,7 @@ body{padding:18px}
                         cancel_check=lambda: bool(self.cancel_requested),
                         on_http_retry=_emit_http_retry,
                         effort=resolved_effort,
+                        **gate_kwargs,
                     ),
                     progress_label=f"{context_label} model call",
                 )
@@ -52234,6 +53863,7 @@ body{padding:18px}
                     estimated_prompt_tokens=estimated_prompt_tokens,
                     context_label=context_label,
                 )
+                self._mark_tool_messages_seen(messages)
                 return response
             except OllamaError as exc:
                 if visible_response_stream:
@@ -52346,6 +53976,7 @@ body{padding:18px}
                                 media_inputs=None,
                                 cancel_check=lambda: bool(self.cancel_requested),
                                 on_http_retry=_emit_http_retry,
+                                **gate_kwargs,
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
@@ -52356,6 +53987,7 @@ body{padding:18px}
                             estimated_prompt_tokens=fallback_estimated_prompt_tokens,
                             context_label=f"{context_label}:no-media",
                         )
+                        self._mark_tool_messages_seen(messages)
                         return response
                     except OllamaError:
                         if visible_response_stream:
@@ -54802,6 +56434,35 @@ body{padding:18px}
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
 
+    @staticmethod
+    def _edit_result_snippet(before_text: str, after_text: str, context: int = 8, max_lines: int = 80) -> tuple[str, tuple[int, int]]:
+        """The changed region of an edit, as numbered lines of the new text.
+
+        The region is found by trimming the common prefix and suffix, then
+        padded by ``context`` lines on each side and capped at ``max_lines``.
+        """
+        before = str(before_text or "").splitlines()
+        after = str(after_text or "").splitlines()
+        if not after or before == after:
+            return "", (0, 0)
+        prefix = 0
+        while prefix < min(len(before), len(after)) and before[prefix] == after[prefix]:
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < min(len(before), len(after)) - prefix
+            and before[len(before) - 1 - suffix] == after[len(after) - 1 - suffix]
+        ):
+            suffix += 1
+        changed_start = prefix + 1
+        changed_end = max(changed_start, len(after) - suffix)
+        lo = max(1, changed_start - context)
+        hi = min(len(after), changed_end + context)
+        if hi - lo + 1 > max_lines:
+            hi = lo + max_lines - 1
+        body = "\n".join(f"{n}: {after[n - 1]}" for n in range(lo, hi + 1))
+        return body, (lo, hi)
+
     def _edit_mismatch_diagnostic(self, content: str, old_text: str) -> str:
         """为 edit_file 匹配失败提供诊断信息"""
         lines = content.splitlines()
@@ -54908,7 +56569,24 @@ body{padding:18px}
         }
         return json_dumps(payload, indent=2)
 
-    def run_subagent(self, prompt: str, agent_type: str = "Explore") -> str:
+    def run_subagent(
+        self,
+        prompt: str,
+        agent_type: str = "Explore",
+        *,
+        priority: str = "subagent",
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        """Run a bounded tool-using subagent.
+
+        ``priority`` is the session-gate class of its model calls
+        (``subagent``, or ``teammate`` for ``_spawn_teammate`` workers).
+        ``cancel_event`` is checked before every round; without one, the
+        cancel flag of the timed ``task`` tool running on this thread is
+        used, so a timed-out subagent stops on its next round.
+        """
+        cancel_token = cancel_event if isinstance(cancel_event, threading.Event) else self._current_tool_cancel_event()
+        gate_priority = str(priority or "subagent")
         subtools = [
             tool_def(
                 "bash",
@@ -54962,6 +56640,10 @@ body{padding:18px}
         last_text = ""
         pinned_selection = self._active_runtime_selection()
         for _ in range(20):
+            if cancel_token is not None and cancel_token.is_set():
+                # The caller timed out (or stopped us); do not start another
+                # model round for a result nobody will read.
+                return last_text or "(subagent cancelled)"
             try:
                 hard_skills = self._loaded_skills_context_block(for_role=str(agent_type or "subagent"), max_chars=ADMIN_MAX_APP_CAPSULE_CHARS)
                 sub_system = f"You are a focused subagent. {model_language_instruction(self.ui_language)}"
@@ -54975,6 +56657,8 @@ body{padding:18px}
                     pinned_selection=pinned_selection,
                     context_label="subagent",
                     retries=MODEL_OUTPUT_RETRY_TIMES,
+                    priority=gate_priority,
+                    label=gate_priority,
                 )
             except OllamaError as exc:
                 return f"Error: {exc}"
@@ -55049,7 +56733,11 @@ body{padding:18px}
 
         def worker():
             try:
-                result = self.run_subagent(f"Teammate={name}, role={role}\n{prompt}", agent_type="general-purpose")
+                result = self.run_subagent(
+                    f"Teammate={name}, role={role}\n{prompt}",
+                    agent_type="general-purpose",
+                    priority="teammate",
+                )
                 self.bus.send(name, "lead", f"[{name}] {result}", "message")
                 status = "idle"
             except Exception as exc:
@@ -64776,9 +66464,44 @@ body{padding:18px}
             # (generic subtasks like "design" or "analyze" don't need tool evidence)
         return unverified
 
+    def _subtask_acceptance_evidence_signature(
+        self, step_id: str, completed_rows: list[dict], failures: list[str], bb: dict
+    ) -> str:
+        """Fingerprint of what the acceptance check would look at for a step."""
+        step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        step_entries = step_files_raw.get(step_id, []) if step_id else []
+        files = [
+            f"{entry.get('op', '?')}:{entry.get('path', '?')}"
+            for entry in (step_entries[-15:] if isinstance(step_entries, list) else [])
+            if isinstance(entry, dict)
+        ]
+        exec_logs = bb.get("execution_logs", [])
+        logs = [
+            trim(str(log.get("content", "") or ""), 200)
+            for log in (exec_logs[-8:] if isinstance(exec_logs, list) else [])
+            if isinstance(log, dict)
+        ]
+        material = {
+            "step": step_id,
+            "completed": sorted(
+                str(row.get("subtask_id", "") or row.get("id", "") or row.get("content", "") or "")
+                for row in completed_rows
+                if isinstance(row, dict)
+            ),
+            "failures": sorted(str(item) for item in failures),
+            "files": files,
+            "logs": logs,
+        }
+        return hashlib.sha1(json_dumps(material).encode("utf-8", errors="replace")).hexdigest()[:20]
+
     def _inject_rework_if_needed(self, plan_step: dict, worker_step: dict):
-        """When subtasks are marked completed but acceptance fails, inject rework instruction.
-        Prevents the system from getting stuck or silently skipping unfinished work."""
+        """Hint once when completed subtasks fail the acceptance check.
+
+        The verdict is advisory: rows keep their status (the agent reopens
+        them through TodoWrite ``rework_completed`` if it agrees), the model
+        check runs at most once per 30s per step, and the same evidence
+        signature is hinted at most once.
+        """
         try:
             step_id = str(plan_step.get("id", "") or "")
             if not step_id:
@@ -64791,73 +66514,72 @@ body{padding:18px}
             failures = self._verify_subtasks_acceptance(completed_rows, step_id, bb)
             if not failures:
                 return
-            # LLM-based acceptance check: semantic analysis over heuristics
-            llm_verdict = self._llm_verify_subtask_acceptance(plan_step, completed_rows, bb)
-            if llm_verdict.get("all_passed", False):
+            signature = self._subtask_acceptance_evidence_signature(step_id, completed_rows, failures, bb)
+            hinted = getattr(self, "_rework_hint_signatures", None)
+            if not isinstance(hinted, dict):
+                hinted = {}
+                self._rework_hint_signatures = hinted
+            if hinted.get(step_id) == signature:
                 return
-            rework_items = llm_verdict.get("rework_items", failures)
-            if not rework_items:
-                return
-            # Rate-limit rework injection
+            # Rate limit before the model call, not after it.
             _rework_key = f"_rework_injected_{step_id}"
             _last_rework = getattr(self, _rework_key, 0.0)
             if float(now_ts()) - float(_last_rework) < 30.0:
                 return
             setattr(self, _rework_key, float(now_ts()))
+            # LLM-based acceptance check: semantic analysis over heuristics
+            llm_verdict = self._llm_verify_subtask_acceptance(plan_step, completed_rows, bb)
+            if not llm_verdict.get("available", True):
+                # Skipped (no free slot) or unreadable: nothing to hint, and
+                # the signature stays open for the next check.
+                return
+            if llm_verdict.get("all_passed", False):
+                hinted[step_id] = signature
+                return
+            rework_items = [
+                str(item) for item in (llm_verdict.get("rework_items") or failures) if str(item).strip()
+            ]
+            if not rework_items:
+                return
             step_label = trim(str(plan_step.get("content", "") or ""), 80)
             rework_text = (
                 f"<step-rework>\n"
-                f"Step \"{step_label}\" acceptance check FAILED. "
-                f"The following subtasks were marked completed but did not pass verification:\n"
+                f"Step \"{step_label}\" acceptance check found possible gaps in subtasks "
+                f"that are marked completed:\n"
             )
             for i, item in enumerate(rework_items[:5]):
                 rework_text += f"  {i+1}. {trim(str(item), 120)}\n"
             rework_text += (
-                "\nACTION REQUIRED: Fix these issues NOW before the step can advance.\n"
+                "\nVerify these before the step can advance:\n"
                 "- For missing files: create them with write_file\n"
                 "- For failed tests/builds: run the command again and fix errors\n"
                 "- For unverified installs: re-run the install command\n"
-                "After fixing, update TodoWrite to reflect the corrected state.\n"
+                "If a completed subtask really needs more work, reopen it with TodoWrite "
+                "update_mode='rework_completed'; otherwise keep its status.\n"
                 "</step-rework>"
             )
-            # Revert false "completed" status back to in_progress
-            _snap = self.todo.snapshot()
-            _modified = False
-            for row in _snap:
-                if not isinstance(row, dict):
-                    continue
-                if str(row.get("parent_step_id", "") or "") != step_id:
-                    continue
-                if str(row.get("status", "")).lower() != "completed":
-                    continue
-                rc = str(row.get("content", "") or "").strip().lower()
-                for fail in rework_items:
-                    fail_lower = str(fail).lower()
-                    if rc and (rc[:20] in fail_lower or any(w in fail_lower for w in rc.split()[:3] if len(w) > 3)):
-                        row["status"] = "in_progress"
-                        _modified = True
-                        break
-            if _modified:
-                try:
-                    self.todo.update(_snap)
-                except Exception:
-                    pass
+            # Advisory only: Todo statuses are never changed here.
             target_roles: tuple[str, ...] = ()
             if self._is_multi_agent_mode():
                 active_role = str(bb.get("active_agent", "") or "developer")
                 if active_role:
                     target_roles = (active_role,)
-            self._append_plan_guidance_bubble(
+            if self._append_plan_guidance_bubble(
                 rework_text,
                 target_roles=target_roles,
                 summary=f"step rework: {len(rework_items)} items failed acceptance",
-            )
+            ):
+                hinted[step_id] = signature
         except Exception:
             pass
 
     def _llm_verify_subtask_acceptance(self, plan_step: dict, completed_subtasks: list[dict], bb: dict) -> dict:
         """Use LLM semantic analysis to verify if subtasks are truly completed.
-        Returns {"all_passed": bool, "rework_items": list[str]}."""
+
+        Returns {"available": bool, "all_passed": bool, "rework_items": list[str]}.
+        ``available`` is False when the call was skipped (no free in-session
+        slot), failed, or returned no readable JSON verdict.
+        """
         try:
             step_id = str(plan_step.get("id", "") or "")
             step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
@@ -64895,20 +66617,26 @@ body{padding:18px}
                 system=self._inject_runtime_environment_context("You are a strict QA reviewer. Verify task completion against evidence. Reply ONLY valid JSON."),
                 max_tokens=300,
                 think=False,
+                auxiliary=True,
+                label="acceptance_verify",
+                request_timeout=ACCEPTANCE_VERIFY_TIMEOUT_SECONDS,
             )
-            import json
-            text = str(resp.get("text", "") or "").strip()
-            if "{" in text:
-                json_str = text[text.index("{"):text.rindex("}") + 1]
-                result = json.loads(json_str)
-                if isinstance(result, dict):
-                    return {
-                        "all_passed": bool(result.get("all_passed", False)),
-                        "rework_items": list(result.get("rework_items", [])),
-                    }
+            # chat() returns the answer under "content"; "text" is accepted
+            # for older/custom clients.
+            text = str((resp or {}).get("content", "") or (resp or {}).get("text", "") or "").strip()
+            result = extract_json_object_from_text(text, {})
+            if isinstance(result, dict) and "all_passed" in result:
+                items = result.get("rework_items", [])
+                return {
+                    "available": True,
+                    "all_passed": bool(result.get("all_passed", False)),
+                    "rework_items": [
+                        trim(str(item), 200) for item in (items if isinstance(items, list) else []) if str(item).strip()
+                    ][:8],
+                }
         except Exception:
             pass
-        return {"all_passed": False, "rework_items": []}
+        return {"available": False, "all_passed": False, "rework_items": []}
 
     def _acceptance_semantic_judge(
         self,
@@ -65680,6 +67408,8 @@ body{padding:18px}
                 max_tokens=900,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(response.get("content", "") or response.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -65711,6 +67441,17 @@ body{padding:18px}
                 "evidence": [trim(str(item or ""), 700) for item in review_evidence[:20] if str(item or "").strip()],
             }
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # Multi-step plan edits have no deterministic approval rule:
+                # a skipped review stays fail-closed, but is reported as a skip.
+                return {
+                    "available": False,
+                    "approved": False,
+                    "skipped": True,
+                    "skip_reason": skip,
+                    "reason": self._todo_llm_skip_text(skip, "plan-step review", exc),
+                }
             return {"available": False, "approved": False, "reason": f"plan-step review unavailable: {trim(str(exc), 240)}"}
 
     def _record_plan_step_revision(
@@ -66045,6 +67786,8 @@ body{padding:18px}
                 max_tokens=420,
                 temperature=0.1,
                 think=False,
+                label="todo_intent",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             payload = extract_json_object_from_text(
                 str(response.get("content", "") or response.get("text", "") or ""),
@@ -66065,7 +67808,12 @@ body{padding:18px}
                 "reason": trim(str(payload.get("reason", "") or ""), 900),
                 "parent_content": parent_content or content,
             }
-        except Exception:
+        except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict (budget used up, no slot, or timeout): treat the
+                # row as ambiguous so it stays a worker subtask.
+                return self._todo_llm_skipped_intent(skip, exc)
             # A provider that cannot support this optional classifier must not
             # lose a legitimate child Todo; the conservative fallback is to keep it.
             return {}
@@ -66144,6 +67892,8 @@ body{padding:18px}
                 max_tokens=360,
                 temperature=0.1,
                 think=False,
+                label="todo_intent",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             payload = extract_json_object_from_text(
                 str(response.get("content", "") or response.get("text", "") or ""),
@@ -66173,8 +67923,33 @@ body{padding:18px}
                 "existing_id": existing_id,
                 "reason": trim(str(payload.get("reason", "") or ""), 900),
             }
-        except Exception:
+        except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict: ambiguous, so the merge keeps its own identity
+                # matching (later dedupe decides whether the row is new).
+                return self._todo_llm_skipped_intent(skip, exc)
             return {}
+
+    @staticmethod
+    def _todo_llm_skipped_intent(skip: str, exc: object) -> dict:
+        """Intent result of a TodoWrite classifier that got no model verdict."""
+        return {
+            "intent": "ambiguous",
+            "confidence": "low",
+            "skipped": True,
+            "skip_reason": skip,
+            "reason": trim(f"intent classification skipped ({skip}): {exc}", 300),
+        }
+
+    @staticmethod
+    def _todo_llm_skip_text(skip: str, what: str, exc: object) -> str:
+        label = {
+            "budget": "TodoWrite model-call budget exhausted",
+            "busy": "no free model slot (busy) or endpoint cooldown",
+            "timeout": "model request timed out",
+        }.get(skip, skip)
+        return trim(f"{what} skipped ({skip}: {label}): {exc}", 300)
 
     def _plan_worker_row_is_foreign_plan_step(
         self,
@@ -66608,6 +68383,11 @@ body{padding:18px}
         review = step_reviews.get(stable_id, {}) if isinstance(step_reviews.get(stable_id), dict) else {}
         if not review or str(review.get("evidence_signature", "") or "") != signature:
             return {}, candidates
+        # Only a real verdict is reusable.  A review that was unavailable
+        # (timeout, provider error, skipped call) must not pin the subtask's
+        # completion state for the rest of this evidence signature.
+        if not bool(review.get("available", False)):
+            return {}, candidates
         return dict(review), candidates
 
     def _record_plan_subtask_semantic_review(
@@ -66728,6 +68508,8 @@ body{padding:18px}
                 max_tokens=360,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -66773,6 +68555,16 @@ body{padding:18px}
                     "raw": trim(raw, 1200),
                 })
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # Skipped (model-call budget used up, no free slot, or a
+                # timeout): nothing is recorded, so a later request reviews
+                # this evidence afresh.  The completion stays unproven.
+                review["reason"] = self._todo_llm_skip_text(skip, "semantic subtask review", exc)
+                review["skipped"] = True
+                review["skip_reason"] = skip
+                review["ts"] = float(now_ts())
+                return review
             review["reason"] = trim(f"semantic subtask review unavailable: {exc}", 300)
         review["ts"] = float(now_ts())
         self._record_plan_subtask_semantic_review(
@@ -67756,10 +69548,14 @@ body{padding:18px}
             )
             or ""
         ).strip()
-        parsed_status, parsed_content = split_todo_status_text(raw_content)
-        content = normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content)
+        parsed_status, parsed_content, tagged_short_id = split_todo_status_text_with_id(raw_content)
+        content_source = parsed_content if tagged_short_id else (parsed_content or raw_content)
+        content = normalize_work_text(content_source) or content_source
         content = trim(str(content or "").strip(), 500)
-        if not content:
+        references = self._todo_input_references(raw, tagged_short_id, parsed_status)
+        if tagged_short_id:
+            references["_todo_display_content"] = parsed_content
+        if not content and not any(references.get(key) for key in ("_ref_short_id", "_ref_subtask_id", "_ref_external_id")):
             return {}
         # Accept provider-specific aliases without changing the canonical row
         # identity.  A resume payload often uses ``done``/``finished`` booleans
@@ -67793,6 +69589,7 @@ body{padding:18px}
             "content": content,
             "status": status,
             "owner": owner,
+            **references,
         }
         if bool(raw.get("_parent_step_inferred", False)):
             row["_parent_step_inferred"] = True
@@ -67829,6 +69626,8 @@ body{padding:18px}
         ):
             alias = trim(str(raw.get(alias_key, "") or "").strip(), 120)
             if alias:
+                if normalize_todo_short_id(alias) or alias.startswith(("rt:", "pst:")):
+                    continue
                 row.setdefault("external_subtask_id", alias)
                 break
         if key and not key.startswith("bb:"):
@@ -67942,7 +69741,108 @@ body{padding:18px}
         route_kind = self._todo_route_kind(role=role)
         return bool(self._todo_route_rows(route_kind, role=role))
 
+    @staticmethod
+    def _todo_text_dedupe_key(text: object) -> str:
+        """Normalize Todo text for duplicate detection.
+
+        Removes the (tN) display tag, status checkboxes, bullets, punctuation
+        and whitespace. An "N.M" substep prefix is kept, so 1.1 and 1.2 never
+        collapse into one row.
+        """
+        _status, body, _sid = split_todo_status_text_with_id(text)
+        body = str(body or text or "")
+        prefix = ""
+        match = re.match(r"^\s*(\d+\.\d+)\b", body)
+        if match:
+            prefix = match.group(1) + ":"
+            body = body[match.end():]
+        body = re.sub(r"^\s*(?:[-*•>]+\s*)+", "", body)
+        body = re.sub(r"[\s\W_]+", "", body.casefold(), flags=re.UNICODE)
+        return prefix + body
+
+    @staticmethod
+    def _todo_substep_numbers_conflict(incoming: dict | None, candidate: dict | None) -> bool:
+        """True when both rows carry different "N.M" numbers.
+
+        Substep numbers are identities: 1.3 is never a rewording of 1.1, even
+        when the remaining text scores as similar.
+        """
+        def number(row: dict | None) -> str:
+            match = re.match(r"^\s*(\d+\.\d+)\b", str((row or {}).get("content", "") or ""))
+            return match.group(1) if match else ""
+
+        a, b = number(incoming), number(candidate)
+        return bool(a and b and a != b)
+
+    def _todo_text_is_duplicate(self, incoming: object, existing: object) -> bool:
+        """Same objective in other words: equal keys, or one contains the other.
+
+        Containment needs a 0.85 length ratio, so a short generic row cannot
+        swallow a longer, different one.
+        """
+        a = self._todo_text_dedupe_key(incoming)
+        b = self._todo_text_dedupe_key(existing)
+        if not a or not b:
+            return False
+        a_num = a.split(":", 1)[0] if re.match(r"^\d+\.\d+:", a) else ""
+        b_num = b.split(":", 1)[0] if re.match(r"^\d+\.\d+:", b) else ""
+        if a_num and b_num and a_num != b_num:
+            return False
+        if a == b:
+            return True
+        short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+        return short in long_ and len(short) / max(1, len(long_)) >= 0.85
+
+    def _todo_signal_rows_for_existing(self, items: list[dict], role: str = "") -> list[dict]:
+        """Keep only text-derived rows that update an existing row's status.
+
+        Assistant prose often repeats or paraphrases a Todo list. Such text is
+        never a request to add work. Unmatched rows are dropped, so prose can
+        no longer create the duplicate rows users saw appearing from nowhere.
+        """
+        existing = [
+            dict(row) for row in self.todo.snapshot()
+            if isinstance(row, dict) and self._todo_row_kind(row) != "system"
+        ]
+        if not existing:
+            return []
+        kept: list[dict] = []
+        used: set[int] = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            sid = normalize_todo_short_id(item.get("short_id", ""))
+            target = -1
+            for index, row in enumerate(existing):
+                if index in used:
+                    continue
+                if sid and normalize_todo_short_id(row.get("short_id", "")) == sid:
+                    target = index
+                    break
+            if target < 0 and str(item.get("content", "") or "").strip():
+                for index, row in enumerate(existing):
+                    if index in used:
+                        continue
+                    if self._todo_text_is_duplicate(item.get("content", ""), row.get("content", "")):
+                        target = index
+                        break
+            if target < 0:
+                continue
+            used.add(target)
+            prior = existing[target]
+            row = {
+                "content": prior.get("content", ""),
+                "status": item.get("status", prior.get("status", "pending")),
+                "short_id": prior.get("short_id", ""),
+            }
+            for field in ("subtask_id", "key", "parent_step_id", "owner", "root_group_id", "external_subtask_id"):
+                if prior.get(field):
+                    row[field] = prior[field]
+            kept.append(row)
+        return kept
+
     def _merge_todo_signal_rows(self, items: list[dict], role: str = "", board: dict | None = None) -> str:
+        items = self._todo_signal_rows_for_existing(items, role=role)
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         role_key = self._sanitize_agent_role(role)
         route_kind = self._todo_route_kind(role=role_key, board=bb)
@@ -68150,6 +70050,8 @@ body{padding:18px}
                 max_tokens=360,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(response.get("content", "") or response.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -68169,6 +70071,19 @@ body{padding:18px}
                 ],
             }
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict: the caller applies the deterministic revision
+                # rule (_todo_revision_fallback_review) instead.
+                return {
+                    "available": False,
+                    "approved": False,
+                    "skipped": True,
+                    "skip_reason": skip,
+                    "confidence": "low",
+                    "reason": self._todo_llm_skip_text(skip, "semantic audit", exc),
+                    "unsupported_changes": [],
+                }
             return {
                 "available": False,
                 "approved": False,
@@ -68202,6 +70117,56 @@ body{padding:18px}
         )
         sequence_score = difflib.SequenceMatcher(None, left_text.lower(), right_text.lower()).ratio()
         return max(token_score, sequence_score) >= float(minimum)
+
+    def _plan_worker_revision_effective_rows(
+        self,
+        existing_rows: list[dict],
+        proposed_rows: list[dict],
+        *,
+        mode: str,
+    ) -> list[dict]:
+        """Step-local tree a rolling revision would commit, for the fallback rule.
+
+        Mirrors the revise merge in ``_merge_plan_worker_todo_items``:
+        completed rows the proposal does not reopen are kept (only
+        ``rework_completed`` may reopen one), and the existing acceptance row
+        is kept when the proposal carries none.
+        """
+        existing = [dict(row) for row in (existing_rows or []) if isinstance(row, dict)]
+        rework = str(mode or "").strip().lower() == "rework_completed"
+        completed = [
+            row for row in existing
+            if self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed"
+        ]
+        reopened: set[int] = set()
+        rows: list[dict] = []
+        for incoming in proposed_rows or []:
+            if not isinstance(incoming, dict):
+                continue
+            ids = self._todo_revision_row_ids(incoming)
+            text_key = self._todo_revision_text_key(incoming)
+            prior_index = next(
+                (
+                    index for index, prior in enumerate(completed)
+                    if (ids & self._todo_revision_row_ids(prior))
+                    or (text_key and text_key == self._todo_revision_text_key(prior))
+                ),
+                -1,
+            )
+            if prior_index < 0:
+                rows.append(dict(incoming))
+                continue
+            if rework and self._normalize_todo_status_value(incoming.get("status", ""), "pending") != "completed":
+                reopened.add(prior_index)
+                rows.append(dict(incoming))
+        effective = [row for index, row in enumerate(completed) if index not in reopened] + rows
+        if not any(self._is_plan_step_acceptance_subtask(row.get("content", "")) for row in effective):
+            acceptance = [
+                row for row in existing
+                if self._is_plan_step_acceptance_subtask(row.get("content", ""))
+            ]
+            effective.extend(acceptance[-1:])
+        return effective
 
     def _review_plan_worker_revision(
         self,
@@ -68263,15 +70228,10 @@ body{padding:18px}
                 "after_open": after_open,
                 "evidence_ids": [],
             }
-        accepted_rows = [
-            row for row in (bb.get("plan_todo_revisions", []) if isinstance(bb.get("plan_todo_revisions"), list) else [])
-            if isinstance(row, dict)
-            and str(row.get("step_id", "") or "") == step_id
-            and str(row.get("status", "") or "") == "accepted"
-        ]
+        # A single discovery can justify several successive refinements. Its
+        # evidence remains valid within this activation of the parent step;
+        # accepting one revision must not consume it for all later revisions.
         since_ts = self._plan_step_activation_ts(plan_step)
-        if accepted_rows:
-            since_ts = max(since_ts, float(accepted_rows[-1].get("ts", 0.0) or 0.0))
         candidates = self._plan_worker_revision_evidence_candidates(plan_step, board=bb, since_ts=since_ts)
         matched: list[dict] = []
         for record in candidates:
@@ -68281,7 +70241,7 @@ body{padding:18px}
             return {
                 "ok": False,
                 "structural": True,
-                "reason": "revision_evidence did not match any current-step evidence recorded since the last accepted revision",
+                "reason": "revision_evidence did not match any evidence recorded during the current-step activation",
                 "before_open": before_open,
                 "after_open": after_open,
                 "evidence_ids": [],
@@ -68305,6 +70265,14 @@ body{padding:18px}
             after_open=after_open,
             evidence=matched,
         )
+        if bool(semantic_audit.get("skipped", False)):
+            # No model verdict (budget, busy or timeout): decide with the
+            # deterministic rule against the tree this merge would commit.
+            semantic_audit = self._todo_revision_fallback_review(
+                existing_rows,
+                self._plan_worker_revision_effective_rows(existing_rows, proposed_rows, mode=mode),
+                skipped_review=semantic_audit,
+            )
         if not bool(semantic_audit.get("available", False)):
             return {
                 "ok": False,
@@ -68330,6 +70298,7 @@ body{padding:18px}
         return {
             "ok": True,
             "structural": True,
+            "fallback": bool(semantic_audit.get("fallback", False)),
             "reason": trim(
                 str(semantic_audit.get("reason", "runtime evidence and semantic audit accepted the rolling subplan revision") or ""),
                 600,
@@ -68477,8 +70446,12 @@ body{padding:18px}
             external = trim(str(row.get("external_subtask_id", "") or "").strip(), 120).casefold()
             if external and external_counts.get(external, 0) > 1:
                 row.pop("external_subtask_id", None)
-            row.pop("subtask_id", None)
+            # Renaming a row must not change its canonical id. Only repair
+            # actual collisions left by legacy sessions.
             stable_id = self._stable_root_todo_id(row)
+            if stable_id in used_ids:
+                row.pop("subtask_id", None)
+                stable_id = self._stable_root_todo_id(row)
             if stable_id in used_ids:
                 content = re.sub(r"\s+", " ", str(row.get("content", "") or "").strip().casefold())
                 stable_id = "rt:" + hashlib.sha1(
@@ -68635,6 +70608,8 @@ body{padding:18px}
                 max_tokens=1000,
                 temperature=0.1,
                 think=False,
+                label="todo_audit",
+                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
             )
             raw = str(response.get("content", "") or response.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
@@ -68680,6 +70655,19 @@ body{padding:18px}
                 "evidence": review_evidence,
             }
         except Exception as exc:
+            skip = todo_llm_skip_reason(exc)
+            if skip:
+                # No verdict: the caller applies the deterministic revision
+                # rule (_todo_revision_fallback_review) instead.
+                return {
+                    "available": False,
+                    "approved": False,
+                    "skipped": True,
+                    "skip_reason": skip,
+                    "confidence": "low",
+                    "completion_risk": "high",
+                    "reason": self._todo_llm_skip_text(skip, "Todo-tree semantic review", exc),
+                }
             return {
                 "available": False,
                 "approved": False,
@@ -68730,6 +70718,146 @@ body{padding:18px}
             },
         )
 
+    def _todo_status_update_evidence_text(self, evidence: object, reason: object = "") -> str:
+        """Evidence a status_update payload attaches to the rows it reports on.
+
+        Payload-level ``revision_evidence``/``evidence`` (or, without any, the
+        ``reason``) no longer turns a status_update into a revision; it is
+        recorded on the matched rows like per-row evidence.
+        """
+        refs = self._plan_worker_revision_references(evidence)
+        text = "; ".join(refs) if refs else str(reason or "").strip()
+        return trim(text, 300)
+
+    def _todo_status_update_result(self, result: object, omitted: int) -> str:
+        """Add one line saying a status_update preserved the rows it omitted."""
+        text = str(result or "")
+        if (
+            omitted <= 0
+            or not text
+            or text == self.todo.no_changes_text()
+            or text.startswith("Error:")
+            or text.lstrip().lower().startswith("control[")
+        ):
+            return text
+        return (
+            f"{text}\nSTATUS UPDATE: {omitted} omitted row(s) were preserved; "
+            "use update_mode='revise_open' to remove or replace rows."
+        )
+
+    @staticmethod
+    def _todo_revision_text_key(row: dict | None) -> str:
+        """Normalized row text used by the deterministic revision fallback."""
+        content = str((row or {}).get("content", "") or "")
+        text = normalize_work_text(content) or content
+        return re.sub(r"\s+", " ", text).strip().casefold()
+
+    @staticmethod
+    def _todo_revision_row_ids(row: dict | None) -> set[str]:
+        """Every id a Todo row carries (canonical and provider aliases)."""
+        item = row if isinstance(row, dict) else {}
+        values: set[str] = set()
+        for field in (
+            "subtask_id", "external_subtask_id", "key", "id", "external_id",
+            "todo_id", "task_id", "item_id", "row_id",
+        ):
+            value = trim(str(item.get(field, "") or "").strip(), 120)
+            if value and not value.startswith("bb:"):
+                values.add(value.casefold())
+        return values
+
+    def _todo_revision_fallback_review(
+        self,
+        current_rows: list[dict],
+        proposed_rows: list[dict],
+        *,
+        skipped_review: dict | None = None,
+        max_rows: int = TODO_REVISION_FALLBACK_MAX_ROWS,
+    ) -> dict:
+        """Deterministic decision for a Todo revision whose model audit was skipped.
+
+        Used only when the reviewer returned no verdict because the TodoWrite
+        model-call budget was exhausted, no in-session slot was free, or the
+        request timed out.  An explicit model approve/reject stays
+        authoritative, and invalid JSON or other errors stay fail-closed.
+
+        The revision is approved only when all three conditions hold:
+        (1) no completed row is removed or downgraded, (2) every removed open
+        row has a counterpart in the proposal by id or identical normalized
+        text, and (3) the proposal has at most ``max_rows`` rows.
+        """
+        current = [row for row in (current_rows or []) if isinstance(row, dict)]
+        proposed = [row for row in (proposed_rows or []) if isinstance(row, dict)]
+        proposed_ids: dict[str, dict] = {}
+        proposed_texts: dict[str, dict] = {}
+        for row in proposed:
+            for value in self._todo_revision_row_ids(row):
+                proposed_ids.setdefault(value, row)
+            text_key = self._todo_revision_text_key(row)
+            if text_key:
+                proposed_texts.setdefault(text_key, row)
+
+        def _counterpart(row: dict) -> dict | None:
+            for value in self._todo_revision_row_ids(row):
+                if value in proposed_ids:
+                    return proposed_ids[value]
+            text_key = self._todo_revision_text_key(row)
+            return proposed_texts.get(text_key) if text_key else None
+
+        completed_lost: list[str] = []
+        open_unmapped: list[str] = []
+        for row in current:
+            label = trim(str(row.get("content", "") or "").strip(), 160)
+            match = _counterpart(row)
+            if self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed":
+                if match is None:
+                    completed_lost.append(f"{label} (removed)")
+                elif self._normalize_todo_status_value(match.get("status", ""), "pending") != "completed":
+                    completed_lost.append(f"{label} (downgraded)")
+            elif match is None:
+                open_unmapped.append(label)
+        failures: list[str] = []
+        if completed_lost:
+            failures.append(
+                "(1) completed rows must not be removed or downgraded: " + "; ".join(completed_lost[:8])
+            )
+        if open_unmapped:
+            failures.append(
+                "(2) removed open rows need a counterpart in the proposal by id or identical text: "
+                + "; ".join(open_unmapped[:8])
+            )
+        limit = max(1, int(max_rows or TODO_REVISION_FALLBACK_MAX_ROWS))
+        if len(proposed) > limit:
+            failures.append(f"(3) the proposal has {len(proposed)} rows; at most {limit} are allowed")
+        skipped = skipped_review if isinstance(skipped_review, dict) else {}
+        skip = trim(str(skipped.get("skip_reason", "") or "unavailable"), 24)
+        prefix = f"semantic review skipped ({skip}); deterministic fallback "
+        if failures:
+            reason = prefix + "rejected the revision: " + " | ".join(failures)
+        else:
+            reason = prefix + (
+                "approved: no completed row was removed or downgraded, every removed open row "
+                f"has a counterpart, and the proposal has {len(proposed)} rows"
+            )
+        return {
+            "available": True,
+            "approved": not failures,
+            "decision": "approve" if not failures else "reject",
+            "fallback": True,
+            "skipped": True,
+            "skip_reason": skip,
+            "confidence": "low",
+            "completion_risk": "low" if not failures else "high",
+            "reason": trim(reason, 1200),
+            "failed_conditions": failures,
+            "removed_objectives": [value for value in open_unmapped[:40] if value],
+            "replacement_mapping": [],
+            "requirement_coverage": [],
+            "evidence": [],
+            # The failed conditions are already listed in ``reason``.
+            "unsupported_changes": [],
+        }
+
     def _root_todo_material_changes(self, existing_rows: list[dict], proposed_rows: list[dict]) -> tuple[list[str], list[str], list[str]]:
         before_open = [
             str(row.get("content", "") or "").strip()
@@ -68779,8 +70907,14 @@ body{padding:18px}
         mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
         if mode not in {"status_update", "revise_open", "rework_completed"}:
             mode = "status_update"
-        if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
-            mode = "revise_open"
+        # Only an explicit revise_open/rework_completed revises the tree.  A
+        # status_update that carries reason/evidence stays a merge; the
+        # evidence is attached to the matched rows it reports on.
+        status_evidence = (
+            self._todo_status_update_evidence_text(revision_evidence, revision_reason)
+            if mode == "status_update"
+            else ""
+        )
 
         normalized: list[dict] = []
         passthrough: list[dict] = []
@@ -68793,6 +70927,14 @@ body{padding:18px}
                 continue
             if role_key in {"manager", "explorer", "developer", "reviewer"}:
                 row["owner"] = role_key
+            if self._bind_todo_row_reference(row, existing_scope):
+                # Resolved by id: no classifier call, and an id-only row keeps
+                # the canonical text.
+                row["subtask_id"] = self._stable_root_todo_id(row)
+                normalized.append(row)
+                continue
+            if not str(row.get("content", "") or "").strip():
+                continue
             root_intent = (
                 self._classify_root_todo_intent(row, existing_scope, board=bb)
                 if mode == "status_update"
@@ -68845,6 +70987,8 @@ body{padding:18px}
                         ).casefold()
                         if candidate_group != incoming_group:
                             continue
+                        if self._todo_substep_numbers_conflict(incoming, candidate):
+                            continue
                         incoming_for_score = {
                             key: value
                             for key, value in incoming.items()
@@ -68875,12 +71019,30 @@ body{padding:18px}
                 for candidate_id, candidate, candidate_index in existing_entries:
                     if candidate_id in used:
                         continue
+                    if self._todo_substep_numbers_conflict(incoming, candidate):
+                        continue
                     score = self._plan_worker_todo_match_score(incoming, candidate)
                     if score >= 0.64:
                         scored.append((score, candidate_id, candidate, candidate_index))
                 scored.sort(key=lambda value: value[0], reverse=True)
                 if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
                     _score, identity, prior, prior_index = scored[0]
+            if prior is None:
+                # Last line of defence against duplicate rows: the same objective
+                # reworded (punctuation, bullets, status words, (tN) tag) inside
+                # the same group updates the open row instead of appending.
+                incoming_group = trim(str(incoming.get("root_group_id", "") or "").strip(), 120).casefold()
+                for candidate_id, candidate, candidate_index in existing_entries:
+                    if candidate_id in used:
+                        continue
+                    candidate_group = trim(str(candidate.get("root_group_id", "") or "").strip(), 120).casefold()
+                    if candidate_group != incoming_group:
+                        continue
+                    if self._normalize_todo_status_value(candidate.get("status", ""), "pending") == "completed":
+                        continue
+                    if self._todo_text_is_duplicate(incoming.get("content", ""), candidate.get("content", "")):
+                        identity, prior, prior_index = candidate_id, candidate, candidate_index
+                        break
             if isinstance(prior, dict):
                 used.add(identity)
                 incoming["subtask_id"] = prior.get("subtask_id", "") or self._stable_root_todo_id(prior)
@@ -68905,6 +71067,21 @@ body{padding:18px}
 
         if mode == "status_update":
             merged_scope = [dict(row) for row in existing_scope]
+            matched_existing = [
+                (incoming, prior, prior_index)
+                for incoming, _identity, prior, prior_index in matched
+                if isinstance(prior, dict) and prior_index >= 0
+            ]
+            # Payload-level evidence reports on the rows this update moves
+            # (or on the only row it names); it never revises the tree.
+            evidence_targets = {
+                prior_index
+                for incoming, prior, prior_index in matched_existing
+                if self._normalize_todo_status_value(incoming.get("status", ""), "pending")
+                != self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            }
+            if not evidence_targets and len(matched_existing) == 1:
+                evidence_targets = {matched_existing[0][2]}
             for incoming, _identity, prior, prior_index in matched:
                 if isinstance(prior, dict) and prior_index >= 0:
                     merged = dict(prior)
@@ -68919,12 +71096,21 @@ body{padding:18px}
                     for meta_key in ("evidence", "evidence_binding", "evidence_ids", "completed_at", "completed_by", "started_at"):
                         if incoming.get(meta_key) not in (None, "", []):
                             merged[meta_key] = incoming.get(meta_key)
+                    if (
+                        status_evidence
+                        and prior_index in evidence_targets
+                        and prior_status != "completed"
+                        and incoming.get("evidence") in (None, "", [])
+                    ):
+                        merged["evidence"] = status_evidence
                     # Status updates cannot silently abbreviate or redirect an
                     # objective. Structural text changes belong to revise_open.
                     merged_scope[prior_index] = merged
                 else:
                     incoming["created_at"] = float(incoming.get("created_at", 0.0) or now_ts())
                     merged_scope.append(incoming)
+            omitted = len(existing_scope) - len({prior_index for _incoming, _prior, prior_index in matched_existing})
+            self._todo_apply_requested_focus(merged_scope, normalized)
             state_lock = getattr(self, "lock", None)
             if state_lock is not None:
                 state_lock.acquire()
@@ -68932,10 +71118,11 @@ body{padding:18px}
                 valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
                 if not valid:
                     return self._emit_stale_todo_write_discarded(stale_reason)
-                return self.todo.update(preserved_rows + passthrough + merged_scope)
+                result = self.todo.update(preserved_rows + passthrough + merged_scope)
             finally:
                 if state_lock is not None:
                     state_lock.release()
+            return self._todo_status_update_result(result, omitted)
 
         reason = trim(str(revision_reason or "").strip(), 1200)
         if not (normalize_work_text(reason) or reason).strip():
@@ -68983,6 +71170,14 @@ body{padding:18px}
             removed_objectives=removed,
             evidence=evidence,
         )
+        if bool(review.get("skipped", False)):
+            # No model verdict (budget, busy or timeout): decide with the
+            # deterministic rule.  Invalid JSON and errors are not skips.
+            review = self._todo_revision_fallback_review(
+                existing_scope,
+                proposed_scope,
+                skipped_review=review,
+            )
         if not bool(review.get("available", False)) or not bool(review.get("approved", False)):
             self._append_root_todo_revision_audit(
                 actor=role_key, status="rejected", mode=mode, reason=reason,
@@ -69009,6 +71204,11 @@ body{padding:18px}
             actor=role_key, status="accepted", mode=mode, reason=reason,
             review=review, before_open=before_open, after_open=after_open, board=bb,
         )
+        if bool(review.get("fallback", False)):
+            return (
+                f"{result}\nTODO TREE REVISION: accepted by the deterministic fallback rule "
+                f"(semantic review skipped). Reason: {review.get('reason', reason)}"
+            )
         return (
             f"{result}\nTODO TREE REVISION: accepted after independent LLM coverage/risk review. "
             f"Reason: {review.get('reason', reason)}"
@@ -69154,6 +71354,9 @@ body{padding:18px}
             if key.startswith("bb:"):
                 incoming_normalized.append(raw)
                 continue
+            # Resolve display/provider/canonical ids before classifying a row
+            # as a new child or parent edit. Id-only updates are valid here too.
+            self._bind_todo_row_reference(raw, target_rows)
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
@@ -69207,8 +71410,16 @@ body{padding:18px}
         mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
         if mode not in {"status_update", "revise_open", "rework_completed"}:
             mode = "status_update"
-        if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
-            mode = "revise_open"
+        # Only an explicit revise_open/rework_completed revises the subplan.  A
+        # status_update that carries reason/evidence stays a status merge; the
+        # evidence is attached to the matched rows it reports on.
+        status_evidence = (
+            self._todo_status_update_evidence_text(revision_evidence, revision_reason)
+            if mode == "status_update"
+            else ""
+        )
+        status_update_omitted = 0
+        revision_fallback = False
 
         completion_audit_warnings: list[str] = []
 
@@ -69379,11 +71590,36 @@ body{padding:18px}
                 )
             patched_by_id = {key: dict(value) for key, value in existing_by_id.items()}
             order = [self._stable_plan_worker_subtask_id(step_id, row) for row in target_rows]
+            matched_existing = [
+                (incoming, subtask_id, prior)
+                for incoming in incoming_worker_rows
+                for subtask_id, prior in (_existing_match(incoming),)
+                if subtask_id and isinstance(prior, dict)
+            ]
+            # Payload-level evidence reports on the rows this update moves (or
+            # on the only row it names); it never revises the subplan.
+            evidence_targets = {
+                subtask_id
+                for incoming, subtask_id, prior in matched_existing
+                if self._normalize_todo_status_value(incoming.get("status", ""), "pending")
+                != self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            }
+            if not evidence_targets and len(matched_existing) == 1:
+                evidence_targets = {matched_existing[0][1]}
             for incoming in incoming_worker_rows:
                 subtask_id, prior = _existing_match(incoming)
                 if not subtask_id or not isinstance(prior, dict):
                     continue
                 prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                # Completed history keeps its own evidence; a payload-level
+                # note never overwrites it.
+                if (
+                    status_evidence
+                    and subtask_id in evidence_targets
+                    and prior_status != "completed"
+                    and not incoming.get("evidence")
+                ):
+                    incoming["evidence"] = status_evidence
                 incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
                 if prior_status == "completed" and incoming_status != "completed":
                     incoming_status = "completed"
@@ -69442,12 +71678,18 @@ body{padding:18px}
                     if binding:
                         merged["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
                         merged["evidence_binding"] = binding
+                elif status_evidence and subtask_id in evidence_targets and prior_status != "completed":
+                    # Evidence for an open row is a note only; it proves nothing.
+                    merged["evidence"] = trim(str(incoming.get("evidence", "") or ""), 300)
                 merged["updated_at"] = float(now_ts())
                 merged["owner"] = _resolved_row_owner(prior, incoming)
                 merged["parent_step_id"] = step_id
                 merged["subtask_id"] = subtask_id
                 patched_by_id[subtask_id] = merged
             current_step_rows = [patched_by_id[key] for key in order if key in patched_by_id]
+            status_update_omitted = len({key for key in order if key}) - len(
+                {subtask_id for _incoming, subtask_id, _prior in matched_existing}
+            )
         else:
             review = self._review_plan_worker_revision(
                 active_step,
@@ -69460,6 +71702,7 @@ body{padding:18px}
                 board=bb,
             )
             refs = self._plan_worker_revision_references(revision_evidence)
+            revision_fallback = bool(review.get("fallback", False))
             if not bool(review.get("ok", False)):
                 self._append_plan_worker_revision_audit(
                     step_id=step_id,
@@ -69569,7 +71812,13 @@ body{padding:18px}
                 step_id=step_id,
                 actor=role_key,
                 status="accepted",
-                reason=revision_reason,
+                # A deterministic fallback approval records its own reason
+                # (which conditions held) next to the proposer's.
+                reason=(
+                    f"{revision_reason} | {review.get('reason', '')}"
+                    if revision_fallback
+                    else revision_reason
+                ),
                 evidence_refs=refs,
                 evidence_ids=list(review.get("evidence_ids", []) or []),
                 before_open=list(review.get("before_open", []) or []),
@@ -69577,6 +71826,7 @@ body{padding:18px}
                 board=bb,
             )
 
+        self._todo_apply_requested_focus(current_step_rows, incoming_worker_rows)
         current_step_rows = self._filter_parent_step_duplicate_worker_rows(
             current_step_rows,
             active_step,
@@ -69659,11 +71909,19 @@ body{padding:18px}
         # just produced (numbering, statuses, the single acceptance gate) rather
         # than guessing. This is what keeps subsequent TodoWrite calls aligned to
         # the canonical N.M scheme instead of inventing a parallel set.
-        canonical = self._render_plan_worker_todo_canonical(step_id, current_step_rows)
+        if mode == "status_update":
+            result = self._todo_status_update_result(result, status_update_omitted)
+        committed_rows = [row for row in self.todo.snapshot() if row.get("parent_step_id") == step_id]
+        canonical = self._render_plan_worker_todo_canonical(step_id, committed_rows)
         if canonical:
             revision_note = ""
             if mode in {"revise_open", "rework_completed"} and target_rows:
-                revision_note = "\nROLLING SUBPLAN REVISION: accepted after current-step evidence audit."
+                revision_note = (
+                    "\nROLLING SUBPLAN REVISION: accepted by the deterministic fallback rule "
+                    "(semantic audit skipped)."
+                    if revision_fallback
+                    else "\nROLLING SUBPLAN REVISION: accepted after current-step evidence audit."
+                )
             audit_note = ""
             if completion_audit_warnings:
                 unique_open = list(dict.fromkeys(value for value in completion_audit_warnings if value))[:4]
@@ -69688,11 +71946,11 @@ body{padding:18px}
             if not ordered:
                 return ""
             _mark = {"completed": "[x]", "in_progress": "[>]", "pending": "[ ]", "blocked": "[!]"}
-            lines = ["CANONICAL SUBTASKS for the active step (continue the [>] item; do not renumber or restate):"]
+            lines = [f"CANONICAL SUBTASKS parent_step_id='{step_id}' (update by id; use revise_open for structural changes):"]
             for r in ordered:
                 st = str(r.get("status", "pending") or "pending").strip().lower()
                 content = normalize_embedded_newlines(str(r.get("content", "") or "")).split("\n", 1)[0].strip()
-                lines.append(f"  {_mark.get(st, '[ ]')} {trim(content, 140)}")
+                lines.append(f"  {_mark.get(st, '[ ]')} ({r.get('short_id') or '-'}) id={r.get('subtask_id', '')} {trim(content, 500)}")
             return "\n".join(lines)
         except Exception:
             return ""
@@ -77758,7 +80016,9 @@ body{padding:18px}
                     limit=12,
                 )
                 if parsed_rows:
-                    merged = self._merge_todo_signal_rows(parsed_rows, role=role_key, board=board)
+                    # Same per-TodoWrite model-call budget as the tool itself.
+                    with todo_llm_budget_scope(limit=TODO_LLM_CALL_BUDGET):
+                        merged = self._merge_todo_signal_rows(parsed_rows, role=role_key, board=board)
                     if merged != self.todo.no_changes_text():
                         self._emit(
                             "status",
@@ -78661,7 +80921,9 @@ body{padding:18px}
                 "arguments": {
                     "items": items,
                     "in_progress_index": 0,
-                    "revision_reason": "runtime compatibility fallback after bounded thinking-only recovery",
+                    # Plain status_update: a bootstrap seeds an empty tree and
+                    # must never enter the audited revision path.
+                    "update_mode": "status_update",
                 },
             },
         }
@@ -78949,6 +81211,10 @@ body{padding:18px}
         row["agent_role"] = role_key
         if "ts" not in row:
             row["ts"] = now_ts()
+        if row.get("role") == "tool":
+            # Cleared after the next successful model call; until then
+            # microcompact must not replace this result.
+            row["_unseen"] = True
         # Write to unified agent_messages with tier-aware trim
         # Skip exact duplicates from the last 6 same-role messages (e.g. user re-submits after interrupt)
         content = str(row.get("content", "") or "")
@@ -78967,6 +81233,9 @@ body{padding:18px}
             self.agent_messages = self.agent_messages[-am_limit:]
         if mirror_to_global:
             mirror = dict(row)
+            # The global mirror is a copy that no role request carries, so it
+            # would never be marked seen; protection applies to the role copy.
+            mirror.pop("_unseen", None)
             if "tool_calls" in mirror and isinstance(mirror.get("tool_calls"), list):
                 mirror["tool_calls"] = [
                     {
@@ -79468,6 +81737,9 @@ body{padding:18px}
             base = base + plan_todo_note + " "
         if todo_contract_note:
             base = base + todo_contract_note + " "
+        role_todo_ids_note = self._role_todo_ids_prompt_block(role_key)
+        if role_todo_ids_note:
+            base = base + role_todo_ids_note + " "
         if agent_loop_note:
             base = base + agent_loop_note + " "
         mcp_note = self._mcp_prompt_block()
@@ -79626,6 +81898,37 @@ body{padding:18px}
                 mirror_to_global=False,
             )
 
+    def _role_todo_ids_prompt_block(self, role: str = "", max_rows: int = 40) -> str:
+        """Current Todo rows with their short ids for a multi-agent role.
+
+        Single-agent prompts already carry the alignment block. Without ids,
+        worker roles could only refer to a row by its text, which turned every
+        rewording into a duplicate row.
+        """
+        try:
+            rows = [
+                dict(row) for row in self.todo.snapshot()
+                if isinstance(row, dict) and self._todo_row_kind(row) != "system"
+                and str(row.get("content", "") or "").strip()
+            ]
+        except Exception:
+            rows = []
+        role_key = self._sanitize_agent_role(role)
+        if role_key in {"explorer", "developer", "reviewer"}:
+            own = [row for row in rows if str(row.get("owner", "") or "") in {"", role_key}]
+            rows = own or rows
+        if not rows:
+            return ""
+        lines = [
+            f"- [{str(row.get('status', 'pending')).lower()}] ({row.get('short_id') or '-'}) "
+            f"{trim(str(row.get('content', '') or ''), 220)}"
+            for row in rows[:max_rows]
+        ]
+        return (
+            "CURRENT TODO ROWS (update a row by sending its id, e.g. {\"id\": \"t3\", \"status\": \"completed\"}; "
+            "rows without an id are treated as new):\n" + "\n".join(lines)
+        )
+
     def _todo_payload_items(
         self,
         args: object,
@@ -79648,6 +81951,7 @@ body{padding:18px}
             "owner": {"owner", "assignee", "agent", "role"},
             "key": {"key"},
             "subtask_id": {"subtaskid"},
+            "short_id": {"shortid"},
             "external_subtask_id": {"externalsubtaskid", "externalid", "todoid", "taskid", "itemid", "rowid"},
             "parent_step_id": {"parentstepid", "parentid", "stepid"},
             "activeForm": {"activeform"},
@@ -79696,13 +82000,16 @@ body{padding:18px}
                 row.get(key) not in (None, "")
                 for key in (
                     "content", "status", "completed", "in_progress", "owner", "key",
-                    "subtask_id", "external_subtask_id", "parent_step_id", "activeForm",
+                    "id", "short_id", "subtask_id", "external_subtask_id", "parent_step_id", "activeForm",
                 )
             )
 
         def _bind_mapping_identity(row: dict, mapping_key: object) -> dict:
             external_id = trim(str(mapping_key or "").strip(), 120)
             if external_id:
+                if normalize_todo_short_id(external_id) or external_id.startswith(("rt:", "pst:")):
+                    row.setdefault("id", external_id)
+                    return row
                 if not str(row.get("key", "") or "").strip():
                     row["key"] = external_id
                 if not str(row.get("external_subtask_id", "") or "").strip():
@@ -80071,6 +82378,52 @@ body{padding:18px}
             ]
         return [dict(row) for row in rows if isinstance(row, dict)]
 
+    @staticmethod
+    def _todo_apply_requested_focus(rows: list[dict], incoming: list[dict]) -> None:
+        """An explicit active row moves its owner's cursor, including partial writes."""
+        targets: dict[str, str] = {}
+        owners = {str(row.get("subtask_id", "") or ""): str(row.get("owner", "") or "") for row in rows}
+        for row in incoming:
+            if row.get("status") != "in_progress" or not row.get("_todo_status_explicit", False):
+                continue
+            identity = str(row.get("subtask_id", "") or "")
+            owner = owners.get(identity, str(row.get("owner", "") or ""))
+            if identity:
+                targets.setdefault(owner, identity)
+        for row in rows:
+            target = targets.get(str(row.get("owner", "") or ""))
+            if target and row.get("status") == "in_progress" and row.get("subtask_id") != target:
+                row["status"] = "pending"
+
+    @staticmethod
+    def _todo_input_references(raw: dict, tagged_short_id: str = "", parsed_status: str = "") -> dict:
+        """Shared reference contract for root and plan-worker Todo payloads."""
+        refs: dict = {}
+        for field in (
+            "short_id", "shortId", "id", "subtask_id", "subtaskId", "external_subtask_id",
+            "externalSubtaskId", "external_id", "externalId", "todo_id", "todoId",
+            "task_id", "taskId", "item_id", "itemId", "row_id", "rowId", "key",
+        ):
+            value = trim(str(raw.get(field, "") or "").strip(), 120)
+            if not value or value.startswith("bb:"):
+                continue
+            short_id = normalize_todo_short_id(value)
+            if short_id:
+                refs.setdefault("_ref_short_id", short_id)
+            elif value.startswith(("rt:", "pst:")):
+                refs.setdefault("_ref_subtask_id", value)
+            else:
+                refs.setdefault("_ref_external_id", value)
+        if tagged_short_id:
+            refs.setdefault("_ref_short_id", tagged_short_id)
+        refs["_todo_status_explicit"] = bool(parsed_status) or any(
+            raw.get(field) not in (None, "") for field in (
+                "status", "state", "phase", "completed", "complete", "done", "finished",
+                "passed", "success", "in_progress", "inprogress", "active", "working", "started",
+            )
+        )
+        return refs
+
     def _normalize_generic_todo_row(self, item: object, *, owner: str = "") -> dict:
         """Normalize a non-plan todo row before owner/flat reconciliation."""
         raw = {"content": item} if isinstance(item, str) else dict(item) if isinstance(item, dict) else {"content": str(item or "")}
@@ -80087,9 +82440,13 @@ body{padding:18px}
             )
             or ""
         ).strip()
-        parsed_status, parsed_content = split_todo_status_text(content)
-        content = trim(normalize_work_text(parsed_content or content) or (parsed_content or content), 500)
-        if not content:
+        parsed_status, parsed_content, tagged_short_id = split_todo_status_text_with_id(content)
+        content_source = parsed_content if tagged_short_id else (parsed_content or content)
+        content = trim(normalize_work_text(content_source) or content_source, 500)
+        references = self._todo_input_references(raw, tagged_short_id, parsed_status)
+        if tagged_short_id:
+            references["_todo_display_content"] = parsed_content
+        if not content and not any(references.get(key) for key in ("_ref_short_id", "_ref_subtask_id", "_ref_external_id")):
             return {}
         raw_status_value = raw.get("status", raw.get("state", raw.get("phase", "")))
         if raw_status_value in (None, ""):
@@ -80106,6 +82463,7 @@ body{padding:18px}
         row = {
             "content": content,
             "status": status,
+            **references,
         }
         role_key = self._sanitize_agent_role(raw.get("owner", "")) or self._sanitize_agent_role(owner)
         if role_key in {"manager", "explorer", "developer", "reviewer"}:
@@ -80129,9 +82487,13 @@ body{padding:18px}
             "row_id", "rowId", "id",
         ):
             alias = trim(str(raw.get(alias_key, "") or "").strip(), 120)
-            if alias:
+            # A short display id or our own rt: id names a canonical row; it is
+            # resolved by the merge path, not stored as a provider id.
+            if alias and not normalize_todo_short_id(alias) and not alias.startswith(("rt:", "pst:")):
                 row["external_subtask_id"] = alias
                 break
+            if alias.startswith("rt:") and not row.get("_ref_subtask_id"):
+                row["_ref_subtask_id"] = alias
         for meta_key in (
             "activeForm", "active_form", "subtask_id", "created_at", "updated_at", "started_at",
             "completed_at", "completed_by", "evidence", "evidence_binding", "evidence_ids",
@@ -80143,6 +82505,72 @@ body{padding:18px}
             if not row.get("evidence") and raw.get(source_key) not in (None, ""):
                 row["evidence"] = raw.get(source_key)
         return row
+
+    def _bind_todo_row_reference(self, row: dict, existing_rows: list[dict]) -> bool:
+        """Point an incoming row at the existing row its id names.
+
+        The model receives "(t3)" in render() output and "id=rt:..." in the
+        alignment block. Resolving those ids first, before any text or model
+        matching, is what keeps a reworded or id-only update from becoming a
+        new row. Returns True when the row was bound to an existing one.
+        """
+        short_ref = normalize_todo_short_id(row.pop("_ref_short_id", ""))
+        rt_ref = str(row.pop("_ref_subtask_id", "") or "").strip()
+        external_ref = str(row.pop("_ref_external_id", "") or "").strip()
+        if not short_ref and not rt_ref and not external_ref:
+            return False
+        candidates = [candidate for candidate in existing_rows or [] if isinstance(candidate, dict)]
+        required = []
+        if short_ref:
+            required.append([candidate for candidate in candidates
+                             if normalize_todo_short_id(candidate.get("short_id", "")) == short_ref])
+        if rt_ref:
+            required.append([candidate for candidate in candidates if candidate.get("subtask_id") == rt_ref])
+        if required:
+            matches = [candidate for candidate in candidates if all(candidate in group for group in required)]
+        elif external_ref:
+            matches = [candidate for candidate in candidates
+                       if external_ref.casefold() in self._todo_revision_row_ids(candidate)]
+        else:
+            matches = []
+        if len(matches) != 1:
+            if required or len(matches) > 1 or not str(row.get("content", "") or "").strip():
+                raise ValueError(
+                    f"Todo reference '{short_ref or rt_ref or external_ref}' is unknown, ambiguous, or outside the active scope. "
+                    "Read the current canonical rows and retry with their id; this update was not applied."
+                )
+            return False
+        prior = matches[0]
+        row.pop("_parent_step_inferred", None)
+        if not row.get("_todo_status_explicit", False):
+            row["status"] = prior.get("status", "pending")
+        prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+        prior_content = str(prior.get("content", "") or "")
+        incoming_content = str(row.get("content", "") or "").strip()
+        display_content = row.pop("_todo_display_content", incoming_content)
+        if display_content == f"{prior_content} <- {prior.get('activeForm', '')}":
+            incoming_content = prior_content
+            row["content"] = prior_content
+        if (
+            incoming_content
+            and prior_status != "completed"
+            and incoming_content != prior_content
+        ):
+            # An explicit id makes the content edit unambiguous.
+            row["_root_model_content_update"] = True
+        else:
+            row["content"] = prior_content
+        if prior.get("subtask_id"):
+            row["subtask_id"] = prior["subtask_id"]
+        row.pop("external_subtask_id", None)
+        if prior.get("external_subtask_id"):
+            row["external_subtask_id"] = prior["external_subtask_id"]
+        if prior.get("short_id"):
+            row["short_id"] = prior["short_id"]
+        for field in ("root_group_id", "key"):
+            if prior.get(field) and not row.get(field):
+                row[field] = prior[field]
+        return True
 
     def _todo_write_rescue(self, args: dict, role: str = "") -> str:
         """Compatibility wrapper over the canonical TodoWrite dispatcher."""
@@ -80190,33 +82618,59 @@ body{padding:18px}
     @staticmethod
     def _todo_no_progress_instruction() -> str:
         return (
-            "Todo state has not changed. Do not repeat TodoWrite, switch to TodoWriteRescue, "
-            "or rewrite the same list. Execute the current in_progress task using a work or "
-            "evidence-gathering tool, then update only the statuses supported by its result. "
-            "Repeated no-progress Todo writes are temporarily unavailable until a non-Todo "
-            "work action runs. Existing tasks and completion/evidence checks remain intact."
+            "Todo state has not changed. Do not repeat the same unchanged TodoWrite request or "
+            "switch to Rescue with the same list. Execute the current in_progress task when it "
+            "is still appropriate, or correct the rejected payload using current row ids and "
+            "the required revision mode/evidence. Corrected requests and real status changes "
+            "remain available. Do not add replacement rows to bypass an update error."
         )
 
     def _filter_todo_progress_tools(self, tools: list[dict], *, role: str = "") -> list[dict]:
-        counts = getattr(self, "_todowrite_step_counter", {})
-        if not counts or counts.get(self._todo_progress_guard_key(role), 0) < 2:
-            return tools
-        return [
-            tool for tool in tools
-            if canonicalize_tool_name(tool.get("function", {}).get("name", ""))
-            not in {"TodoWrite", "TodoWriteRescue"}
-        ]
+        # Hiding all writers also hid legitimate corrections and status updates.
+        # The dispatcher suppresses repeated identical requests instead.
+        return tools
 
     def _dispatch_todo_update(self, args: dict, *, role: str = "", resume: bool = False) -> str:
         key = self._todo_progress_guard_key(role)
         counts = getattr(self, "_todowrite_step_counter", None)
         if not isinstance(counts, dict):
             counts = self._todowrite_step_counter = {}
+        requests = getattr(self, "_todo_last_write_request", None)
+        if not isinstance(requests, dict):
+            requests = self._todo_last_write_request = {}
+        source = args if isinstance(args, dict) else {}
+        request_rows = self._apply_todo_payload_in_progress_index(self._todo_payload_items(source), source)
+        is_resume = resume or _to_bool_like(
+            source.get("resume", source.get("continue", source.get("resume_existing", False))), default=False,
+        )
+        if not request_rows and is_resume and counts.get(key, 0) >= 2:
+            return self._plan_control_feedback(
+                "todo_no_progress", f"{self._todo_no_progress_instruction()}\n\n{self.todo.render()}",
+            )
+        mode, reason, evidence = self._todo_payload_controls(source, resume=resume)
+        request_signature = json.dumps(
+            [request_rows, mode, reason, evidence, source.get("plan_updates", source.get("planUpdates", [])),
+             is_resume],
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
+        if requests.get(key) != request_signature:
+            counts.pop(key, None)
+        requests[key] = request_signature
+        if len(requests) > 40:
+            requests.pop(next(iter(requests)))
         if counts.get(key, 0) >= 2:
             return self._plan_control_feedback("todo_no_progress", self._todo_no_progress_instruction())
         before = self._todo_material_signature(self.todo.snapshot())
         plan_before = self._todo_material_signature(self._ensure_blackboard().get("project_todos", []))
-        result = self._dispatch_todo_update_inner(args, role=role, resume=resume)
+        # Every model call this TodoWrite makes on this thread (intent,
+        # audit, review and acceptance helpers) shares one budget; once it is
+        # used up the helpers fall back to their deterministic rules.  The
+        # step-skill evaluator runs on its own thread and is not counted.
+        with todo_llm_budget_scope(limit=TODO_LLM_CALL_BUDGET):
+            try:
+                result = self._dispatch_todo_update_inner(args, role=role, resume=resume)
+            except ValueError as exc:
+                return f"Error: {exc}\n\n{self.todo.render()}"
         if key != self._todo_progress_guard_key(role):
             counts.pop(key, None)
             return result
@@ -80230,10 +82684,49 @@ body{padding:18px}
             counts[key] = counts.get(key, 0) + 1
             if len(counts) > 40:
                 counts.pop(next(iter(counts)))
+            if any(marker in str(result) for marker in (
+                "Control[preserve_todo_tree]", "preserve_current_subplan", "plan_update_rejected",
+            )):
+                return self._todo_rejection_next_step(result)
             return self._plan_control_feedback(
-                "todo_no_progress", f"{self._todo_no_progress_instruction()}\n\n{result}",
+                "todo_no_progress",
+                f"{self._todo_no_progress_instruction()}\n\n{self._todo_rejection_next_step(result)}",
             )
-        return result
+        return self._todo_rejection_next_step(result)
+
+    def _todo_rejection_next_step(self, result: object) -> str:
+        """Append one concrete next step to a rejected Todo revision.
+
+        A bare "rejected" made models resubmit the same revision in new words.
+        Naming the current row and the id-based update form gives the model a
+        move that makes progress instead.
+        """
+        text = str(result or "")
+        if not any(
+            marker in text
+            for marker in ("Control[preserve_todo_tree]", "preserve_current_subplan", "plan_update_rejected")
+        ):
+            return text
+        current = next(
+            (
+                row for row in self.todo.snapshot()
+                if isinstance(row, dict) and self._todo_row_kind(row) != "system"
+                and str(row.get("status", "")) == "in_progress"
+            ),
+            None,
+        )
+        target = (
+            f"({current.get('short_id')}) {trim(str(current.get('content', '') or ''), 160)}"
+            if current and current.get("short_id")
+            else "the current in_progress item"
+        )
+        return (
+            f"{text}\n\nNext step: correct the specific rejection above before retrying; do not append "
+            "replacement todos. For status progress, send the existing row id and status. For a structural "
+            "change, submit the complete open snapshot with update_mode='revise_open', revision_reason "
+            "and matching revision_evidence. Preserve ids of retained rows. "
+            f"Current work: {target}; continue it only if it is still appropriate."
+        )
 
     def _dispatch_todo_update_inner(self, args: dict, *, role: str = "", resume: bool = False) -> str:
         """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
@@ -80255,6 +82748,19 @@ body{padding:18px}
             default_parent_step_id=active_step_id,
             limit=40,
         )
+        # Validate all explicit references before any parent edit, model
+        # classification, or row mutation. A bad id rejects the whole payload.
+        route_before = self._todo_route_kind(role=role_key, board=bb)
+        reference_rows = self._todo_route_rows(route_before, role=role_key, board=bb)
+        if route_before in {"plan_single", "plan_sync"}:
+            reference_rows = [
+                {**row, "subtask_id": self._stable_plan_worker_subtask_id(active_step_id, row)}
+                for row in reference_rows
+            ]
+        for item in items:
+            probe = self._normalize_generic_todo_row(item, owner=role_key)
+            if probe and not str(probe.get("key", "") or "").startswith("bb:"):
+                self._bind_todo_row_reference(probe, reference_rows)
         plan_updates = source.get("plan_updates", source.get("planUpdates", []))
         plan_update_result = self._apply_plan_step_updates(
             plan_updates,
@@ -81736,6 +84242,35 @@ body{padding:18px}
         except Exception:
             pass
 
+    def _current_tool_cancel_event(self) -> threading.Event | None:
+        """Cancel flag of the timed tool running on this thread, if any.
+
+        ``_dispatch_tool`` sets it when a pooled tool outlives its timeout;
+        long-running tools (the ``task`` subagent) poll it cooperatively.
+        """
+        event = getattr(_TOOL_CANCEL_LOCAL, "event", None)
+        return event if isinstance(event, threading.Event) else None
+
+    def _run_tool_with_cancel_event(self, cancel_event: threading.Event, name: str, args: dict, role_key: str, tool_call_id: str) -> str:
+        """Pool-thread entry for timed tools: expose ``cancel_event`` to the tool.
+
+        ``cancel_event.finished`` / ``cancel_event.orphaned`` are only changed
+        under ``_TOOL_ORPHAN_LOCK`` so the orphan counter cannot miss a
+        decrement when the timeout races with the tool returning.
+        """
+        previous = getattr(_TOOL_CANCEL_LOCAL, "event", None)
+        _TOOL_CANCEL_LOCAL.event = cancel_event
+        try:
+            return self._dispatch_tool_inner(name, args, role_key, tool_call_id)
+        finally:
+            _TOOL_CANCEL_LOCAL.event = previous
+            with _TOOL_ORPHAN_LOCK:
+                cancel_event.finished = True
+                if getattr(cancel_event, "orphaned", False):
+                    # The caller already returned the timeout result; this
+                    # thread was an orphan until now.
+                    self.tool_orphan_threads = max(0, int(getattr(self, "tool_orphan_threads", 0) or 0) - 1)
+
     def _peek_tool_result_meta(self) -> dict:
         try:
             local = getattr(self, "_tool_result_local", None)
@@ -81879,6 +84414,9 @@ body{padding:18px}
             )
         role_key = self._sanitize_agent_role(agent_role)
         args = dict(args)
+        # Read bookkeeping (visible_reads) needs the id of the tool message
+        # that will carry this result. Tools run serially within a session.
+        _READ_DISPATCH_CONTEXT.tool_call_id = str(tool_call_id or "")
         flow_context = self._flow_context(role_key, tool_call_id)
         # Main agent loops emit a visible tool_start first. Subagent and
         # programmatic callers may not; create the graph node only when no
@@ -81941,7 +84479,8 @@ body{padding:18px}
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
-            future = pool.submit(self._dispatch_tool_inner, name, args, role_key, tool_call_id)
+            cancel_event = threading.Event()
+            future = pool.submit(self._run_tool_with_cancel_event, cancel_event, name, args, role_key, tool_call_id)
             try:
                 out = future.result(timeout=timeout)
                 out = self._trace_tool_result(name, args, out, role_key)
@@ -81951,6 +84490,15 @@ body{padding:18px}
                 return out
             except concurrent.futures.TimeoutError:
                 future.cancel()
+                # The tool thread may keep running.  Ask it to stop at its
+                # next check (the task subagent exits on its next round) and
+                # count it as an orphan until it actually returns.
+                cancel_event.set()
+                with _TOOL_ORPHAN_LOCK:
+                    if future.running() and not getattr(cancel_event, "finished", False):
+                        cancel_event.orphaned = True
+                        self.tool_orphan_threads = int(getattr(self, "tool_orphan_threads", 0) or 0) + 1
+                        self.tool_orphan_threads_total = int(getattr(self, "tool_orphan_threads_total", 0) or 0) + 1
                 pool.shutdown(wait=False, cancel_futures=True)
                 if name == "agent_web_search":
                     self._agent_web_search_emit(
@@ -82093,7 +84641,15 @@ body{padding:18px}
             return ""
         if re.search(r"(?:^|[;&|]\s*)(?:rm|mv|cp|touch|chmod|chown|mkdir|rmdir|sed\s+-i|perl\s+-i)\b", raw, re.I):
             return ""
-        if any(token in raw for token in (">", "$(", "`")):
+        # Discarding stderr or stdout (2>/dev/null, 2>&1, >/dev/null) writes no
+        # file, so it must not disable the cache. Any other redirection, including
+        # >> and &>, still does.
+        probe = re.sub(
+            r"(?:(?<=\s)|^)(?:2>/dev/null|1>/dev/null|>/dev/null|2>&1)(?=\s|$|[;&|])",
+            " ",
+            raw,
+        )
+        if any(token in probe for token in (">", "$(", "`")):
             return ""
         targets = self._bash_file_read_targets(raw)
         if not targets:
@@ -82335,21 +84891,28 @@ body{padding:18px}
                     source_lines = None
                     source_text = None
                     source_fp = None
-            out = self._run_read(
-                rel,
-                args.get("limit"),
-                args.get("offset"),
-                mode=args.get("mode"),
-                target=args.get("target"),
-                query=args.get("query"),
-                line=args.get("line"),
-                context=args.get("context"),
-                regex=args.get("regex"),
-                max_chars=args.get("max_chars"),
-                segment_id=args.get("segment_id"),
-                fresh=args.get("fresh", False),
-                _source_lines=source_lines,
-            )
+            # The reuse/delta checks inside _run_read need to know whose
+            # context counts as "already visible". Tools run serially within a
+            # session, so an attribute is enough here.
+            _READ_DISPATCH_CONTEXT.read_role = role_key
+            try:
+                out = self._run_read(
+                    rel,
+                    args.get("limit"),
+                    args.get("offset"),
+                    mode=args.get("mode"),
+                    target=args.get("target"),
+                    query=args.get("query"),
+                    line=args.get("line"),
+                    context=args.get("context"),
+                    regex=args.get("regex"),
+                    max_chars=args.get("max_chars"),
+                    segment_id=args.get("segment_id"),
+                    fresh=args.get("fresh", False),
+                    _source_lines=source_lines,
+                )
+            finally:
+                _READ_DISPATCH_CONTEXT.read_role = ""
             coordinator = getattr(self, "collaboration_write_coordinator", None)
             if coordinator is not None and not str(out).startswith("Error"):
                 try:
@@ -82369,8 +84932,24 @@ body{padding:18px}
                 source_fp=source_fp,
             )
             try:
-                if source_lines is not None and not str(out).startswith("Error"):
-                    self._mark_long_content_read(rel, fp, source_lines, args, out, role=role_key)
+                if (
+                    source_lines is not None
+                    and not str(out).startswith("Error")
+                    and "already_in_context" not in str(out).split("\n", 1)[0]
+                ):
+                    # Small whole-file reads render raw text without line
+                    # numbers; tell the recorder which lines the body holds.
+                    whole_file_range = (
+                        (1, len(source_lines))
+                        if source_lines and str(args.get("mode", "") or "auto").strip().lower() in {"", "auto"}
+                        and args.get("offset") in (None, "") and args.get("limit") in (None, "")
+                        and args.get("line") in (None, "") and not args.get("target") and not args.get("query")
+                        else None
+                    )
+                    self._mark_long_content_read(
+                        rel, fp, source_lines, args, out, role=role_key,
+                        tool_call_id=tool_call_id, read_range=whole_file_range,
+                    )
             except Exception:
                 pass
             limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
@@ -82589,6 +85168,20 @@ body{padding:18px}
                     self._emit("status", {"summary": summary})
                     out = f"{out}\n{summary}"
                 after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+                # Return the edited region with line numbers and record it as a
+                # fresh read. A bare "Edited x" made the model re-read the file
+                # to confirm the change, or to plan the next edit nearby.
+                try:
+                    snippet, span = self._edit_result_snippet(before_text, after_text)
+                    if snippet:
+                        out = f"{out}\n[edited region lines={span[0]}-{span[1]}]\n{snippet}"
+                        after_lines = after_text.splitlines()
+                        self._mark_long_content_read(
+                            rel, fp, after_lines, {"mode": "window", "path": rel}, snippet, role=role_key,
+                            tool_call_id=getattr(_READ_DISPATCH_CONTEXT, "tool_call_id", ""),
+                        )
+                except Exception:
+                    pass
                 diff, added, deleted = make_unified_diff(rel, before_text, after_text)
                 numbered = make_numbered_diff(before_text, after_text)
                 numbered_text = render_numbered_diff_text(numbered)
@@ -83734,6 +86327,9 @@ body{padding:18px}
                         reset_agent_contexts=True,
                     )
                 self.run_generation = int(self.run_generation) + 1
+                # Requests still in flight from the previous run become
+                # orphaned and stop counting against this run's slots.
+                self._sync_llm_gate_generation()
                 clean_goal = submitted_text
                 self._refresh_runtime_code_reference(clean_goal or content)
                 _user_msg_ts = now_ts()
@@ -89512,6 +92108,7 @@ body{padding:18px}
                             "SKIP_SHORT",
                             "ARBITER_TIMEOUT",
                             "ARBITER_ERROR",
+                            "ARBITER_SKIPPED",
                         }
                         if arbiter_status == "USER_INPUT_REQUIRED":
                             arbiter_planning_rounds = 0
@@ -90245,6 +92842,9 @@ body{padding:18px}
                     }
                     if result_item.get("exit_code") is not None:
                         tool_message["exit_code"] = int(result_item.get("exit_code"))
+                    # Not yet seen by the model: protected from microcompact
+                    # until the next successful model call.
+                    tool_message["_unseen"] = True
                     self.messages.append(tool_message)
                     single_round_tool_results.append(result_item)
                     is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
@@ -91185,7 +93785,11 @@ body{padding:18px}
                     and getattr(self, "_snapshot_cache_lite_key", None) == cache_key
                     and not bool(cached.get("degraded", False))
                 ):
-                    return dict(cached)
+                    # Gate state is not part of the cache key; patch the live
+                    # value into the returned copy.
+                    hit = dict(cached)
+                    hit["llm_concurrency"] = self._llm_concurrency_snapshot()
+                    return hit
             msg_window = 120 if lite else 200
             op_feed_window = 80 if lite else 240
             upload_window = 12 if lite else 40
@@ -91793,6 +94397,9 @@ body{padding:18px}
                 "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
                 "user_profile_capsule_meta": dict(getattr(self, "user_profile_capsule_meta", {}) or {}),
                 "auto_task_level_ceiling": self._auto_task_level_ceiling_value(),
+                "session_llm_concurrency": normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 "read_context_budget": self._read_context_budget(),
                 "read_context_registry_count": len(getattr(self, "read_context_registry", {}) or {}),
                 "tool_memory_budget": self._tool_memory_budget(),
@@ -91854,6 +94461,9 @@ body{padding:18px}
                 "teammates": list(self.teammates.values()),
                 "activity": self.activity[-activity_window:],
                 "operations": operations_view,
+                # Live gate state (small, bounded); counted by the lite byte
+                # budget below.  Cache hits re-read it above.
+                "llm_concurrency": self._llm_concurrency_snapshot(),
             }
             if lite:
                 snapshot_payload = _apply_lite_snapshot_bounds(snapshot_payload)
@@ -91904,6 +94514,9 @@ body{padding:18px}
             cached["degraded_reason"] = trim(reason, 220)
             if uploads_view and not cached.get("uploads"):
                 cached["uploads"] = uploads_view
+            # The gate has its own lock, so the live value is readable even
+            # while the session lock is busy.
+            cached["llm_concurrency"] = self._llm_concurrency_snapshot()
             return cached
         return {
             "id": self.id,
@@ -91935,6 +94548,7 @@ body{padding:18px}
             "teammates": [],
             "activity": [],
             "operations": [],
+            "llm_concurrency": self._llm_concurrency_snapshot(),
         }
 
     def snapshot_safe(self, include_model_catalog: bool = False, lite: bool = False, lock_timeout: float = 0.4) -> dict:
@@ -92346,6 +94960,7 @@ class SessionManager:
         kernel_registry=None,
         kernel_runtime=None,
         skills_snapshot: SkillStore | None = None,
+        session_llm_concurrency: int | None = None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -92398,6 +95013,7 @@ class SessionManager:
             fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        self.session_llm_concurrency = normalize_session_llm_concurrency(session_llm_concurrency)
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
         self.l2_todo_policy = normalize_l2_todo_policy(
             l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
@@ -92581,6 +95197,9 @@ class SessionManager:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "session_llm_concurrency": normalize_session_llm_concurrency(
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+            ),
             "l2_todo_policy": normalize_l2_todo_policy(
                 getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
             ),
@@ -92671,6 +95290,12 @@ class SessionManager:
                 raw_auto_task_level_ceiling
                 if raw_auto_task_level_ceiling is not None
                 else getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            )
+            raw_session_llm_concurrency = extract_session_llm_concurrency_setting(raw)
+            self.session_llm_concurrency = normalize_session_llm_concurrency(
+                raw_session_llm_concurrency
+                if raw_session_llm_concurrency is not None
+                else getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
             )
             cfg_l2_todo_policy = extract_l2_todo_policy_setting(raw)
             if cfg_l2_todo_policy is not None:
@@ -92826,6 +95451,10 @@ class SessionManager:
         sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
             getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
         )
+        set_session_llm_concurrency_on_runtime(
+            sess,
+            getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
+        )
         sess.l2_todo_policy = normalize_l2_todo_policy(
             getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
         )
@@ -92892,6 +95521,13 @@ class SessionManager:
                 sess,
                 "auto_task_level_ceiling",
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
+            )
+        )
+        self.session_llm_concurrency = normalize_session_llm_concurrency(
+            getattr(
+                sess,
+                "session_llm_concurrency",
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
             )
         )
         self.l2_todo_policy = normalize_l2_todo_policy(
@@ -93100,6 +95736,9 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
@@ -93831,6 +96470,9 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
@@ -94528,6 +97170,9 @@ class SessionManager:
             cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
             if cfg_auto_task_level_ceiling is not None:
                 self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+            cfg_session_llm_concurrency = extract_session_llm_concurrency_setting(cfg)
+            if cfg_session_llm_concurrency is not None:
+                self.session_llm_concurrency = normalize_session_llm_concurrency(cfg_session_llm_concurrency)
             cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
             if cfg_l2_todo_policy is not None:
                 self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
@@ -95090,6 +97735,8 @@ body[data-ui-style="trad"] button,body[data-ui-style="trad"] a{border-radius:10p
 .stat .v{font-size:1.25rem;font-weight:700}
 .stat.compact .v{font-size:1.05rem}
 .stat.model .v{font-size:.94rem;line-height:1.25;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.stat.model .llm-conc{margin-top:4px;font-size:.74rem;line-height:1.25;color:var(--muted);cursor:help;font-variant-numeric:tabular-nums}
+.stat.model .llm-conc.busy{color:#b45309}
 main{display:grid;grid-template-columns:minmax(220px,260px) minmax(520px,920px) minmax(300px,360px);justify-content:center;gap:12px;height:74vh;min-height:620px;max-height:74vh}
 .panel{background:var(--card);backdrop-filter:blur(8px);border:1px solid #fff;box-shadow:0 10px 28px rgba(14,30,62,.08);border-radius:16px;padding:12px;display:flex;flex-direction:column;min-height:0;min-width:0;height:100%}
 body[data-ui-style="trad"] .panel{border-radius:14px;backdrop-filter:none;box-shadow:0 6px 18px rgba(14,30,62,.05);border-color:#dfe7f2}
@@ -95739,7 +98386,7 @@ const I18N={
     upload_pick_file:'Choose files',
     upload_drop_release:'Drop to upload',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'Files',sec_catalog:'Catalog',
-    stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_global_tasks:'Global Tasks',stat_daily_sessions:'Daily Sessions',stat_model:'Model',
+    stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_global_tasks:'Global Tasks',stat_daily_sessions:'Daily Sessions',stat_model:'Model',stat_llm_concurrency:'Model concurrency',stat_llm_peak:'Peak',stat_llm_queued:'Queued',stat_llm_orphaned:'Orphaned',stat_llm_abandoned:'Abandoned',stat_llm_no_requests:'No model requests in flight',
     no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_current_subtasks:'No subtasks for the current plan step yet',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_files:'No files',no_catalog:'No catalog',no_uploads:'No uploads',
     running:'running',idle:'idle',submitting:'Submitting',accepted:'Accepted',starting:'Starting',queued:'Queued',checking:'Checking',submit_failed:'Submit failed',open:'open',completed:'completed',blocked:'blocked',
     status_pending:'PENDING',status_in_progress:'IN PROGRESS',status_completed:'COMPLETED',status_blocked:'BLOCKED',status_deleted:'DELETED',
@@ -95778,7 +98425,7 @@ const I18N={
     upload_pick_file:'选择文件',
     upload_drop_release:'释放以上传文件',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'文件',sec_catalog:'Catalog',
-    stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_global_tasks:'全局任务',stat_daily_sessions:'每日会话',stat_model:'模型',
+    stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_global_tasks:'全局任务',stat_daily_sessions:'每日会话',stat_model:'模型',stat_llm_concurrency:'模型并发',stat_llm_peak:'峰值',stat_llm_queued:'排队',stat_llm_orphaned:'孤儿',stat_llm_abandoned:'已放弃',stat_llm_no_requests:'当前没有在途的模型请求',
     no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_current_subtasks:'当前计划步骤尚未生成子任务',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_files:'暂无文件',no_catalog:'暂无目录',no_uploads:'暂无上传',
     running:'运行中',idle:'空闲',submitting:'正在提交',accepted:'已接收',starting:'正在启动',queued:'排队中',checking:'正在确认',submit_failed:'提交失败',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待处理',status_in_progress:'进行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已删除',
@@ -95817,7 +98464,7 @@ const I18N={
     upload_pick_file:'選擇檔案',
     upload_drop_release:'釋放以上傳檔案',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'檔案',sec_catalog:'Catalog',
-    stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_global_tasks:'全域任務',stat_daily_sessions:'每日會話',stat_model:'模型',
+    stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_global_tasks:'全域任務',stat_daily_sessions:'每日會話',stat_model:'模型',stat_llm_concurrency:'模型並行',stat_llm_peak:'峰值',stat_llm_queued:'排隊',stat_llm_orphaned:'孤兒',stat_llm_abandoned:'已放棄',stat_llm_no_requests:'目前沒有進行中的模型請求',
     no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_current_subtasks:'目前計劃步驟尚未產生子任務',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_files:'尚無檔案',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
     running:'執行中',idle:'閒置',submitting:'正在提交',accepted:'已接收',starting:'正在啟動',queued:'排隊中',checking:'正在確認',submit_failed:'提交失敗',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待處理',status_in_progress:'進行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已刪除',
@@ -95856,7 +98503,7 @@ const I18N={
     upload_pick_file:'ファイルを選択',
     upload_drop_release:'ドロップしてアップロード',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'ファイル',sec_catalog:'Catalog',
-    stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_global_tasks:'タスク',stat_daily_sessions:'日次セッション',stat_model:'モデル',
+    stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_global_tasks:'タスク',stat_daily_sessions:'日次セッション',stat_model:'モデル',stat_llm_concurrency:'モデル並列',stat_llm_peak:'ピーク',stat_llm_queued:'待機',stat_llm_orphaned:'孤立',stat_llm_abandoned:'放棄',stat_llm_no_requests:'実行中のモデルリクエストはありません',
     no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_current_subtasks:'現在の計画ステップにはまだサブタスクがありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_files:'ファイルなし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
     running:'実行中',idle:'待機中',submitting:'送信中',accepted:'受付済み',starting:'起動中',queued:'待機列',checking:'確認中',submit_failed:'送信失敗',open:'未完了',completed:'完了',blocked:'ブロック',
     status_pending:'未着手',status_in_progress:'進行中',status_completed:'完了',status_blocked:'ブロック',status_deleted:'削除済み',
@@ -96576,6 +99223,7 @@ function onRuntimeEvent(evt){
   if(seqState.gap)return{handled:true,needsSnapshot:true};
   const typ=String(evt.type||'');
   if(typ==='render_frame'){_renderBridgeEnqueue(evt.data||{});return{handled:true,needsSnapshot:false}}
+  if(typ==='llm_concurrency'){const sid=String(evt.session_id||'');if(S.snap&&typeof S.snap==='object'&&(!sid||sid===String(S.activeId||''))){S.snap.llm_concurrency=(evt.data&&typeof evt.data==='object')?evt.data:{};renderLlmConcurrencyStat()}return{handled:true,needsSnapshot:false}}
   if(typ==='render_bridge'){const d=evt.data||{};const summary=String(d?.summary||'').trim();if(summary){_renderBridgeShow();_renderBridgeUpdateMeta(summary,true);_renderBridgeHideLater(30000)}return{handled:true,needsSnapshot:false}}
   if(typ==='compact'){scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);const reason=parseCompactReason(evt.data||{});if(reason==='auto'||reason.startsWith('truncation-rescue')){const pct=Number(evt.data?.context_left_percent_before);const left=Number(evt.data?.context_left_before);const limit=Number(evt.data?.context_limit_before);const pctTxt=Number.isFinite(pct)?pct.toFixed(1):'-';const leftTxt=Number.isFinite(left)&&Number.isFinite(limit)?`${left}/${limit}`:'-';showCompactToast(`${t('compact_auto')}：${pctTxt}% left (${leftTxt}) · delta-sync`)}_deltaAppendActivity(typ,evt.data||{},Number(evt?.ts||Date.now()/1000));return{handled:true,needsSnapshot:false}}
   return _deltaApplyRuntimeEvent(evt);
@@ -96623,7 +99271,9 @@ function mergeSessionRows(base,incoming,opt={}){const current=Array.isArray(base
 function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{},rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]),append=!!opt.append,offset=Math.max(0,Number(payload.offset||0)||0);if(!append&&offset===0&&opt.reset){S.sessions=[];S.sessionById.clear();S.sessionNextOffset=0}S.sessions=mergeSessionRows(S.sessions,rows,{append});const revision=Number(payload.catalog_revision);if(Number.isFinite(revision))S.sessionCatalogRevision=revision;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=rows.length?total:Math.max(S.sessions.length,rows.length);const next=offset+rows.length;S.sessionNextOffset=append?Math.max(Number(S.sessionNextOffset||0),next):next;const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'shell_timeout_mode'))S.config.shell_timeout_mode=String(cfg.shell_timeout_mode||'auto');if(Object.prototype.hasOwnProperty.call(cfg,'shell_async_handoff_seconds'))S.config.shell_async_handoff_seconds=cfg.shell_async_handoff_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
-function renderStats(){const sessions=Math.max(Number(S.sessionTotal||0),S.sessions.length);const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
+function renderStats(){const sessions=Math.max(Number(S.sessionTotal||0),S.sessions.length);const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div><div class=\"llm-conc\" id=\"llmConcurrencyStat\" hidden></div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats');renderLlmConcurrencyStat()}
+function _llmConcurrencyView(raw){if(!raw||typeof raw!=='object'||!Number.isFinite(Number(raw.limit))||Number(raw.limit)<=0)return null;const n=(v)=>Math.max(0,Math.round(Number(v)||0));const rows=(Array.isArray(raw.requests)?raw.requests:[]).slice(0,16).map(r=>({label:String(r?.label||r?.priority||'model'),role:String(r?.role||''),seconds:Math.max(0,Math.round(Number(r?.elapsed_seconds??r?.elapsed??0)||0)),abandoned:!!r?.abandoned,orphaned:!!r?.orphaned}));return{limit:n(raw.limit),inFlight:n(raw.in_flight),peak:n(raw.peak),queued:n(raw.queued),orphaned:n(raw.orphaned_in_flight),rows:rows}}
+function renderLlmConcurrencyStat(){const el=E('llmConcurrencyStat');if(!el)return;const v=_llmConcurrencyView(S.snap?.llm_concurrency);if(!v){if(!el.hidden){el.hidden=true;el.textContent='';el.removeAttribute('title')}return}const parts=[`${t('stat_llm_concurrency')} ${v.inFlight}/${v.limit}`,`${t('stat_llm_peak')} ${v.peak}`,`${t('stat_llm_queued')} ${v.queued}`];if(v.orphaned>0)parts.push(`${t('stat_llm_orphaned')} ${v.orphaned}`);const tip=v.rows.length?v.rows.map(r=>{const flags=[r.abandoned?t('stat_llm_abandoned'):'',r.orphaned?t('stat_llm_orphaned'):''].filter(Boolean).join(', ');return `${r.label}${r.role?' · '+r.role:''} · ${r.seconds}s${flags?' ('+flags+')':''}`}).join('\\n'):t('stat_llm_no_requests');el.hidden=false;setTextIfChanged(el,parts.join(' · '));if(el.getAttribute('title')!==tip)el.setAttribute('title',tip);el.classList.toggle('busy',v.queued>0||v.inFlight>=v.limit)}
 function renderSessions(){
   const host=E('sessionList');
   if(!host)return;
@@ -100070,6 +102720,7 @@ async function refreshSnapshot(opt={}){
     }
     S.lastDeltaTs=Date.now();
     if(_syncActiveSessionSummaryFromSnapshot()){const sessSig=sessionsSignature(S.sessions);if(sessSig!==S.lastSessionsSig){S.lastSessionsSig=sessSig;renderSessions();renderStats()}}
+    renderLlmConcurrencyStat();
     const cat=S.snap?.llm_model_catalog;
     const hasCat=!!(
       cat&&(
@@ -100254,6 +102905,7 @@ async function selectSession(id,opt={}){
   _chatVirtResetScrollState(E('chat'));
   applyStaticUiClass();
   renderSessions();
+  renderLlmConcurrencyStat();
   ensurePreviewState(id);
   bindEvents(id);
   _deltaStartWatchdog();
@@ -101547,7 +104199,7 @@ const ADMIN_CONFIG_I18N_ROWS=[
 ['Skills Studio','Skills Studio','Skills Studio','Skills Studio','Skills Studio'],['RAG admin','RAG 管理服务','RAG 管理服務','RAG 管理','RAG admin'],['Code library admin','代码库管理服务','程式碼庫管理服務','コードライブラリ管理','Code library admin'],['Programming IDE','编程 IDE','程式設計 IDE','プログラミング IDE','Programming IDE'],['IDE password login','IDE 密码登录','IDE 密碼登入','IDE パスワードログイン','IDE password login'],['MCP service','MCP 服务','MCP 服務','MCP サービス','MCP service'],['LAN collaboration','LAN 协作','LAN 協作','LAN コラボレーション','LAN collaboration'],
 ['Collaboration TLS certificate','协作 TLS 证书','協作 TLS 憑證','コラボレーション TLS 証明書','Collaboration TLS certificate'],['Collaboration TLS private key','协作 TLS 私钥','協作 TLS 私鑰','コラボレーション TLS 秘密鍵','Collaboration TLS private key'],['Trusted HTTPS reverse proxy','可信 HTTPS 反向代理','可信任 HTTPS 反向代理','信頼済み HTTPS リバースプロキシ','Trusted HTTPS reverse proxy'],['Trusted LAN HTTP mode','可信 LAN HTTP 模式','可信任 LAN HTTP 模式','信頼済み LAN HTTP モード','Trusted LAN HTTP mode'],
 ['External WebUI mode','外部 WebUI 模式','外部 WebUI 模式','外部 WebUI モード','External WebUI mode'],['Export built-in WebUI on start','启动时导出内置 WebUI','啟動時匯出內建 WebUI','起動時に内蔵 WebUI をエクスポート','Export built-in WebUI on start'],['Overwrite WebUI export','覆盖 WebUI 导出','覆蓋 WebUI 匯出','WebUI エクスポートを上書き','Overwrite WebUI export'],['UI language','界面语言','介面語言','表示言語','UI language'],['Chat UI style','聊天界面样式','聊天介面樣式','チャット UI スタイル','Chat UI style'],['Upload list','上传列表','上傳清單','アップロード一覧','Upload list'],['Download offline JS libraries','下载离线 JS 库','下載離線 JS 程式庫','オフライン JS ライブラリをダウンロード','Download offline JS libraries'],
-['Read context policy','上下文读取策略','上下文讀取策略','コンテキスト読取ポリシー','Read context policy'],['Tool memory policy','工具记忆策略','工具記憶策略','ツールメモリポリシー','Tool memory policy'],['Web search','网页搜索','網頁搜尋','Web 検索','Web search'],['User memory mode','用户记忆模式','使用者記憶模式','ユーザーメモリモード','User memory mode'],['Auto task level ceiling','自动任务等级上限','自動任務等級上限','自動タスクレベル上限','Auto task level ceiling'],['Level-2 Todo policy','二级 Todo 策略','二級 Todo 策略','レベル 2 Todo ポリシー','Level-2 Todo policy'],['Daily sessions per user','每用户每日会话数','每位使用者每日工作階段數','ユーザーごとの日次セッション数','Daily sessions per user'],
+['Read context policy','上下文读取策略','上下文讀取策略','コンテキスト読取ポリシー','Read context policy'],['Tool memory policy','工具记忆策略','工具記憶策略','ツールメモリポリシー','Tool memory policy'],['Web search','网页搜索','網頁搜尋','Web 検索','Web search'],['User memory mode','用户记忆模式','使用者記憶模式','ユーザーメモリモード','User memory mode'],['Auto task level ceiling','自动任务等级上限','自動任務等級上限','自動タスクレベル上限','Auto task level ceiling'],['In-session model request concurrency','会话内模型请求并发数','工作階段內模型請求並行數','セッション内モデルリクエスト同時実行数','In-session model request concurrency'],['Level-2 Todo policy','二级 Todo 策略','二級 Todo 策略','レベル 2 Todo ポリシー','Level-2 Todo policy'],['Daily sessions per user','每用户每日会话数','每位使用者每日工作階段數','ユーザーごとの日次セッション数','Daily sessions per user'],
 ['Ollama base URL','Ollama 基础 URL','Ollama 基礎 URL','Ollama ベース URL','Ollama base URL'],['Default model','默认模型','預設模型','既定モデル','Default model'],['Automatic model recovery','自动模型恢复','自動模型復原','モデルの自動復旧','Automatic model recovery'],['Arbiter enabled','启用仲裁器','啟用仲裁器','アービターを有効化','Arbiter enabled'],['Arbiter model override','仲裁器模型覆盖','仲裁器模型覆蓋','アービターモデル上書き','Arbiter model override'],['Arbiter timeout (seconds)','仲裁器超时（秒）','仲裁器逾時（秒）','アービタータイムアウト（秒）','Arbiter timeout (seconds)'],['Arbiter max tokens','仲裁器最大 Token','仲裁器最大 Token','アービター最大 Token','Arbiter max tokens'],['Arbiter temperature','仲裁器温度','仲裁器溫度','アービター温度','Arbiter temperature'],['Agent execution mode','Agent 执行模式','Agent 執行模式','Agent 実行モード','Agent execution mode'],['Max output tokens','最大输出 Token','最大輸出 Token','最大出力 Token','Max output tokens'],['Global concurrent tasks','全局并发任务数','全域並行任務數','グローバル同時タスク数','Global concurrent tasks'],['Concurrent tasks per user','每用户并发任务数','每位使用者並行任務數','ユーザーごとの同時タスク数','Concurrent tasks per user'],['Use filenames as RAG entities','将文件名用作 RAG 实体','將檔名用作 RAG 實體','ファイル名を RAG エンティティとして使用','Use filenames as RAG entities']
 ];
 const adminDynamicRow=(source,ja,en,cn=source,tw=cn)=>[source,cn,tw,ja,en];
@@ -112074,6 +114726,8 @@ class UserMemoryStore:
                 system=system_prompt,
                 max_tokens=400,
                 think=False,
+                priority="app",
+                label="preference_distill",
             )
             raw = str((rsp or {}).get("content", "") or "").strip()
         except Exception:
@@ -113498,6 +116152,8 @@ class RAGIngestionService:
                 think=False,
                 stream_thinking=False,
                 media_inputs=selected,
+                priority="app",
+                label="rag_multimodal",
             )
             payload = parse_json_object(str(rsp.get("content", "") or ""), {})
             summary = trim(str(payload.get("summary", "") or rsp.get("content", "") or ""), 2400)
@@ -115362,10 +118018,27 @@ function renderStats(){
     ['Tasks',S.tasks?.length||0,'async import queue'],
     ['Communities',Object.keys(stats.communities||{}).length||0,'graph communities'],
   ];
-  E('statsGrid').innerHTML=cards.map(([label,val,meta])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(val)}</div><div class="stat-meta">${esc(meta)}</div></div>`).join('');
+  const conc=sessionLlmConcurrencyCard();
+  E('statsGrid').innerHTML=cards.map(([label,val,meta])=>`<div class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(val)}</div><div class="stat-meta">${esc(meta)}</div></div>`).join('')+(conc?`<div class="stat-card" title="${esc(conc.tip)}"><div class="stat-label">Model Concurrency</div><div class="stat-value">${esc(conc.value)}</div><div class="stat-meta">${esc(conc.meta)}</div></div>`:'');
+}
+function sessionLlmConcurrencyCard(){
+  // In-session model request concurrency of the selected session, as of the
+  // last config refresh (this page has no event stream).
+  const sessions=Array.isArray(S.config?.sessions)?S.config.sessions:[];
+  const sid=selectedSession()||String(S.config?.default_session_id||'');
+  const row=sessions.find(s=>String(s?.id||'')===sid);
+  const c=(row&&typeof row.llm_concurrency==='object'&&row.llm_concurrency)?row.llm_concurrency:null;
+  if(!c||!(Number(c.limit)>0))return null;
+  const n=v=>Math.max(0,Math.round(Number(v)||0));
+  const meta=[`peak ${n(c.peak)}`,`queued ${n(c.queued)}`];
+  if(n(c.orphaned_in_flight)>0)meta.push(`orphaned ${n(c.orphaned_in_flight)}`);
+  const reqs=Array.isArray(c.requests)?c.requests.slice(0,16):[];
+  const tip=reqs.length?reqs.map(r=>{const flags=[r?.abandoned?'abandoned':'',r?.orphaned?'orphaned':''].filter(Boolean).join(', ');return `${String(r?.label||r?.priority||'model')}${r?.role?' · '+String(r.role):''} · ${n(r?.elapsed_seconds)}s${flags?' ('+flags+')':''}`}).join('\\n'):'No model requests in flight';
+  return {value:`${n(c.in_flight)}/${n(c.limit)}`,meta:`${meta.join(' · ')} · ${String(row.title||row.id||'')}`,tip};
 }
 function renderSessions(){
   const sel=E('sessionSelect'); if(!sel) return;
+  if(!sel._llmConcBound){sel._llmConcBound=true;sel.addEventListener('change',()=>renderStats())}
   const sessions=Array.isArray(S.config?.sessions)?S.config.sessions:[];
   const current=selectedSession()||String(S.config?.default_session_id||'');
   sel.innerHTML=`<option value="">(none)</option>`+sessions.map(s=>`<option value="${esc(s.id)}" ${String(s.id)===current?'selected':''}>${esc(s.title||s.id)} · ${esc(s.id)}</option>`).join('');
@@ -118305,7 +120978,7 @@ function renderAgentState(state){
 const renderAgentStateBase=renderAgentState;
 renderAgentState=function(state){if(state.title)applyIdeSessionTitleEvent({session_id:S.activeSession,session_title:state.title,title_origin:state.title_origin,title_revision:state.title_revision,workspace_id:S.sessions.find(row=>String(row?.id||'')===String(S.activeSession||''))?.workspace_id});S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
 function scheduleAgentEventFrame(){if(S.agentEventRaf)return;const flush=()=>{S.agentEventRaf=0;if(S.agentFileRefresh.size)scheduleWorkspaceRefresh(120);S.agentPollRequested=true;scheduleAgentPoll(40)};if(document.hidden){S.agentEventRaf=setTimeout(flush,500)}else S.agentEventRaf=setTimeout(flush,120)}
-function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(data.session_title)applyIdeSessionTitleEvent(data,event);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello')scheduleAgentEventFrame()}
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(data.session_title)applyIdeSessionTitleEvent(data,event);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello'&&type!=='llm_concurrency')scheduleAgentEventFrame()}
 function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
 function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,seq=S.sessionSwitchSeq,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`),current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq&&S.agentEvents===source;S.agentEvents=source;source.onopen=()=>{if(!current())return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(!current())return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(!current())return source.close();S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
 function mergeAgentWindow(base,incoming,keyFn,limit){const map=new Map();for(const row of Array.isArray(base)?base:[]){const key=keyFn(row);if(key)map.set(key,row)}for(const row of Array.isArray(incoming)?incoming:[]){const key=keyFn(row);if(key)map.set(key,{...(map.get(key)||{}),...row})}return [...map.values()].sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)||Number(a.seq||0)-Number(b.seq||0)).slice(-limit)}
@@ -120907,6 +123580,7 @@ class AppContext:
         shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
         shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         liquid_kernel_startup_policy: str = "inherit",
+        session_llm_concurrency: int | None = None,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -120950,6 +123624,7 @@ class AppContext:
             fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        self.session_llm_concurrency = normalize_session_llm_concurrency(session_llm_concurrency)
         # The AppContext loads its base config below.  Keep an explicit
         # constructor value authoritative, and resolve the file value only
         # after ``self.default_llm_config`` exists.
@@ -126954,6 +129629,16 @@ document.addEventListener('DOMContentLoaded', function(){{
             return None
         return max(sessions, key=lambda s: float(getattr(s, "updated_at", 0.0) or 0.0))
 
+    @staticmethod
+    def _session_row_llm_concurrency(session: object) -> dict:
+        """Live in-session model concurrency for library admin session rows."""
+        if not isinstance(session, SessionState):
+            return {}
+        try:
+            return session._llm_concurrency_snapshot()
+        except Exception:
+            return {}
+
     def _resolve_session_for_user(self, user_id: str, session_id: str = "") -> SessionState | None:
         sid = str(session_id or "").strip()
         mgr = self.manager_for_user(user_id)
@@ -127051,6 +129736,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "id": s.id,
                         "title": s.title,
                         "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                        "llm_concurrency": self._session_row_llm_concurrency(s),
                     }
                     for s in mgr.sessions.values()
                 ),
@@ -127625,6 +130311,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                     temperature=0.0,
                     think=False,
                     stream_thinking=False,
+                    priority="app",
+                    label="rag_evaluate",
                 )
                 parsed = self._rag_parse_evaluation((response or {}).get("content", ""), batch)
                 if not parsed.get("evaluations"):
@@ -127646,7 +130334,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         if isinstance(session, SessionState) and hasattr(getattr(session, "ollama", None), "chat") and evaluations:
             prompt = "Synthesize only from these independent evidence evaluations. Do not use conversation history or outside knowledge. Cite exact citations. Return JSON with answer, answerability, uncertainties.\n\n" + json_dumps({"query": query, "evaluations": evaluations}, indent=2)
             try:
-                response = session.ollama.chat([{"role": "user", "content": prompt}], system="/no_think\nYou are a stateless grounded answer synthesizer.", max_tokens=1200, temperature=0.0, think=False, stream_thinking=False)
+                response = session.ollama.chat([{"role": "user", "content": prompt}], system="/no_think\nYou are a stateless grounded answer synthesizer.", max_tokens=1200, temperature=0.0, think=False, stream_thinking=False, priority="app", label="rag_synthesize")
                 raw = str((response or {}).get("content", "") or "").strip()
                 try:
                     parsed_answer = json.loads(raw)
@@ -127715,6 +130403,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 temperature=0.0,
                 think=False,
                 stream_thinking=False,
+                priority="app",
+                label="rag_synthesize",
             )
             return trim(str(rsp.get("content", "") or ""), 6000)
         except Exception:
@@ -127773,6 +130463,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                     system=system_prompt,
                     max_tokens=120,
                     think=False,
+                    priority="app",
+                    label="rag_translate",
                 )
                 translated = str((rsp or {}).get("content", "") or "").strip()
             except Exception:
@@ -128128,6 +130820,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "id": s.id,
                         "title": s.title,
                         "updated_at": float(getattr(s, "updated_at", 0.0) or 0.0),
+                        "llm_concurrency": self._session_row_llm_concurrency(s),
                     }
                     for s in mgr.sessions.values()
                 ),
@@ -129891,6 +132584,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 kernel_registry=self.liquid_kernel.registry,
                 kernel_runtime=self.liquid_kernel.runtime,
                 skills_snapshot=self.skills_store,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
             )
             mgr.read_context_policy = normalize_read_context_policy(
                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -129900,6 +132596,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             )
             mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+            )
+            mgr.session_llm_concurrency = normalize_session_llm_concurrency(
+                getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
             )
             mgr.single_no_plan_todo_enabled = bool(
                 getattr(self, "single_no_plan_todo_enabled", False)
@@ -129947,6 +132646,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "read_context_policy": normalize_read_context_policy(source.read_context_policy),
                 "tool_memory_policy": normalize_tool_memory_policy(source.tool_memory_policy),
                 "auto_task_level_ceiling": normalize_auto_task_level_ceiling(source.auto_task_level_ceiling),
+                "session_llm_concurrency": normalize_session_llm_concurrency(
+                    getattr(source, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
                 "l2_todo_policy": normalize_l2_todo_policy(source.l2_todo_policy),
                 "single_no_plan_todo_enabled": bool(source.single_no_plan_todo_enabled),
                 "single_no_plan_todo_prompt": str(source.single_no_plan_todo_prompt or ""),
@@ -130245,6 +132947,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 collaboration_context=public_context,
                 collaboration_context_provider=lambda p=principal: self.collaboration.snapshot(p),
                 collaboration_write_coordinator=coordinator,
+                session_llm_concurrency=normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                ),
             )
             mgr.read_context_policy = normalize_read_context_policy(
                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -130400,6 +133105,9 @@ document.addEventListener('DOMContentLoaded', function(){{
         cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+        cfg_session_llm_concurrency = extract_session_llm_concurrency_setting(cfg)
+        if cfg_session_llm_concurrency is not None:
+            self.session_llm_concurrency = normalize_session_llm_concurrency(cfg_session_llm_concurrency)
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
         if cfg_l2_todo_policy is not None:
             self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
@@ -130457,6 +133165,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                     getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                 )
+                mgr.session_llm_concurrency = normalize_session_llm_concurrency(
+                    getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                )
                 mgr.l2_todo_policy = normalize_l2_todo_policy(
                     getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
                 )
@@ -130479,6 +133190,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                     )
                     sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    )
+                    # Live admin change: resize the running session's gate too.
+                    set_session_llm_concurrency_on_runtime(
+                        sess,
+                        getattr(self, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY),
                     )
                     sess.l2_todo_policy = normalize_l2_todo_policy(
                         getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
@@ -131629,6 +134345,10 @@ class TelemetryStore:
         tool_duration = [float(x["duration_ms"]) for x in tool_call_rows if x.get("duration_ms") is not None]
         models = aggregate_dimension(db_rows, "model", "llm_call")
         tools = aggregate_dimension(db_rows, "name", "tool_call")
+        # llm_call rows are named by their source (main, semantic_enrichment,
+        # arbiter, ...; older rows say "chat").  This is a breakdown only: the
+        # llm totals above count every llm_call row whatever its name.
+        llm_sources = aggregate_dimension(db_rows, "name", "llm_call")
 
         users_map: dict[str, list[dict]] = {}
         apps_map: dict[str, list[dict]] = {}
@@ -131763,7 +134483,7 @@ class TelemetryStore:
                 "usage_covered_calls": covered_calls, "llm_calls": len(llm_rows),
                 "coverage_rate": covered_calls / len(llm_rows) if llm_rows else 0.0,
             },
-            "series": series, "tools": tools, "models": models, "apps": apps, "users": users,
+            "series": series, "tools": tools, "models": models, "llm_sources": llm_sources, "apps": apps, "users": users,
             "statuses": [{"kind": kind, "status": status, "count": count} for (kind, status), count in sorted(statuses.items())],
             "coverage": {
                 "user_identified_events": sum(1 for x in db_rows if x.get("user_hash")) / total_events if total_events else 0.0,
@@ -133118,6 +135838,9 @@ class Handler(BaseHTTPRequestHandler):
                         "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                             getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                         ),
+                        "session_llm_concurrency": normalize_session_llm_concurrency(
+                            getattr(mgr, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
+                        ),
                         "user_memory_mode": normalize_user_memory_mode(
                             getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
                         ),
@@ -133193,6 +135916,9 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                     "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                         getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    ),
+                    "session_llm_concurrency": normalize_session_llm_concurrency(
+                        getattr(mgr, "session_llm_concurrency", DEFAULT_SESSION_LLM_CONCURRENCY)
                     ),
                     "user_memory_mode": normalize_user_memory_mode(
                         getattr(mgr, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
@@ -134856,6 +137582,13 @@ class SkillsHandler(BaseHTTPRequestHandler):
                             mgr,
                             "auto_task_level_ceiling",
                             DEFAULT_AUTO_TASK_LEVEL_CEILING,
+                        )
+                    ),
+                    "session_llm_concurrency": normalize_session_llm_concurrency(
+                        getattr(
+                            mgr,
+                            "session_llm_concurrency",
+                            DEFAULT_SESSION_LLM_CONCURRENCY,
                         )
                     ),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
@@ -138669,7 +141402,7 @@ def main():
             "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout, "
             "shell_timeout_mode, shell_async_handoff_seconds, "
             "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling, "
-            "l2_todo_policy (force|auto|off) and "
+            "session_llm_concurrency, l2_todo_policy (force|auto|off) and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
             "max_daily_sessions_per_ip / session_daily_limit; shell aliases: "
             "shell_timeout / bash_timeout / command_timeout)."
@@ -138752,6 +141485,20 @@ def main():
             "Manual task-level overrides and manual plan-mode preference are not capped. "
             "Also configurable via config keys auto_task_level_ceiling/task_level_ceiling/"
             "max_auto_task_level/complexity_ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--session-llm-concurrency",
+        "--session_llm_concurrency",
+        dest="session_llm_concurrency",
+        default=None,
+        type=int,
+        help=(
+            "Maximum model requests one session may have in flight at once "
+            f"({SESSION_LLM_CONCURRENCY_MIN}-{SESSION_LLM_CONCURRENCY_MAX}, default "
+            f"{DEFAULT_SESSION_LLM_CONCURRENCY}; env AGENT_SESSION_LLM_CONCURRENCY sets the default). "
+            "Applies inside each session only; other sessions and users are not limited by it. "
+            "Also configurable via config keys session_llm_concurrency/llm_concurrency_per_session."
         ),
     )
     parser.add_argument(
@@ -138974,6 +141721,7 @@ def main():
     resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
+    resolved_session_llm_concurrency = DEFAULT_SESSION_LLM_CONCURRENCY
     resolved_l2_todo_policy = DEFAULT_L2_TODO_POLICY
     resolved_single_no_plan_todo_enabled = False
     resolved_single_no_plan_todo_prompt = ""
@@ -139036,6 +141784,9 @@ def main():
             external_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(external_config)
             if external_auto_task_level_ceiling is not None:
                 resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(external_auto_task_level_ceiling)
+            external_session_llm_concurrency = extract_session_llm_concurrency_setting(external_config)
+            if external_session_llm_concurrency is not None:
+                resolved_session_llm_concurrency = normalize_session_llm_concurrency(external_session_llm_concurrency)
             external_l2_todo_policy = extract_l2_todo_policy_setting(external_config)
             if external_l2_todo_policy is not None:
                 resolved_l2_todo_policy = normalize_l2_todo_policy(external_l2_todo_policy)
@@ -139092,6 +141843,9 @@ def main():
     web_ui_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(web_ui_config)
     if web_ui_auto_task_level_ceiling is not None:
         resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(web_ui_auto_task_level_ceiling)
+    web_ui_session_llm_concurrency = extract_session_llm_concurrency_setting(web_ui_config)
+    if web_ui_session_llm_concurrency is not None:
+        resolved_session_llm_concurrency = normalize_session_llm_concurrency(web_ui_session_llm_concurrency)
     web_ui_l2_todo_policy = extract_l2_todo_policy_setting(web_ui_config)
     if web_ui_l2_todo_policy is not None:
         resolved_l2_todo_policy = normalize_l2_todo_policy(web_ui_l2_todo_policy)
@@ -139157,6 +141911,10 @@ def main():
             getattr(args, "auto_task_level_ceiling", "")
         )
     resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(resolved_auto_task_level_ceiling)
+    cli_session_llm_concurrency = getattr(args, "session_llm_concurrency", None)
+    if cli_session_llm_concurrency is not None and str(cli_session_llm_concurrency).strip():
+        resolved_session_llm_concurrency = normalize_session_llm_concurrency(cli_session_llm_concurrency)
+    resolved_session_llm_concurrency = normalize_session_llm_concurrency(resolved_session_llm_concurrency)
     cli_l2_todo_policy = str(getattr(args, "l2_todo_policy", "") or "").strip()
     if cli_l2_todo_policy:
         resolved_l2_todo_policy = normalize_l2_todo_policy(cli_l2_todo_policy)
@@ -139307,6 +142065,10 @@ def main():
         + ". To allow more complex automatic plans, start with "
         "--auto-task-level-ceiling 3, 4, or 5; use --auto-task-level-ceiling 0 to remove the cap. "
         "Manual Level and Plan settings are never capped."
+    )
+    print(
+        f"[web-agent] session_llm_concurrency={int(resolved_session_llm_concurrency)} "
+        "(model requests in flight per session; other sessions are not affected)"
     )
     requested_live_input_delay_write = int(args.live_input_delay_write if args.live_input_delay_write is not None else LIVE_INPUT_DELAY_WRITE_ROUNDS)
     resolved_live_input_delay_write = max(0, min(20, requested_live_input_delay_write))
@@ -139537,6 +142299,7 @@ def main():
         web_search_enabled=resolved_web_search_enabled,
         shell_timeout_mode=resolved_shell_timeout_mode,
         shell_async_handoff_seconds=resolved_shell_async_handoff_seconds,
+        session_llm_concurrency=resolved_session_llm_concurrency,
         web_search_setting_locked=web_search_setting_locked,
         user_memory_mode=resolved_user_memory_mode,
         user_memory_setting_locked=user_memory_setting_locked,
@@ -139583,6 +142346,7 @@ def main():
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    app.session_llm_concurrency = resolved_session_llm_concurrency
     if _l2_todo_cli_explicit or _l2_todo_admin_explicit:
         app.l2_todo_policy = normalize_l2_todo_policy(resolved_l2_todo_policy)
     app.web_search_enabled = bool(resolved_web_search_enabled)
@@ -139607,6 +142371,7 @@ def main():
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    app.session_llm_concurrency = resolved_session_llm_concurrency
     if bool(web_search_setting_locked):
         app.web_search_enabled = bool(resolved_web_search_enabled)
     app.web_search_setting_locked = bool(web_search_setting_locked)
@@ -139623,6 +142388,7 @@ def main():
         _mgr.read_context_policy = resolved_read_context_policy
         _mgr.tool_memory_policy = resolved_tool_memory_policy
         _mgr.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+        _mgr.session_llm_concurrency = resolved_session_llm_concurrency
         _mgr.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
         _mgr.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
         _mgr.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
@@ -139637,6 +142403,7 @@ def main():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
             _sess.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+            set_session_llm_concurrency_on_runtime(_sess, resolved_session_llm_concurrency)
             _sess.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
             _sess.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
             _sess.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
@@ -139711,6 +142478,7 @@ def main():
         "tool_memory_policy": str(resolved_tool_memory_policy),
         "user_memory_mode": str(resolved_user_memory_mode),
         "auto_task_level_ceiling": int(resolved_auto_task_level_ceiling),
+        "session_llm_concurrency": int(resolved_session_llm_concurrency),
         "l2_todo_policy": normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy)),
         "single_no_plan_todo_enabled": bool(resolved_single_no_plan_todo_enabled),
         "single_no_plan_todo_prompt": str(resolved_single_no_plan_todo_prompt or ""),
@@ -140090,6 +142858,10 @@ def main():
         + ". To allow more complex automatic plans, start with "
         "--auto-task-level-ceiling 3, 4, or 5; use --auto-task-level-ceiling 0 to remove the cap. "
         "Manual Level and Plan settings are never capped."
+    )
+    print(
+        f"[web-agent] session_llm_concurrency={int(resolved_session_llm_concurrency)} "
+        "(model requests in flight per session; other sessions are not affected)"
     )
     print(f"[web-agent] max_rounds={resolved_max_rounds}")
     print(
