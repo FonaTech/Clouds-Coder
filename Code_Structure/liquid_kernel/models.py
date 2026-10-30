@@ -3,9 +3,24 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 
+from .context import json_text, utf8_bytes
 from .control import LiquidKernelError, normalize_model_ref
+
+
+def configured_model_ids(profile):
+    values = profile.get("configured_models", profile.get("models", []))
+    values = values if isinstance(values, list) else []
+    return list(dict.fromkeys(str(item).strip() for item in [profile.get("model", ""), *values] if str(item).strip()))
+
+
+def prioritize_model_options(options, profiles):
+    order = {(pid, model): (profile_index, model_index) for profile_index, (pid, profile) in enumerate(profiles.items())
+             for model_index, model in enumerate(configured_model_ids(profile))}
+    for option in options:
+        option['configured'] = (option.get('profile_id'), option.get('model')) in order
+    return sorted(options, key=lambda option: (not option['configured'],
+                  order.get((option.get('profile_id'), option.get('model')), (len(profiles), 0))))
 
 
 class EvolutionModels:
@@ -18,13 +33,14 @@ class EvolutionModels:
     def model_ids(self, profile):
         configured = profile.get("models", [])
         configured = configured if isinstance(configured, list) else []
-        return sorted({str(item).strip() for item in [profile.get("model", ""), *configured,
-                       *(row.get("id", "") for row in self.records(profile))] if str(item).strip()})
+        preferred = configured_model_ids(profile)
+        others = {str(item).strip() for item in [*configured, *(row.get("id", "") for row in self.records(profile))] if str(item).strip()}
+        return preferred + sorted(others - set(preferred))
 
     def effective(self, profile, model):
         row = {**profile, **self.settings(profile, model), "model": model}
         # Directory/UI metadata and settings for other models do not affect this call.
-        for key in ("id", "label", "title", "display_name", "source", "selection", "models", "model_settings"):
+        for key in ("id", "label", "title", "display_name", "source", "selection", "models", "configured_models", "model_settings"):
             row.pop(key, None)
         row["provider"] = str(row.get("provider") or "ollama")
         row["base_url"] = str(row.get("base_url") or "").rstrip("/")
@@ -35,7 +51,7 @@ class EvolutionModels:
         return row
 
     def fingerprint(self, profile):
-        raw = json.dumps(profile, sort_keys=True, ensure_ascii=False, default=str).encode()
+        raw = utf8_bytes(json_text(profile, sort_keys=True, default=str))
         return hmac.new(self.signing_key, raw, hashlib.sha256).hexdigest()
 
     def resolve(self, reference=None, legacy=""):
@@ -120,9 +136,11 @@ class EvolutionModels:
                         reason, signature = str(exc), f"{pid}:{model}"
                     if signature in merged:
                         merged[signature]["aliases"].append(ref)
+                        merged[signature]['configured'] |= model in configured_model_ids(profile)
                         continue
                     option = {"ref": ref, "aliases": [ref], "sources": [source], "model": model,
-                              "label": f"[{source}] {model} · {pid}", "available": not reason, "reason": reason}
+                              "label": f"[{source}] {model} · {pid}", "available": not reason, "reason": reason,
+                              "configured": model in configured_model_ids(profile)}
                     merged[signature] = option
                     options.append(option)
         resolved = {}
@@ -132,4 +150,5 @@ class EvolutionModels:
                 resolved[role] = {"ref": ref, "available": True, "reason": ""}
             except LiquidKernelError as exc:
                 resolved[role] = {"ref": config.get(f"{role}_model_ref"), "available": False, "reason": str(exc)}
+        options.sort(key=lambda item: not item.get('configured', False))
         return {"ok": True, "options": options, "sources": sources, "resolved": resolved}

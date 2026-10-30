@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import copy
 import hashlib
 import hmac
 import importlib.util
@@ -8,6 +10,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -16,16 +19,30 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from zoneinfo import ZoneInfo
 
+from .agentic import (
+    AgenticBenchmark,
+    SCORING_PROTOCOL_VERSION,
+    KernelWorker,
+    build_task_bank,
+    canonicalize_task_bank,
+    compare_agentic_flows,
+    rollout_complete,
+    task_config,
+    trajectory_model_view,
+    training_opportunity_evidence,
+)
+from .context import EvaluationDefinitionError, normalize_executable_command, json_text, utf8_bytes, utf8_text, subprocess_environment
 
 EVOLUTION_MODES = ("Off", "Tuning", "Thinking", "Aggressive")
 CONTROL_SCHEMA_VERSION = 1
-EVOLUTION_MODEL_CAPABILITY_VERSION = 2
+EVOLUTION_MODEL_CAPABILITY_VERSION = 19
 KERNEL_CONTRACT_VERSION = 1
 BASELINE_KERNEL_SOURCE = '''from __future__ import annotations
 
@@ -81,7 +98,9 @@ BASELINE_KERNEL_FILES = {
     "harness.py": BASELINE_HARNESS_SOURCE,
 }
 
-CONTROLLED_KERNEL_FILES = frozenset({"kernel.py", "tool_policy.py", "prompt_policy.py"})
+TUNING_KERNEL_FILES = frozenset({"kernel.py", "tool_policy.py", "prompt_policy.py", "context_policy.py", "recovery.py"})
+CONTROLLED_KERNEL_FILES = frozenset({*TUNING_KERNEL_FILES, "planning.py", "memory.py", "tool_router.py",
+                                    "verification.py", "scheduler.py", "state.py", "serialization.py"})
 FULL_AGENT_CORE_FILES = frozenset({*CONTROLLED_KERNEL_FILES, "harness.py"})
 IMMUTABLE_CONTROL_COMPONENTS = (
     "authentication",
@@ -107,7 +126,39 @@ def _now() -> float:
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return json_text(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def normalize_proposal_output(value):
+    """Repair unambiguous envelope placement, never infer a decision or patch."""
+    result = copy.deepcopy(value)
+    changes = []
+    for _ in range(4):
+        if not isinstance(result, dict) or any(key in result for key in ('decision', 'patch')):
+            break
+        envelopes = [(key, result[key]) for key in ('proposal', 'result', 'data', 'output') if isinstance(result.get(key), dict)]
+        if len(envelopes) != 1:
+            break
+        key, result = envelopes[0]
+        changes.append('unwrap:' + key)
+    if not isinstance(result, dict):
+        raise LiquidKernelError('invalid_proposal_schema', 'Proposal must contain an explicit decision and reason', 422)
+    patch = result.get('patch') if isinstance(result.get('patch'), dict) else {}
+    for key in ('decision', 'reason', 'changelog'):
+        outer, nested = result.get(key), patch.get(key)
+        if key == 'decision' and outer and nested and outer != nested:
+            raise LiquidKernelError('invalid_proposal_schema', 'Proposal decisions conflict', 422, {'field':key})
+        if not outer and isinstance(nested, str) and nested.strip():
+            result[key] = nested
+            changes.append('patch.' + key + '->' + key)
+    if not isinstance(result.get('decision'), str) or result['decision'] not in {'change', 'no_change'} or not isinstance(result.get('reason'), str) or not result['reason'].strip():
+        raise LiquidKernelError('invalid_proposal_schema', 'Proposal must contain an explicit decision and reason', 422,
+                                {'required_fields':['decision','reason'], 'received_keys':sorted(result)})
+    if result['decision'] == 'no_change' and patch.get('files'):
+        raise LiquidKernelError('invalid_proposal_schema', 'No-change proposal contains an executable patch', 422)
+    if changes:
+        result['_proposal_normalization'] = changes
+    return result
 
 
 def _read_json(path: Path, fallback: Any) -> Any:
@@ -120,7 +171,7 @@ def _read_json(path: Path, fallback: Any) -> Any:
 def _atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    temp.write_text(json_text(payload, indent=2, sort_keys=True), encoding="utf-8")
     try:
         os.chmod(temp, 0o600)
     except Exception:
@@ -134,7 +185,7 @@ def _sha256_bytes(raw: bytes) -> str:
 
 def _normalize_kernel_files(value: object) -> dict[str, str]:
     if isinstance(value, str):
-        return {"kernel.py": value}
+        return {"kernel.py": utf8_text(value)}
     if not isinstance(value, dict):
         raise LiquidKernelError("invalid_kernel_bundle", "kernel artifact must be source text or a file map")
     files: dict[str, str] = {}
@@ -142,18 +193,18 @@ def _normalize_kernel_files(value: object) -> dict[str, str]:
         path = str(raw_path or "").strip().replace("\\", "/")
         if not path or path.startswith("/") or ".." in Path(path).parts or "/" in path:
             raise LiquidKernelError("invalid_kernel_path", "kernel artifact contains an invalid file path")
-        files[path] = str(raw_source or "")
+        files[path] = utf8_text(raw_source or "")
     if "kernel.py" not in files:
         raise LiquidKernelError("kernel_contract_missing", "kernel artifact is missing kernel.py")
     return files
 
 
 def _kernel_file_hashes(files: dict[str, str]) -> dict[str, str]:
-    return {path: _sha256_bytes(source.encode("utf-8")) for path, source in sorted(files.items())}
+    return {path: _sha256_bytes(utf8_bytes(source)) for path, source in sorted(files.items())}
 
 
 def _kernel_bundle_hash(files: dict[str, str]) -> str:
-    return _sha256_bytes(_json(_kernel_file_hashes(files)).encode("utf-8"))
+    return _sha256_bytes(utf8_bytes(_json(_kernel_file_hashes(files))))
 
 
 def _kernel_bundle_text(files: dict[str, str]) -> str:
@@ -188,10 +239,10 @@ MODE_PRESETS: dict[str, dict] = {
         "cooldown_hours": 72,
         "candidate_limit": 1,
         "max_files": 5,
-        "max_changed_lines": 400,
+        "max_changed_lines": 0,
         "max_cases": 36,
-        "max_tokens": 48_000,
-        "timeout_seconds": 3600,
+        "max_tokens": 0,
+        "timeout_seconds": 0,
         "mutable_surface": "controlled",
         "auto_promote": True,
         "minimum_gain": 1.5,
@@ -201,10 +252,10 @@ MODE_PRESETS: dict[str, dict] = {
         "cooldown_hours": 48,
         "candidate_limit": 2,
         "max_files": 12,
-        "max_changed_lines": 1200,
+        "max_changed_lines": 0,
         "max_cases": 72,
-        "max_tokens": 120_000,
-        "timeout_seconds": 7200,
+        "max_tokens": 0,
+        "timeout_seconds": 0,
         "mutable_surface": "controlled",
         "auto_promote": False,
         "minimum_gain": 3.0,
@@ -214,10 +265,10 @@ MODE_PRESETS: dict[str, dict] = {
         "cooldown_hours": 24,
         "candidate_limit": 3,
         "max_files": 30,
-        "max_changed_lines": 4000,
+        "max_changed_lines": 0,
         "max_cases": 120,
-        "max_tokens": 240_000,
-        "timeout_seconds": 14_400,
+        "max_tokens": 0,
+        "timeout_seconds": 0,
         "mutable_surface": "full_agent_core",
         "auto_promote": False,
         "minimum_gain": 5.0,
@@ -228,9 +279,9 @@ MODE_PRESETS: dict[str, dict] = {
 HARD_BUDGET_LIMITS = {
     "candidate_limit": 3,
     "max_files": 30,
-    "max_changed_lines": 4000,
+    "max_changed_lines": 100_000_000,
     "max_cases": 160,
-    "max_tokens": 300_000,
+    "max_tokens": 10_000_000,
     "timeout_seconds": 21_600,
 }
 
@@ -260,6 +311,8 @@ def default_evolution_config() -> dict:
     preset = dict(MODE_PRESETS["Off"])
     return {
         "revision": 1,
+        "quota_policy_version": 2,
+        "timeout_policy_version": 1,
         "mode": "Off",
         "schedule": preset.pop("schedule"),
         "timezone": "Asia/Shanghai",
@@ -283,9 +336,12 @@ def default_evolution_config() -> dict:
         },
         "mutable_surface": preset["mutable_surface"],
         "auto_promote": preset["auto_promote"],
+        "deployment_policy": "mode",
         "minimum_gain": preset["minimum_gain"],
-        "hard_score_weight": 0.30,
-        "soft_score_weight": 0.70,
+        "task_benchmark": task_config("Off"),
+        "hard_score_weight": 0.70,
+        "soft_score_weight": 0.20,
+        "efficiency_score_weight": 0.10,
         "hard_regression_limit": 0.05,
         "canary": {
             "stages": [5, 25, 100],
@@ -346,23 +402,40 @@ def normalize_evolution_config(raw: object, *, current: dict | None = None) -> d
         if f"{role}_profile" in raw_values and f"{role}_model_ref" not in raw_values:
             out[f"{role}_model_ref"] = None
         out[f"{role}_model_ref"] = normalize_model_ref(out.get(f"{role}_model_ref"))
-    supplied_budget = (
-        {}
-        if mode_changed
-        else out.get("budget", {}) if isinstance(out.get("budget"), dict) else {}
-    )
+    supplied_budget = out.get("budget", {}) if isinstance(out.get("budget"), dict) else {}
+    if not current and "budget" not in raw_values:
+        supplied_budget = {}
+    if mode_changed:
+        # Strength controls code edits. Compute limits are explicit choices;
+        # zero must survive a mode switch as the unlimited sentinel.
+        submitted = raw_values.get("budget", {})
+        supplied_budget = {key: submitted[key] for key in ("max_tokens", "timeout_seconds", "max_changed_lines")
+                           if isinstance(submitted, dict) and key in submitted}
+        for key in ("max_tokens", "max_changed_lines", "timeout_seconds"):
+            if key not in supplied_budget:
+                supplied_budget[key] = (current or {}).get("budget", {}).get(key, 0)
     budget: dict[str, int] = {}
     for key, hard_limit in HARD_BUDGET_LIMITS.items():
         default_value = int(preset[key])
         requested = int(supplied_budget.get(key, default_value) or 0)
-        budget[key] = max(0, min(int(hard_limit), requested))
+        ceiling = int(hard_limit) if key in {"max_tokens", "timeout_seconds", "max_changed_lines"} and mode != "Off" else min(int(hard_limit), default_value)
+        budget[key] = max(0, min(ceiling, requested))
     out["budget"] = budget
+    out["quota_policy_version"] = 2
+    prior_task = source.get("task_benchmark", {})
+    task_source = raw_values.get("task_benchmark", {"enabled": prior_task.get("enabled", True), "max_task_tokens": prior_task.get("max_task_tokens", 0)} if mode_changed else prior_task)
+    out["task_benchmark"] = task_config(mode, task_source)
     out["mutable_surface"] = str(preset["mutable_surface"])
-    out["auto_promote"] = bool(preset["auto_promote"])
+    policy = str(out.get("deployment_policy", "mode") or "mode")
+    if policy not in {"mode", "automatic", "manual"}:
+        raise LiquidKernelError("invalid_deployment_policy", "deployment_policy must be mode, automatic or manual")
+    out["deployment_policy"] = policy
+    out["auto_promote"] = mode != "Off" and (policy == "automatic" or (policy == "mode" and bool(preset["auto_promote"])))
     minimum_gain_source = preset["minimum_gain"] if mode_changed else out.get("minimum_gain")
     out["minimum_gain"] = max(float(preset["minimum_gain"]), float(minimum_gain_source or 0.0))
-    out["hard_score_weight"] = 0.30
-    out["soft_score_weight"] = 0.70
+    out["hard_score_weight"] = 0.70
+    out["soft_score_weight"] = 0.20
+    out["efficiency_score_weight"] = 0.10
     out["hard_regression_limit"] = 0.05
     canary = out.get("canary", {}) if isinstance(out.get("canary"), dict) else {}
     out["canary"] = {
@@ -392,6 +465,159 @@ class _ClosingSQLiteConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc_value, exc_traceback)
         finally:
             self.close()
+
+
+_PROGRESS_TRANSIENT = frozenset({'task_round_started', 'task_round_completed', 'task_tool_started', 'task_tool_completed', 'model_request_wait', 'model_request_retry', 'model_http_attempt_started', 'model_phase_round_started', 'token_usage'})
+_PROGRESS_FIELDS = frozenset({'task_id', 'task_index', 'task_total', 'round', 'round_limit', 'tool_calls', 'tool_name', 'tool_index', 'arm', 'split', 'attempt', 'max_attempts', 'operation', 'candidate_index', 'candidate_total', 'stage', 'model', 'request_id', 'timeout_seconds', 'elapsed_seconds', 'retry_after_seconds', 'http_status', 'error_type', 'error_code', 'provider', 'endpoint_host', 'status_origin', 'last_http_status', 'cause_code', 'success', 'score', 'used', 'limit', 'train', 'holdout', 'per_task_tokens', 'paired_rollouts', 'reserve_percent', 'scope', 'remaining', 'exhausted', 'stop_reason', 'required_input_tokens'})
+_TERMINAL_RUNS = frozenset({'no_change', 'rejected', 'failed', 'cancelled', 'promoted', 'rolled_back', 'awaiting_approval'})
+
+
+def _progress_update(state, kind, payload, now, config=None):
+    """Reduce metadata only; no prompts, source bodies or reasoning enter bubbles."""
+    config = config or {}
+    state = dict(state or {})
+    state.setdefault('schema_version', 1)
+    state.setdefault('design', {'completed': 0, 'total': int(config.get('task_benchmark', {}).get('max_tasks', 0))})
+    state.setdefault('execution', {'completed': 0, 'arm_completed': 0, 'total': 0, 'round': 0, 'tool_calls': 0,
+                                    'round_limit': int(config.get('task_benchmark', {}).get('max_rounds', 0))})
+    state.setdefault('model', {'started': 0, 'completed': 0, 'failed': 0, 'state': 'idle'})
+    state.setdefault('tokens', {'used': 0, 'limit': int(config.get('budget', {}).get('max_tokens', 0))})
+    safe = {key: value for key, value in payload.items() if key in _PROGRESS_FIELDS and isinstance(value, (str, int, float, bool, type(None)))}
+    for key in ('thinking_chars', 'content_chars', 'output_limit', 'finish_reason', 'recovery_mode', 'retry_budget'):
+        if isinstance(payload.get(key), (str, int, float, bool)):
+            safe[key] = payload[key]
+    if payload.get('reason') in {'native_tool_output_truncated', 'oversized_native_tool_arguments', 'native_tool_output_unusable'}:
+        safe['reason'] = payload['reason']
+    state['heartbeat_at'] = now
+    if kind == 'model_request_wait':
+        if state['model'].get('request_id') == safe.get('request_id') and state['model'].get('state') in {'waiting', 'retrying'}:
+            state['model']['elapsed_seconds'] = safe.get('elapsed_seconds', 0)
+        return state
+    state['last_activity_at'] = now
+    state['last_kind'] = kind
+    design, execution, model = state['design'], state['execution'], state['model']
+    if kind == 'queued':
+        state['stage'] = 'queued'
+    elif kind == 'collecting':
+        state['stage'] = 'collecting'
+    elif kind.startswith('task_design'):
+        state['stage'] = safe.get('operation', 'task_design')
+        design.update({key: safe[key] for key in ('task_index', 'task_total', 'attempt', 'max_attempts', 'operation') if key in safe})
+        if 'task_total' in safe:
+            design['total'] = safe['task_total']
+        if kind == 'task_design_completed':
+            design['completed'] = max(int(design.get('completed', 0)), int(safe.get('task_index', 0)))
+    elif kind == 'task_bank_frozen':
+        design['completed'] = design['total'] = int(payload.get('train', 0)) + int(payload.get('holdout', 0))
+        state['stage'] = 'task_bank_frozen'
+    elif kind == 'task_budget_allocated':
+        execution['planned_rollouts'] = safe.get('paired_rollouts', 0)
+        state['tokens']['per_task_limit'] = safe.get('per_task_tokens', 0)
+    elif kind == 'task_started':
+        state['stage'] = 'task_execution'
+        if execution.get('arm') != safe.get('arm'):
+            execution['arm_completed'] = 0
+        execution.update(safe)
+        execution.update(round=0, tool_calls=0, tool_name='', action='starting')
+    elif kind in {'task_round_started', 'task_round_completed', 'task_tool_started', 'task_tool_completed', 'task_checks_started'}:
+        state['stage'] = 'task_checks' if kind == 'task_checks_started' else 'task_execution'
+        execution.update(safe)
+        execution['action'] = kind
+    elif kind == 'task_completed':
+        execution.update(safe)
+        execution['completed'] = int(execution.get('completed', 0)) + 1
+        execution['arm_completed'] = int(execution.get('arm_completed', 0)) + 1
+        execution['action'] = kind
+        if safe.get('stop_reason') == 'quota_exhausted':
+            execution['quota_failures'] = int(execution.get('quota_failures', 0)) + 1
+    elif kind == 'model_call_started':
+        state['stage'] = 'baseline_review' if safe.get('stage') == 'baseline_judge' else 'judging' if safe.get('stage') == 'judge' else 'generating'
+        state.update({key: safe[key] for key in ('candidate_index', 'candidate_total') if key in safe})
+    elif kind == 'model_request_started':
+        model.update(safe)
+        model.update(state='waiting', started=int(model.get('started', 0)) + 1, started_at=now, elapsed_seconds=0, attempt=1)
+    elif kind in {'model_request_retry','model_transport_recovery'}:
+        model.update(safe)
+        model['state'] = 'retrying'
+    elif kind in {'model_phase_round_started', 'model_reasoning_continued', 'model_http_attempt_started'}:
+        model.update(safe)
+        model['state'] = 'waiting'
+        if kind == 'model_http_attempt_started':
+            model['retry_after_seconds'] = 0
+    elif kind in {'model_request_completed', 'model_request_failed'}:
+        if model.get('request_id') == safe.get('request_id'):
+            model.update(safe)
+            model['state'] = 'failed' if kind.endswith('failed') else 'completed'
+            model['finished_at'] = now
+        key = 'failed' if kind.endswith('failed') else 'completed'
+        model[key] = int(model.get(key, 0)) + 1
+    elif kind == 'token_usage':
+        state['tokens'].update(safe)
+    elif kind == 'model_budget_consumed':
+        state['last_budget'] = {key: payload[key] for key in ('scope', 'limit', 'used', 'remaining', 'exhausted') if key in payload}
+    elif kind in _TERMINAL_RUNS:
+        state['stage'] = kind
+        evaluations = payload.get('evaluations', [])
+        if evaluations and all(row.get('code') == 'proposal_budget_exhausted' for row in evaluations):
+            state['summary'] = {'code': 'proposal_budget_exhausted', 'affected_candidates': len(evaluations)}
+    if kind != 'token_usage':
+        state['activity'] = (state.get('activity', []) + [{'kind': kind, 'at': now, **safe}])[-40:]
+    return state
+
+
+def _progress_outcome(state, result):
+    evaluations = result.get('evaluations', []) if isinstance(result, dict) else []
+    if evaluations and all(row.get('code') == 'proposal_budget_exhausted' for row in evaluations):
+        state['summary'] = {'code': 'proposal_budget_exhausted', 'affected_candidates': len(evaluations)}
+    return state
+
+
+def _legacy_progress(root, run, events):
+    """Read old checkpoints without modifying the registry or loading user text."""
+    state = {}
+    for event in events:
+        payload = event.get('payload', {})
+        if event['kind'] == 'task_completed':
+            payload = {**payload, 'round': payload.get('round', payload.get('rounds', 0))}
+            if 'budget_exhausted' in str(payload.get('error', '')):
+                payload = {**payload, 'stop_reason': 'quota_exhausted'}
+        state = _progress_update(state, event['kind'], payload, event['created_at'], run.get('config', {}))
+    state['legacy'] = True
+    state['detailed_telemetry_available'] = False
+    archives = list((Path(root) / 'experience' / run['run_id'] / 'model_calls').glob('*/full_history.jsonl'))
+    if archives:
+        # Stat only: archives may contain private requests. A file is not a
+        # proof of model completion or a network heartbeat.
+        state['legacy_archive_count'] = len(archives)
+        state['legacy_archive_activity_at'] = max(path.stat().st_mtime for path in archives)
+    return state
+
+
+def read_evolution_progress(root, run_id):
+    """Read-only diagnostics for existing processes; never starts a control plane."""
+    root = Path(root)
+    with contextlib.closing(sqlite3.connect(f'file:{(root / "registry.sqlite").resolve()}?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT run_id,status,config_json,result_json,created_at,updated_at,completed_at,error FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        if row is None:
+            raise LiquidKernelError('run_not_found', 'evolution run not found', 404)
+        run = dict(row)
+        run['config'] = json.loads(run.pop('config_json'))
+        result = json.loads(run.pop('result_json'))
+        events = [dict(item) for item in conn.execute('SELECT kind,payload_json,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT 200', (run_id,))][::-1]
+        for event in events:
+            event['payload'] = json.loads(event.pop('payload_json'))
+        try:
+            stored = conn.execute('SELECT state_json FROM run_progress WHERE run_id=?', (run_id,)).fetchone()
+        except sqlite3.OperationalError:
+            stored = None
+    run['progress'] = json.loads(stored[0]) if stored else _legacy_progress(root, run, events)
+    _progress_outcome(run['progress'], result)
+    if run['status'] in _TERMINAL_RUNS:
+        run['progress']['stage'] = run['status']
+    run['server_time'] = _now()
+    run.pop('config')
+    return run
 
 
 class LiquidKernelRegistry:
@@ -469,6 +695,11 @@ class LiquidKernelRegistry:
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,kind TEXT NOT NULL,
                     payload_json TEXT NOT NULL,previous_hash TEXT NOT NULL,event_hash TEXT NOT NULL,created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS candidate_evaluations(
+                    version TEXT PRIMARY KEY,run_id TEXT NOT NULL,evaluation_json TEXT NOT NULL,updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS run_progress(run_id TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS run_events_run_id ON run_events(run_id,event_id);
                 CREATE TABLE IF NOT EXISTS deployments(
                     deployment_id TEXT PRIMARY KEY,version TEXT NOT NULL,previous_version TEXT NOT NULL,
                     status TEXT NOT NULL,stage_percent INTEGER NOT NULL,metrics_json TEXT NOT NULL,
@@ -483,7 +714,7 @@ class LiquidKernelRegistry:
             )
 
     def _sign(self, manifest: dict) -> str:
-        return hmac.new(self.signing_key, _json(manifest).encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.new(self.signing_key, utf8_bytes(_json(manifest)), hashlib.sha256).hexdigest()
 
     def _manifest(
         self,
@@ -523,7 +754,7 @@ class LiquidKernelRegistry:
             target = self.artifacts_root / version
             target.mkdir(parents=True, exist_ok=False)
             for path, source in files.items():
-                (target / path).write_text(source, encoding="utf-8")
+                (target / path).write_text(utf8_text(source), encoding="utf-8")
             manifest = self._manifest(
                 version,
                 "",
@@ -571,7 +802,7 @@ class LiquidKernelRegistry:
         percent = max(0, min(100, int(canary.get("percent", 0) or 0)))
         if not candidate or percent <= 0:
             return str(state["version"])
-        bucket = int(hashlib.sha256(f"{user_id}|{session_id}|{candidate}".encode("utf-8")).hexdigest()[:8], 16) % 100
+        bucket = int(hashlib.sha256(utf8_bytes(f"{user_id}|{session_id}|{candidate}")).hexdigest()[:8], 16) % 100
         return candidate if bucket < percent else str(state["version"])
 
     def artifact(self, version: str) -> KernelArtifact:
@@ -594,7 +825,7 @@ class LiquidKernelRegistry:
                 if not relative or not file_path.is_file():
                     raise LiquidKernelError("artifact_hash_invalid", "kernel artifact file is missing", 409)
                 source = file_path.read_text(encoding="utf-8")
-                if _sha256_bytes(source.encode("utf-8")) != str(expected_hash or ""):
+                if _sha256_bytes(utf8_bytes(source)) != str(expected_hash or ""):
                     raise LiquidKernelError("artifact_hash_invalid", "kernel artifact file hash is invalid", 409)
                 files[relative] = source
             if _kernel_bundle_hash(files) != str(row["source_hash"]):
@@ -612,6 +843,15 @@ class LiquidKernelRegistry:
                 "SELECT version,parent_version,status,source_hash,changelog,hard_score,soft_score,mixed_score,created_at,promoted_at FROM versions ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (max(1, min(500, int(limit))), max(0, int(offset))),
             ).fetchall()]
+        for row in rows:
+            with self._connect() as conn:
+                saved = conn.execute('SELECT run_id,evaluation_json FROM candidate_evaluations WHERE version=?', (row['version'],)).fetchone()
+            if saved:
+                evaluation = json.loads(saved['evaluation_json'])
+                row.update(run_id=saved['run_id'], deployment_eligible=evaluation.get('deployment_eligible', False),
+                           score_status=(evaluation.get('candidate') or {}).get('score_status', 'pending_evaluation'))
+                for key in ('hard', 'soft', 'mixed'):
+                    row[key + '_score'] = (evaluation.get('candidate') or {}).get(key)
         return {"versions": rows, "total": total, "active": self.active_state()}
 
     def version_detail(self, version: str) -> dict:
@@ -625,6 +865,11 @@ class LiquidKernelRegistry:
         row["deployments"] = deployments
         row["sources"] = self.sources(version)
         row["source"] = row["sources"]["kernel.py"]
+        with self._connect() as conn:
+            saved = conn.execute('SELECT run_id,evaluation_json FROM candidate_evaluations WHERE version=?', (version,)).fetchone()
+        if saved:
+            row['run_id'] = saved['run_id']
+            row['evaluation'] = json.loads(saved['evaluation_json'])
         return row
 
     def source(self, version: str) -> str:
@@ -661,7 +906,7 @@ class LiquidKernelRegistry:
             "diff": "\n".join(chunks),
         }
 
-    def register_candidate(self, run_id: str, parent: str, source: str | dict[str, str], *, mode: str, changelog: str, scores: dict) -> str:
+    def register_candidate(self, run_id: str, parent: str, source: str | dict[str, str], *, mode: str, changelog: str, scores: dict, evaluation: dict | None = None) -> str:
         files = _normalize_kernel_files(source)
         digest = _kernel_bundle_hash(files)
         with self._connect() as conn:
@@ -670,7 +915,7 @@ class LiquidKernelRegistry:
         staging = self.candidates_root / run_id / version
         staging.mkdir(parents=True, exist_ok=False)
         for path, file_source in files.items():
-            (staging / path).write_text(file_source, encoding="utf-8")
+            (staging / path).write_text(utf8_text(file_source), encoding="utf-8")
         manifest = self._manifest(
             version,
             parent,
@@ -680,7 +925,7 @@ class LiquidKernelRegistry:
             files=files,
         )
         _atomic_json(staging / "manifest.json", manifest)
-        (staging / "CHANGELOG.md").write_text(str(changelog or "Candidate kernel update."), encoding="utf-8")
+        (staging / "CHANGELOG.md").write_text(utf8_text(changelog or "Candidate kernel update."), encoding="utf-8")
         target = self.artifacts_root / version
         os.replace(staging, target)
         with self._connect() as conn:
@@ -688,9 +933,43 @@ class LiquidKernelRegistry:
                 "INSERT INTO versions(version,parent_version,status,source_hash,manifest_json,changelog,hard_score,soft_score,mixed_score,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (version, parent, "candidate", digest, _json(manifest), str(changelog or ""), float(scores.get("hard", 0)), float(scores.get("soft", 0)), float(scores.get("mixed", 0)), _now()),
             )
+        if evaluation is not None:
+            self.record_candidate_evaluation(version, evaluation, run_id=run_id)
         return version
 
+    def record_candidate_evaluation(self, version, evaluation, *, run_id=''):
+        if not version:
+            return
+        with self._connect() as conn:
+            previous = conn.execute('SELECT run_id,evaluation_json FROM candidate_evaluations WHERE version=?', (version,)).fetchone()
+            prior = json.loads(previous['evaluation_json']) if previous else {}
+            record = {**prior, **evaluation}
+            # This flag is computed by protected control code, never a model.
+            flow = record.get('flow_comparison') or {}
+            confirmation = record.get('confirmation') or {}
+            eligible = (record.get('decision') == 'promote' and flow.get('eligible') is True
+                        and confirmation.get('completed') is True and confirmation.get('passed') is True
+                        and float(record.get('gain', 0)) > 0)
+            record['deployment_eligible'] = bool(eligible)
+            state = 'candidate' if eligible else 'rejected' if record.get('decision') in {'reject', 'rejected'} else 'evaluating'
+            scores = record.get('candidate') or {}
+            conn.execute('INSERT OR REPLACE INTO candidate_evaluations VALUES(?,?,?,?)',
+                         (version, run_id or (previous['run_id'] if previous else ''), _json(record), _now()))
+            conn.execute('UPDATE versions SET status=?,hard_score=?,soft_score=?,mixed_score=? WHERE version=? AND promoted_at=0 AND status NOT IN (\'canary\',\'active\')',
+                         (state, float(scores.get('hard') or 0), float(scores.get('soft') or 0), float(scores.get('mixed') or 0), version))
+
+    def _require_candidate_eligible(self, version):
+        with self._connect() as conn:
+            row = conn.execute('SELECT evaluation_json,run_id FROM candidate_evaluations WHERE version=?', (version,)).fetchone()
+        if row:
+            with self._connect() as conn:
+                run = conn.execute('SELECT status FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
+            if json.loads(row['evaluation_json']).get('deployment_eligible') is True and run and run['status'] not in {'failed', 'cancelled', 'rejected'}:
+                return
+            raise LiquidKernelError('candidate_not_eligible', 'Retained candidate has not passed real evaluation and independent confirmation', 409)
+
     def begin_canary(self, version: str, percent: int = 5) -> dict:
+        self._require_candidate_eligible(version)
         artifact = self.artifact(version)
         active = self.active_state()
         existing_canary = active.get("canary") if isinstance(active.get("canary"), dict) else None
@@ -750,6 +1029,7 @@ class LiquidKernelRegistry:
         }
 
     def promote(self, version: str) -> dict:
+        self._require_candidate_eligible(version)
         artifact = self.artifact(version)
         state = self.active_state()
         canary = state.get("canary") if isinstance(state.get("canary"), dict) else None
@@ -774,6 +1054,11 @@ class LiquidKernelRegistry:
     def rollback(self, target_version: str = "", *, reason: str = "") -> dict:
         state = self.active_state()
         current = str(state["version"])
+        if target_version:
+            with self._connect() as conn:
+                prior = conn.execute('SELECT promoted_at FROM versions WHERE version=?', (target_version,)).fetchone()
+            if not prior or not prior['promoted_at']:
+                raise LiquidKernelError('rollback_unavailable', 'Rollback requires a previously active kernel version', 409)
         if isinstance(state.get("canary"), dict):
             if not target_version or str(target_version) == current:
                 return self.abort_canary(reason=reason or "manual Canary rollback")
@@ -944,15 +1229,31 @@ class LiquidKernelRegistry:
             conn.execute(f"UPDATE runs SET {','.join(assignments)} WHERE run_id=?", values)
 
     def event(self, run_id: str, kind: str, payload: dict) -> None:
-        with self._connect() as conn:
-            self._event(conn, run_id, kind, payload)
+        with self.lock, self._connect() as conn:
+            if kind in _PROGRESS_TRANSIENT:
+                self._save_progress(conn, run_id, kind, payload)
+            else:
+                self._event(conn, run_id, kind, payload)
+
+    def _save_progress(self, conn, run_id, kind, payload):
+        run = conn.execute("SELECT config_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if not run:
+            return
+        row = conn.execute("SELECT state_json FROM run_progress WHERE run_id=?", (run_id,)).fetchone()
+        now = _now()
+        state = _progress_update(json.loads(row[0]) if row else {}, kind, payload, now, json.loads(run[0]))
+        state['detailed_telemetry_available'] = True
+        conn.execute("INSERT OR REPLACE INTO run_progress(run_id,state_json,updated_at) VALUES(?,?,?)", (run_id, _json(state), now))
+        if kind != 'model_request_wait':
+            conn.execute("UPDATE runs SET updated_at=? WHERE run_id=?", (now, run_id))
 
     def _event(self, conn, run_id: str, kind: str, payload: dict) -> None:
         now = _now()
+        self._save_progress(conn, run_id, kind, payload)
         previous = conn.execute("SELECT event_hash FROM run_events ORDER BY event_id DESC LIMIT 1").fetchone()
         previous_hash = str(previous[0] if previous else "")
         material = _json({"run_id": run_id, "kind": kind, "payload": payload, "previous_hash": previous_hash, "created_at": now})
-        event_hash = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        event_hash = hashlib.sha256(utf8_bytes(material)).hexdigest()
         conn.execute(
             "INSERT INTO run_events(run_id,kind,payload_json,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?)",
             (run_id, kind, _json(payload), previous_hash, event_hash, now),
@@ -968,20 +1269,131 @@ class LiquidKernelRegistry:
             row["payload"] = json.loads(row.pop("payload_json", "{}") or "{}")
         return {"events": rows, "last_event_id": int(rows[-1]["event_id"] if rows else after_event_id or 0)}
 
-    def run_detail(self, run_id: str) -> dict:
+    def run_detail(self, run_id: str, event_limit: int = 200) -> dict:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
             if not row:
                 raise LiquidKernelError("run_not_found", "evolution run not found", 404)
             events = [dict(item) for item in conn.execute(
-                "SELECT event_id,kind,payload_json,event_hash,created_at FROM run_events WHERE run_id=? ORDER BY event_id", (run_id,)
+                "SELECT event_id,kind,payload_json,event_hash,created_at FROM run_events WHERE run_id=? ORDER BY event_id DESC LIMIT ?", (run_id, max(1, min(1000, int(event_limit))))
             ).fetchall()]
         out = dict(row)
         for key in ("config_json", "experience_json", "proposal_json", "result_json"):
             out[key[:-5]] = json.loads(out.pop(key, "{}") or "{}")
         for event in events:
             event["payload"] = json.loads(event.pop("payload_json", "{}") or "{}")
-        out["events"] = events
+        out["events"] = list(reversed(events))
+        with self._connect() as conn:
+            stored = conn.execute("SELECT state_json FROM run_progress WHERE run_id=?", (run_id,)).fetchone()
+            total = conn.execute("SELECT COUNT(*) FROM run_events WHERE run_id=?", (run_id,)).fetchone()[0]
+        out['progress'] = json.loads(stored[0]) if stored else _legacy_progress(self.root, out, out['events'])
+        _progress_outcome(out['progress'], out.get('result', {}))
+        out['events_total'] = total
+        out['events_truncated'] = total > len(events)
+        if out['status'] in _TERMINAL_RUNS:
+            out['progress']['stage'] = out['status']
+        result = out.get('result') or {}
+        failure = result.get('details') or {}
+        if result.get('code') == 'model_call_failed' and failure.get('reason') == 'model request total deadline exhausted':
+            # Diagnose historical generic-client errors without rewriting history.
+            failure.update(error_code='request_deadline_exhausted', status_origin='client', http_status=0)
+            for item in out['progress'].get('activity', []):
+                if item.get('kind') in {'model_transport_error', 'model_request_failed'}:
+                    item.update(error_code='request_deadline_exhausted', status_origin='client', http_status=0)
+            out['progress'].get('model', {}).update(error_code='request_deadline_exhausted')
+            retry = next((item for item in reversed(out['progress'].get('activity', [])) if item.get('kind') == 'model_request_retry' and item.get('http_status')), {})
+            if retry:
+                failure.update(last_http_status=retry['http_status'], cause_code='model_rate_limited' if retry['http_status'] == 429 else 'model_http_error')
+                for item in out['progress'].get('activity', []):
+                    if item.get('kind') in {'model_transport_error', 'model_request_failed'}:
+                        item.update(last_http_status=failure['last_http_status'], cause_code=failure['cause_code'])
+        baseline = result.get('incumbent') or {}
+        if 'hard' not in baseline:
+            path = (self.experience_root / str(run_id) / 'incumbent_rollouts.json').resolve()
+            if path.is_relative_to(self.experience_root.resolve()) and path.is_file() and path.stat().st_size <= 16_000_000:
+                stat = path.stat()
+                cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+                cache = getattr(self, '_score_summary_cache', {})
+                if cache_key not in cache:
+                    archived = _read_json(path, {})
+                    cache[cache_key] = {key: archived[key] for key in ('score', 'success_rate') if key in archived}
+                    if len(cache) > 64:
+                        cache.pop(next(iter(cache)))
+                    self._score_summary_cache = cache
+                saved = cache[cache_key]
+                if 'score' in saved:
+                    baseline = {'hard': saved['score'], 'success_rate': saved.get('success_rate')}
+        if 'hard' not in baseline:
+            # Older interrupted runs persisted completed task events before
+            # they persisted the arm. Recover only those measured scores in
+            # the read-only view; no review/composite score can be inferred.
+            with self._connect() as conn:
+                completed = conn.execute("SELECT payload_json FROM run_events WHERE run_id=? AND kind='task_completed' ORDER BY event_id", (run_id,)).fetchall()
+            measured = {}
+            for record in completed:
+                item = json.loads(record[0])
+                score = item.get('score')
+                if item.get('arm') == 'incumbent' and isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(score) and 0 <= score <= 100:
+                    measured[item['task_id']] = item
+            if measured:
+                baseline = {'hard': sum(item['score'] for item in measured.values()) / len(measured),
+                            'completed_tasks': len(measured), 'expected_tasks': max(item.get('task_total', len(measured)) for item in measured.values()),
+                            'score_status': 'partial', 'task_execution_measured': True, 'score_source': 'completed_task_events'}
+        evaluations = result.get('evaluations') or []
+        validation_codes = {'mutable_surface_violation', 'patch_too_large', 'kernel_contract_missing', 'empty_patch',
+                            'forbidden_import', 'forbidden_name', 'forbidden_scope', 'forbidden_decorator',
+                            'forbidden_attribute', 'forbidden_call', 'patch_context_missing', 'invalid_patch_syntax',
+                            'duplicate_patch_file', 'invalid_patch_operation', 'task_specific_policy'}
+        views = []
+        for item in evaluations:
+            view = {key: item.get(key) for key in ('candidate_index', 'candidate_version', 'decision', 'code', 'reason', 'flow_comparison', 'confirmation', 'opportunity_audit')}
+            view['incumbent'] = item.get('incumbent') or baseline
+            view['candidate'] = item.get('candidate') or {}
+            if not view['candidate'] and item.get('code') in validation_codes:
+                view['candidate'] = {'hard': None, 'soft': None, 'mixed': 0.0, 'validation': 0,
+                                     'score_status': 'validation_failed', 'task_execution_measured': False}
+            views.append(view)
+        evaluated = next((item for item in reversed(views) if item['candidate']), {})
+        candidate = result.get('candidate') or evaluated.get('candidate') or {}
+        out['score_summary'] = {'incumbent': baseline, 'candidate': candidate,
+                                'review_completed': candidate.get('soft') is not None,
+                                'evaluations': views}
+        valid = result.get('code') != 'invalid_evaluation_definition'
+        bank_path = (self.experience_root / str(run_id) / 'task_bank.json').resolve()
+        if bank_path.is_relative_to(self.experience_root.resolve()) and bank_path.is_file():
+            stat = bank_path.stat()
+            cache_key = (str(bank_path), stat.st_mtime_ns, stat.st_size)
+            cache = getattr(self, '_evaluator_definition_cache', {})
+            if cache_key not in cache:
+                bank_valid = stat.st_size <= 16_000_000
+                bank = {}
+                try:
+                    bank = _read_json(bank_path, {}) if bank_valid else {}
+                    for task in bank.get('tasks', []):
+                        for check in task.get('checks', []):
+                            if check.get('kind') == 'command':
+                                normalized = normalize_executable_command(check.get('command', ''), check.get('language', ''), validate_shell=True)
+                                bank_valid &= normalized['command'] == check.get('command')
+                except (ValueError, OSError, subprocess.SubprocessError):
+                    bank_valid = False
+                cache[cache_key] = {'valid': bool(bank_valid), 'minimum_calls': {task.get('id'): task.get('minimum_tool_calls', 0) for task in bank.get('tasks', [])}}
+                if len(cache) > 64:
+                    cache.pop(next(iter(cache)))
+                self._evaluator_definition_cache = cache
+            valid &= cache[cache_key]['valid']
+            if result.get('scoring_protocol_version', 1) < SCORING_PROTOCOL_VERSION:
+                legacy_rows = [row for evaluation in evaluations for row in evaluation.get('task_results', [])]
+                biased = [row['task_id'] for row in legacy_rows if row.get('score') == 0 and not row.get('error')
+                          and 0 < row.get('tool_calls', 0) < cache[cache_key]['minimum_calls'].get(row.get('task_id'), 0)
+                          and row.get('checks') and all(check.get('ok') for check in row['checks'])]
+                if biased:
+                    valid = False
+                    out['score_summary']['scoring_issue'] = {'code': 'legacy_tool_count_floor', 'task_ids': sorted(set(biased)),
+                        'reason': 'A task-design tool-call estimate incorrectly zeroed otherwise passing artifacts; fresh paired evaluation required'}
+        out['score_summary']['evaluation_valid'] = bool(valid)
+        if not valid:
+            out['score_summary']['warning_code'] = 'invalid_evaluation_definition'
+        out["server_time"] = _now()
         return out
 
     def list_runs(self, limit: int = 100, offset: int = 0) -> dict:
@@ -1065,11 +1477,13 @@ class StructuredPatchValidator:
     FORBIDDEN_NAMES = {
         "eval", "exec", "compile", "__import__", "open", "breakpoint", "globals", "locals",
         "subprocess", "socket", "ctypes", "multiprocessing", "urllib", "requests", "shutil", "pathlib",
+        "getattr", "setattr", "delattr", "vars", "dir", "type", "object", "help", "input", "breakpoint",
     }
 
     @staticmethod
     def allowed_files(config: dict) -> frozenset[str]:
-        return FULL_AGENT_CORE_FILES if str(config.get("mode", "")) == "Aggressive" else CONTROLLED_KERNEL_FILES
+        mode = str(config.get("mode", ""))
+        return FULL_AGENT_CORE_FILES if mode == "Aggressive" else TUNING_KERNEL_FILES if mode == "Tuning" else CONTROLLED_KERNEL_FILES
 
     @staticmethod
     def _changed_lines(before: str, after: str) -> int:
@@ -1084,7 +1498,11 @@ class StructuredPatchValidator:
         return total
 
     def _validate_ast(self, path: str, source: str, allowed_files: frozenset[str]) -> None:
-        tree = ast.parse(source, filename=path)
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError as exc:
+            raise LiquidKernelError("invalid_patch_syntax", "candidate contains invalid Python syntax",
+                                    details={"path": path, "line": exc.lineno, "reason": exc.msg}) from exc
         allowed_modules = {Path(name).stem for name in allowed_files}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -1101,6 +1519,8 @@ class StructuredPatchValidator:
                 raise LiquidKernelError("forbidden_decorator", "candidate functions may not use decorators")
             if isinstance(node, ast.Attribute) and str(node.attr or "").startswith("__"):
                 raise LiquidKernelError("forbidden_attribute", "candidate may not access dunder attributes")
+            if isinstance(node, ast.Name) and (node.id.startswith("__") or node.id in self.FORBIDDEN_NAMES):
+                raise LiquidKernelError("forbidden_name", "candidate may not reference runtime escape capabilities")
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in self.FORBIDDEN_NAMES:
                 raise LiquidKernelError("forbidden_call", f"candidate calls forbidden function {node.func.id}")
 
@@ -1118,8 +1538,12 @@ class StructuredPatchValidator:
         changed_lines = 0
         for item in files:
             path = str(item.get("path", "") if isinstance(item, dict) else "").strip().replace("\\", "/")
-            if not isinstance(item, dict) or path not in allowed_files:
-                raise LiquidKernelError("mutable_surface_violation", "candidate attempted to modify an immutable file")
+            custom_core = (config.get("mode") == "Aggressive" and path.startswith("core_")
+                           and path.endswith(".py") and path[5:-3].replace("_", "").isalnum()
+                           and "/" not in path and "\\" not in path)
+            if not isinstance(item, dict) or (path not in allowed_files and not custom_core):
+                raise LiquidKernelError("mutable_surface_violation", "candidate attempted to modify a file outside this mode: " + path,
+                                        details={"path": path, "allowed_files": sorted(allowed_files)})
             if path in touched:
                 raise LiquidKernelError("duplicate_patch_file", "candidate contains multiple operations for one file")
             touched.add(path)
@@ -1137,13 +1561,15 @@ class StructuredPatchValidator:
                 raise LiquidKernelError("invalid_patch_operation", "unsupported structured patch operation")
             changed_lines += self._changed_lines(before, updated)
             current[path] = updated
-        if changed_lines > int(budget["max_changed_lines"]):
-            raise LiquidKernelError("patch_too_large", "candidate exceeds the changed-line budget")
-        unexpected = sorted(set(current) - FULL_AGENT_CORE_FILES)
+        if int(budget["max_changed_lines"]) > 0 and changed_lines > int(budget["max_changed_lines"]):
+            raise LiquidKernelError("patch_too_large", "candidate exceeds the explicitly configured changed-line limit",
+                                    details={"changed_lines": changed_lines, "limit": int(budget["max_changed_lines"]), "scope": "changed_lines"})
+        unexpected = sorted(path for path in set(current) - FULL_AGENT_CORE_FILES
+                            if not (path.startswith("core_") and path.endswith(".py") and path[5:-3].replace("_", "").isalnum()))
         if unexpected:
             raise LiquidKernelError("mutable_surface_violation", "kernel bundle contains unsupported files", details={"files": unexpected})
         for path, file_source in current.items():
-            self._validate_ast(path, file_source, FULL_AGENT_CORE_FILES)
+            self._validate_ast(path, file_source, frozenset(current))
         contract = KernelBenchmark.run_bundle(
             current,
             [{"id": "contract", "role": "developer", "intent": "verify liquid kernel contract", "nonce": 1}],
@@ -1161,6 +1587,33 @@ class StructuredPatchValidator:
             "paths": sorted(touched),
             "mutable_surface": str(config.get("mutable_surface", "none")),
         }
+
+    def check_generalization(self, source, candidate, training_tasks, config):
+        """Probe unconditional training-schema leakage without consulting holdout data."""
+        text = _json([{key: task.get(key) for key in ('goal', 'followups')} for task in training_tasks])
+        reserved = {'read_file', 'write_file', 'edit_file', 'list_files', 'finish_task', 'context_recall',
+                    'before_round', 'before_run', 'after_tool_results', 'filter_tools', 'augment_prompt',
+                    'max_output_tokens', 'context_token_limit', 'tool_calls', 'tool_call_id', 'recent_results'}
+        terms = {word for word in re.findall(r'\b[A-Za-z][A-Za-z0-9_]{7,}\b', text) if '_' in word and word not in reserved}
+        if not terms:
+            return {'contrastive_probe': 'no_specific_schema_terms', 'checked_terms': 0}
+        context = {'goal': 'Inspect a source file and repair a failing test. Follow its actual schema; no domain-specific field names are prescribed.',
+                   'messages': [], 'recent_results': [], 'round': 3, 'execution_mode': 'single',
+                   'max_output_tokens': config['task_benchmark']['turn_max_tokens']}
+        rendered = []
+        for files in (source, candidate):
+            worker = KernelWorker(files)
+            try:
+                policy = worker.call('before_round', {'context': context}, lambda: None)
+                prompt = worker.call('augment_prompt', {'prompt': 'Inspect the source and repair the failing test.', 'role': 'developer', 'context': context}, lambda: None)
+                rendered.append(_json({'policy': policy, 'prompt': prompt}))
+            finally:
+                worker.close()
+        leaked = sorted(term for term in terms if term in rendered[1] and term not in rendered[0])
+        if leaked:
+            raise LiquidKernelError('task_specific_policy', 'Candidate applies training-only schema names to an unrelated task',
+                                    details={'training_terms': leaked, 'probe': 'unrelated_task_context', 'holdout_accessed': False})
+        return {'contrastive_probe': 'passed', 'checked_terms': len(terms), 'holdout_accessed': False}
 
 
 def safe_builtins() -> dict:
@@ -1187,11 +1640,11 @@ import pathlib
 import sys
 import tempfile
 
-payload = json.loads(sys.stdin.read() or "{}")
+payload = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
 with tempfile.TemporaryDirectory(prefix="liquid-kernel-benchmark-") as temp:
     root = pathlib.Path(temp)
     for relative, source in dict(payload.get("files") or {}).items():
-        (root / relative).write_text(str(source or ""), encoding="utf-8")
+        (root / relative).write_text(str(source or ""), encoding="utf-8", errors="backslashreplace")
     name = "isolated_liquid_kernel"
     spec = importlib.util.spec_from_file_location(name, root / "kernel.py", submodule_search_locations=[str(root)])
     if spec is None or spec.loader is None:
@@ -1235,12 +1688,13 @@ with tempfile.TemporaryDirectory(prefix="liquid-kernel-benchmark-") as temp:
 '''
         try:
             completed = subprocess.run(
-                [sys.executable, "-I", "-S", "-c", runner],
+                [sys.executable, "-X", "utf8", "-I", "-S", "-c", runner],
                 input=_json(payload),
                 text=True,
+                encoding="utf-8", errors="backslashreplace",
                 capture_output=True,
                 timeout=max(0.5, float(timeout_seconds or 15.0)),
-                env={"PYTHONIOENCODING": "utf-8", "PYTHONNOUSERSITE": "1"},
+                env=subprocess_environment(),
             )
         except subprocess.TimeoutExpired:
             return {"ok": False, "score": 0.0, "error": "isolated benchmark timed out", "rows": []}
@@ -1293,6 +1747,7 @@ class LiquidKernelControlPlane:
         judge_callback: Callable[[dict, str, int], dict] | None = None,
         model_resolver: Callable[[dict], dict] | None = None,
         config_validator: Callable[..., dict] | None = None,
+        task_runtime_limits: Callable[[], dict] | None = None,
     ):
         self.root = Path(root).resolve()
         self.registry = LiquidKernelRegistry(self.root)
@@ -1310,6 +1765,7 @@ class LiquidKernelControlPlane:
         self.judge_callback = judge_callback
         self.model_resolver = model_resolver
         self.config_validator = config_validator
+        self.task_runtime_limits = task_runtime_limits
         self.last_trigger_error = None
         self._stop = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
@@ -1326,7 +1782,34 @@ class LiquidKernelControlPlane:
 
     def config(self) -> dict:
         with self.config_lock:
-            return normalize_evolution_config(_read_json(self.config_path, {}))
+            stored = _read_json(self.config_path, {})
+            if int(stored.get('quota_policy_version', 0) or 0) < 2:
+                # Previous Admin had no editable line-limit field; its values
+                # were imposed by mode presets, not an explicit user setting.
+                stored = {**stored, 'budget': {**stored.get('budget', {}), 'max_changed_lines': 0}}
+            if int(stored.get('timeout_policy_version',0) or 0)<1:
+                legacy_timeout={'Off':0,'Tuning':3600,'Thinking':7200,'Aggressive':14400}.get(stored.get('mode'),0)
+                if stored.get('budget',{}).get('timeout_seconds')==legacy_timeout:
+                    stored={**stored,'budget':{**stored.get('budget',{}),'timeout_seconds':0}}
+            return self._apply_task_runtime_limits(normalize_evolution_config(stored))
+
+    def _apply_task_runtime_limits(self, config: dict) -> dict:
+        if self.task_runtime_limits is not None:
+            runtime = self.task_runtime_limits()
+            rounds = max(1, min(8000, int(runtime["max_rounds"])))
+            config["task_benchmark"].update(
+                max_rounds=rounds, max_tool_calls=rounds * 8,
+                task_timeout_seconds=max(1, int(runtime.get("max_run_seconds", 3000))),
+                round_limit_source="admin.max_rounds",
+            )
+            if runtime.get("max_output_tokens"):
+                config["task_benchmark"]["turn_max_tokens"] = max(128, int(runtime["max_output_tokens"]))
+            if runtime.get("context_token_limit"):
+                config["task_benchmark"]["context_token_limit"] = max(4096, int(runtime["context_token_limit"]))
+                config["task_benchmark"]["context_limit_source"] = "admin.ctx_limit"
+            # Evolution owns its optional cumulative quotas. Ordinary-session
+            # token settings must not turn its explicit zero into a hidden cap.
+        return config
 
     def save_config(self, values: object, expected_revision: int = 0, *, context=None) -> dict:
         with self.config_lock:
@@ -1336,6 +1819,7 @@ class LiquidKernelControlPlane:
             clean = normalize_evolution_config(values, current=current)
             if self.config_validator:
                 clean = self.config_validator(clean, context=context, current=current)
+            clean = self._apply_task_runtime_limits(clean)
             clean["revision"] = int(current.get("revision", 0)) + 1
             _atomic_json(self.config_path, clean)
             if clean["mode"] == "Off":
@@ -1437,9 +1921,15 @@ class LiquidKernelControlPlane:
             return {"ok": True, "run_id": run_id, "status": "queued", "revision": config["revision"],
                     "models": {role: config.get(f"{role}_model_ref") for role in ("generator", "judge")}}
 
-    def inject_embedded_kernel(self, reason: str = "administrator selected embedded kernel") -> dict:
+    def inject_embedded_kernel(self, reason: str = "administrator selected embedded kernel", *, force: bool = False) -> dict:
         """Install the bundled kernel without deleting version or session history."""
         incumbent = self.registry.active_version()
+        state = self.registry.active_state()
+        detail = self.registry.version_detail(incumbent)
+        if not force and (detail.get("parent_version") or state.get("canary")):
+            return {"ok": True, "injected": False, "protected_evolved_kernel": True,
+                    "version": incumbent, "previous_version": incumbent,
+                    "reason": "Startup framework upgrade preserves the evolved kernel and active canary. Explicit force is required to replace it."}
         embedded_source = dict(BASELINE_KERNEL_FILES)
         if _kernel_bundle_hash(self.registry.sources(incumbent)) == _kernel_bundle_hash(embedded_source):
             return {
@@ -1507,14 +1997,140 @@ class LiquidKernelControlPlane:
     def _check_cancel(self, run_id: str) -> None:
         if run_id in self.cancelled:
             raise LiquidKernelError("run_cancelled", "evolution run was cancelled", 409)
+        if getattr(self, "_token_budget_exhausted", False):
+            raise LiquidKernelError("run_budget_exhausted", "Evolution model-token budget exhausted.", 409)
+        if getattr(self, "_active_deadline", 0) and time.monotonic() > self._active_deadline:
+            raise LiquidKernelError("run_budget_exhausted", "Evolution wall-clock budget exhausted.", 409)
+
+    def _model_allowance(self, prompt: str, requested: int) -> int:
+        total_limit = getattr(self, "_token_limit", 0)
+        local_ceiling = getattr(self, "_rollout_token_ceiling", 0)
+        if not total_limit and not local_ceiling:
+            return requested
+        # The host callback accounts for the actual transported native history.
+        # Raw rollout JSON may include archived write bodies no longer sent.
+        used = getattr(self, "_tokens_used", 0)
+        remaining = total_limit - used if total_limit else requested
+        if total_limit and not local_ceiling:
+            remaining -= max(1, len(prompt) // 4)
+        if local_ceiling:
+            local_remaining = local_ceiling - used
+            if local_remaining < 128:
+                raise TimeoutError("task_token_budget_exhausted: reserved per-task model budget exhausted")
+            remaining = min(remaining, local_remaining)
+        if remaining < 128:
+            self._token_budget_exhausted = True
+            raise LiquidKernelError("run_budget_exhausted", "Evolution model-token budget exhausted.", 409)
+        return min(requested, remaining)
+
+    @contextlib.contextmanager
+    def _model_budget_scope(self, limit, label="task"):
+        previous = getattr(self, "_rollout_token_ceiling", 0)
+        previous_label = getattr(self, "_model_budget_label", "")
+        started = self._tokens_used
+        limit = max(0, int(limit or 0))
+        ceilings = [value for value in (previous, started + limit if limit else 0) if value]
+        self._rollout_token_ceiling = min(ceilings) if ceilings else 0
+        self._model_budget_label = label
+        state = {"scope": label, "limit": int(limit), "used": 0, "exhausted": False}
+        try:
+            yield state
+        except TimeoutError as exc:
+            state["exhausted"] = "budget" in str(exc)
+            raise
+        finally:
+            state["used"] = self._tokens_used - started
+            state["remaining"] = max(0, limit - state["used"]) if limit else None
+            state["exhausted"] = state["exhausted"] or bool(limit and state["used"] >= limit)
+            self._rollout_token_ceiling = previous
+            self._model_budget_label = previous_label
+            if self.active_run_id:
+                self.registry.event(self.active_run_id, "model_budget_consumed", state)
+
+    def _record_model_tokens(self, prompt: str, result: dict) -> None:
+        usage = result.pop("_evolution_usage", {})
+        reported = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
+        estimate = max(1, (len(prompt) + len(_json(result))) // 4)
+        self._tokens_used = getattr(self, "_tokens_used", 0) + (max(1, int(reported or 0)) if isinstance(usage, dict) and usage.get("transport_accounted") else max(estimate, int(reported or 0)))
+        total_limit = getattr(self, "_token_limit", 0)
+        if self.active_run_id:
+            self.registry.event(self.active_run_id, 'token_usage', {'used': self._tokens_used, 'limit': total_limit})
+        if total_limit and self._tokens_used > total_limit:
+            self._token_budget_exhausted = True
+            raise LiquidKernelError("run_budget_exhausted", "Evolution model-token budget exhausted.", 409)
+        if getattr(self, "_rollout_token_ceiling", 0) and self._tokens_used > self._rollout_token_ceiling:
+            raise TimeoutError("task_token_budget_exhausted: observed task model usage exceeded its reserved budget")
+
+    @contextlib.contextmanager
+    def observe_model_request(self, model, *, timeout_seconds=0, label="", provider='', endpoint_host=''):
+        run_id = self.active_run_id
+        request_id = uuid.uuid4().hex
+        if not run_id:
+            yield request_id
+            return
+        started = time.monotonic()
+        payload = {'request_id': request_id, 'model': str(model), 'timeout_seconds': timeout_seconds, 'operation': label,
+                   'provider': str(provider), 'endpoint_host': str(endpoint_host)}
+        self.registry.event(run_id, 'model_request_started', payload)
+        stop = threading.Event()
+        def heartbeat():
+            while not stop.wait(5):
+                self.registry.event(run_id, 'model_request_wait', {'request_id': request_id, 'elapsed_seconds': round(time.monotonic() - started, 1)})
+        thread = threading.Thread(target=heartbeat, name='evolution-model-heartbeat', daemon=True)
+        thread.start()
+        try:
+            yield request_id
+        except BaseException as exc:
+            diagnostic = exc.diagnostics() if callable(getattr(exc, 'diagnostics', None)) else {}
+            self.registry.event(run_id, 'model_request_failed', {**payload, 'elapsed_seconds': round(time.monotonic() - started, 1), 'error_type': type(exc).__name__, 'error_code': str(getattr(exc, 'code', '')), **diagnostic})
+            raise
+        else:
+            self.registry.event(run_id, 'model_request_completed', {**payload, 'elapsed_seconds': round(time.monotonic() - started, 1)})
+        finally:
+            stop.set()
+            thread.join(timeout=.2)
+
+    def note_model_retry(self, request_id, info):
+        if self.active_run_id:
+            info = info if isinstance(info, dict) else {}
+            self.registry.event(self.active_run_id, 'model_http_attempt_started' if info.get('phase') == 'request' else 'model_request_retry', {
+                'request_id': request_id, 'attempt': info.get('attempt', info.get('retry', 0)),
+                'retry_budget': info.get('retry_budget', 0),
+                'http_status': info.get('status', 0), **({'error_code': 'model_rate_limited'} if info.get('status') == 429 else {}), 'retry_after_seconds': info.get('delay', info.get('sleep_seconds', info.get('wait_seconds', 0)))})
 
     def _call_model(self, system: str, prompt: str, profile: str, max_tokens: int) -> dict:
         if not callable(self.model_callback):
             raise LiquidKernelError("model_unavailable", "Evolution model callback is not configured.")
-        result = self.model_callback(system, prompt, profile, max_tokens)
+        allowance = self._model_allowance(system + prompt, max_tokens)
+        result = self.model_callback(system, prompt, profile, allowance)
         if not isinstance(result, dict):
             raise LiquidKernelError("invalid_model_output", "evolution model did not return a JSON object")
+        self._record_model_tokens(system + prompt, result)
         return result
+
+    def _call_proposal_model(self, system, payload, profile, max_tokens):
+        original = json.loads(payload) if isinstance(payload, str) else payload
+        request = original
+        attempts = []
+        for attempt in range(3):
+            self._check_cancel(self.active_run_id)
+            result = self._call_model(system, _json(request), profile, max_tokens)
+            try:
+                return normalize_proposal_output(result)
+            except LiquidKernelError as exc:
+                attempts.append({'attempt':attempt+1,'code':exc.code,'reason':str(exc),'details':exc.details})
+                if attempt == 2:
+                    raise LiquidKernelError('invalid_proposal_schema', 'Proposal schema remains invalid after bounded repair', 422,
+                                            {'attempts':attempts}) from exc
+                if self.active_run_id:
+                    self.registry.event(self.active_run_id, 'model_json_recovery', {
+                        'attempt':attempt+1,'reason':'invalid_proposal_schema','stage':'generator','recovery_mode':'schema'})
+                request = {'task':'Repair the proposal JSON schema without inventing evidence or changing deployment/acceptance rules.',
+                           'original_request':original,
+                           'previous_output':{key:value for key,value in result.items() if key!='_evolution_usage'},
+                           'validation_errors':attempts,
+                           'required_contract':{'decision':'change|no_change','reason':'nonempty top-level string',
+                                                'patch':'For change, retain the full proposed files under patch.files. Never infer a missing decision.'}}
 
     def _experience(self, config: dict, incumbent: str) -> dict:
         versions = self.registry.lineage_versions(incumbent, int(config["history_version_depth"]))
@@ -1526,7 +2142,7 @@ class LiquidKernelControlPlane:
 
     @staticmethod
     def _experience_audit_view(experience: dict) -> dict:
-        audit = {key: value for key, value in dict(experience or {}).items() if key not in {"records", "history_by_version"}}
+        audit = {key: value for key, value in dict(experience or {}).items() if key not in {"records", "history_by_version", "task_source_records"}}
         grouped = experience.get("history_by_version", {}) if isinstance(experience.get("history_by_version"), dict) else {}
         audit["history_by_version"] = {
             str(version): {
@@ -1550,22 +2166,27 @@ class LiquidKernelControlPlane:
         candidate_source: str | dict[str, str],
         cases: list[dict],
         config: dict,
+        observations: dict | None = None,
     ) -> dict:
         incumbent_files = _normalize_kernel_files(incumbent_source)
         candidate_files = _normalize_kernel_files(candidate_source)
         if callable(self.judge_callback):
+            payload = {
+                "incumbent_source": _kernel_bundle_text(incumbent_files) if observations is None else "",
+                "candidate_source": _kernel_bundle_text(candidate_files) if observations is None else "",
+                "incumbent_files": incumbent_files if observations is None else {},
+                "candidate_files": candidate_files if observations is None else {},
+                "cases": cases,
+                "observations": observations,
+            }
+            tokens = self._model_allowance("" if observations is not None else _json(payload), int(config['task_benchmark']['turn_max_tokens']))
             result = self.judge_callback(
-                {
-                    "incumbent_source": _kernel_bundle_text(incumbent_files),
-                    "candidate_source": _kernel_bundle_text(candidate_files),
-                    "incumbent_files": incumbent_files,
-                    "candidate_files": candidate_files,
-                    "cases": cases,
-                },
+                payload,
                 config.get("judge_model_ref") or str(config.get("judge_profile", "")),
-                min(16_000, int(config["budget"]["max_tokens"]), int(config.get("_judge_token_limit", 16_000))),
+                tokens,
             )
             if isinstance(result, dict):
+                self._record_model_tokens(_json(payload), result)
                 a = valid_judge_score(result.get("incumbent"))
                 b = valid_judge_score(result.get("candidate"))
                 return {"incumbent": a, "candidate": b, "details": result}
@@ -1612,7 +2233,7 @@ class LiquidKernelControlPlane:
                 if fingerprint in seen:
                     continue
                 seen.add(fingerprint)
-                case["nonce"] = int(hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:8], 16)
+                case["nonce"] = int(hashlib.sha256(utf8_bytes(fingerprint)).hexdigest()[:8], 16)
                 cases.append(case)
         return cases
 
@@ -1673,8 +2294,372 @@ class LiquidKernelControlPlane:
             "soft_details": soft.get("details", {}),
         }, scores
 
-    def _run(self, run_id: str, config: dict) -> None:
+    def _exploration_proposal(self, source, evidence, index):
+        """Construct an explicitly unproven context-policy trial, never a baseline clone."""
+        training = evidence.get('rows', [])
+        rounds = max([int(row.get('rounds', 0)) for row in training] or [0])
+        # Keep more exact recent exchanges during recovery. Older exchanges
+        # remain in the protected archive with host-enforced progress handoff.
+        keep = (6 if rounds > 12 else 8) + 2 * (index % 3)
+        tag = _kernel_bundle_hash(source)[:12] + '_' + str(index)
+        parent = 'exploration_parent_' + tag
+        suffix = ('\n\n' + parent + ' = before_round\n'
+                  'def before_round(context=None):\n'
+                  '    context = context or {}\n'
+                  '    policy = dict(' + parent + '(context=context) or {})\n'
+                  '    failures = any(row.get("ok") is False for row in context.get("recent_results", []) if isinstance(row, dict))\n'
+                  '    policy["recent_tool_exchanges"] = ' + str(keep + 6) + ' if failures else ' + str(keep) + '\n'
+                  '    return policy\n')
+        return {'decision': 'change',
+                'reason': 'Test an inherited adaptive recent-observation window against measured training round/token costs. Keep more exchanges during recovery; exact evidence and user goals remain protected. This is an experiment, not a proven improvement.',
+                'changelog': 'Experimental adaptive context selection; deployment requires real paired and independent confirmation.',
+                'origin': 'architecture_exploration',
+                'hypothesis': {'mechanism': 'adaptive_recent_tool_exchanges', 'recent_exchanges': keep,
+                               'recovery_exchanges': keep + 6, 'training_evidence': evidence, 'verified_gain': False},
+                'patch': {'files': [{'path': 'kernel.py', 'operation': 'replace_file', 'content': source['kernel.py'] + suffix}]}}
+
+    def _run_task_driven(self, run_id: str, config: dict, incumbent: str, source: dict, experience: dict) -> None:
+        self._active_deadline = getattr(self,"_active_deadline",0) or (time.monotonic()+config["budget"]["timeout_seconds"] if config["budget"]["timeout_seconds"] else 0)
+        self._token_limit = max(0, config["budget"]["max_tokens"])
+        self._tokens_used = 0
+        self._token_budget_exhausted = False
+        seed = random.SystemRandom().randint(1, 2**31 - 1)
+        profile = config.get("generator_model_ref") or config.get("generator_profile", "")
+        output_root = self.registry.experience_root / run_id
+
+        def task_model(system, prompt, tokens=None, *, deadline=None):
+            self._check_cancel(run_id)
+            self._call_deadline = deadline or 0
+            try:
+                return self._call_model(system, _json(prompt), profile, tokens or config['task_benchmark']['turn_max_tokens'])
+            finally:
+                self._call_deadline = 0
+
+        self.registry.event(run_id, "task_design_started", {"stage": "task_designer"})
         try:
+            bank = build_task_bank(experience, config, task_model, seed, progress=lambda kind, payload: self.registry.event(run_id, kind, payload))
+        except ValueError as exc:
+            raise LiquidKernelError("invalid_task_design", str(exc), 422) from exc
+        self._check_cancel(run_id)
+        if not bank["tasks"]:
+            result = {"decision": "failed", "code": "insufficient_session_tasks", "reason": bank["reason"],
+                      "benchmark_kind": "session_agentic", "evaluated": False}
+            self.registry.update_run(run_id, "failed", error=bank["reason"], result_json=result, completed_at=_now())
+            self.registry.event(run_id, "failed", result)
+            return
+        bank = canonicalize_task_bank(bank)
+        frozen_hash = bank["fingerprint"]
+        _atomic_json(output_root / "task_bank.json", bank)
+        self.registry.event(run_id, "task_bank_frozen", {"fingerprint": frozen_hash, "train": bank["train_count"],
+                                                         "holdout": bank["holdout_count"], "source_split": True})
+        # Only a positive, explicitly configured task quota limits a rollout.
+        # Total quota is shared as-is; no fair-share or proposal/review slice is
+        # synthesized from it. Zero never means a tiny fallback allowance.
+        rollout_count = len(bank["tasks"]) * (1 + 3 * max(1, config["budget"]["candidate_limit"]))
+        task_tokens = max(0, int(config["task_benchmark"].get("max_task_tokens", 0) or 0))
+        config["task_benchmark"]["token_budget"] = task_tokens
+        phase_tokens = 0
+        self.registry.event(run_id, "task_budget_allocated", {"per_task_tokens": task_tokens, "paired_rollouts": rollout_count,
+                                                             "reserved_tokens": 0, "per_proposal_tokens": 0,
+                                                             "per_review_tokens": 0, "total_limit": self._token_limit,
+                                                             "reserve_percent": 0, "round_limit": config["task_benchmark"]["max_rounds"]})
+
+        @contextlib.contextmanager
+        def task_budget_scope():
+            with self._model_budget_scope(task_tokens, "task") as state:
+                yield state
+
+        candidate_versions = {}
+
+        def save_task_checkpoint(arm, snapshot):
+            _atomic_json(output_root / (arm + '_rollouts.json'), snapshot)
+            if arm == 'incumbent':
+                current = self.registry.run_detail(run_id).get('result', {})
+                summary = {'hard': snapshot['score'], 'success_rate': snapshot['success_rate'],
+                           'completed_tasks': snapshot['completed_tasks'], 'expected_tasks': snapshot['expected_tasks'],
+                           'score_status': 'partial', 'task_execution_measured': True}
+                self.registry.update_run(run_id, 'benchmarking', result_json={**current, 'incumbent': summary})
+            elif arm in candidate_versions:
+                version = candidate_versions[arm]
+                summary = {'hard': snapshot['score'], 'success_rate': snapshot['success_rate'],
+                           'completed_tasks': snapshot['completed_tasks'], 'expected_tasks': snapshot['expected_tasks'],
+                           'score_status': 'partial', 'task_execution_measured': True}
+                self.registry.record_candidate_evaluation(version, {'candidate': summary})
+                current = self.registry.run_detail(run_id).get('result', {})
+                self.registry.update_run(run_id, 'benchmarking', result_json={**current, 'candidate': summary})
+
+        benchmark = AgenticBenchmark(task_model, lambda: self._check_cancel(run_id),
+                                     lambda kind, payload: self.registry.event(run_id, kind, payload), task_budget_scope,
+                                     archive_root=output_root / "full_history", reference_files=source, on_checkpoint=save_task_checkpoint)
+        self.registry.update_run(run_id, "benchmarking")
+        baseline = benchmark.run(source, bank["tasks"], config["task_benchmark"], "incumbent")
+        _atomic_json(output_root / "incumbent_rollouts.json", baseline)
+        baseline_summary = {"hard": baseline["score"], "success_rate": baseline["success_rate"], "completed_tasks": len(baseline["rows"])}
+        self.registry.update_run(run_id, "benchmarking", result_json={"incumbent": baseline_summary})
+        self.registry.update_run(run_id, "judging")
+        self.registry.event(run_id, "model_call_started", {"stage": "baseline_judge", "kind": "frozen_baseline_outcomes"})
+        baseline_review = self._soft_score(source, source, bank["tasks"], config,
+                                          observations={"incumbent": baseline, "candidate": baseline})
+        baseline_soft = (baseline_review["incumbent"] + baseline_review["candidate"]) / 2
+        baseline_summary.update(soft=baseline_soft, mixed=baseline["score"] * .7 + baseline_soft * .2 + 5,
+                                score_status="completed" if rollout_complete(baseline) else "partial", task_execution_measured=True)
+        self.registry.update_run(run_id, "judging", result_json={"incumbent": baseline_summary})
+        self.registry.event(run_id, "baseline_scored", {"score": baseline_summary["mixed"]})
+        self._check_cancel(run_id)
+        training_tasks = [task for task in bank["tasks"] if task["split"] == "train"]
+        baseline_training = [trajectory_model_view(row) for row in baseline["rows"] if row["split"] == "train"]
+        optimization_evidence = training_opportunity_evidence(baseline)
+        evaluations = []
+        proposals = []
+        accepted = []
+        previous_training_rollouts = []
+        count = max(1, config["budget"]["candidate_limit"])
+        for index in range(count):
+            self._check_cancel(run_id)
+            self.registry.update_run(run_id, "generating")
+            prompt = {
+                "task": "Improve the executable agent architecture using measured quality and efficiency on user-derived long tasks, including successful tasks. Construct one concrete experimental architecture variant as a structured code patch. The experiment may underperform; evaluation, not the proposer, decides whether to deploy.",
+                "candidate_index": index + 1, "mode": config["mode"], "kernel_files": source,
+                "allowed_patch_files": sorted(self.validator.allowed_files(config)),
+                "new_modules": "Aggressive additionally permits core_<name>.py modules; other modes use only the allowed names.",
+                "budget": config["budget"], "task_execution_limits": config["task_benchmark"], "training_tasks": training_tasks, "baseline_training_rollouts": baseline_training,
+                "previous_training_rollouts": previous_training_rollouts,
+                "optimization_evidence": optimization_evidence,
+                "previous_evaluations": [{key: row[key] for key in ("candidate_index", "decision", "code", "details", "reason", "gain", "measured_task_gain", "patch") if key in row}
+                                         for row in evaluations],
+                "execution_policy_contract": {
+                    "kernel_entrypoint": "kernel.py MUST preserve KERNEL_CONTRACT_VERSION = 1 and export all five callable hooks: filter_tools, augment_prompt, before_run, before_round, after_tool_results. Preserve unchanged hooks by importing/re-exporting them from the original artifact modules.",
+                    "before_round": "context contains messages, recent_results, goal, round, max_output_tokens and context_token_limit. Supported effective fields are allowed_tools, tool_order, recent_tool_exchanges and system_suffix; arbitrary messages/history/max_output_tokens replacements are not applied. Return only supported fields that need a measured change. Omit allowed_tools/recent_tool_exchanges to inherit host defaults. Output allowance is controlled exclusively by Admin/runtime/quota, never by candidate max_output_tokens. Host recall is always protected. History selection retains a protected progress handoff plus exact archived evidence.",
+                    "python_constraints": "Inputs are JSON dict/list data: use .get() and normal indexing. Dynamic reflection (getattr/setattr/vars/dir/type), external imports, decorators and dunder access are unavailable.",
+                    "available_builtins": sorted(key for key in safe_builtins() if not key.startswith("__") and key not in self.validator.FORBIDDEN_NAMES),
+                    "modules": "Implement algorithms in Python: planning, context/evidence selection, recovery, routing, verification and state. Re-export hooks through kernel.py. Only relative imports within this artifact and __future__ annotations are allowed. No standard-library imports, including threading/hashlib/json/re, are allowed; use plain Python builtins and artifact modules. In controlled modes never edit harness.py; import and re-export a hook from an allowed new module through kernel.py instead.",
+                    "other_hooks": "before_run(context)->dict; filter_tools(tools,role,context)->list; augment_prompt(prompt,role,context)->str; after_tool_results(results,context)->list. Each result is {name, ok, output}; output may be a nested object containing content/exit_code, not just a string. Preserve pairing by tool name and archived exact evidence.",
+                    "immutable": list(IMMUTABLE_CONTROL_COMPONENTS),
+                },
+                "rules": ["Do not access or infer held-out task contents. Do not weaken acceptance checks or safety controls.",
+                          "Optimize actual task behavior, not just prompt wording or contract-test scores.",
+                          "Propose one bounded mechanism-level hypothesis supported by observed correctness, quality, token/round costs, context/memory, routing or recovery evidence. Passing every check or having zero failed tools is not by itself a reason for no_change. Preserve working behavior. A hypothesis is not a claimed improvement until the real paired evaluation verifies it.",
+                          "Do not stop because the baseline succeeds. Select a bounded mechanism-level experiment from the optimization axes, state its falsifiable hypothesis and uncertainty, and submit real executable changes. Never copy the baseline or make comment/name-only changes; avoid speculative global rewrites.",
+                          "Never encode training filenames, JSON keys, expected values or metric definitions as universal instructions. Derive schema and counter semantics from the current task. Plural field names can legally be counts; names alone never determine types.",
+                          "Test recovery across unrelated contexts. A sandbox or missing-command error is an environment constraint: use portable Python operations, not smaller output limits or blanket history deletion.",
+                          "All arms use fresh workspaces, the same frozen tasks, and the same worker model configuration."],
+                "output_schema": {"decision": "change", "reason": "measured evidence and a testable experimental mechanism; benefits remain unverified until evaluation", "changelog": "change summary",
+                                  "patch": {"files": [{"path": "allowed module", "operation": "replace|replace_file", "old": "text", "new": "text", "content": "module source"}]}},
+            }
+            self.registry.event(run_id, "model_call_started", {"stage": "generator", "candidate_index": index + 1, "candidate_total": count})
+            try:
+                with self._model_budget_scope(phase_tokens, "proposal"):
+                    proposal = self._call_proposal_model("You evolve agent code from measured task outcomes. Return strict JSON. Evaluator and deployment controls are immutable.",
+                                          prompt, profile, config["task_benchmark"]["turn_max_tokens"])
+                    if proposal['decision'] == 'no_change':
+                        initial = proposal
+                        self.registry.event(run_id, 'opportunity_audit_started', {'candidate_index': index + 1})
+                        try:
+                            proposal = self._call_proposal_model(
+                                "Audit a no-change decision against actual training costs and quality. A successful task can still support a bounded mechanism-level efficiency trial. Return the same strict proposal JSON; never invent benefits or bypass real evaluation.",
+                                {**prompt, 'proposal_phase': 'opportunity_audit', 'previous_proposal': initial,
+                                 'audit_instruction': 'Reconsider the initial no_change using every optimization axis and the exact training evidence. A failure-only explanation is insufficient. Propose a small testable general mechanism when supported; otherwise select one conservative architecture exploration and label its benefit unproven. Do not access holdout contents.'},
+                                profile, config['task_benchmark']['turn_max_tokens'])
+                            proposal['opportunity_audit'] = {'status': 'completed', 'initial_decision': 'no_change', 'final_decision': proposal['decision']}
+                            self.registry.event(run_id, 'opportunity_audit_completed', {'candidate_index': index + 1, 'decision': proposal['decision']})
+                        except LiquidKernelError as exc:
+                            if exc.code not in {'invalid_proposal_schema', 'invalid_model_output', 'structured_round_budget_exhausted'}:
+                                raise
+                            proposal = initial
+                            proposal['opportunity_audit'] = {'status': 'failed', 'code': exc.code}
+                            self.registry.event(run_id, 'opportunity_audit_failed', {'candidate_index': index + 1, 'code': exc.code})
+            except TimeoutError as exc:
+                evaluations.append({"candidate_index": index + 1, "decision": "reject", "code": "proposal_budget_exhausted", "reason": str(exc)})
+                continue
+            except LiquidKernelError as exc:
+                if exc.code not in {'invalid_proposal_schema', 'invalid_model_output', 'structured_round_budget_exhausted'}:
+                    raise
+                proposal = self._exploration_proposal(source, optimization_evidence, index)
+                proposal['generation_diagnostic'] = {'code': exc.code, 'reason': str(exc), 'details': exc.details}
+                self.registry.event(run_id, 'architecture_exploration_started', {'candidate_index': index + 1, 'reason': exc.code})
+            if proposal["decision"] == "no_change":
+                prior = proposal
+                proposal = self._exploration_proposal(source, optimization_evidence, index)
+                proposal['opportunity_audit'] = prior.get('opportunity_audit')
+                proposal['declined_proposal'] = prior
+                self.registry.event(run_id, 'architecture_exploration_started', {'candidate_index': index + 1, 'mechanism': proposal['hypothesis']['mechanism']})
+            proposals.append(proposal)
+            self.registry.update_run(run_id, "proposal_ready", proposal_json={"candidates": proposals})
+            self.registry.event(run_id, "model_call_completed", {"stage": "generator", "decision": proposal["decision"]})
+            phase, partial_candidate, candidate_version = "proposal", {}, ""
+            try:
+                self.registry.update_run(run_id, "validating_patch")
+                repairs = []
+                repairable = {"kernel_contract_missing", "forbidden_import", "forbidden_name", "forbidden_scope",
+                              "forbidden_decorator", "forbidden_attribute", "forbidden_call", "patch_context_missing",
+                              "empty_patch", "mutable_surface_violation", "patch_too_large", "invalid_patch_syntax",
+                              "duplicate_patch_file", "invalid_patch_operation", "task_specific_policy"}
+                for repair_index in range(3):
+                    self._check_cancel(run_id)
+                    try:
+                        candidate, patch_meta = self.validator.apply(source, proposal, config)
+                        patch_meta["generalization"] = self.validator.check_generalization(source, candidate, training_tasks, config)
+                        break
+                    except LiquidKernelError as invalid:
+                        if invalid.code not in repairable:
+                            raise
+                        repairs.append({"code": invalid.code, "reason": str(invalid), "details": invalid.details})
+                        if repair_index == 2:
+                            failed = proposal
+                            proposal = self._exploration_proposal(source, optimization_evidence, index)
+                            proposal['failed_model_proposal'] = failed
+                            proposal['opportunity_audit'] = failed.get('opportunity_audit')
+                            candidate, patch_meta = self.validator.apply(source, proposal, config)
+                            patch_meta['generalization'] = self.validator.check_generalization(source, candidate, training_tasks, config)
+                            proposals[-1] = proposal
+                            self.registry.update_run(run_id, 'validating_patch', proposal_json={'candidates': proposals})
+                            self.registry.event(run_id, 'architecture_exploration_started', {'candidate_index': index + 1, 'reason': 'model_patch_validation_exhausted'})
+                            break
+                        self.registry.event(run_id, "candidate_patch_repair_started", {"candidate_index": index + 1, "attempt": repair_index + 1, "code": invalid.code})
+                        self.registry.event(run_id, "model_call_started", {"stage": "generator", "candidate_index": index + 1, "attempt": repair_index + 1})
+                        repaired = self._call_proposal_model("Repair the proposed agent code using the exact validator diagnostics. Return the complete strict JSON patch against the ORIGINAL kernel_files. Preserve all safety and acceptance rules.",
+                                              {**prompt, "previous_proposal": proposal, "validation_errors": repairs},
+                                              profile, config["task_benchmark"]["turn_max_tokens"])
+                        if repaired.get("decision") != "change" or not str(repaired.get("reason", "")).strip():
+                            raise invalid
+                        if proposal.get("opportunity_audit"):
+                            repaired["opportunity_audit"] = proposal["opportunity_audit"]
+                        proposal = repaired
+                        proposals[-1] = proposal
+                        self.registry.update_run(run_id, "validating_patch", proposal_json={"candidates": proposals})
+                patch_meta["validation_repairs"] = repairs
+                if _kernel_bundle_hash(candidate) == _kernel_bundle_hash(source):
+                    raise LiquidKernelError('empty_patch', 'Candidate must contain actual executable changes')
+                candidate_version = self.registry.register_candidate(
+                    run_id, incumbent, candidate, mode=config['mode'],
+                    changelog=proposal.get('changelog', proposal['reason']), scores={},
+                    evaluation={'candidate_index': index + 1, 'decision': 'pending_evaluation', 'candidate': {},
+                                'incumbent': dict(baseline_summary), 'patch': patch_meta, 'proposal': proposal})
+                candidate_versions[f'candidate_{index + 1}'] = candidate_version
+                self.registry.update_run(run_id, 'benchmarking', candidate_version=candidate_version)
+                self.registry.event(run_id, 'candidate_registered', {'candidate_index': index + 1, 'candidate_version': candidate_version})
+                self._check_cancel(run_id)
+                phase = "task"
+                self.registry.update_run(run_id, "benchmarking")
+                observed = benchmark.run(candidate, bank["tasks"], config["task_benchmark"], f"candidate_{index + 1}")
+                previous_training_rollouts = [trajectory_model_view(row) for row in observed["rows"] if row["split"] == "train"]
+                _atomic_json(output_root / f"candidate_{index + 1}_rollouts.json", observed)
+                # Persist measured artifacts before a reviewer/network failure can
+                # interrupt the pair. Missing reviews remain explicitly unscored.
+                checkpoint = {"candidate_index": index + 1, "candidate_version": candidate_version, "decision": "pending_review", "incumbent": dict(baseline_summary),
+                              "candidate": {"hard": observed["score"], "success_rate": observed["success_rate"],
+                                            "score_status": "pending_review", "task_execution_measured": True}}
+                partial_candidate = checkpoint["candidate"]
+                self.registry.record_candidate_evaluation(candidate_version, checkpoint)
+                self.registry.update_run(run_id, "judging", result_json={"incumbent": baseline_summary,
+                                         "evaluations": [*evaluations, checkpoint], "tokens_used": self._tokens_used})
+                if _json(bank["tasks"]) != _json(json.loads((output_root / "task_bank.json").read_text(encoding="utf-8"))["tasks"]):
+                    raise LiquidKernelError("task_bank_changed", "Frozen task bank changed during evaluation", 409)
+                self._check_cancel(run_id)
+                # Every incumbent-passing holdout assertion remains a gate;
+                # a high style score cannot compensate for losing working behavior.
+                regressed = []
+                baseline_by_id = {row["task_id"]: row for row in baseline["rows"]}
+                for row in observed["rows"]:
+                    prior = baseline_by_id[row["task_id"]]
+                    current_checks = {check["index"]: bool(check["ok"]) for check in row["checks"]}
+                    lost_assertion = any(check["ok"] and not current_checks.get(check["index"], False)
+                                         for check in prior["checks"])
+                    if row["split"] == "holdout" and (lost_assertion or row["score"] < prior["score"] or (prior["success"] and not row["success"])):
+                        regressed.append(row["task_id"])
+                self.registry.update_run(run_id, "judging")
+                phase = "review"
+                self.registry.event(run_id, "model_call_started", {"stage": "judge", "kind": "observed_agentic_outcomes"})
+                with self._model_budget_scope(phase_tokens, "review"):
+                    soft = self._soft_score(source, candidate, bank["tasks"], config,
+                                            observations={"incumbent": baseline, "candidate": observed})
+                self.registry.event(run_id, "model_call_completed", {"stage": "judge", "scores": {key: soft[key] for key in ("incumbent", "candidate")}})
+                flow = compare_agentic_flows(baseline, observed)
+                incumbent_mixed = baseline["score"] * .7 + soft["incumbent"] * .2 + 5
+                candidate_mixed = observed["score"] * .7 + soft["candidate"] * .2 + 5 + flow['efficiency_delta'] * .05
+                gain = candidate_mixed - incumbent_mixed
+                # No measured task improvement => no autonomous promotion.
+                measured_gain = flow['measured_gain']
+                decision = "promote" if flow['eligible'] and gain > 0 and gain >= config["minimum_gain"] else "reject"
+                confirmation = {'required': True, 'completed': False, 'passed': False}
+                if decision == 'promote':
+                    self.registry.event(run_id, 'flow_confirmation_started', {'candidate_index': index + 1, 'task_total': len(bank['tasks'])})
+                    repeated_base = benchmark.run(source, bank['tasks'], config['task_benchmark'], 'incumbent_confirmation')
+                    repeated_candidate = benchmark.run(candidate, bank['tasks'], config['task_benchmark'], f'candidate_{index + 1}_confirmation')
+                    _atomic_json(output_root / f'confirmation_{index + 1}.json', {'incumbent': repeated_base, 'candidate': repeated_candidate})
+                    confirmed = compare_agentic_flows(repeated_base, repeated_candidate)
+                    repeat_review = self._soft_score(source, candidate, bank['tasks'], config,
+                                                     observations={'incumbent': repeated_base, 'candidate': repeated_candidate})
+                    repeat_base_score = repeated_base['score'] * .7 + repeat_review['incumbent'] * .2 + 5
+                    repeat_candidate_score = repeated_candidate['score'] * .7 + repeat_review['candidate'] * .2 + 5 + confirmed['efficiency_delta'] * .05
+                    repeat_gain = repeat_candidate_score - repeat_base_score
+                    confirmation = {'required': True, 'completed': True,
+                                    'passed': confirmed['eligible'] and confirmed['measured_gain'] >= config['minimum_gain'] and repeat_gain > 0 and repeat_gain >= config['minimum_gain'],
+                                    'comparison': confirmed, 'gain': repeat_gain,
+                                    'incumbent': {'hard': repeated_base['score'], 'soft': repeat_review['incumbent'], 'mixed': repeat_base_score},
+                                    'candidate': {'hard': repeated_candidate['score'], 'soft': repeat_review['candidate'], 'mixed': repeat_candidate_score}}
+
+                    if not confirmation['passed']:
+                        decision = 'reject'
+                    self.registry.event(run_id, 'flow_confirmation_completed', {'candidate_index': index + 1, 'success': confirmation['passed']})
+                result = {"candidate_index": index + 1, "candidate_version": candidate_version, "decision": decision, "gain": gain, "measured_task_gain": measured_gain,
+                          "opportunity_audit": proposal.get('opportunity_audit'),
+                          "benchmark_kind": "session_agentic", "scoring_protocol_version": SCORING_PROTOCOL_VERSION, "task_bank_fingerprint": frozen_hash,
+                          "flow_comparison": flow, "confirmation": confirmation,
+                          "train_count": bank["train_count"], "holdout_count": bank["holdout_count"],
+                          "incumbent": {"hard": baseline["score"], "soft": soft["incumbent"], "mixed": incumbent_mixed, "score_status": "completed" if rollout_complete(baseline) else "partial", "task_execution_measured": True},
+                          "candidate": {"hard": observed["score"], "soft": soft["candidate"], "mixed": candidate_mixed, "score_status": "completed" if rollout_complete(observed) else "partial", "task_execution_measured": True},
+                          "patch": patch_meta, "soft_details": soft.get("details", {}),
+                          "task_results": [{"task_id": row["task_id"], "split": row["split"], "score": row["score"],
+                                            "success": row["success"], "rounds": row["rounds"], "tool_calls": row["tool_calls"],
+                                            "checks": row["checks"], "error": row["error"]} for row in observed["rows"]],
+                          "reason": "Full agentic workflow quality/efficiency gain passed independent paired confirmation" if decision == "promote" else "Independent paired confirmation failed" if confirmation.get("completed") and not confirmation.get("passed") else "Real task or held-out acceptance regressed" if regressed else "No reproducible agentic workflow improvement"}
+                self.registry.record_candidate_evaluation(candidate_version, result)
+                evaluations.append(result)
+                if decision == "promote":
+                    accepted.append((candidate, proposal, result))
+            except TimeoutError as exc:
+                evaluations.append({"candidate_index": index + 1, "decision": "reject", "code": phase + "_budget_exhausted", "reason": str(exc),
+                                    "incumbent": dict(baseline_summary), "candidate": partial_candidate})
+            except LiquidKernelError as exc:
+                if exc.code not in {"mutable_surface_violation", "patch_too_large", "kernel_contract_missing", "empty_patch",
+                                    "forbidden_import", "forbidden_name", "forbidden_scope", "forbidden_decorator", "forbidden_attribute", "forbidden_call", "patch_context_missing", "invalid_patch_syntax", "duplicate_patch_file", "invalid_patch_operation", "task_specific_policy"}:
+                    raise
+                evaluations.append({"candidate_index": index + 1, "decision": "reject", "code": exc.code, "reason": str(exc),
+                                    "details": exc.details,
+                                    "incumbent": dict(baseline_summary),
+                                    "candidate": {"hard": None, "soft": None, "mixed": 0.0, "validation": 0, "score_status": "validation_failed", "task_execution_measured": False}})
+            if candidate_version:
+                evaluations[-1]['candidate_version'] = candidate_version
+                self.registry.record_candidate_evaluation(candidate_version, evaluations[-1])
+            self.registry.update_run(run_id, "judging", result_json={"incumbent": baseline_summary, "evaluations": evaluations, "tokens_used": self._tokens_used})
+            self.registry.event(run_id, "candidate_evaluated", {"candidate_index": index + 1, "decision": evaluations[-1]["decision"]})
+        if not accepted:
+            changed = any(proposal["decision"] == "change" for proposal in proposals) or any(row.get('decision')=='reject' for row in evaluations)
+            status = "rejected" if changed else "no_change"
+            result = {"decision": status, "benchmark_kind": "session_agentic", "scoring_protocol_version": SCORING_PROTOCOL_VERSION, "task_bank_fingerprint": frozen_hash,
+                      "evaluations": evaluations, "incumbent": evaluations[-1].get("incumbent", baseline_summary) if evaluations else baseline_summary, "tokens_used": self._tokens_used, "case_count": len(bank["tasks"])}
+            self.registry.update_run(run_id, status, result_json=result, completed_at=_now())
+            self.registry.event(run_id, status, {"benchmark_kind": "session_agentic"})
+            return
+        candidate, proposal, result = max(accepted, key=lambda item: item[2]["gain"])
+        result = {**result, "evaluations": evaluations, "tokens_used": self._tokens_used, "candidate_count": len(proposals)}
+        with self.config_lock:
+            self._check_cancel(run_id)
+            if self.registry.active_version() != incumbent:
+                raise LiquidKernelError("baseline_changed", "Active baseline changed during evaluation; rerun against the new baseline before deployment", 409)
+            version = result["candidate_version"]
+            result["candidate_version"] = version
+            status = "canary" if config["auto_promote"] else "awaiting_approval"
+            if config["auto_promote"]:
+                self.registry.begin_canary(version, 5)
+            self.registry.update_run(run_id, status, candidate_version=version, result_json=result, completed_at=_now())
+            self.registry.event(run_id, status, {"candidate_version": version, "gain": result["gain"], "benchmark_kind": "session_agentic"})
+
+    def _run(self, run_id: str, config: dict) -> None:
+        self._active_run_config = config
+        try:
+            self._active_deadline = (time.monotonic()+config["budget"]["timeout_seconds"]) if config["budget"]["timeout_seconds"] and config.get("task_benchmark",{}).get("enabled",True) else 0
             incumbent = self.registry.active_version()
             source = self.registry.sources(incumbent)
             self.registry.update_run(run_id, "collecting")
@@ -1684,13 +2669,16 @@ class LiquidKernelControlPlane:
             _atomic_json(self.registry.experience_root / run_id / "manifest.json", experience)
             self.registry.update_run(run_id, "assessing", experience_json=self._experience_audit_view(experience))
             self._check_cancel(run_id)
+            if config.get("task_benchmark", {}).get("enabled", True):
+                self._run_task_driven(run_id, config, incumbent, source, experience)
+                return
             system = (
                 "You are the Liquid Agent Kernel evolution designer. Assess whether the incumbent should change. "
                 "Return strict JSON. Never alter authentication, persistence, evaluator, promotion, audit, sandbox, or signing controls."
             )
             seed = random.SystemRandom().randint(1, 2**31 - 1)
             candidate_limit = max(1, int(config["budget"].get("candidate_limit", 1) or 1))
-            generator_tokens = max(512, int(config["budget"]["max_tokens"]) // candidate_limit)
+            generator_tokens = config["task_benchmark"]["turn_max_tokens"]
             prompt_cases = self.benchmark.random_cases(
                 min(max(8, int(config["budget"]["max_cases"]) // 2), int(config["budget"]["max_cases"])),
                 seed,
@@ -1740,7 +2728,7 @@ class LiquidKernelControlPlane:
                 })
                 self.registry.update_run(run_id, "generating")
                 self.registry.event(run_id, "model_call_started", {"stage": "generator", "candidate_index": candidate_index + 1, "model": config.get("generator_model_ref")})
-                proposal = self._call_model(
+                proposal = self._call_proposal_model(
                     system, prompt,
                     config.get("generator_model_ref") or str(config.get("generator_profile", "")),
                     generator_tokens,
@@ -1828,25 +2816,39 @@ class LiquidKernelControlPlane:
                     changelog=str(proposal.get("changelog", "") or proposal.get("reason", "Candidate kernel update.")), scores=scores,
                 )
                 result["candidate_version"] = version
-                status = "canary" if bool(config["auto_promote"]) else "awaiting_approval"
+                # The retained internal contract evaluator is diagnostic only.
+                # Automatic deployment requires the real paired task pathway.
+                status = "awaiting_approval"
+                result["automatic_deployment_eligible"] = False
                 # Complete the control-plane deployment before publishing the
                 # terminal run state. Observers use the run status as a readiness
                 # signal; publishing ``canary`` first can let them tear down a
                 # temporary registry while this thread is still opening SQLite.
-                if bool(config["auto_promote"]):
-                    self.registry.begin_canary(version, 5)
                 self.registry.update_run(run_id, status, candidate_version=version, result_json=result, completed_at=_now())
                 self.registry.event(run_id, status, {"candidate_version": version, "gain": result.get("gain", 0)})
-        except LiquidKernelError as exc:
+        except (LiquidKernelError, EvaluationDefinitionError) as exc:
             status = "cancelled" if exc.code == "run_cancelled" or run_id in self.cancelled else "failed"
-            self.registry.update_run(run_id, status, error=str(exc), result_json={"code": exc.code, "details": exc.details}, completed_at=_now())
+            self.registry.update_run(run_id, status, error=str(exc), result_json={**self.registry.run_detail(run_id).get("result", {}), "code": exc.code, "details": exc.details}, completed_at=_now())
             self.registry.event(run_id, status, {"code": exc.code, "error": str(exc)})
         except Exception as exc:
             status = "cancelled" if run_id in self.cancelled else "failed"
             error = "Evolution computation failed (" + type(exc).__name__ + ")"
-            self.registry.update_run(run_id, status, error=error, result_json={"code": "run_failed"}, completed_at=_now())
+            self.registry.update_run(run_id, status, error=error, result_json={**self.registry.run_detail(run_id).get("result", {}), "code": "run_failed"}, completed_at=_now())
             self.registry.event(run_id, status, {"error": error})
         finally:
+            detail = self.registry.run_detail(run_id)
+            if detail['status'] in {'failed', 'cancelled'}:
+                with self.registry._connect() as conn:
+                    retained = conn.execute('SELECT version,evaluation_json FROM candidate_evaluations WHERE run_id=?', (run_id,)).fetchall()
+                for row in retained:
+                    saved = json.loads(row['evaluation_json'])
+                    if saved.get('decision') in {'pending_evaluation', 'pending_review'}:
+                        self.registry.record_candidate_evaluation(row['version'], {'decision': 'reject', 'code': detail.get('result', {}).get('code'), 'reason': detail.get('error')})
+            self._active_run_config = None
+            self._active_deadline = 0
+            self._rollout_token_ceiling = 0
+            self._token_limit = 0
+            self._token_budget_exhausted = False
             self.cancelled.discard(run_id)
             self.active_run_id = ""
             try:
@@ -1861,6 +2863,10 @@ class LiquidKernelControlPlane:
             detail = self.registry.run_detail(run_id)
             if detail["status"] != "awaiting_approval":
                 raise LiquidKernelError("invalid_run_state", "run is not awaiting approval", 409)
+            if detail.get('score_summary', {}).get('evaluation_valid') is False:
+                raise LiquidKernelError('invalid_evaluation_definition', 'Invalid evaluation evidence cannot authorize deployment', 409)
+            if detail.get("incumbent_version") != self.registry.active_version():
+                raise LiquidKernelError("baseline_changed", "Active baseline changed during evaluation; rerun against the new baseline before deployment", 409)
             version = str(detail.get("candidate_version", "") or "")
             state = self.registry.begin_canary(version, 5)
             self.registry.update_run(run_id, "canary")
@@ -1933,13 +2939,18 @@ class LiquidKernelControlPlane:
         with self.config_lock:
             if not self.run_lock.locked():
                 self._recover_interrupted_runs()
+        runs = self.registry.list_runs(limit=50)
+        latest_id = runs['runs'][0]['run_id'] if runs['runs'] else ''
+        latest_progress = self.registry.run_detail(self.active_run_id or latest_id).get('progress') if (self.active_run_id or latest_id) else None
         return {
             "ok": True,
             "config": self.config(),
             "active": self.registry.active_state(),
             "active_run_id": self.active_run_id,
+            "active_progress": latest_progress if self.active_run_id else None,
+            "latest_progress": latest_progress,
             "last_trigger_error": self.last_trigger_error,
-            "runs": self.registry.list_runs(limit=50),
+            "runs": runs,
             "versions": self.registry.list_versions(limit=100),
             "events": self.registry.events_since(0, limit=200),
             "immutable_control_components": list(IMMUTABLE_CONTROL_COMPONENTS),

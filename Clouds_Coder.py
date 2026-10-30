@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -24474,48 +24475,33 @@ class SkillStore:
         Each external directory is registered as a separate provider for clean namespacing.
         """
         workspace = self.skills_root.parent
-        if not workspace.exists():
-            return
-        skills_root_resolved = self.skills_root.resolve()
-        already_loaded_names = {s.get("name", "") for s in self.skills.values() if s.get("name")}
-        # Scan workspace for directories that look like skill libraries
         try:
-            candidates = sorted(
-                (d for d in workspace.iterdir() if d.is_dir() and d.resolve() != skills_root_resolved),
-                key=lambda p: p.name.lower(),
-            )
-        except Exception:
+            if not workspace.is_dir():
+                return
+            skills_root_resolved = self.skills_root.resolve()
+            candidates = sorted(workspace.iterdir(), key=lambda path: path.name.lower())
+        except OSError as exc:
+            self.warnings.append(f"External skill discovery unavailable: {type(exc).__name__}")
             return
+        already_loaded_names = {row.get("name", "") for row in self.skills.values() if row.get("name")}
         for candidate in candidates:
             skill_files: list[Path] = []
-            # Pattern 1: Root-level SKILL.md (e.g., academic-pptx-skill-main/SKILL.md)
-            root_skill = candidate / "SKILL.md"
-            if root_skill.exists():
-                skill_files.append(root_skill)
-            # Pattern 2: skills/*/SKILL.md (e.g., skills-main/skills/docx/SKILL.md)
-            skills_subdir = candidate / "skills"
-            if skills_subdir.exists() and skills_subdir.is_dir():
+            try:
+                if not candidate.is_dir() or candidate.resolve() == skills_root_resolved:
+                    continue
+                root_skill = candidate / "SKILL.md"
+                if root_skill.is_file():
+                    skill_files.append(root_skill)
+            except OSError as exc:
+                self.warnings.append(f"External skill library unavailable ({type(exc).__name__}): {candidate.name}")
+                continue
+            for relative in ("skills", "source-code/skills", "plugins"):
                 try:
-                    for sf in sorted(skills_subdir.rglob("SKILL.md")):
-                        skill_files.append(sf)
-                except Exception:
-                    pass
-            # Pattern 3: source-code/skills/*/SKILL.md (e.g., kimi-agent-internals-main/)
-            source_skills = candidate / "source-code" / "skills"
-            if source_skills.exists() and source_skills.is_dir():
-                try:
-                    for sf in sorted(source_skills.rglob("SKILL.md")):
-                        skill_files.append(sf)
-                except Exception:
-                    pass
-            # Pattern 4: plugins/*/skills/*/SKILL.md (e.g., Minimax/plugins/pptx-plugin/)
-            plugins_dir = candidate / "plugins"
-            if plugins_dir.exists() and plugins_dir.is_dir():
-                try:
-                    for sf in sorted(plugins_dir.rglob("SKILL.md")):
-                        skill_files.append(sf)
-                except Exception:
-                    pass
+                    directory = candidate / relative
+                    if directory.is_dir():
+                        skill_files.extend(sorted(directory.rglob("SKILL.md")))
+                except OSError as exc:
+                    self.warnings.append(f"External skill directory unavailable ({type(exc).__name__}): {candidate.name}/{relative}")
             if not skill_files:
                 continue
             # Register this external directory as a provider
@@ -32653,8 +32639,11 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
                 [
                     bwrap,
                     "--die-with-parent",
+                    "--new-session",
                     "--unshare-user",
                     "--unshare-pid",
+                    "--unshare-uts",
+                    "--unshare-ipc",
                     "--ro-bind", "/", "/",
                     "--proc", "/proc",
                     "--dev", "/dev",
