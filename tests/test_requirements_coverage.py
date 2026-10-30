@@ -1,16 +1,14 @@
 import ast
 import builtins
-import importlib.util
-import os
 import re
 import sys
-import sysconfig
 import unittest
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import Clouds_Coder as cc
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "Clouds_Coder.py"
@@ -47,32 +45,6 @@ IMPORT_TO_DISTRIBUTION = {
 DYNAMIC_RUNTIME_MODULES = {"debugpy"}
 
 
-def stdlib_module_names(imported: set[str]) -> set[str]:
-    """Return standard-library roots on Python versions with/without the 3.10 API."""
-    native = getattr(sys, "stdlib_module_names", None)
-    if native is not None:
-        return set(native)
-    stdlib_root = os.path.realpath(sysconfig.get_paths()["stdlib"])
-    names = set(sys.builtin_module_names)
-    for name in imported:
-        try:
-            spec = importlib.util.find_spec(name)
-        except (ImportError, ModuleNotFoundError, ValueError):
-            continue
-        origin = getattr(spec, "origin", None)
-        if not origin or origin in {"built-in", "frozen"}:
-            continue
-        origin_path = os.path.realpath(origin)
-        if any(part in {"site-packages", "dist-packages"} for part in origin_path.split(os.sep)):
-            continue
-        try:
-            if os.path.commonpath((stdlib_root, origin_path)) == stdlib_root:
-                names.add(name)
-        except ValueError:
-            continue
-    return names
-
-
 def canonical_distribution(value: str) -> str:
     return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
 
@@ -106,7 +78,8 @@ class RequirementsCoverageTests(unittest.TestCase):
             for path in ROOT.iterdir()
             if path.is_dir() and (path / "__init__.py").is_file()
         )
-        third_party = imported - stdlib_module_names(imported) - {"__future__"} - local_modules
+        from liquid_kernel.context import PORTABLE_STDLIB_ROOTS
+        third_party = imported - set(getattr(sys, "stdlib_module_names", PORTABLE_STDLIB_ROOTS)) - {"__future__"} - local_modules
         unmapped = sorted(third_party - set(IMPORT_TO_DISTRIBUTION))
         self.assertEqual(unmapped, [], f"Map new third-party imports: {unmapped}")
 

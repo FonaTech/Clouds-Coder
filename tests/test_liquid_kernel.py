@@ -5,7 +5,26 @@ import unittest
 from pathlib import Path
 
 import Clouds_Coder as cc
-from liquid_kernel import LiquidKernelControlPlane, LiquidKernelError, default_evolution_config
+from liquid_kernel import LiquidKernelControlPlane as _LiquidKernelControlPlane
+from liquid_kernel import LiquidKernelError, default_evolution_config
+
+
+def LiquidKernelControlPlane(root, **kwargs):
+    """Legacy contract/source-review fixtures explicitly opt out of task execution."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if not (root / "config.json").exists():
+        config = default_evolution_config()
+        config["task_benchmark"]["enabled"] = False
+        (root / "config.json").write_text(json.dumps(config))
+    plane = _LiquidKernelControlPlane(root, **kwargs)
+    # Exercise the retained internal contract evaluator directly. The public
+    # configuration always migrates to real session-task evaluation now.
+    plane._production_run = plane._run
+    def run_contract_fixture(run_id, config):
+        return plane._production_run(run_id, {**config, "task_benchmark": {**config.get("task_benchmark", {}), "enabled": False}})
+    plane._run = run_contract_fixture
+    return plane
 
 
 def wait_for_run(plane: LiquidKernelControlPlane, run_id: str, timeout: float = 8.0) -> dict:
@@ -57,7 +76,7 @@ class LiquidKernelConfigurationTests(unittest.TestCase):
             config = plane.apply_startup_config("Tuning", "")["config"]
             self.assertEqual(config["schedule"], "weekly")
             self.assertEqual(config["budget"]["candidate_limit"], 1)
-            self.assertEqual(config["budget"]["max_changed_lines"], 400)
+            self.assertEqual(config["budget"]["max_changed_lines"], 0)
             config = plane.apply_startup_config("Aggressive", "hourly")["config"]
             self.assertEqual(config["schedule"], "hourly")
             self.assertEqual(config["mutable_surface"], "full_agent_core")
@@ -80,7 +99,7 @@ class LiquidKernelConfigurationTests(unittest.TestCase):
         self.assertIn("--liquid-kernel-mode", schema["liquid_kernel_mode"]["flag"])
         self.assertIn("--liquid-kernel-startup-policy", schema["liquid_kernel_startup_policy"]["flag"])
         self.assertIn("/api/admin/evolution/emergency-off", cc.ADMIN_JS)
-        self.assertIn("history=current +", cc.ADMIN_JS)
+        self.assertIn("History version depth", cc.ADMIN_JS)
 
     def test_missing_liquid_kernel_package_is_restored_from_clouds_coder(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -216,7 +235,7 @@ class LiquidKernelEvolutionTests(unittest.TestCase):
             )
             plane.registry.begin_canary(evolved, 100)
             plane.registry.promote(evolved)
-            injected = plane.inject_embedded_kernel()
+            injected = plane.inject_embedded_kernel(force=True)
             self.assertTrue(injected["injected"])
             self.assertEqual(injected["previous_version"], evolved)
             self.assertNotEqual(injected["version"], evolved)
@@ -225,15 +244,16 @@ class LiquidKernelEvolutionTests(unittest.TestCase):
             self.assertEqual(plane.registry.artifact(incumbent).version, incumbent)
             self.assertEqual(plane.registry.version_detail(injected["version"])["manifest"]["mode"], "embedded")
 
-    def test_tuning_benchmarks_and_enters_canary_automatically(self):
+    def test_internal_contract_benchmark_cannot_automatically_deploy(self):
         with tempfile.TemporaryDirectory() as temp:
             plane = LiquidKernelControlPlane(Path(temp), model_callback=improving_model, judge_callback=improving_judge)
             plane.apply_startup_config("Tuning", "off")
             run = plane.trigger("manual")
             detail = wait_for_run(plane, run["run_id"])
-            self.assertEqual(detail["status"], "canary")
+            self.assertEqual(detail["status"], "awaiting_approval")
             self.assertTrue(detail["candidate_version"])
-            self.assertEqual(plane.registry.active_state()["canary"]["version"], detail["candidate_version"])
+            self.assertIsNone(plane.registry.active_state()["canary"])
+            self.assertFalse(detail["result"]["automatic_deployment_eligible"])
             self.assertEqual(detail["result"]["patch"]["paths"], ["tool_policy.py"])
             self.assertGreater(detail["result"]["candidate"]["mixed"], detail["result"]["incumbent"]["mixed"])
 
@@ -335,6 +355,7 @@ class LiquidKernelEvolutionTests(unittest.TestCase):
             plane.apply_startup_config("Tuning", "off")
             detail = wait_for_run(plane, plane.trigger("manual")["run_id"])
             candidate = detail["candidate_version"]
+            plane.approve(detail["run_id"])
             stopped = plane.emergency_off()
             self.assertEqual(stopped["config"]["mode"], "Off")
             self.assertEqual(plane.registry.active_version(), incumbent)

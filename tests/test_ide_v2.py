@@ -2102,6 +2102,12 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(allowed.returncode, 0)
+        nested = cc.subprocess.run(
+            [*prefix, "/bin/sh", "-c", "mkdir -p nested/deeper && cd nested/deeper && printf checked > result.txt"],
+            cwd=self.files, capture_output=True, text=True,
+        )
+        self.assertEqual(nested.returncode, 0, nested.stderr)
+        self.assertEqual((self.files / "nested/deeper/result.txt").read_text(), "checked")
         self.assertEqual(
             (self.files / "made.txt").read_text(encoding="utf-8").strip(), "changed"
         )
@@ -3314,7 +3320,7 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("planning_depth", backend_source)
         self.assertIn("solution_diversity", backend_source)
         self.assertIn("scope_breadth", backend_source)
-        self.assertIn('max_tokens=int(budget_spec["max_tokens"])', backend_source)
+        self.assertIn('max_tokens=min(int(budget_spec["max_tokens"])', backend_source)
         self.assertIn("client.timeout = None", backend_source)
         self.assertIn("_ide_prompt_enhancement_fallback(", backend_source)
         self.assertIn("Local template", cc.IDE_JS)
@@ -5008,7 +5014,7 @@ class SubprocessTextSafetyTests(unittest.TestCase):
         self.assertEqual(posix, "python3 'script name.py' plain")
 
     def test_decode_subprocess_bytes_never_raises_for_mixed_output(self):
-        raw = "Windows 中文输出".encode() + b"\xad"
+        raw = "Windows 中文输出".encode("utf-8") + b"\xad"
         with (
             mock.patch.object(cc, "_windows_subprocess_encodings", return_value=["cp936"]),
             mock.patch.object(cc.locale, "getpreferredencoding", return_value="gbk"),

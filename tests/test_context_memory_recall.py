@@ -115,6 +115,133 @@ class ContextMemoryRecallTests(unittest.TestCase):
         self.assertIn("target='function_339'", located)
         self.assertIn("function_339", located)
 
+    def test_large_file_search_uses_index_and_returns_late_evidence(self):
+        session = self.bare_session()
+        source = session.files_root / "large.log"
+        source.write_text(
+            "\n".join([f"noise line {idx}" for idx in range(1, 5001)] + ["CRITICAL late failure code=E42"]),
+            encoding="utf-8",
+        )
+        first = session._run_read("large.log", mode="search", query="CRITICAL late failure")
+        self.assertIn("indexed=true", first)
+        self.assertIn("5001: CRITICAL late failure code=E42", first)
+        second = session._run_read("large.log", mode="search", query="CRITICAL late failure")
+        self.assertIn("5001: CRITICAL late failure code=E42", second)
+        self.assertEqual(len(getattr(session, "_long_content_search_index_cache", {})), 1)
+
+    def test_small_file_uses_same_source_evidence_memory_schema(self):
+        session = self.bare_session()
+        source = session.files_root / "small.txt"
+        source.write_text("first fact\nsecond fact\n", encoding="utf-8")
+        output = session._run_read("small.txt", mode="search", query="second fact")
+        self.assertIn("read_file search", output)
+        memory = next(iter(session.long_content_memory.values()))
+        self.assertEqual(memory["scale"], "compact")
+        self.assertIn("content_id", memory)
+        self.assertIn("read_ranges", memory)
+        self.assertIn("retrieval_plan", memory)
+
+    def test_evidence_trace_and_fact_memory_require_exact_source_values(self):
+        session = self.bare_session()
+        output = session._trace_tool_result(
+            "read_file",
+            {"path": "params.txt", "mode": "window", "line": 1},
+            "cutoff = 0.35 eV\ntemperature = 300 K\n",
+            "developer",
+        )
+        self.assertIn("evidence_ref id=", output)
+        evidence_id = output.split("evidence_ref id=", 1)[1].split()[0]
+        rejected = session._evidence_memory_tool({
+            "mode": "remember",
+            "kind": "fact",
+            "claim": "cutoff = 0.53 eV",
+            "references": [{"evidence_id": evidence_id, "quote": "cutoff = 0.35 eV"}],
+        })
+        self.assertIn("verbatim", rejected)
+        saved = session._evidence_memory_tool({
+            "mode": "remember",
+            "kind": "fact",
+            "claim": "cutoff = 0.35 eV",
+            "conditions": "parameter from params.txt",
+            "references": [{"evidence_id": evidence_id, "quote": "cutoff = 0.35 eV"}],
+        })
+        self.assertIn('"ok": true', saved.lower())
+        recalled = session._evidence_memory_tool({"mode": "recall", "query": "cutoff"})
+        self.assertIn(evidence_id, recalled)
+        trace = session._evidence_memory_tool({"mode": "trace", "id": evidence_id})
+        self.assertIn("temperature = 300 K", trace)
+        self.assertIn("params.txt", trace)
+
+        newer = session._trace_tool_result(
+            "read_file", {"path": "params.txt", "mode": "window", "line": 1}, "cutoff = 0.40 eV\n", "developer"
+        )
+        newer_id = newer.split("evidence_ref id=", 1)[1].split()[0]
+        conflict = session._evidence_memory_tool({
+            "mode": "remember",
+            "kind": "fact",
+            "claim": "cutoff = 0.40 eV",
+            "references": [{"evidence_id": newer_id, "quote": "cutoff = 0.40 eV"}],
+        })
+        self.assertIn("conflict", conflict.lower())
+
+
+    def test_multifile_bash_uses_per_file_observation_heads_and_trace_parents(self):
+        session = self.bare_session()
+        (session.files_root / "a.html").write_text("<svg id='a'></svg>\n", encoding="utf-8")
+        (session.files_root / "b.html").write_text("<svg id='b'></svg>\n", encoding="utf-8")
+        output = session._trace_tool_result(
+            "bash",
+            {"command": "grep -o svg a.html b.html"},
+            "a.html:<svg id='a'></svg>\nb.html:<svg id='b'></svg>",
+            "developer",
+        )
+        command_id = output.split("evidence_ref id=", 1)[1].split()[0]
+        controller = session._evidence_controller()
+        head_a = controller.file_head("a.html")
+        head_b = controller.file_head("b.html")
+
+        self.assertNotEqual(head_a["evidence_id"], command_id)
+        self.assertNotEqual(head_b["evidence_id"], command_id)
+        self.assertNotEqual(head_a["evidence_id"], head_b["evidence_id"])
+        self.assertEqual(controller.recall(eid=head_a["evidence_id"], limit=1)[0]["path"], "a.html")
+        self.assertEqual(controller.recall(eid=head_b["evidence_id"], limit=1)[0]["path"], "b.html")
+        trace = session._evidence_memory_tool({"mode": "trace", "id": head_a["evidence_id"]})
+        self.assertIn(command_id, trace)
+
+    def test_evidence_prompt_keeps_claims_bounded_and_points_to_verification(self):
+        session = self.bare_session()
+        output = session._trace_tool_result("bash", {"command": "cat params.txt"}, "alpha = 1\n")
+        evidence_id = output.split("evidence_ref id=", 1)[1].split()[0]
+        session._evidence_memory_tool({
+            "mode": "remember",
+            "kind": "fact",
+            "claim": "alpha = 1",
+            "references": [{"evidence_id": evidence_id, "quote": "alpha = 1"}],
+        })
+        prompt = session._evidence_memory_prompt_block(max_chars=1200)
+        self.assertLessEqual(len(prompt), 1200)
+        self.assertIn(evidence_id, prompt)
+        self.assertIn("verify", prompt.lower())
+
+    def test_retrieval_plan_reports_information_gain_and_next_frontier(self):
+        session = self.bare_session()
+        session.runtime_authoritative_goal = "find the failure section"
+        source = session.files_root / "frontier.txt"
+        source.write_text("\n".join(f"section {idx}" for idx in range(500)), encoding="utf-8")
+        output = session._run_read("frontier.txt", mode="window", offset=0, limit=20)
+        session._mark_long_content_read(
+            "frontier.txt",
+            source,
+            source.read_text(encoding="utf-8").splitlines(),
+            {"mode": "window", "offset": 0, "limit": 20},
+            output,
+        )
+        memory = next(iter(session.long_content_memory.values()))
+        plan = memory.get("retrieval_plan", {})
+        self.assertEqual(plan.get("action"), "frontier_segment")
+        self.assertGreater(float(plan.get("information_gain", 0.0)), 0.0)
+        self.assertTrue(plan.get("next_segments"))
+
     def test_code_parser_keeps_large_source_symbols_beyond_legacy_300k_cap(self):
         root = pathlib.Path(tempfile.mkdtemp(prefix="clouds-code-parser-test-"))
         source = root / "large.py"
@@ -638,6 +765,68 @@ class ContextMemoryRecallTests(unittest.TestCase):
         self.assertEqual(payload["returned"], 1)
         self.assertEqual(payload["items"][0]["tool"], "bash")
         self.assertTrue(any("42 percent" in row for row in payload["items"][0]["cached_matches"]))
+
+    def test_declared_short_perception_bash_is_recorded_and_traceable(self):
+        session = self.bare_session()
+        args = {
+            "command": "tesseract image.png stdout",
+            "operation": "ocr",
+        }
+        traced = session._trace_tool_result("bash", args, "ONE OCR LINE", "developer")
+        session._maybe_record_tool_memory_after_result("bash", args, traced, "developer")
+        rows = list(session.tool_memory_registry.values())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["evidence_kind"], "ocr")
+        self.assertEqual(rows[0]["operation"], "ocr")
+        self.assertTrue(rows[0]["evidence_id"])
+        trace = session._tool_memory_tool({"mode": "trace", "id": rows[0]["evidence_id"]})
+        self.assertIn("ONE OCR LINE", trace)
+
+    def test_declared_document_extract_short_result_is_not_dropped(self):
+        session = self.bare_session()
+        args = {
+            "command": "pdftotext report.pdf -",
+            "operation": "document_extract",
+        }
+        session._maybe_record_tool_memory_after_result(
+            "bash", args, "single extracted heading", "developer"
+        )
+        row = next(iter(session.tool_memory_registry.values()))
+        self.assertEqual(row["evidence_kind"], "document_extraction")
+        self.assertEqual(row["operation"], "document_extract")
+
+    def test_custom_marker_is_preserved_without_restricting_shell(self):
+        operation, declared = cc.SessionState._bash_operation_from_args(
+            {"command": "my-reader input.bin", "operation": "spectroscopy_pass"}
+        )
+        self.assertTrue(declared)
+        self.assertEqual(operation, "custom:spectroscopy_pass")
+        self.assertFalse(cc.bash_operation_is_observation(operation))
+        session = self.bare_session()
+        (session.files_root / "input.bin").write_bytes(b"binary")
+        self.assertEqual(
+            session._bash_file_read_targets(
+                "my-reader input.bin", operation="spectroscopy_pass"
+            ),
+            ["input.bin"],
+        )
+
+    def test_declared_extractors_discover_inputs_without_keyword_guessing(self):
+        session = self.bare_session()
+        for name in ("report.pdf", "photo.png", "clip.mp4"):
+            (session.files_root / name).write_bytes(b"placeholder")
+        self.assertEqual(
+            session._bash_file_read_targets("pdftotext report.pdf -", operation="document_extract"),
+            ["report.pdf"],
+        )
+        self.assertEqual(
+            session._bash_file_read_targets("tesseract photo.png stdout", operation="ocr"),
+            ["photo.png"],
+        )
+        self.assertEqual(
+            session._bash_file_read_targets("ffprobe -v quiet clip.mp4", operation="media_metadata"),
+            ["clip.mp4"],
+        )
 
     def test_semantic_input_connects_verified_reads_across_sources(self):
         session = self.bare_session()

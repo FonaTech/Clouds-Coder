@@ -32,17 +32,10 @@ class _RagAuthApp:
             "session_ttl_seconds": cc.ADMIN_AUTH_SESSION_TTL_SECONDS,
         }
 
-    def setup_admin(
-        self, username, password, *, local_setup_allowed, bootstrap_token=""
-    ):
+    def setup_admin(self, username, password, *, local_setup_allowed, bootstrap_token=""):
         if self.admin_auth.configured():
-            raise cc.AdminAuthError(
-                "setup_already_completed", "already configured", 409
-            )
-        if (
-            not local_setup_allowed
-            and self.verify_admin_token(bootstrap_token) != "token"
-        ):
+            raise cc.AdminAuthError("setup_already_completed", "already configured", 409)
+        if not local_setup_allowed and self.verify_admin_token(bootstrap_token) != "token":
             raise cc.AdminAuthError("setup_local_only", "local setup required", 403)
         return self.admin_auth.setup(username, password)
 
@@ -98,10 +91,7 @@ class RagAdminAuthenticationHTTPTests(unittest.TestCase):
         self.app = _RagAuthApp(Path(self.temp.name))
         self.servers = {}
         self.threads = []
-        for name, handler in (
-            ("rag", cc.RagAdminHandler),
-            ("code", cc.CodeAdminHandler),
-        ):
+        for name, handler in (("rag", cc.RagAdminHandler), ("code", cc.CodeAdminHandler)):
             server = cc.AgentHTTPServer(("127.0.0.1", 0), handler, self.app)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -139,10 +129,7 @@ class RagAdminAuthenticationHTTPTests(unittest.TestCase):
         return response.status, data, response_headers
 
     def test_both_pages_include_complete_auth_ui_without_prompt_token_login(self):
-        for service, script_path in (
-            ("rag", "/assets/rag-admin.js"),
-            ("code", "/assets/code-admin.js"),
-        ):
+        for service, script_path in (("rag", "/assets/rag-admin.js"), ("code", "/assets/code-admin.js")):
             status, html, _ = self.request(service, "GET", "/")
             self.assertEqual(status, 200)
             self.assertIn('id="authOverlay"', html)
@@ -151,9 +138,7 @@ class RagAdminAuthenticationHTTPTests(unittest.TestCase):
             self.assertIn('id="readOnlyBtn"', html)
             status, script, _ = self.request(service, "GET", script_path)
             self.assertEqual(status, 200)
-            self.assertNotIn(
-                "prompt('Admin token required for library changes')", script
-            )
+            self.assertNotIn("prompt('Admin token required for library changes')", script)
             self.assertIn("/api/admin/auth/token-login", script)
             self.assertIn("bootstrapAuth()", script)
 
@@ -168,39 +153,27 @@ class RagAdminAuthenticationHTTPTests(unittest.TestCase):
         self.assertEqual(denied["code"], "unauthorized")
 
         credentials = {"username": "library-admin", "password": "Strong-Admin-123!"}
-        status, setup, _ = self.request(
-            "rag", "POST", "/api/admin/auth/setup", credentials
-        )
+        status, setup, _ = self.request("rag", "POST", "/api/admin/auth/setup", credentials)
         self.assertEqual(status, 201)
         session = setup["access_token"]
         self.assertTrue(session.startswith("cc_session_"))
 
         auth_header = {"Authorization": "Bearer " + session}
-        status, state, _ = self.request(
-            "code", "GET", "/api/admin/auth/session", headers=auth_header
-        )
+        status, state, _ = self.request("code", "GET", "/api/admin/auth/session", headers=auth_header)
         self.assertEqual(status, 200)
         self.assertEqual(state["auth_kind"], "session")
 
-        status, rebuilt, _ = self.request(
-            "code", "POST", "/api/code/rebuild", {}, auth_header
-        )
+        status, rebuilt, _ = self.request("code", "POST", "/api/code/rebuild", {}, auth_header)
         self.assertEqual(status, 200)
         self.assertEqual(rebuilt["kind"], "code")
         self.assertEqual(self.app.code_rebuild_count, 1)
 
-        status, _, _ = self.request(
-            "rag", "POST", "/api/admin/auth/logout", {}, auth_header
-        )
+        status, _, _ = self.request("rag", "POST", "/api/admin/auth/logout", {}, auth_header)
         self.assertEqual(status, 200)
-        status, _, _ = self.request(
-            "code", "GET", "/api/admin/auth/session", headers=auth_header
-        )
+        status, _, _ = self.request("code", "GET", "/api/admin/auth/session", headers=auth_header)
         self.assertEqual(status, 401)
 
-        status, login, _ = self.request(
-            "code", "POST", "/api/admin/auth/login", credentials
-        )
+        status, login, _ = self.request("code", "POST", "/api/admin/auth/login", credentials)
         self.assertEqual(status, 200)
         self.assertTrue(login["access_token"].startswith("cc_session_"))
 

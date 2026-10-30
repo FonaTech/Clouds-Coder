@@ -1,6 +1,6 @@
+import os
 import http.client
 import json
-import os
 import sqlite3
 import tempfile
 import threading
@@ -26,8 +26,7 @@ class CollaborationStoreTests(unittest.TestCase):
             self.root / "state" / "collaboration",
         )
         self.password = "Valid-project-pass-123!"
-        self.project = self.store.create_project(
-            "Project Alpha", self.password, timezone_name="Asia/Shanghai")
+        self.project = self.store.create_project("Project Alpha", self.password, timezone_name="Asia/Shanghai")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -59,7 +58,7 @@ class CollaborationStoreTests(unittest.TestCase):
         self.assertNotIn(self.password.encode("utf-8"), raw)
         with self.store._connect() as conn:
             row = conn.execute(
-                "SELECT password_algorithm,password_iterations,password_hash,password_salt FROM projects WHERE project_id=?",  # noqa: E501
+                "SELECT password_algorithm,password_iterations,password_hash,password_salt FROM projects WHERE project_id=?",
                 (self.project["project_id"],),
             ).fetchone()
         self.assertEqual(row["password_algorithm"], "pbkdf2_hmac_sha256")
@@ -119,8 +118,7 @@ class CollaborationStoreTests(unittest.TestCase):
             stage_id="collab:1",
         )
 
-        self.assertEqual([row["id"]
-                         for row in stages["stages"]], ["collab:1", "collab:2"])
+        self.assertEqual([row["id"] for row in stages["stages"]], ["collab:1", "collab:2"])
         self.assertEqual(stages["latest_id"], "collab:2")
         self.assertEqual(first["full_text"], "value = 1\n")
         self.assertEqual(first["stage"]["index"], 1)
@@ -165,8 +163,7 @@ class CollaborationStoreTests(unittest.TestCase):
 
     def test_blocked_device_cannot_reenter_and_old_session_is_revoked(self):
         pending, logged_in, principal = self.approve_and_login()
-        self.store.set_member_access(
-            self.project["project_id"], principal.member_id, "block")
+        self.store.set_member_access(self.project["project_id"], principal.member_id, "block")
         with self.assertRaises(CollaborationError) as blocked_session:
             self.store.authenticate(logged_in["access_token"])
         self.assertEqual(blocked_session.exception.code, "session_expired")
@@ -182,14 +179,10 @@ class CollaborationStoreTests(unittest.TestCase):
         with self.assertRaises(CollaborationError):
             self.store.authenticate(logged_in["access_token"])
         with self.assertRaises(CollaborationError):
-            self.store.request_admission(
-                self.project["name"], self.password, "a" * 40, "Alice")
+            self.store.request_admission(self.project["name"], self.password, "a" * 40, "Alice")
         resumed = self.store.request_admission(
-            self.project["name"],
-            new_password,
-            "a" * 40,
-            "Alice",
-            client_ip="192.168.1.20")
+            self.project["name"], new_password, "a" * 40, "Alice", client_ip="192.168.1.20"
+        )
         self.assertEqual(resumed["status"], "approved")
         self.assertEqual(resumed["member"]["member_id"], principal.member_id)
 
@@ -251,8 +244,7 @@ class CollaborationStoreTests(unittest.TestCase):
             self.store.write_file(bob, "shared.txt", b"another stale branch", 1)
         cases = self.store.list_conflicts(self.project["project_id"], status="open")
         self.assertEqual(len(cases), 1)
-        self.assertEqual([row["branch_label"]
-                         for row in cases[0]["candidates"]], ["A", "B", "C"])
+        self.assertEqual([row["branch_label"] for row in cases[0]["candidates"]], ["A", "B", "C"])
         with self.assertRaises(CollaborationError) as frozen:
             self.store.write_file(alice, "shared.txt", b"next", 2)
         self.assertEqual(frozen.exception.code, "document_frozen")
@@ -268,17 +260,13 @@ class CollaborationStoreTests(unittest.TestCase):
         cases = self.store.list_conflicts(self.project["project_id"], status="open")
         self.assertEqual(len(cases), 1)
         with self.store._connect() as conn:
-            frozen = conn.execute(
-                "SELECT frozen FROM documents WHERE project_id=? AND path='external.txt'",  # noqa: E501
-                (self.project["project_id"],
-                 )).fetchone()[0]
+            frozen = conn.execute("SELECT frozen FROM documents WHERE project_id=? AND path='external.txt'", (self.project["project_id"],)).fetchone()[0]
         self.assertEqual(frozen, 1)
 
     def test_external_watcher_ignores_transient_truncate_then_restore(self):
         _, _, alice = self.approve_and_login()
         self.store.write_file(alice, "transient.txt", b"complete", 0)
-        path = self.store.project_workspace(
-            self.project["project_id"]) / "transient.txt"
+        path = self.store.project_workspace(self.project["project_id"]) / "transient.txt"
 
         path.write_bytes(b"")
         with mock.patch.object(cc, "_now", return_value=100.0):
@@ -292,14 +280,12 @@ class CollaborationStoreTests(unittest.TestCase):
         self.assertEqual(first["count"], 0)
         self.assertEqual(second["count"], 0)
         self.assertEqual(restored["count"], 0)
-        self.assertEqual(self.store.list_conflicts(
-            self.project["project_id"], status="open"), [])
+        self.assertEqual(self.store.list_conflicts(self.project["project_id"], status="open"), [])
 
     def test_external_watcher_confirms_stable_real_write(self):
         _, _, alice = self.approve_and_login()
         self.store.write_file(alice, "stable-external.txt", b"database", 0)
-        path = self.store.project_workspace(
-            self.project["project_id"]) / "stable-external.txt"
+        path = self.store.project_workspace(self.project["project_id"]) / "stable-external.txt"
         path.write_bytes(b"outside")
 
         with mock.patch.object(cc, "_now", return_value=200.0):
@@ -309,8 +295,7 @@ class CollaborationStoreTests(unittest.TestCase):
 
         self.assertEqual(first["count"], 0)
         self.assertEqual(confirmed["count"], 1)
-        conflict = self.store.list_conflicts(
-            self.project["project_id"], status="open")[0]
+        conflict = self.store.list_conflicts(self.project["project_id"], status="open")[0]
         self.assertEqual(conflict["reason"], "external_write")
 
     def test_process_same_content_retry_is_idempotent_not_conflict(self):
@@ -322,8 +307,7 @@ class CollaborationStoreTests(unittest.TestCase):
         self.assertTrue(retried["ok"])
         self.assertTrue(retried["idempotent"])
         self.assertEqual(retried["revision"], written["revision"])
-        self.assertEqual(self.store.list_conflicts(
-            self.project["project_id"], status="open"), [])
+        self.assertEqual(self.store.list_conflicts(self.project["project_id"], status="open"), [])
 
     def test_process_delete_is_committed_without_empty_conflict_branch(self):
         _, _, alice = self.approve_and_login()
@@ -334,8 +318,7 @@ class CollaborationStoreTests(unittest.TestCase):
             alice.member_id,
             alice.device_id,
         )
-        path = self.store.project_workspace(
-            self.project["project_id"]) / "remove-me.txt"
+        path = self.store.project_workspace(self.project["project_id"]) / "remove-me.txt"
 
         with coordinator.mutation_lease():
             before = coordinator.begin_process()
@@ -345,8 +328,7 @@ class CollaborationStoreTests(unittest.TestCase):
         deleted = next(row for row in changes if row.get("path") == "remove-me.txt")
         self.assertTrue(deleted["ok"])
         self.assertEqual(deleted["action"], "delete")
-        self.assertEqual(self.store.list_conflicts(
-            self.project["project_id"], status="open"), [])
+        self.assertEqual(self.store.list_conflicts(self.project["project_id"], status="open"), [])
         with self.store._connect() as conn:
             row = conn.execute(
                 "SELECT 1 FROM documents WHERE project_id=? AND path='remove-me.txt'",
@@ -360,8 +342,7 @@ class CollaborationStoreTests(unittest.TestCase):
         self.store.write_file(alice, "abort.txt", b"current", 1)
         with self.assertRaises(CollaborationError):
             self.store.write_file(alice, "abort.txt", b"stale", 1)
-        conflict = self.store.list_conflicts(
-            self.project["project_id"], status="open")[0]
+        conflict = self.store.list_conflicts(self.project["project_id"], status="open")[0]
 
         result = self.store.emergency_abort_conflict(
             self.project["project_id"], conflict["conflict_id"], actor_id="admin-test"
@@ -369,8 +350,7 @@ class CollaborationStoreTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "aborted")
         self.assertEqual(
-            self.store.project_workspace(self.project["project_id"]).joinpath(
-                "abort.txt").read_bytes(),
+            self.store.project_workspace(self.project["project_id"]).joinpath("abort.txt").read_bytes(),
             b"current",
         )
         with self.store._connect() as conn:
@@ -379,12 +359,11 @@ class CollaborationStoreTests(unittest.TestCase):
                 (self.project["project_id"],),
             ).fetchone()
             audit = conn.execute(
-                "SELECT action,actor_id FROM audit_events WHERE target_id=? ORDER BY created_at DESC LIMIT 1",  # noqa: E501
+                "SELECT action,actor_id FROM audit_events WHERE target_id=? ORDER BY created_at DESC LIMIT 1",
                 (conflict["conflict_id"],),
             ).fetchone()
         self.assertEqual(document["frozen"], 0)
-        self.assertEqual((audit["action"], audit["actor_id"]),
-                         ("conflict.emergency_abort", "admin-test"))
+        self.assertEqual((audit["action"], audit["actor_id"]), ("conflict.emergency_abort", "admin-test"))
 
     def test_unassigned_conflict_review_roles_are_claimed_by_distinct_members(self):
         _, _, alice = self.approve_and_login()
@@ -393,13 +372,11 @@ class CollaborationStoreTests(unittest.TestCase):
         login_b = self.admit("Bob", "b" * 40, "192.168.1.21")
         bob = self.store.authenticate(login_b["access_token"])
         self.store.write_file(alice, "external-review.txt", b"database", 0)
-        path = self.store.project_workspace(
-            self.project["project_id"]) / "external-review.txt"
+        path = self.store.project_workspace(self.project["project_id"]) / "external-review.txt"
         path.write_text("outside", encoding="utf-8")
         with self.assertRaises(CollaborationError):
             self.store.read_document(self.project["project_id"], "external-review.txt")
-        conflict = self.store.list_conflicts(
-            self.project["project_id"], status="open")[0]
+        conflict = self.store.list_conflicts(self.project["project_id"], status="open")[0]
         candidate_id = conflict["candidates"][0]["candidate_id"]
 
         first = self.store.submit_conflict_review(
@@ -451,8 +428,7 @@ class CollaborationStoreTests(unittest.TestCase):
         self.store.write_file(alice, "folder/original.txt", b"shared", 0)
         renamed = self.store.rename_path(alice, "folder", "renamed")
         self.assertEqual(renamed["document_count"], 1)
-        current = self.store.read_document(
-            self.project["project_id"], "renamed/original.txt")
+        current = self.store.read_document(self.project["project_id"], "renamed/original.txt")
         self.assertEqual(current["content"], "shared")
         with self.assertRaises(CollaborationError):
             self.store.read_document(self.project["project_id"], "folder/original.txt")
@@ -465,8 +441,7 @@ class CollaborationStoreTests(unittest.TestCase):
         self.admit()
         self.assertTrue(self.store.verify_audit_chain()["ok"])
         with self.store._connect() as conn:
-            conn.execute(
-                "UPDATE audit_events SET action='tampered' WHERE audit_id=(SELECT MAX(audit_id) FROM audit_events)")  # noqa: E501
+            conn.execute("UPDATE audit_events SET action='tampered' WHERE audit_id=(SELECT MAX(audit_id) FROM audit_events)")
         self.assertFalse(self.store.verify_audit_chain()["ok"])
 
     def test_blackboard_non_owner_change_requires_owner_proposal_resolution(self):
@@ -475,19 +450,15 @@ class CollaborationStoreTests(unittest.TestCase):
         self.store.approve_device(self.project["project_id"], pending_b["device_id"])
         login_b = self.admit("Bob", "b" * 40, "192.168.1.21")
         bob = self.store.authenticate(login_b["access_token"])
-        created = self.store.upsert_blackboard_item(
-            alice, {"title": "Owner task", "status": "pending"})
+        created = self.store.upsert_blackboard_item(alice, {"title": "Owner task", "status": "pending"})
         proposed = self.store.upsert_blackboard_item(
             bob,
-            {"item_id": created["item_id"], "title": "Owner task",
-                "status": "completed", "result_summary": "done"},
+            {"item_id": created["item_id"], "title": "Owner task", "status": "completed", "result_summary": "done"},
         )
         self.assertTrue(proposed["proposal"])
-        result = self.store.resolve_blackboard_proposal(
-            alice, proposed["proposal_id"], accept=True)
+        result = self.store.resolve_blackboard_proposal(alice, proposed["proposal_id"], accept=True)
         self.assertEqual(result["status"], "accepted")
-        item = next(row for row in self.store.blackboard(
-            self.project["project_id"]) if row["item_id"] == created["item_id"])
+        item = next(row for row in self.store.blackboard(self.project["project_id"]) if row["item_id"] == created["item_id"])
         self.assertEqual(item["status"], "completed")
 
     def test_agent_tasks_merge_atomically_with_one_active_worker_coordinator(self):
@@ -524,8 +495,7 @@ class CollaborationStoreTests(unittest.TestCase):
         item = self.store.blackboard(self.project["project_id"])[0]
         self.assertEqual(item["origin"], "agent_bridge")
         self.assertEqual(len(item["participants"]), 6)
-        coordinator = next(
-            row for row in item["participants"] if row["role"] == "coordinator")
+        coordinator = next(row for row in item["participants"] if row["role"] == "coordinator")
         self.assertEqual(coordinator["agent_id"], item["coordinator_agent_id"])
         self.assertIn("Execute", coordinator["assignment"])
         self.assertIn("divide", coordinator["assignment"])
@@ -570,14 +540,12 @@ class CollaborationStoreTests(unittest.TestCase):
         self.assertEqual(cfd["item_id"], same_cfd["item_id"])
         self.assertFalse(fem["merged"])
         self.assertTrue(same_cfd["merged"])
-        titles = {row["title"]
-                  for row in self.store.blackboard(self.project["project_id"])}
+        titles = {row["title"] for row in self.store.blackboard(self.project["project_id"])}
         self.assertIn("完成一个 CFD 流体力学仿真软件。", titles)
         self.assertIn("完成一个固体力学 FEM 仿真软件。", titles)
         self.assertNotIn("IDE programming request.", titles)
 
-    def test_coordinator_delegates_plan_while_contributors_only_publish_own_evidence(
-            self):
+    def test_coordinator_delegates_plan_while_contributors_only_publish_own_evidence(self):
         _, _, alice = self.approve_and_login("Alice", "a" * 40)
         first = self.store.begin_agent_task(
             alice,
@@ -608,19 +576,18 @@ class CollaborationStoreTests(unittest.TestCase):
             agent_id="agent:first",
             session_id="first",
             section="plan_steps",
-            content="1. Inspect routing and implement the backend\n2. Verify the IDE event bridge",  # noqa: E501
+            content="1. Inspect routing and implement the backend\n2. Verify the IDE event bridge",
         )
         self.assertTrue(accepted["recorded"])
         item = self.store.blackboard(self.project["project_id"])[0]
-        assignments = {row["agent_id"]: row["assignment"]
-                       for row in item["participants"]}
-        self.assertIn("Inspect routing and implement the backend",
-                      assignments["agent:first"])
+        assignments = {row["agent_id"]: row["assignment"] for row in item["participants"]}
+        self.assertIn("Inspect routing and implement the backend", assignments["agent:first"])
         self.assertIn("Verify the IDE event bridge", assignments["agent:second"])
         self.assertIn("integrate participant results", assignments["agent:first"])
         self.assertEqual(
-            item["coordination_plan"], [
-                "Inspect routing and implement the backend", "Verify the IDE event bridge"], )  # noqa: E501
+            item["coordination_plan"],
+            ["Inspect routing and implement the backend", "Verify the IDE event bridge"],
+        )
 
         own_clue = self.store.record_agent_blackboard_update(
             alice,
@@ -631,8 +598,7 @@ class CollaborationStoreTests(unittest.TestCase):
         )
         self.assertTrue(own_clue["recorded"])
         item = self.store.blackboard(self.project["project_id"])[0]
-        clue = next(row for row in item["evidence"]
-                    if row["summary"].startswith("The event route"))
+        clue = next(row for row in item["evidence"] if row["summary"].startswith("The event route"))
         self.assertEqual(clue["agent_id"], "agent:second")
 
     def test_agent_bridge_redacts_private_prompt_credentials_and_host_paths(self):
@@ -651,7 +617,7 @@ class CollaborationStoreTests(unittest.TestCase):
             agent_id="agent:safe",
             session_id="safe",
             kind="clue",
-            summary="Bearer abcdefghijklmnop was found in /Users/Alice/private/config.json",  # noqa: E501
+            summary="Bearer abcdefghijklmnop was found in /Users/Alice/private/config.json",
         )
         private = self.store.record_agent_blackboard_update(
             alice,
@@ -667,10 +633,9 @@ class CollaborationStoreTests(unittest.TestCase):
             agent_id="agent:safe",
             session_id="safe",
             status="completed",
-            result_summary="Completed without publishing password=hunter2 or sk-secretcredential123456789.",  # noqa: E501
+            result_summary="Completed without publishing password=hunter2 or sk-secretcredential123456789.",
         )
-        public_payload = json.dumps(self.store.blackboard(
-            self.project["project_id"]), ensure_ascii=False)
+        public_payload = json.dumps(self.store.blackboard(self.project["project_id"]), ensure_ascii=False)
         self.assertNotIn("super-secret-value", public_payload)
         self.assertNotIn("hunter2", public_payload)
         self.assertNotIn("abcdefghijklmnop", public_payload)
@@ -710,8 +675,7 @@ class CollaborationStoreTests(unittest.TestCase):
             result_summary="Review found an unresolved constraint.",
         )
         self.assertEqual(second_blocked["status"], "blocked")
-        item = next(row for row in self.store.blackboard(
-            self.project["project_id"]) if row["item_id"] == first["item_id"])
+        item = next(row for row in self.store.blackboard(self.project["project_id"]) if row["item_id"] == first["item_id"])
         self.assertEqual(item["status"], "blocked")
         self.assertIn("Backend change completed", item["result_summary"])
         self.assertIn("unresolved constraint", item["result_summary"])
@@ -786,7 +750,7 @@ class CollaborationStoreTests(unittest.TestCase):
                 "SELECT status FROM file_intents WHERE agent_id='agent:abandoned'"
             ).fetchone()[0]
             assignment_status = conn.execute(
-                "SELECT status FROM blackboard_agent_assignments WHERE item_id=? AND agent_id='agent:abandoned'",  # noqa: E501
+                "SELECT status FROM blackboard_agent_assignments WHERE item_id=? AND agent_id='agent:abandoned'",
                 (started["item_id"],),
             ).fetchone()[0]
         self.assertEqual(agent_status, "idle")
@@ -813,17 +777,11 @@ class CollaborationStoreTests(unittest.TestCase):
         self.assertTrue(result["purged"])
         with self.store._connect() as conn:
             self.assertEqual(
-                conn.execute(
-                    "SELECT COUNT(*) FROM blackboard_agent_assignments WHERE item_id=?",
-                    (started["item_id"],
-                     )).fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM blackboard_agent_assignments WHERE item_id=?", (started["item_id"],)).fetchone()[0],
                 0,
             )
             self.assertEqual(
-                conn.execute(
-                    "SELECT COUNT(*) FROM blackboard_agent_evidence WHERE item_id=?",
-                    (started["item_id"],
-                     )).fetchone()[0],
+                conn.execute("SELECT COUNT(*) FROM blackboard_agent_evidence WHERE item_id=?", (started["item_id"],)).fetchone()[0],
                 0,
             )
 
@@ -837,8 +795,7 @@ class CollaborationStoreTests(unittest.TestCase):
         )
         self.assertGreater(lease["expires_at"], __import__("time").time())
         self.assertLessEqual(lease["expires_at"] - __import__("time").time(), 24 * 3600)
-        self.assertTrue(self.store.validate_lease(
-            self.project["project_id"], "lease.txt", ["agent-b", "agent-a"]))
+        self.assertTrue(self.store.validate_lease(self.project["project_id"], "lease.txt", ["agent-b", "agent-a"]))
 
 
 class OperationalTransformTests(unittest.TestCase):
@@ -865,8 +822,7 @@ class TrustedClientIPTests(unittest.TestCase):
         handler = self.Handler("127.0.0.1", "192.168.1.50, 127.0.0.1")
         with mock.patch.dict(
             os.environ,
-            {"CLOUDS_CODER_TRUST_PROXY": "true",
-                "CLOUDS_CODER_TRUSTED_PROXIES": "127.0.0.1/32"},
+            {"CLOUDS_CODER_TRUST_PROXY": "true", "CLOUDS_CODER_TRUSTED_PROXIES": "127.0.0.1/32"},
         ):
             self.assertEqual(cc.trusted_client_ip(handler), "192.168.1.50")
 
@@ -893,13 +849,11 @@ class CollaborationAccessLogTests(unittest.TestCase):
             os.environ.pop("CLOUDS_CODER_COLLAB_ACCESS_LOG", None)
             with mock.patch("builtins.print") as output:
                 for path in paths:
-                    self.make_handler(path).log_message(
-                        '"%s" %s %s', "GET / HTTP/1.1", "200", "-")
+                    self.make_handler(path).log_message('"%s" %s %s', "GET / HTTP/1.1", "200", "-")
         output.assert_not_called()
 
     def test_stale_terminal_not_found_poll_is_silent(self):
-        handler = self.make_handler(
-            "/api/ide/v2/terminals/term_stale/output?offset=170")
+        handler = self.make_handler("/api/ide/v2/terminals/term_stale/output?offset=170")
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CLOUDS_CODER_COLLAB_ACCESS_LOG", None)
             with mock.patch("builtins.print") as output:
@@ -916,9 +870,11 @@ class CollaborationAccessLogTests(unittest.TestCase):
             os.environ.pop("CLOUDS_CODER_COLLAB_ACCESS_LOG", None)
             with mock.patch("builtins.print") as output:
                 self.make_handler("/api/ide/v2/terminals/term_123/output").log_message(
-                    '"%s" %s %s', "GET /api/ide/v2/terminals/term_123/output HTTP/1.1", "401", "-")  # noqa: E501
-                self.make_handler("/api/collab/v1/conflicts/case_123/resolve").log_message(  # noqa: E501
-                    '"%s" %s %s', "POST /api/collab/v1/conflicts/case_123/resolve HTTP/1.1", "200", "-")  # noqa: E501
+                    '"%s" %s %s', "GET /api/ide/v2/terminals/term_123/output HTTP/1.1", "401", "-"
+                )
+                self.make_handler("/api/collab/v1/conflicts/case_123/resolve").log_message(
+                    '"%s" %s %s', "POST /api/collab/v1/conflicts/case_123/resolve HTTP/1.1", "200", "-"
+                )
         output.assert_called_once()
 
     def test_diagnostic_switch_restores_polling_logs(self):
@@ -926,12 +882,9 @@ class CollaborationAccessLogTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CLOUDS_CODER_COLLAB_ACCESS_LOG": "1"}):
             with mock.patch("builtins.print") as output:
                 handler.log_message(
-                    '"%s" %s %s',
-                    "GET /api/ide/v2/sessions/sess_123/agent-state HTTP/1.1",
-                    "200",
-                    "-")
+                    '"%s" %s %s', "GET /api/ide/v2/sessions/sess_123/agent-state HTTP/1.1", "200", "-"
+                )
         output.assert_called_once()
-
 
 class CollaborationConfigTests(unittest.TestCase):
     def test_collaboration_is_lan_ready_by_default(self):
@@ -974,8 +927,7 @@ class CollaborationConfigTests(unittest.TestCase):
             return {"ok": True, "draft": values}
 
         app.save_admin_config = save
-        result = cc.AppContext.save_lan_collaboration_config(
-            app, True, expected_revision="rev-1")
+        result = cc.AppContext.save_lan_collaboration_config(app, True, expected_revision="rev-1")
         self.assertTrue(result["ok"])
         self.assertTrue(captured["collaboration_enabled"])
         self.assertEqual(captured["collab_host"], "0.0.0.0")
@@ -985,8 +937,7 @@ class CollaborationConfigTests(unittest.TestCase):
         self.assertEqual(captured["expected_revision"], "rev-1")
 
         captured.clear()
-        cc.AppContext.save_lan_collaboration_config(
-            app, False, expected_revision="rev-2")
+        cc.AppContext.save_lan_collaboration_config(app, False, expected_revision="rev-2")
         self.assertFalse(captured["collaboration_enabled"])
         self.assertEqual(captured["model"], "keep-this-model")
 
@@ -1011,8 +962,7 @@ class CollaborationConfigTests(unittest.TestCase):
             stale.update({"port": 8128, "config": "", "model": "stale-draft-model"})
             cc._write_json_file(
                 app.admin_config_path,
-                {"version": 1, "draft": stale,
-                    "defaults": app.admin_initial_config, "updated_at": 1},
+                {"version": 1, "draft": stale, "defaults": app.admin_initial_config, "updated_at": 1},
             )
 
             before = cc.AppContext.admin_config_payload(app)
@@ -1036,9 +986,7 @@ class CollaborationConfigTests(unittest.TestCase):
         self.assertIn('id="collabConflictList"', cc.ADMIN_INDEX_HTML)
         self.assertIn("'/api/admin/config/sync-active'", cc.ADMIN_JS)
         self.assertIn("api(root+'/conflicts')", cc.ADMIN_JS)
-        self.assertIn(
-            "+'/conflicts/'+encodeURIComponent(conflict.conflict_id)+'/abort'",
-            cc.ADMIN_JS)
+        self.assertIn("+'/conflicts/'+encodeURIComponent(conflict.conflict_id)+'/abort'", cc.ADMIN_JS)
         source = Path(cc.__file__).read_text(encoding="utf-8")
         self.assertIn('if path == "/api/admin/config/sync-active":', source)
         self.assertIn('m_collab_conflicts = re.match(', source)
@@ -1047,8 +995,7 @@ class CollaborationConfigTests(unittest.TestCase):
     def test_session_state_keeps_private_state_with_controlled_shared_files_root(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            shared = (root / "Codes" / "collaboration" /
-                      str(__import__("uuid").uuid4()) / "workspace").resolve()
+            shared = (root / "Codes" / "collaboration" / str(__import__("uuid").uuid4()) / "workspace").resolve()
             shared.mkdir(parents=True)
             private = root / "private-sessions"
             manager = cc.SessionManager(
@@ -1090,10 +1037,7 @@ class CollaborationConfigTests(unittest.TestCase):
             class Bridge:
                 def begin_task(self, session_id, task_text):
                     calls.append((session_id, task_text))
-                    return {
-                        "role": "coordinator",
-                        "participant_count": 1,
-                        "merged": False}
+                    return {"role": "coordinator", "participant_count": 1, "merged": False}
 
             session.collaboration_write_coordinator = Bridge()
             session._agent_worker = lambda: None
@@ -1113,17 +1057,18 @@ class CollaborationConfigTests(unittest.TestCase):
             pending_user_question = None
             run_started_at = 100.0
             messages = [{"role": "user", "content": "api_key=private-user-secret"}]
-            operations = [{"ts": 101.0,
-                           "type": "file_patch",
-                           "data": {"path": "src/app.py",
-                                    "diff": "password=hunter2"},
-                           },
-                          {"ts": 102.0,
-                           "type": "command",
-                           "data": {"command": "pytest -q --token private-command-secret",  # noqa: E501
-                                    "exit_code": 0},
-                           },
-                          ]
+            operations = [
+                {
+                    "ts": 101.0,
+                    "type": "file_patch",
+                    "data": {"path": "src/app.py", "diff": "password=hunter2"},
+                },
+                {
+                    "ts": 102.0,
+                    "type": "command",
+                    "data": {"command": "pytest -q --token private-command-secret", "exit_code": 0},
+                },
+            ]
 
         status, summary = cc.AppContext._collaboration_run_outcome(Session())
         self.assertEqual(status, "completed")
@@ -1168,10 +1113,8 @@ class CollaborationConfigTests(unittest.TestCase):
         source = cc.AppContext._collaboration_runtime_source(app, "192.168.1.20")
         self.assertEqual(captured["user_id"], cc.user_id_from_ip("192.168.1.20"))
         self.assertEqual(source["source_kind"], "current_ip_user")
-        self.assertEqual(source["config"]["profiles"][0]
-                         ["base_url"], "http://192.168.1.10:9000/v1")
-        self.assertEqual(source["config"]["profiles"][0]
-                         ["api_key"], "server-side-secret")
+        self.assertEqual(source["config"]["profiles"][0]["base_url"], "http://192.168.1.10:9000/v1")
+        self.assertEqual(source["config"]["profiles"][0]["api_key"], "server-side-secret")
 
         app.force_global_llm_config_for_users = True
         source = cc.AppContext._collaboration_runtime_source(app, "192.168.1.20")
@@ -1227,8 +1170,7 @@ class CollaborationConfigTests(unittest.TestCase):
                 root,
             )
             self.assertTrue(reloaded.collaboration_llm_independent)
-            self.assertEqual(reloaded.collaboration_llm_source_kind,
-                             "collaboration_private")
+            self.assertEqual(reloaded.collaboration_llm_source_kind, "collaboration_private")
             self.assertEqual(reloaded._active_profile()["model"], "private-model")
 
             shared_config = {
@@ -1272,7 +1214,7 @@ class CollaborationConfigTests(unittest.TestCase):
         app._lock = threading.RLock()
         app._session_mgrs = {"collab:project:member": manager}
         app._collaboration_runtime_source = mock.Mock(return_value={"revision": "new"})
-        with mock.patch.object(cc.AppContext, "_sync_collaboration_runtime_source") as sync:  # noqa: E501
+        with mock.patch.object(cc.AppContext, "_sync_collaboration_runtime_source") as sync:
             resolved = cc.AppContext.manager_for_collaboration(
                 app, principal, client_ip="192.168.1.20"
             )
@@ -1304,8 +1246,7 @@ class CollaborationConfigTests(unittest.TestCase):
         self.assertEqual(result["live_users_updated"], 0)
         manager.reset_to_llm_config.assert_not_called()
 
-    def test_startup_config_reapplies_when_existing_user_revision_matches_but_model_drifted(  # noqa: E501
-            self):
+    def test_startup_config_reapplies_when_existing_user_revision_matches_but_model_drifted(self):
         app = cc.AppContext.__new__(cc.AppContext)
         config = {
             "provider": "glm",
@@ -1462,8 +1403,7 @@ class CollaborationHTTPTests(unittest.TestCase):
             root / "Codes",
             root / "state" / "collaboration",
         )
-        self.project = self.store.create_project(
-            "HTTP Project", "Http-project-pass-123!")
+        self.project = self.store.create_project("HTTP Project", "Http-project-pass-123!")
 
         class App:
             collaboration = self.store
@@ -1495,37 +1435,15 @@ class CollaborationHTTPTests(unittest.TestCase):
             @staticmethod
             def collaboration_resource_manifest(_user_id):
                 return {
-                    "llm": {
-                        "source": "current_ip_user",
-                        "profile_count": 2,
-                        "server_side_credentials": True},
-                    "skills": {
-                        "enabled": True,
-                        "count": 1,
-                        "read_only": True},
-                    "shared_apps": {
-                        "enabled": True,
-                        "count": 1,
-                        "read_only": True},
+                    "llm": {"source": "current_ip_user", "profile_count": 2, "server_side_credentials": True},
+                    "skills": {"enabled": True, "count": 1, "read_only": True},
+                    "shared_apps": {"enabled": True, "count": 1, "read_only": True},
                     "libraries": {
-                        "knowledge": {
-                            "enabled": True,
-                            "agent_access": True,
-                            "stats": {
-                                "document_count": 3}},
-                        "code": {
-                            "enabled": True,
-                            "agent_access": True,
-                            "stats": {
-                                "file_count": 4}},
+                        "knowledge": {"enabled": True, "agent_access": True, "stats": {"document_count": 3}},
+                        "code": {"enabled": True, "agent_access": True, "stats": {"file_count": 4}},
                     },
-                    "api_paths": {
-                        "skills": "/api/skills",
-                        "shared_apps": "/api/apps/shared"},
-                    "services": {
-                        "main": {
-                            "enabled": True,
-                            "port": 8128}},
+                    "api_paths": {"skills": "/api/skills", "shared_apps": "/api/apps/shared"},
+                    "services": {"main": {"enabled": True, "port": 8128}},
                 }
 
             @staticmethod
@@ -1573,8 +1491,7 @@ class CollaborationHTTPTests(unittest.TestCase):
             def rag_js_lib_asset_path(_path):
                 return None
 
-        self.server = cc.AgentHTTPServer(
-            ("127.0.0.1", 0), cc.CollaborationHandler, App())
+        self.server = cc.AgentHTTPServer(("127.0.0.1", 0), cc.CollaborationHandler, App())
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.port = self.server.server_address[1]
@@ -1692,12 +1609,10 @@ class CollaborationHTTPTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(presence["ok"])
-        status, me, _ = self.request(
-            "GET", "/api/collab/v1/status", headers={"Cookie": cookie})
+        status, me, _ = self.request("GET", "/api/collab/v1/status", headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertTrue(me["authenticated"])
-        self.assertEqual(me["snapshot"]["project"]["project_id"],
-                         self.project["project_id"])
+        self.assertEqual(me["snapshot"]["project"]["project_id"], self.project["project_id"])
 
     def test_collaboration_port_serves_the_ide_shell_and_collaboration_identity(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -1728,19 +1643,16 @@ class CollaborationHTTPTests(unittest.TestCase):
         })
         self.assertEqual(status, 200)
         cookie = headers["Set-Cookie"].split(";", 1)[0]
-        status, me, _ = self.request(
-            "GET", "/api/ide/v2/auth/me", headers={"Cookie": cookie})
+        status, me, _ = self.request("GET", "/api/ide/v2/auth/me", headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertTrue(me["account"]["collaboration_mode"])
         self.assertEqual(me["account"]["project_id"], self.project["project_id"])
-        status, config, _ = self.request(
-            "GET", "/api/ide/config", headers={"Cookie": cookie})
+        status, config, _ = self.request("GET", "/api/ide/config", headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertTrue(config["collaboration_mode"])
         self.assertEqual(config["mounts"], [])
 
-        status, resources, _ = self.request(
-            "GET", "/api/collab/v1/resources", headers={"Cookie": cookie})
+        status, resources, _ = self.request("GET", "/api/collab/v1/resources", headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertEqual(resources["llm"]["source"], "current_ip_user")
         self.assertTrue(resources["llm"]["server_side_credentials"])
@@ -1749,8 +1661,7 @@ class CollaborationHTTPTests(unittest.TestCase):
         self.assertEqual(resources["services"]["main"]["url"], "http://127.0.0.1:8128")
         self.assertNotIn("api_key", json.dumps(resources))
 
-        status, skills, _ = self.request(
-            "GET", "/api/skills", headers={"Cookie": cookie})
+        status, skills, _ = self.request("GET", "/api/skills", headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertEqual(skills[0]["id"], "skill-one")
 
@@ -1764,7 +1675,7 @@ class CollaborationHTTPTests(unittest.TestCase):
         self.assertEqual(denied["code"], "admin_required")
 
         status, _, _ = self.request(
-            "GET", "/api/ide/v2/auth/me", headers={"Cookie": "clouds_ide_session=forged"}  # noqa: E501
+            "GET", "/api/ide/v2/auth/me", headers={"Cookie": "clouds_ide_session=forged"}
         )
         self.assertEqual(status, 401)
 

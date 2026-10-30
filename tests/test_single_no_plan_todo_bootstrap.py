@@ -1,6 +1,6 @@
 import json
-import threading
 import types
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory

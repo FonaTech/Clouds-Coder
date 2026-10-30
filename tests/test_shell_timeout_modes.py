@@ -41,15 +41,13 @@ class ShellTimeoutModeTests(unittest.TestCase):
         self.assertEqual(cc.extract_shell_timeout_mode_setting(raw), "auto")
         self.assertEqual(cc.extract_shell_async_handoff_setting(raw), 42)
         schema = {row["key"]: row for row in cc._admin_config_schema()}
-        self.assertEqual(
-            schema["shell_timeout_mode"]["choices"], ["fixed", "auto", "async"]
-        )
+        self.assertEqual(schema["shell_timeout_mode"]["choices"], ["fixed", "auto", "async"])
         self.assertEqual(schema["shell_async_handoff_seconds"]["factory_default"], 600)
 
     def test_fixed_uses_total_elapsed_time(self):
         self.session.shell_timeout_mode = "fixed"
         meta = self.session._run_shell_meta(
-            "python3 -u -c 'import time; [print(i, flush=True) or time.sleep(.4) for i in range(5)]'",  # noqa: E501
+            "python3 -u -c 'import time; [print(i, flush=True) or time.sleep(.4) for i in range(5)]'",
             self.session.files_root,
             1,
         )
@@ -60,7 +58,7 @@ class ShellTimeoutModeTests(unittest.TestCase):
     def test_auto_resets_timeout_on_output_and_stops_after_silence(self):
         self.session.shell_timeout_mode = "auto"
         active = self.session._run_shell_meta(
-            "python3 -u -c 'import time; [print(i, flush=True) or time.sleep(.4) for i in range(5)]'",  # noqa: E501
+            "python3 -u -c 'import time; [print(i, flush=True) or time.sleep(.4) for i in range(5)]'",
             self.session.files_root,
             1,
         )
@@ -80,10 +78,10 @@ class ShellTimeoutModeTests(unittest.TestCase):
         self.session._shell_async_handoff_seconds = lambda: 1
         marker = self.session.files_root / "launch-count.txt"
         command = (
-            'python3 -u -c "import os,time,pathlib; '
+            "python3 -u -c \"import os,time,pathlib; "
             "p=pathlib.Path('launch-count.txt'); "
             "p.write_text((p.read_text() if p.exists() else '')+'x'); "
-            '[(print(i, flush=True), time.sleep(.4)) for i in range(7)]"'
+            "[(print(i, flush=True), time.sleep(.4)) for i in range(7)]\""
         )
         started = time.time()
         meta = self.session._run_shell_meta(command, self.session.files_root, 2)
@@ -91,17 +89,13 @@ class ShellTimeoutModeTests(unittest.TestCase):
         self.assertLess(time.time() - started, 2.0)
         task_id = str(meta.get("background_task_id", ""))
         self.assertTrue(task_id.startswith("bg_"))
-        first = next(
-            row for row in self.session.bg.list_objects() if row["id"] == task_id
-        )
+        first = next(row for row in self.session.bg.list_objects() if row["id"] == task_id)
         self.assertEqual(first["status"], "running")
         self.assertGreater(first["pid"], 0)
         deadline = time.time() + 5
         final = first
         while time.time() < deadline:
-            final = next(
-                row for row in self.session.bg.list_objects() if row["id"] == task_id
-            )
+            final = next(row for row in self.session.bg.list_objects() if row["id"] == task_id)
             if final["status"] != "running":
                 break
             time.sleep(0.1)

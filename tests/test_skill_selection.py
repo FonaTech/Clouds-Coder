@@ -97,7 +97,7 @@ class SkillSelectionTests(unittest.TestCase):
         self.assertEqual(once, repeated)
 
     def test_cfd_metadata_recalls_shader_dev_without_loading_body(self):
-        store = cc.SkillStore(Path(__file__).resolve().parents[1] / "skills")
+        store = cc.SkillStore(Path(__file__).resolve().parent / "fixtures" / "skills")
 
         recalled = store.recall_metadata(
             "IDE programming request.\n"
@@ -107,8 +107,6 @@ class SkillSelectionTests(unittest.TestCase):
             limit=12,
         )
 
-        if not recalled:
-            self.skipTest("CFD skill metadata is unavailable in this release")
         self.assertEqual(recalled[0]["id"], "local:shader-dev")
         self.assertGreaterEqual(recalled[0]["score"], 6.0)
         self.assertIn("techniques/fluid-simulation.md", recalled[0]["entrypoints"])

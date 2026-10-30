@@ -35,21 +35,13 @@ class PublicWebDiscoveryTests(unittest.TestCase):
         <link>https://docs.python.org/3/whatsnew/3.14.html</link>
         <description>Official release notes</description></item></channel></rss>"""
         with (
-            mock.patch.object(
-                self.engine,
-                "_validate_url",
-                side_effect=lambda value: (True, value, "ok"),
-            ),
+            mock.patch.object(self.engine, "_validate_url", side_effect=lambda value: (True, value, "ok")),
             mock.patch.object(cc, "urlopen", return_value=_Response(feed)),
         ):
-            payload = self.engine._public_search_feed_candidates(
-                "Python 3.14 release", 5
-            )
+            payload = self.engine._public_search_feed_candidates("Python 3.14 release", 5)
         self.assertEqual(payload["provider"], "bing-rss")
         self.assertEqual(payload["error"], "")
-        self.assertEqual(
-            payload["results"][0]["url"], "https://docs.python.org/3/whatsnew/3.14.html"
-        )
+        self.assertEqual(payload["results"][0]["url"], "https://docs.python.org/3/whatsnew/3.14.html")
 
     def test_cold_start_uses_public_results_without_sitemap_probes(self):
         page = {

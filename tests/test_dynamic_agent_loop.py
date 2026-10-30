@@ -24,15 +24,12 @@ class DynamicAgentLoopTests(unittest.TestCase):
         session.read_file_loop_count = 0
         session.read_file_loop_last_intervention_ts = 0.0
         session.tool_memory_loop_state = {}
+        session._loop_stop_requested = {}
         session.web_search_context_registry = {}
         session.messages = []
         session.events = []
         bind(session, "_ensure_blackboard", lambda self: self.blackboard)
-        bind(
-            session,
-            "_emit",
-            lambda self, *args, **kwargs: self.events.append((args, kwargs)),
-        )
+        bind(session, "_emit", lambda self, *args, **kwargs: self.events.append((args, kwargs)))
         bind(session, "_ledger_record_stall", lambda self, *args, **kwargs: None)
         return session
 
@@ -48,12 +45,10 @@ class DynamicAgentLoopTests(unittest.TestCase):
 
     def test_reused_evidence_is_reported_without_selecting_next_action(self):
         session = self.bare_session()
-        session.todo.update(
-            [
-                {"content": "汇总研究证据并编写文章分类报告", "status": "in_progress"},
-                {"content": "验证报告", "status": "pending"},
-            ]
-        )
+        session.todo.update([
+            {"content": "汇总研究证据并编写文章分类报告", "status": "in_progress"},
+            {"content": "验证报告", "status": "pending"},
+        ])
         result = self.read_result()
 
         first = session._update_agent_loop_progress_state([result])
@@ -74,53 +69,39 @@ class DynamicAgentLoopTests(unittest.TestCase):
 
     def test_broad_fresh_reads_eventually_raise_observation_signal(self):
         session = self.bare_session()
-        session.todo.update(
-            [
-                {"content": "收集并总结论文标题", "status": "in_progress"},
-            ]
-        )
+        session.todo.update([
+            {"content": "收集并总结论文标题", "status": "in_progress"},
+        ])
 
         states = []
         for index in range(4):
-            states.append(
-                session._update_agent_loop_progress_state(
-                    [
-                        self.read_result(
-                            command=f"head -20 paper_{index}.txt",
-                            output=f"metadata {index}",
-                        )
-                    ]
+            states.append(session._update_agent_loop_progress_state([
+                self.read_result(
+                    command=f"head -20 paper_{index}.txt",
+                    output=f"metadata {index}",
                 )
-            )
+            ]))
 
         self.assertTrue(states[-1]["guidance_active"])
-        self.assertEqual(
-            states[-1]["guidance_reason"], "evidence_without_todo_progress"
-        )
+        self.assertEqual(states[-1]["guidance_reason"], "evidence_without_todo_progress")
         self.assertNotIn("next_action", states[-1])
 
     def test_real_mutation_resets_stagnation_without_rewriting_todos(self):
         session = self.bare_session()
-        session.todo.update(
-            [
-                {"content": "实现文章预览页面", "status": "in_progress"},
-            ]
-        )
+        session.todo.update([
+            {"content": "实现文章预览页面", "status": "in_progress"},
+        ])
         repeated = self.read_result("head -20 app.js", "const app = true")
         for _ in range(3):
             session._update_agent_loop_progress_state([repeated])
         before = session.todo.snapshot()
 
-        state = session._update_agent_loop_progress_state(
-            [
-                {
-                    "name": "write_file",
-                    "args": {"path": "index.html", "content": "<main></main>"},
-                    "output": "Wrote 13 bytes to index.html",
-                    "ok": True,
-                }
-            ]
-        )
+        state = session._update_agent_loop_progress_state([{
+            "name": "write_file",
+            "args": {"path": "index.html", "content": "<main></main>"},
+            "output": "Wrote 13 bytes to index.html",
+            "ok": True,
+        }])
 
         self.assertEqual(state["round_kind"], "mutation")
         self.assertFalse(state["guidance_active"])
@@ -129,23 +110,17 @@ class DynamicAgentLoopTests(unittest.TestCase):
 
     def test_completed_todos_plus_validation_are_reported_without_forcing_finish(self):
         session = self.bare_session()
-        session.todo.update(
-            [
-                {"content": "生成报告", "status": "completed"},
-                {"content": "验收报告", "status": "completed"},
-            ]
-        )
-        state = session._update_agent_loop_progress_state(
-            [
-                {
-                    "name": "bash",
-                    "args": {"command": "python3 -m pytest -q"},
-                    "output": "2 passed",
-                    "ok": True,
-                    "exit_code": 0,
-                }
-            ]
-        )
+        session.todo.update([
+            {"content": "生成报告", "status": "completed"},
+            {"content": "验收报告", "status": "completed"},
+        ])
+        state = session._update_agent_loop_progress_state([{
+            "name": "bash",
+            "args": {"command": "python3 -m pytest -q"},
+            "output": "2 passed",
+            "ok": True,
+            "exit_code": 0,
+        }])
 
         self.assertTrue(state["guidance_active"])
         self.assertTrue(state["seen_validation"])
@@ -155,15 +130,11 @@ class DynamicAgentLoopTests(unittest.TestCase):
         self.assertIn("seen_validation=true", prompt)
         self.assertNotIn("finish the overall task", prompt)
 
-    def test_strategy_intervention_uses_internal_state_not_synthetic_user_messages(
-        self,
-    ):
+    def test_strategy_intervention_uses_internal_state_not_synthetic_user_messages(self):
         session = self.bare_session()
-        session.todo.update(
-            [
-                {"content": "分析资料并写出结论", "status": "in_progress"},
-            ]
-        )
+        session.todo.update([
+            {"content": "分析资料并写出结论", "status": "in_progress"},
+        ])
         result = {
             "name": "query_knowledge_library",
             "args": {"query": "article classification"},
@@ -179,29 +150,66 @@ class DynamicAgentLoopTests(unittest.TestCase):
         self.assertTrue(state["guidance_active"])
         self.assertEqual(state["guidance_reason"], "repeated_tool_evidence")
 
-    def test_multi_agent_prompt_reads_the_same_worker_scoped_progress_state_it_records(
-        self,
-    ):
+
+    def test_repeated_traceable_evidence_gets_two_prompts_then_pauses(self):
+        session = self.bare_session()
+        session.execution_mode = "single"
+        session.runtime_execution_mode = "single"
+        session.todo.update([{"content": "检查并总结 SVG 页面", "status": "in_progress"}])
+        bind(session, "_maybe_inject_read_file_strategy_intervention", lambda self, *_a, **_kw: False)
+        bind(session, "_record_flow_node", lambda self, *_a, **_kw: "flow-test")
+
+        result = self.read_result("grep -o 'gradient' P003.html", "linearGradient")
+        result.update(
+            evidence_id="a" * 24,
+            evidence_digest="b" * 64,
+            source_versions={"P003.html": "c" * 64},
+        )
+        recovery_prompts = 0
+        for _ in range(12):
+            session._maybe_inject_tool_strategy_intervention([result], role="developer")
+            state = session.agent_loop_progress_state["developer"]
+            if state.get("recovery") and not state["recovery"].get("delivered"):
+                recovery_prompts += 1
+                session._agent_loop_progress_prompt_block(for_role="developer")
+            if session._loop_stop_requested:
+                break
+
+        self.assertEqual(recovery_prompts, 2)
+        self.assertIn("developer", session._loop_stop_requested)
+        self.assertEqual(session._loop_stop_requested["developer"]["evidence_refs"][0]["id"], "a" * 24)
+        self.assertEqual(state["round_kind"], "evidence_reused")
+
+    def test_new_evidence_resets_recovery_instead_of_stopping(self):
+        session = self.bare_session()
+        repeated = self.read_result("cat P003.html", "same")
+        repeated.update(evidence_id="a" * 24, evidence_digest="b" * 64, source_versions={"P003.html": "c" * 64})
+        session._update_agent_loop_progress_state([repeated], role="developer")
+        session._update_agent_loop_progress_state([repeated], role="developer")
+        state = session._update_agent_loop_progress_state([repeated], role="developer")
+        state["recovery"] = {"attempts": 1, "at_repeat": 2, "delivered": True}
+        session.agent_loop_progress_state["developer"] = state
+
+        novel = dict(repeated, output="new focused line", evidence_digest="d" * 64)
+        updated = session._update_agent_loop_progress_state([novel], role="developer")
+
+        self.assertEqual(updated["round_kind"], "evidence_new")
+        self.assertEqual(updated["recovery"], {})
+        self.assertFalse(getattr(session, "_loop_stop_requested", {}))
+
+    def test_multi_agent_prompt_reads_the_same_worker_scoped_progress_state_it_records(self):
         session = self.bare_session()
         session.runtime_assigned_expert = "developer"
-        session.todo.update(
-            [
-                {
-                    "content": "实现当前计划步骤",
-                    "status": "in_progress",
-                    "owner": "developer",
-                },
-            ]
-        )
+        session.todo.update([
+            {"content": "实现当前计划步骤", "status": "in_progress", "owner": "developer"},
+        ])
         result = self.read_result("head -20 current_step.js", "const ready = true")
 
         for _ in range(3):
             session._update_agent_loop_progress_state([result], role="developer")
 
         self.assertIn("developer", session.agent_loop_progress_state)
-        prompt = session._agent_loop_progress_prompt_block(
-            for_role=session.runtime_assigned_expert
-        )
+        prompt = session._agent_loop_progress_prompt_block(for_role=session.runtime_assigned_expert)
         self.assertIn("progress_signal=evidence_reused", prompt)
         self.assertIn("实现当前计划步骤", prompt)
         self.assertIn("Choose autonomously", prompt)
@@ -213,15 +221,9 @@ class DynamicAgentLoopTests(unittest.TestCase):
         session.execution_mode = "single"
         session.runtime_execution_mode = "single"
         session.runtime_assigned_expert = "developer"
-        session.todo.update(
-            [
-                {
-                    "content": "实现当前计划步骤",
-                    "status": "in_progress",
-                    "owner": "developer",
-                },
-            ]
-        )
+        session.todo.update([
+            {"content": "实现当前计划步骤", "status": "in_progress", "owner": "developer"},
+        ])
         result = self.read_result("head -20 current_step.js", "const ready = true")
 
         for _ in range(3):
@@ -243,28 +245,20 @@ class DynamicAgentLoopTests(unittest.TestCase):
 
     def test_multi_agent_does_not_receive_single_todo_alignment_block(self):
         session = self.bare_session()
-        session.todo.update(
-            [
-                {
-                    "content": "实现当前计划步骤",
-                    "status": "in_progress",
-                    "owner": "developer",
-                },
-            ]
-        )
+        session.todo.update([
+            {"content": "实现当前计划步骤", "status": "in_progress", "owner": "developer"},
+        ])
         self.assertEqual(
             session._single_agent_todo_alignment_prompt_block(for_role="developer"),
             "",
         )
 
-    def test_single_system_prompt_injects_alignment_without_restoring_phase_classifier(
-        self,
-    ):
+    def test_single_system_prompt_injects_alignment_without_restoring_phase_classifier(self):
         source = inspect.getsource(cc.SessionState._system_prompt)
         self.assertIn("_single_agent_todo_alignment_prompt_block", source)
         discipline = inspect.getsource(cc.SessionState._plan_todo_discipline_prompt)
         self.assertIn(
-            "Observable tool results provide completion evidence but do not close ordinary work rows by themselves",  # noqa: E501
+            "Observable tool results provide completion evidence but do not close ordinary work rows by themselves",
             discipline,
         )
         self.assertIn("update them together in one call", discipline)
@@ -281,21 +275,11 @@ class DynamicAgentLoopTests(unittest.TestCase):
         session.skills = types.SimpleNamespace(descriptions=lambda: "")
         session.files_root = "/workspace"
         session.context_token_upper_bound = 200_000
-        session.todo.update(
-            [
-                {
-                    "content": "检查 Python 运行环境",
-                    "status": "completed",
-                    "owner": "developer",
-                },
-                {
-                    "content": "验证物理模型数值",
-                    "status": "in_progress",
-                    "owner": "developer",
-                },
-                {"content": "编写正式脚本", "status": "pending", "owner": "developer"},
-            ]
-        )
+        session.todo.update([
+            {"content": "检查 Python 运行环境", "status": "completed", "owner": "developer"},
+            {"content": "验证物理模型数值", "status": "in_progress", "owner": "developer"},
+            {"content": "编写正式脚本", "status": "pending", "owner": "developer"},
+        ])
         bind(session, "_effective_execution_mode", lambda self: "single")
         bind(session, "_ensure_skills_ready", lambda self, force=False: None)
         bind(session, "_ensure_blackboard", lambda self: self.blackboard)
@@ -320,16 +304,8 @@ class DynamicAgentLoopTests(unittest.TestCase):
             "_public_progress_prompt_instruction",
         ):
             bind(session, method_name, lambda self, *args, **kwargs: "")
-        bind(
-            session,
-            "_blackboard_memory_context_markdown",
-            lambda self, max_chars=3200: "",
-        )
-        bind(
-            session,
-            "_runtime_environment_context_prompt_block",
-            lambda self: "runtime context",
-        )
+        bind(session, "_blackboard_memory_context_markdown", lambda self, max_chars=3200: "")
+        bind(session, "_runtime_environment_context_prompt_block", lambda self: "runtime context")
 
         prompt = session._system_prompt()
         self.assertIn("<single-todo-alignment-state>", prompt)

@@ -563,7 +563,8 @@ class SubmissionAndLanguagePerformanceTests(unittest.TestCase):
         self.assertEqual(retry_payload["model"], "kimi-k3")
         self.assertEqual(retry_payload["tools"], tools)
         self.assertFalse(retry_payload["stream"])
-        for key in ("temperature", "max_tokens", "tool_choice", "thinking"):
+        self.assertEqual(retry_payload["max_tokens"], 1234)
+        for key in ("temperature", "tool_choice", "thinking"):
             self.assertNotIn(key, retry_payload)
 
     def test_shared_skill_snapshot_and_new_session_use_one_initial_state_write(self):

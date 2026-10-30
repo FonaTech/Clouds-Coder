@@ -4,9 +4,9 @@ import threading
 import types
 
 import pytest
-import test_skill_selection as selection_tests
 
 import Clouds_Coder as cc
+import test_skill_selection as selection_tests
 
 
 def evaluation(payload, *, load=(), keep=(), unload=(), discover=()):

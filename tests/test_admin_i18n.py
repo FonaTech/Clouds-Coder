@@ -32,6 +32,40 @@ class AdminLanguagePayloadTests(unittest.TestCase):
 
 
 class AdminI18nAssetTests(unittest.TestCase):
+    def test_score_comparison_renders_historical_zero_without_invented_reviews(self):
+        renderer = cc.ADMIN_JS.split('function renderEvolutionRunDetail(detail){', 1)[1].split('\nconst EVOLUTION_PIPELINE=', 1)[0]
+        script = r'''
+const A={},elements={};
+function node(tag,attrs={},text=''){return {tag,text,children:[],classList:{remove(){}},appendChild(x){this.children.push(x)},append(...xs){this.children.push(...xs)},replaceChildren(){this.children=[]}}}
+function E(id){return elements[id]??=node('div')}
+function renderEvolutionProgress(){}
+function evolutionText(x){return x}
+function evolutionReason(x){return x}
+function renderEvolutionRunDetail(detail){
+''' + renderer + r'''
+renderEvolutionRunDetail({run_id:'old-rejection',result:{evaluations:[{code:'patch_too_large'}]},score_summary:{
+  incumbent:{hard:0},evaluations:[{candidate_index:1,code:'patch_too_large',incumbent:{hard:0},
+  candidate:{mixed:0,score_status:'validation_failed',task_execution_measured:false}}]}});
+const panel=E('evolutionDetail').children.find(n=>n.children.some(c=>c.tag==='table'));
+const table=panel.children.find(n=>n.tag==='table');
+console.log(JSON.stringify({rows:table.children.map(n=>n.children.map(c=>c.text)),notices:panel.children.filter(c=>c.tag==='p').map(c=>c.text)}));
+'''
+        completed = subprocess.run(['node', '-e', script], check=True, capture_output=True, text=True)
+        rendered = json.loads(completed.stdout)
+        self.assertEqual(rendered['rows'][1], ['Baseline', '0.0', 'Not scored', 'Not scored'])
+        self.assertEqual(rendered['rows'][2], ['Candidate', 'Not scored', 'Not scored', '0.0'])
+        self.assertTrue(any('were not performed' in notice for notice in rendered['notices']))
+
+    def test_new_quota_deployment_and_score_labels_have_all_translations(self):
+        prefix = cc.ADMIN_JS.split('const ADMIN_TEXT_SOURCE', 1)[0]
+        labels = ['Unlimited', 'Score comparison', 'Not scored', 'Scoring baseline', '部署方式', '单任务 Token 配额（0=不限）', '补丁修改行数上限（0=不限）']
+        script = "global.sessionStorage={getItem:()=>''};global.document={getElementById:()=>null};\n" + prefix
+        script += '\nconsole.log(JSON.stringify(' + json.dumps(labels, ensure_ascii=False) + '.map(s=>[s,...["zh-CN","zh-TW","ja","en"].map(l=>adminTranslate(s,l))])));'
+        completed = subprocess.run(['node', '-e', script], check=True, capture_output=True, text=True)
+        for row in json.loads(completed.stdout):
+            self.assertTrue(all(row))
+            self.assertNotEqual(row[3], row[0], row)
+
     def test_admin_page_has_language_controls_in_shell_and_login(self):
         self.assertIn('id="adminLanguageSelect"', cc.ADMIN_INDEX_HTML)
         self.assertIn('id="adminLoginLanguageSelect"', cc.ADMIN_INDEX_HTML)
@@ -59,7 +93,7 @@ class AdminI18nAssetTests(unittest.TestCase):
         for marker in required:
             self.assertIn(marker, cc.ADMIN_JS)
         for mode in ("Off", "Tuning", "Thinking", "Aggressive"):
-            self.assertIn(f"<option>{mode}</option>", cc.ADMIN_INDEX_HTML)
+            self.assertIn(f'<option value="{mode}">{mode}</option>', cc.ADMIN_INDEX_HTML)
 
     def test_admin_translation_runtime_switches_representative_text(self):
         prefix = cc.ADMIN_JS.split("const ADMIN_TEXT_SOURCE", 1)[0]

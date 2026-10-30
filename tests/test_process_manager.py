@@ -42,8 +42,9 @@ class UserProcessManagerTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _sleep_command(self, seconds=30):
-        return f"{shlex.quote(sys.executable)} -c " + shlex.quote(
-            f"import time; time.sleep({seconds})"
+        return (
+            f"{shlex.quote(sys.executable)} -c "
+            + shlex.quote(f"import time; time.sleep({seconds})")
         )
 
     def test_background_run_is_registered_completes_and_redacts_secrets(self):
@@ -248,9 +249,7 @@ class ProcessManagerHTTPTests(unittest.TestCase):
             "GET", "/api/admin/processes", headers=admin_header
         )
         self.assertEqual(status, 200)
-        self.assertEqual(
-            {row["id"] for row in all_rows["processes"]}, {own_id, "bg_other"}
-        )
+        self.assertEqual({row["id"] for row in all_rows["processes"]}, {own_id, "bg_other"})
 
         status, denied = self.request(
             "POST", "/api/processes/bg_other/stop", {"reason": "not mine"}
@@ -322,8 +321,9 @@ class ProcessManagerAgentToolTests(unittest.TestCase):
 
     @staticmethod
     def _sleep_command(seconds=30):
-        return f"{shlex.quote(sys.executable)} -c " + shlex.quote(
-            f"import time; time.sleep({seconds})"
+        return (
+            f"{shlex.quote(sys.executable)} -c "
+            + shlex.quote(f"import time; time.sleep({seconds})")
         )
 
     def _start(self, background):
@@ -391,9 +391,7 @@ class ProcessManagerAgentToolTests(unittest.TestCase):
         self.assertNotIn("user_id", stop_spec["parameters"]["properties"])
         self.assertEqual(stop_spec["parameters"]["required"], ["process_id"])
         self.assertIn("list_background_processes", cc.PLAN_MODE_RESEARCH_TOOL_ALLOWLIST)
-        self.assertNotIn(
-            "stop_background_process", cc.PLAN_MODE_RESEARCH_TOOL_ALLOWLIST
-        )
+        self.assertNotIn("stop_background_process", cc.PLAN_MODE_RESEARCH_TOOL_ALLOWLIST)
         self.assertIn("list_background_processes", cc.AGENT_TOOL_ALLOWLIST["explorer"])
         self.assertNotIn("stop_background_process", cc.AGENT_TOOL_ALLOWLIST["explorer"])
         self.assertIn("stop_background_process", cc.AGENT_TOOL_ALLOWLIST["developer"])
