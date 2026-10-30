@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clouds-coder"
-version = "2026.9.22"
+version = "2026.10.30"
 description = "Clouds Coder: local-first Cloud CLI coder runtime with Web UI and Skills Studio."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
   { name = "Clouds Coder Contributors" }
@@ -28,24 +28,29 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Software Development",
   "Topic :: Software Development :: Build Tools",
   "Topic :: Software Development :: Libraries :: Python Modules"
 ]
-dependencies = [
-  "anthropic>=0.25.0",
-  "certifi>=2024.2.2",
-  "python-dotenv>=1.0.0"
-]
+dynamic = ["dependencies"]
 
 [project.scripts]
 clouds-coder = "Clouds_Coder:main"
 
 [tool.setuptools]
 py-modules = ["Clouds_Coder"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 exclude = [

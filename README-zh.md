@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI 下载量" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-10-30.md">Liquid Kernel：任务驱动进化与执行可靠性 · 2026-10-30 (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-09-12.md">2026-09-12 Liquid Kernel 与可扩展会话运行时更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 协作模式与 Skills Studio 2.0 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE 与运行时更新日志（EN/中文/日本語）</a> ·
@@ -38,7 +39,22 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-架构更新日志归档：[`CHANGELOG-2026-09-12.md`](./log/CHANGELOG-2026-09-12.md) | [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+架构更新日志归档：[`CHANGELOG-2026-10-30.md`](./log/CHANGELOG-2026-10-30.md) | [`CHANGELOG-2026-09-12.md`](./log/CHANGELOG-2026-09-12.md) | [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+## Liquid Kernel：任务驱动进化与执行可靠性 · 2026-10-30
+
+Liquid Kernel 通过多轮真实任务、工具执行和基线／候选成对运行，迭代 Agent 的执行架构。当前框架推进到能力版本 **19**。本次强化的是内核执行任务、获取可信反馈和交付已验证改动的能力，让规划、工具路由、上下文使用与恢复机制在管理员设定的修改强度内接受检验。
+
+| 内核能力 | 本次更新带来的进步 |
+| --- | --- |
+| 任务驱动优化 | 现有进化闭环根据完整任务轨迹、实际产物、独立审核与执行成本比较 Agent flow；一次响应成功不足以证明架构更好。 |
+| 可检查的候选版本 | 基线与候选在新工作区运行同一批冻结任务；候选代码、差异、父版本、评分和拒绝原因持续留存。自动部署要求完成真实评测、无回归、独立复跑通过，且评分严格高于基线。 |
+| 跨平台执行 · 能力 19 | 受限工作区解释器补齐有资源边界的 `re`、Pattern/Match 和 `chr`/`ord`；没有原生沙箱的环境也能执行更多常见验证操作，文件访问仍限制在工作区内。 |
+| 更可信的反馈 · 能力 19 | 任务生成器与执行器共用能力声明；AST 检查会将不支持的导入、成员和语法送回定义修复流程，减少评测器自身缺陷对评分的干扰。 |
+| 共享运行时韧性 | 公共模型传输正确处理不限时请求；结构化输出恢复区分思考、截断与完整正文，UTF-8 边界保护多语言长任务。IDE 提示词增强是这些公共修复的一个实测入口。 |
+| 一致的交付方式 | 单文件内嵌已发布的内核源码；拆分器 3.1 将 **1276 条语句、1192 个定义名**完整归入 **68 个源码模块**，**未归类项为 0**。默认归类和自动布局共用并发门控、证据检索、上下文状态及工具链规则。 |
+
+启动更新保留已有进化产物、会话固定版本和回退历史。Python 3.9–3.13、内嵌提取、拆分包独立启动与安装包均有验证记录。测试入口会在收集用例前初始化内嵌内核，支持没有本地内核目录或 pytest.ini 的干净检出；源码更新同时包含必需的验证工具与技能夹具。详见 [Liquid Kernel 更新日志](./log/CHANGELOG-2026-10-30.md)、[内核架构](./liquid_kernel/README.md)和[交付验证](./docs/liquid_kernel_delivery_verification_20261030.md)。
 
 ## IDE 工作区
 
@@ -1332,7 +1348,7 @@ clouds-coder --host 0.0.0.0 --port 8080
 
 ### 9.1 环境要求（源码安装）
 
-- Python 3.10+
+- Python 3.9+
 - Ollama（推荐，用于本地模型）
 - 安装依赖（启用完整源码模式文件预览/解析能力）：
 

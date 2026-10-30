@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI downloads" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-10-30.md">Liquid Kernel: task-driven evolution and reliable execution · 2026-10-30 (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-09-12.md">2026-09-12 Liquid Kernel & Scalable Session Runtime Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 Collaboration & Skills Studio 2.0 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE & Runtime Changelog (EN/中文/日本語)</a> ·
@@ -38,7 +39,22 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Architecture changelog archive: [`CHANGELOG-2026-09-12.md`](./log/CHANGELOG-2026-09-12.md) | [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+Architecture changelog archive: [`CHANGELOG-2026-10-30.md`](./log/CHANGELOG-2026-10-30.md) | [`CHANGELOG-2026-09-12.md`](./log/CHANGELOG-2026-09-12.md) | [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+## Liquid Kernel: task-driven evolution and reliable execution · 2026-10-30
+
+Liquid Kernel evolves the Agent's execution architecture through multi-turn tasks, real tool use, and paired baseline/candidate runs. The current framework reaches capability **19**. This update strengthens the execution and feedback paths that let the kernel evaluate changes to planning, tool routing, context use, and recovery within the Admin-selected edit strength.
+
+| Kernel capability | What the current update delivers |
+| --- | --- |
+| Task-driven optimization | The established evolution loop uses task trajectories, produced artifacts, independent review, and execution cost to compare Agent flows. A successful single response is insufficient evidence of a better architecture. |
+| Inspectable candidate versions | Baseline and candidate run the same frozen tasks in fresh workspaces. Candidate code, diffs, parent versions, scores, and rejection reasons remain available. Automatic deployment requires completed real evaluation, no regression, independent confirmation, and a score strictly above the baseline. |
+| Portable execution · capability 19 | The constrained workspace interpreter gains bounded `re`, Pattern/Match operations, and `chr`/`ord`. Common verification work can run on systems without a native sandbox while file access remains confined to the workspace. |
+| More trustworthy feedback · capability 19 | The task designer and executor share a capability contract. AST checks send unsupported imports, members, and language constructs back to definition repair before scoring, reducing failures caused by the evaluator itself. |
+| Shared runtime resilience | Shared model transport handles unlimited requests correctly. Structured-output recovery distinguishes thinking, truncated output, and a complete final body; UTF-8 boundaries protect multilingual tasks. The IDE Prompt Enhancer is one tested consumer of these runtime fixes. |
+| Consistent delivery | The single file embeds the released kernel sources. Splitter 3.1 assigns all **1276 statements and 1192 defined names** across **68 source modules**, with **0 unclassified statements**. Default and auto-layout share rules for concurrency gates, evidence, context state, and toolchains. |
+
+Startup preserves existing evolved artifacts, session pins, and rollback history. Python 3.9–3.13, embedded extraction, independent split-package startup, and package installation have verification records. The test entrypoint initializes the embedded kernel before collection, including clean checkouts without a local package or pytest.ini. Source updates include the required verification tools and skill fixtures. See the [Liquid Kernel changelog](./log/CHANGELOG-2026-10-30.md), [kernel architecture](./liquid_kernel/README.md), and [delivery verification](./docs/liquid_kernel_delivery_verification_20261030.md).
 
 ## IDE Workspace
 
@@ -1524,7 +1540,7 @@ clouds-coder --host 0.0.0.0 --port 8080
 
 ### 9.1 Requirements (Source Install)
 
-- Python 3.10+
+- Python 3.9+
 - Ollama (for local model serving, optional but recommended)
 - Install dependencies for full source-mode preview / parsing support:
 
