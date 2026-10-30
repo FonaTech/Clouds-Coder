@@ -1593,6 +1593,30 @@ _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
 )
 
 
+def sync_embedded_liquid_kernel_bundle(entrypoints=None, *, source_root: Path | None = None) -> None:
+    """Rebuild explicit source entrypoints using UTF-8, without changing runtime state."""
+    root = Path(source_root or Path(__file__).resolve().parent).resolve()
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in ("__init__.py", "control.py", "models.py", "agentic.py", "context.py", "execution.py", "README.md"):
+            entry = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(entry, (root / "liquid_kernel" / name).read_bytes())
+    encoded = base64.b64encode(stream.getvalue()).decode("ascii")
+    assignment = "_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (\n" + "".join(
+        '    "' + encoded[index:index + 120] + '"\n' for index in range(0, len(encoded), 120)
+    ) + ")"
+    for name in entrypoints or ("Clouds_Coder.py",):
+        path = root / name
+        text, count = re.subn(
+            r"_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = \(\n.*?\n\)",
+            lambda _: assignment, path.read_text(encoding="utf-8"), count=1, flags=re.S,
+        )
+        if count != 1:
+            raise RuntimeError(f"embedded package marker missing: {name}")
+        path.write_text(text, encoding="utf-8")
+
+
 def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> dict:
     """Upgrade framework code only; signed/evolved artifacts and state are immutable here."""
     raw_root = Path(package_root or (Path(__file__).resolve().parent / "liquid_kernel"))

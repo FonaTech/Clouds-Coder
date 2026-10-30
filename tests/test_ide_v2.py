@@ -1,0 +1,5427 @@
+import base64
+import http.client
+import inspect
+import io
+import json
+import os
+import re
+import sqlite3
+import tempfile
+import threading
+import time
+import types
+import unittest
+import zipfile
+from pathlib import Path
+from unittest import mock
+
+import Clouds_Coder as cc
+
+
+class RuntimeWorkdirTests(unittest.TestCase):
+    def test_installed_module_uses_stable_clouds_coder_home(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed_root = root / "lib" / "python3.13" / "site-packages"
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", installed_root),
+                mock.patch.dict(
+                    os.environ,
+                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(root / "runtime")},
+                ),
+            ):
+                self.assertEqual(
+                    cc._resolve_default_agent_workdir(),
+                    (root / "runtime" / "workspace").resolve(),
+                )
+
+    def test_direct_script_keeps_script_directory_as_default_workdir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script_root = Path(temp) / "source"
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                mock.patch.dict(
+                    os.environ,
+                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(Path(temp) / "runtime")},
+                ),
+            ):
+                self.assertEqual(cc._resolve_default_agent_workdir(), script_root)
+                self.assertEqual(cc._runtime_storage_mode(), "script-local")
+
+    def test_explicit_workdir_wins_for_installed_and_direct_runtimes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            explicit = root / "chosen"
+            for script_root in (
+                root / "source",
+                root / "lib" / "python3.13" / "site-packages",
+            ):
+                with (
+                    mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                    mock.patch.dict(
+                        os.environ,
+                        {"AGENT_WORKDIR": str(explicit), "CLOUDS_CODER_HOME": str(root / "runtime")},
+                    ),
+                ):
+                    self.assertEqual(cc._resolve_default_agent_workdir(), explicit.resolve())
+                    self.assertEqual(cc._runtime_storage_mode(), "explicit-workdir")
+
+    def test_direct_runtime_does_not_import_from_stable_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script_root = root / "source"
+            local_codes = script_root / "Codes"
+            local_crypto = cc.CryptoBox(local_codes)
+            local_state = local_codes / "user_local" / "sessions" / "sess_local" / "state.json"
+            local_crypto.write_json(local_state, {"title": "local history"})
+            source_state = local_state.read_bytes()
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                mock.patch.dict(
+                    os.environ,
+                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(root / "runtime")},
+                ),
+            ):
+                result = cc._migrate_legacy_runtime_roots(script_root)
+            self.assertEqual(result["storage_mode"], "script-local")
+            self.assertEqual(result["imported_sessions"], 0)
+            self.assertEqual(local_state.read_bytes(), source_state)
+            self.assertFalse((root / "runtime" / "workspace").exists())
+
+    def test_legacy_skills_runtime_copy_preserves_original_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script_root = Path(temp) / "source"
+            legacy_file = script_root / "skills" / "Codes" / "legacy.txt"
+            legacy_file.parent.mkdir(parents=True)
+            legacy_file.write_text("preserve me", encoding="utf-8")
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                mock.patch.dict(os.environ, {"AGENT_WORKDIR": ""}),
+            ):
+                result = cc._migrate_legacy_runtime_roots(script_root)
+            self.assertIn("skills:Codes", result["copied"])
+            self.assertEqual(legacy_file.read_text(encoding="utf-8"), "preserve me")
+            self.assertEqual(
+                (script_root / "Codes" / "legacy.txt").read_text(encoding="utf-8"),
+                "preserve me",
+            )
+
+    def test_installed_runtime_copies_legacy_history_without_removing_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed_root = root / "lib" / "python3.13" / "site-packages"
+            legacy_codes = installed_root / "Codes"
+            workspace = root / "stable" / "workspace"
+            session_dir = legacy_codes / "user_local" / "sessions" / "sess_legacy"
+            legacy_crypto = cc.CryptoBox(legacy_codes)
+            legacy_crypto.write_json(session_dir / "state.json", {"title": "legacy", "messages": [{"role": "user", "content": "kept"}]})
+            legacy_crypto.write_json(session_dir / "meta.json", {"title": "legacy", "message_count": 1})
+            source_state = (session_dir / "state.json").read_bytes()
+
+            with mock.patch.object(cc, "SCRIPT_DIR", installed_root):
+                result = cc._migrate_legacy_runtime_roots(workspace)
+
+            target_codes = workspace / "Codes"
+            target_state = target_codes / "user_local" / "sessions" / "sess_legacy" / "state.json"
+            self.assertIn("site-packages:Codes", result["copied"])
+            self.assertEqual(result["imported_sessions"], 1)
+            self.assertEqual((legacy_codes / ".encryption_key").read_bytes(), (target_codes / ".encryption_key").read_bytes())
+            self.assertEqual((session_dir / "state.json").read_bytes(), source_state)
+            self.assertEqual(cc.CryptoBox(target_codes).read_json(target_state, {}).get("title"), "legacy")
+
+    def test_installed_runtime_merges_different_keys_without_overwriting_new_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed_root = root / "lib" / "python3.13" / "site-packages"
+            legacy_codes = installed_root / "Codes"
+            workspace = root / "stable" / "workspace"
+            target_codes = workspace / "Codes"
+            legacy_crypto = cc.CryptoBox(legacy_codes)
+            target_crypto = cc.CryptoBox(target_codes)
+            legacy_user = legacy_codes / "user_local" / "sessions"
+            target_user = target_codes / "user_local" / "sessions"
+            legacy_crypto.write_json(legacy_user / "sess_old" / "state.json", {"title": "old history"})
+            legacy_crypto.write_json(legacy_user / "sess_same" / "state.json", {"title": "legacy collision"})
+            target_crypto.write_json(target_user / "sess_new" / "state.json", {"title": "new history"})
+            target_crypto.write_json(target_user / "sess_same" / "state.json", {"title": "current collision"})
+            source_state = (legacy_user / "sess_old" / "state.json").read_bytes()
+
+            with mock.patch.object(cc, "SCRIPT_DIR", installed_root):
+                result = cc._migrate_legacy_runtime_roots(workspace)
+
+            imported = target_user / "sess_old" / "state.json"
+            self.assertEqual(result["imported_sessions"], 1)
+            self.assertEqual(result["skipped_sessions"], 1)
+            self.assertEqual(target_crypto.read_json(imported, {}).get("title"), "old history")
+            self.assertEqual(target_crypto.read_json(target_user / "sess_new" / "state.json", {}).get("title"), "new history")
+            self.assertEqual(target_crypto.read_json(target_user / "sess_same" / "state.json", {}).get("title"), "current collision")
+            self.assertEqual((legacy_user / "sess_old" / "state.json").read_bytes(), source_state)
+
+
+class OfflineJSAssetTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "js_lib"
+        self.root.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_incomplete_package_is_not_treated_as_complete(self):
+        entry = {
+            "id": "sample",
+            "filename": "main.js",
+            "relative_path": "sample/dist/main.js",
+            "package_urls": ["https://example.invalid/sample.tgz"],
+            "package_install_dir": "sample",
+            "package_required_paths": ["package.json", "dist/main.js"],
+        }
+        partial = self.root / "sample" / "dist"
+        partial.mkdir(parents=True)
+        (partial / "unrelated.js").write_text("partial", encoding="utf-8")
+        ok, source, error, _ = cc._ensure_offline_js_package(
+            self.root, entry, allow_download=False
+        )
+        self.assertFalse(ok)
+        self.assertEqual(source, "download-disabled")
+        self.assertIn("incomplete", error)
+
+    def test_package_glob_minimum_is_enforced(self):
+        package = self.root / "sample"
+        (package / "dist" / "fonts").mkdir(parents=True)
+        (package / "package.json").write_text("{}", encoding="utf-8")
+        for index in range(2):
+            (package / "dist" / "fonts" / f"font-{index}.woff2").write_bytes(b"font")
+        self.assertFalse(
+            cc._package_install_ready(
+                package,
+                ["package.json"],
+                [("dist/fonts/*.woff2", 3)],
+            )
+        )
+        (package / "dist" / "fonts" / "font-2.woff2").write_bytes(b"font")
+        self.assertTrue(
+            cc._package_install_ready(
+                package,
+                ["package.json"],
+                [("dist/fonts/*.woff2", 3)],
+            )
+        )
+
+    def test_existing_asset_and_disabled_download_never_use_http(self):
+        existing = self.root / "monaco" / "min" / "vs" / "loader.js"
+        existing.parent.mkdir(parents=True)
+        existing.write_text("window.require = {};", encoding="utf-8")
+        with mock.patch.object(cc, "_download_http_bytes") as download:
+            resolved, reason = cc.ensure_offline_js_asset(
+                self.root, "monaco/min/vs/loader.js", allow_download=False
+            )
+            self.assertEqual(resolved, existing.resolve())
+            self.assertEqual(reason, "existing")
+            missing, reason = cc.ensure_offline_js_asset(
+                self.root, "codicons/dist/codicon.css", allow_download=False
+            )
+        self.assertIsNone(missing)
+        self.assertEqual(reason, "download-disabled")
+        download.assert_not_called()
+
+    def test_connection_deadline_still_indexes_every_catalog_entry(self):
+        catalog = [
+            {
+                "id": "one",
+                "filename": "one.js",
+                "urls": ["https://example.invalid/one.js"],
+            },
+            {
+                "id": "two",
+                "filename": "two.js",
+                "urls": ["https://example.invalid/two.js"],
+            },
+        ]
+        with (
+            mock.patch.object(cc, "OFFLINE_JS_LIB_CATALOG", catalog),
+            mock.patch.object(cc, "_download_http_bytes") as download,
+        ):
+            summary = cc.ensure_offline_js_libs(
+                Path(self.tmp.name), no_connection_deadline=-1
+            )
+        self.assertEqual(summary["catalog_total"], 2)
+        self.assertEqual(len([row for row in summary["libs"] if row.get("catalog")]), 2)
+        self.assertEqual(summary["missing"], 2)
+        download.assert_not_called()
+
+    def test_session_html_localization_honors_disabled_downloads(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.js_lib_root = self.root
+        session.js_lib_download_enabled = False
+        with mock.patch.object(cc, "_download_http_bytes") as download:
+            resolved, reason = session._resolve_offline_js_asset_for_url(
+                "https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"
+            )
+        self.assertIsNone(resolved)
+        self.assertEqual(reason, "download-disabled")
+        download.assert_not_called()
+
+    def test_source_bundle_honors_disabled_downloads(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        app.workspace = Path(self.tmp.name)
+        app.skills_root = Path(self.tmp.name) / "skills"
+        app.skills_root.mkdir()
+        app.js_lib_root = self.root
+        app.js_lib_download_enabled = False
+        with (
+            mock.patch.object(cc, "ensure_runtime_skills"),
+            mock.patch.object(cc, "ensure_offline_js_libs") as ensure_all,
+        ):
+            bundle = app.source_bundle()
+        self.assertGreater(len(bundle), 1000)
+        ensure_all.assert_not_called()
+
+    def test_chat_submission_uses_short_upload_handoff_and_keeps_post_path(self):
+        self.assertIn("const CHAT_UPLOAD_HANDOFF_WAIT_MS=250;", cc.APP_JS)
+        self.assertIn("waitForPendingUploads(handoffWait)", cc.APP_JS)
+        self.assertNotIn("waitForPendingUploads(10000)", cc.APP_JS)
+        self.assertIn(
+            '"chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS)',
+            inspect.getsource(cc.Handler.do_GET),
+        )
+
+    def test_web_and_ide_creation_preserve_title_provenance(self):
+        self.assertIn("JSON.stringify({title,user_named:userNamed})", cc.APP_JS)
+        self.assertIn("title_origin:String(out?.title_origin", cc.APP_JS)
+        ide_source = inspect.getsource(cc.AppContext.ide_create_session)
+        self.assertIn('title_origin = "manual" if requested_title else "default"', ide_source)
+        self.assertIn('"IDE Workspace"', ide_source)
+        self.assertIn(
+            "self.ide_create_session(user_id, None",
+            inspect.getsource(cc.AppContext.ide_agent_task),
+        )
+
+    def test_session_manager_does_not_probe_ollama_during_construction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            crypto = cc.CryptoBox(root / "codes")
+            with mock.patch.object(
+                cc,
+                "probe_ollama_environment",
+                side_effect=AssertionError("probe must be lazy"),
+            ):
+                manager = cc.SessionManager(
+                    root / "sessions",
+                    "user-a",
+                    "http://127.0.0.1:11434",
+                    "demo-model",
+                    root / "skills",
+                    root / "js_lib",
+                    crypto,
+                    root,
+                    False,
+                    {},
+                    "zh-CN",
+                    cc.DEFAULT_CONTEXT_TOKEN_LIMIT,
+                    False,
+                    cc.MAX_AGENT_ROUNDS,
+                    cc.MAX_RUN_SECONDS,
+                    cc.DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+                    cc.DEFAULT_AUTO_TASK_LEVEL_CEILING,
+                    cc.DEFAULT_L2_TODO_POLICY,
+                    False,
+                    True,
+                    "",
+                    cc.ARBITER_DEFAULT_TIMEOUT_SECONDS,
+                    cc.ARBITER_DEFAULT_MAX_TOKENS,
+                    cc.ARBITER_DEFAULT_TEMPERATURE,
+                    cc.EXECUTION_MODE_SYNC,
+                    cc.AGENT_MAX_OUTPUT_TOKENS,
+                )
+            self.assertFalse(manager.ollama_env_available)
+
+
+class IDESandboxBackendTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.files = Path(self.tmp.name) / "files"
+        (self.files / "nested").mkdir(parents=True)
+        self.skills = Path(self.tmp.name) / "skills"
+        self.js_lib = Path(self.tmp.name) / "js_lib"
+        self.skills.mkdir()
+        self.js_lib.mkdir()
+        self.session = cc.SessionState.__new__(cc.SessionState)
+        self.session.files_root = self.files
+        self.session.skills = types.SimpleNamespace(
+            skills_root=self.skills,
+            shell_virtual_mappings=lambda: [],
+        )
+        self.session.js_lib_root = self.js_lib
+        self.session._remote_runtime_read_roots = lambda: []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_bubblewrap_prefix_mounts_only_workspace_writable(self):
+        backend = {
+            "available": True,
+            "name": "bubblewrap",
+            "processes": True,
+            "terminal": True,
+            "debug": True,
+        }
+        with (
+            mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend),
+            mock.patch.object(
+                cc.shutil,
+                "which",
+                side_effect=lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+            ),
+        ):
+            prefix = self.session._workspace_sandbox_shell_prefix(self.files / "nested")
+            command = self.session._sandbox_virtualize_command(
+                f"cat {self.files / 'nested' / 'input.txt'}", self.files / "nested"
+            )
+        self.assertIn("--bind", prefix)
+        self.assertIn(str(self.files.resolve()), prefix)
+        self.assertIn("/workspace", prefix)
+        self.assertIn("--ro-bind", prefix)
+        self.assertIn(str(self.skills.resolve()), prefix)
+        self.assertIn(str(self.js_lib.resolve()), prefix)
+        self.assertIn("/clouds_shared/skills", prefix)
+        self.assertIn("/clouds_shared/js_lib", prefix)
+        self.assertIn("/workspace/nested/input.txt", command)
+        self.assertNotIn(str(self.files.resolve()), command)
+
+    def test_container_prefix_is_readonly_and_disables_terminal_debug(self):
+        backend = {
+            "available": True,
+            "name": "docker",
+            "processes": True,
+            "terminal": False,
+            "debug": False,
+            "image": "clouds-coder-sandbox:latest",
+        }
+        with (
+            mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend),
+            mock.patch.object(cc.shutil, "which", return_value="/usr/bin/docker"),
+        ):
+            prefix = self.session._workspace_sandbox_shell_prefix(self.files / "nested")
+            terminal_prefix = self.session._workspace_sandbox_shell_prefix(
+                self.files, feature="terminal"
+            )
+        self.assertIn("--read-only", prefix)
+        self.assertIn("ALL", prefix)
+        self.assertIn("no-new-privileges", prefix)
+        self.assertIn("/workspace/nested", prefix)
+        self.assertIn(
+            f"type=bind,src={self.skills.resolve()},dst=/clouds_shared/skills,readonly",
+            prefix,
+        )
+        self.assertIn(
+            f"type=bind,src={self.js_lib.resolve()},dst=/clouds_shared/js_lib,readonly",
+            prefix,
+        )
+        self.assertIn("SKILLS_ROOT=/clouds_shared/skills", prefix)
+        self.assertIn("JS_LIB_ROOT=/clouds_shared/js_lib", prefix)
+        self.assertEqual(terminal_prefix, [])
+
+    def test_capabilities_follow_backend_feature_support(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        backend = {
+            "available": True,
+            "name": "docker",
+            "processes": True,
+            "terminal": False,
+            "debug": False,
+            "image": "local-image",
+            "reason": "container limitations",
+        }
+        with mock.patch.object(
+            cc.AppContext, "_ide_remote_sandbox_backend", return_value=backend
+        ):
+            capabilities = app.ide_request_capabilities(
+                {"role": "user"}, client_ip="192.168.1.22", direct_loopback=False
+            )
+        self.assertTrue(capabilities["processes"])
+        self.assertFalse(capabilities["terminal"])
+        self.assertFalse(capabilities["debug"])
+        self.assertEqual(capabilities["sandbox_backend"], "docker")
+
+    def test_linux_and_windows_backend_detection(self):
+        ready = types.SimpleNamespace(returncode=0)
+        with (
+            mock.patch.dict(os.environ, {"CLOUDS_CODER_SANDBOX_BACKEND": "bwrap"}),
+            mock.patch.object(cc.os, "name", "posix"),
+            mock.patch.object(cc.sys, "platform", "linux"),
+            mock.patch.object(cc.shutil, "which", return_value="/usr/bin/bwrap"),
+            mock.patch.object(cc.subprocess, "run", return_value=ready),
+        ):
+            linux = cc._detect_ide_sandbox_backend(force=True)
+        self.assertEqual(linux["name"], "bubblewrap")
+        self.assertTrue(linux["terminal"])
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CLOUDS_CODER_SANDBOX_BACKEND": "docker",
+                    "CLOUDS_CODER_SANDBOX_IMAGE": "local-sandbox:test",
+                },
+            ),
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.sys, "platform", "win32"),
+            mock.patch.object(cc.shutil, "which", return_value="C:/docker.exe"),
+            mock.patch.object(cc.subprocess, "run", return_value=ready),
+        ):
+            windows = cc._detect_ide_sandbox_backend(force=True)
+        self.assertEqual(windows["name"], "docker")
+        self.assertTrue(windows["processes"])
+        self.assertFalse(windows["terminal"])
+        self.assertFalse(windows["debug"])
+
+    def test_linux_probe_checks_all_namespaces_used_by_execution(self):
+        probes = []
+
+        def probe(command, **kwargs):
+            probes.append(command)
+            return types.SimpleNamespace(returncode=1 if '--unshare-uts' in command else 0)
+
+        with (
+            mock.patch.dict(os.environ, {'CLOUDS_CODER_SANDBOX_BACKEND': 'bwrap'}),
+            mock.patch.object(cc.os, 'name', 'posix'),
+            mock.patch.object(cc.sys, 'platform', 'linux'),
+            mock.patch.object(cc.shutil, 'which', return_value='/usr/bin/bwrap'),
+            mock.patch.object(cc.subprocess, 'run', side_effect=probe),
+        ):
+            backend = cc._detect_ide_sandbox_backend(force=True)
+        self.assertFalse(backend['available'])
+        self.assertEqual(len(probes), 1)
+        for option in ('--new-session', '--unshare-user', '--unshare-pid', '--unshare-uts', '--unshare-ipc'):
+            self.assertIn(option, probes[0])
+
+    def test_windows_auto_uses_builtin_job_sandbox_without_container(self):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CLOUDS_CODER_SANDBOX_BACKEND": "auto"},
+            ),
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.sys, "platform", "win32"),
+            mock.patch.object(
+                cc, "_windows_builtin_sandbox_probe", return_value=(True, "ready")
+            ),
+            mock.patch.object(cc.shutil, "which", return_value=None),
+        ):
+            backend = cc._detect_ide_sandbox_backend(force=True)
+        self.assertEqual(backend["name"], "windows-job")
+        self.assertTrue(backend["available"])
+        self.assertTrue(backend["processes"])
+        self.assertTrue(backend["terminal"])
+        self.assertTrue(backend["debug"])
+
+    def test_windows_job_prefix_is_internal_marker(self):
+        backend = {
+            "available": True,
+            "name": "windows-job",
+            "processes": True,
+            "terminal": True,
+            "debug": True,
+        }
+        with mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend):
+            prefix = self.session._workspace_sandbox_shell_prefix(self.files)
+            terminal = self.session._workspace_sandbox_shell_prefix(
+                self.files, feature="terminal"
+            )
+        self.assertTrue(cc._is_windows_job_sandbox_prefix(prefix))
+        self.assertTrue(cc._is_windows_job_sandbox_prefix(terminal))
+
+    def test_remote_environment_exposes_shared_roots_read_only_by_contract(self):
+        self.session.ide_remote_sandbox_required = True
+        backend = {
+            "available": True,
+            "name": "windows-job",
+            "processes": True,
+            "terminal": True,
+            "debug": True,
+        }
+        with mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend):
+            env = self.session._shell_process_env()
+        self.assertEqual(env["SKILLS_ROOT"], str(self.skills.resolve()))
+        self.assertEqual(env["JS_LIB_ROOT"], str(self.js_lib.resolve()))
+
+    def test_windows_shell_virtual_paths_rewrite_to_host_shared_roots(self):
+        windows_workspace = Path("C:/Clouds Coder/session")
+        windows_skills = Path("C:/Clouds Coder/skills")
+        windows_js = Path("C:/Clouds Coder/js_lib")
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = windows_workspace
+        session.skills = types.SimpleNamespace(
+            skills_root=windows_skills,
+            shell_virtual_mappings=lambda: [],
+        )
+        session.js_lib_root = windows_js
+        with (
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.Path, "resolve", lambda value: value),
+        ):
+            rewritten = session._rewrite_shell_virtual_paths(
+                "type /skills/demo/SKILL.md & type /js_lib/marked.min.js & dir /workspace",
+                windows_workspace,
+            )
+        self.assertIn('"C:/Clouds Coder/skills"/demo/SKILL.md', rewritten)
+        self.assertIn('"C:/Clouds Coder/js_lib"/marked.min.js', rewritten)
+        self.assertIn('dir "C:/Clouds Coder/session"', rewritten)
+
+    def test_hard_background_command_is_virtualized_for_container_backend(self):
+        backend = {
+            "available": True,
+            "name": "bubblewrap",
+            "processes": True,
+            "terminal": True,
+            "debug": True,
+        }
+        host_file = self.files / "nested" / "input.txt"
+        with mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend):
+            prepared = self.session._background_shell_command(
+                f"cat {host_file}", self.files, ["/usr/bin/bwrap"]
+            )
+        self.assertIn("/workspace/nested/input.txt", prepared)
+        self.assertNotIn(str(self.files.resolve()), prepared)
+
+    def test_local_hard_ide_run_virtualizes_workspace_for_container_prefix(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        sess = types.SimpleNamespace(
+            skill_mode="hard",
+            _guard_shell_write_scope=lambda _command, _cwd: "",
+            _rewrite_shell_virtual_paths=lambda command, _cwd: command,
+            _sandbox_virtualize_command=lambda command, _cwd: command.replace(
+                str(self.files), "/workspace"
+            ).replace(str(self.files.resolve()), "/workspace"),
+            _shell_process_env=lambda: {},
+            _hard_snapshot_integrity_callback=lambda _phase, _command: "",
+        )
+        app.ide_resolve_workspace = lambda *_args: (
+            self.files,
+            self.files,
+            {"id": "session"},
+        )
+        app._ide_session = lambda *_args: sess
+        app._ide_process_prefix = mock.Mock(return_value=["/usr/bin/bwrap"])
+        app._ide_emit_workspace_change = mock.Mock()
+        completed = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+        host_file = self.files / "nested" / "input.txt"
+        with mock.patch.object(cc, "run_subprocess_text", return_value=completed) as run:
+            result = app.ide_run_command(
+                "user-a",
+                "sess-a",
+                {"command": f"cat {host_file}", "root_id": "session"},
+                remote=False,
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[-3:-1], ["/bin/sh", "-c"])
+        self.assertIn("/workspace/nested/input.txt", command[-1])
+        self.assertNotIn(str(self.files.resolve()), command[-1])
+        self.assertTrue(result["ok"])
+        app._ide_process_prefix.assert_called_once_with(
+            sess, remote=False, cwd=self.files
+        )
+
+    def test_remote_shell_guard_blocks_windows_shared_root_writes(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.root = Path("C:/Clouds Coder/session")
+        session.files_root = session.root
+        session.ide_remote_sandbox_required = True
+        session.skill_mode = "dynamic"
+        session.skills = types.SimpleNamespace(
+            skills_root=Path("C:/Clouds Coder/skills"),
+            shell_virtual_mappings=lambda: [],
+        )
+        session.js_lib_root = Path("C:/Clouds Coder/js_lib")
+        with (
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.Path, "resolve", lambda value: value),
+            mock.patch.object(
+                session,
+                "_remote_shared_read_roots",
+                return_value=[session.skills.skills_root, session.js_lib_root],
+            ),
+        ):
+            skill_error = session._guard_shell_write_scope(
+                "echo escaped > C:/Clouds-Coder/skills/demo/SKILL.md",
+                session.files_root,
+            )
+            js_error = session._guard_shell_write_scope(
+                "python -c \"from pathlib import Path; Path('/js_lib/x.js').write_text('x')\"",
+                session.files_root,
+            )
+        self.assertIn("write blocked", skill_error)
+        self.assertIn("write blocked", js_error)
+
+    def test_ide_contains_embedded_icon_fallback(self):
+        self.assertIn('<body class="icons-fallback">', cc.IDE_INDEX_HTML)
+        self.assertIn(".icons-fallback .codicon::before", cc.IDE_CSS)
+        self.assertIn("function initIconFallback()", cc.IDE_JS)
+
+
+class IDEAuthStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = cc.IDEAuthStore(Path(self.tmp.name) / "ide_auth.sqlite")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_first_admin_binds_legacy_loopback_identity(self):
+        legacy = cc.user_id_from_ip("127.0.0.1")
+        result = self.store.setup_admin(
+            "local-admin", "Strong-Passphrase-42!", legacy_user_id=legacy
+        )
+        self.assertEqual(result["account"]["role"], "admin")
+        self.assertEqual(result["account"]["user_id"], legacy)
+        self.assertTrue(self.store.configured())
+        self.assertIsNotNone(self.store.verify_session(result["access_token"]))
+        with self.assertRaises(cc.IDEAuthError) as caught:
+            self.store.setup_admin(
+                "second-admin",
+                "Another-Passphrase-42!",
+                legacy_user_id="ide_second_admin",
+            )
+        self.assertEqual(caught.exception.code, "setup_already_completed")
+
+    def test_missing_initialized_database_fails_closed(self):
+        session = self.store.local_session(
+            legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
+            client_ip="127.0.0.1",
+        )
+        self.store.path.unlink()
+
+        with self.assertRaises(cc.IDEAuthError) as caught:
+            self.store.verify_session(session["access_token"], "127.0.0.1")
+
+        self.assertEqual(caught.exception.code, "auth_store_unavailable")
+        self.assertEqual(caught.exception.status, 503)
+        self.assertFalse(self.store.path.exists())
+        self.assertEqual(
+            self.store.storage_health(),
+            {"available": False, "code": "ide_store_unavailable"},
+        )
+
+    def test_change_password_revokes_sessions_without_leaking_verification_session(
+        self,
+    ):
+        setup = self.store.setup_admin(
+            "local-admin",
+            "Strong-Passphrase-42!",
+            legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
+        )
+        account = setup["account"]
+        self.store.change_password(
+            account, "Strong-Passphrase-42!", "Replacement-Passphrase-73!"
+        )
+        self.assertIsNone(self.store.verify_session(setup["access_token"]))
+        with sqlite3.connect(str(self.store.path)) as conn:
+            active = conn.execute(
+                "SELECT COUNT(*) FROM ide_sessions WHERE revoked_at=0"
+            ).fetchone()[0]
+        self.assertEqual(active, 0)
+        logged_in = self.store.login(
+            "local-admin", "Replacement-Passphrase-73!", "127.0.0.1"
+        )
+        self.assertIsNotNone(self.store.verify_session(logged_in["access_token"]))
+
+    def test_user_disable_revokes_session(self):
+        self.store.setup_admin(
+            "local-admin",
+            "Strong-Passphrase-42!",
+            legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
+        )
+        account = self.store.create_user("developer-one", "Developer-Passphrase-93!")
+        session = self.store.login(
+            "developer-one", "Developer-Passphrase-93!", "192.168.1.22"
+        )
+        self.assertEqual(session["account"]["user_id"], account["user_id"])
+        self.store.set_disabled("developer-one", True)
+        self.assertIsNone(self.store.verify_session(session["access_token"]))
+
+    def test_local_session_is_passwordless_and_device_ip_change_rebinds_automatically(
+        self,
+    ):
+        local_user_id = cc.user_id_from_ip("127.0.0.1")
+        local = self.store.local_session(legacy_user_id=local_user_id)
+        self.assertEqual(local["account"]["user_id"], local_user_id)
+        self.assertTrue(local["account"]["username"].startswith("local-user_"))
+        self.assertEqual(local["account"]["role"], "user")
+        self.assertIsNotNone(
+            self.store.verify_session(local["access_token"], "127.0.0.1")
+        )
+
+        device_key = "cc_device_" + "A" * 43
+        approved = self.store.register_device(
+            device_key,
+            label="Test browser",
+            fingerprint="test-fingerprint",
+            client_ip="192.168.1.22",
+        )
+        self.assertFalse(approved.get("pending", False))
+        self.assertEqual(approved["device"]["status"], "approved")
+        self.assertEqual(approved["account"]["role"], "user")
+        self.assertIsNotNone(
+            self.store.verify_session(approved["access_token"], "192.168.1.22")
+        )
+        self.assertIsNone(
+            self.store.verify_session(approved["access_token"], "192.168.1.23")
+        )
+        moved = self.store.register_device(
+            device_key,
+            label="Test browser",
+            fingerprint="test-fingerprint",
+            client_ip="192.168.1.23",
+        )
+        self.assertFalse(moved.get("pending", False))
+        self.assertEqual(moved["device"]["status"], "approved")
+        self.assertEqual(moved["account"]["user_id"], approved["account"]["user_id"])
+        self.assertIsNone(
+            self.store.verify_session(approved["access_token"], "192.168.1.22")
+        )
+        self.assertIsNotNone(
+            self.store.verify_session(moved["access_token"], "192.168.1.23")
+        )
+
+        self.store.revoke_device(moved["device"]["pairing_id"])
+        with self.assertRaises(cc.IDEAuthError) as caught:
+            self.store.register_device(
+                device_key,
+                label="Test browser",
+                fingerprint="test-fingerprint",
+                client_ip="192.168.1.23",
+            )
+        self.assertEqual(caught.exception.code, "device_revoked")
+
+    def test_local_session_isolated_by_caller_identity(self):
+        first_id = cc.user_id_from_ip("192.168.1.21")
+        second_id = cc.user_id_from_ip("192.168.1.22")
+        first = self.store.local_session(legacy_user_id=first_id, client_ip="192.168.1.21")
+        second = self.store.local_session(legacy_user_id=second_id, client_ip="192.168.1.22")
+
+        self.assertNotEqual(first["account"]["user_id"], second["account"]["user_id"])
+        self.assertNotEqual(first["account"]["username"], second["account"]["username"])
+        self.assertEqual(first["account"]["role"], "user")
+        self.assertEqual(second["account"]["role"], "user")
+        self.assertIsNotNone(self.store.verify_session(first["access_token"], "192.168.1.21"))
+        self.assertIsNone(self.store.verify_session(first["access_token"], "192.168.1.22"))
+
+        same_identity = self.store.local_session(
+            legacy_user_id=first_id,
+            client_ip="192.168.1.21",
+        )
+        self.assertEqual(same_identity["account"]["user_id"], first_id)
+        self.assertNotEqual(same_identity["access_token"], first["access_token"])
+
+    def test_schema_upgrade_revokes_unclassified_legacy_sessions(self):
+        local_user_id = cc.user_id_from_ip("127.0.0.1")
+        local = self.store.local_session(
+            legacy_user_id=local_user_id,
+            client_ip="127.0.0.1",
+        )
+        with sqlite3.connect(str(self.store.path)) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("ALTER TABLE ide_sessions RENAME TO ide_sessions_current")
+            conn.execute(
+                """CREATE TABLE ide_sessions (
+                    token_digest TEXT PRIMARY KEY, username_key TEXT NOT NULL,
+                    auth_version INTEGER NOT NULL, csrf_token TEXT NOT NULL,
+                    created_at REAL NOT NULL, expires_at REAL NOT NULL,
+                    revoked_at REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
+                    device_digest TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO ide_sessions
+                   (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
+                    revoked_at,last_ip,device_digest)
+                   SELECT token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
+                          revoked_at,last_ip,device_digest FROM ide_sessions_current"""
+            )
+            conn.execute("DROP TABLE ide_sessions_current")
+        upgraded = cc.IDEAuthStore(self.store.path)
+        self.assertIsNone(upgraded.verify_session(local["access_token"], "127.0.0.1"))
+        with sqlite3.connect(str(self.store.path)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(ide_sessions)")}
+            active = conn.execute(
+                "SELECT COUNT(*) FROM ide_sessions WHERE revoked_at=0"
+            ).fetchone()[0]
+        self.assertIn("session_kind", columns)
+        self.assertEqual(active, 0)
+
+    def test_local_admin_can_set_password_when_optional_login_is_enabled(self):
+        self.store.setup_admin(
+            "local-admin",
+            "Strong-Passphrase-42!",
+            legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
+        )
+        local = self.store.local_session(legacy_user_id=cc.user_id_from_ip("127.0.0.1"))
+        self.assertEqual(local["account"]["username"], "local-admin")
+        self.store.reset_password("local-admin", "Known-Passphrase-73!")
+        self.assertIsNone(self.store.verify_session(local["access_token"], "127.0.0.1"))
+        logged_in = self.store.login("local-admin", "Known-Passphrase-73!", "127.0.0.1")
+        self.assertIsNotNone(
+            self.store.verify_session(logged_in["access_token"], "127.0.0.1")
+        )
+
+
+class IDECapabilityTests(unittest.TestCase):
+    def test_loopback_mounts_and_remote_process_sandbox_capabilities(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        local = app.ide_request_capabilities(
+            {"role": "user"}, client_ip="127.0.0.1", direct_loopback=True
+        )
+        self.assertTrue(local["mounts"])
+        self.assertTrue(local["processes"])
+        terminal_supported = bool(
+            (cc._pty is not None and os.name == "posix") or os.name == "nt"
+        )
+        self.assertEqual(local["terminal"], terminal_supported)
+        lan = app.ide_request_capabilities(
+            {"role": "admin"}, client_ip="192.168.1.22", direct_loopback=False
+        )
+        self.assertFalse(lan["mounts"])
+        self.assertEqual(
+            lan["terminal"], bool(lan["hard_isolation"] and terminal_supported)
+        )
+        if not lan["hard_isolation"]:
+            with self.assertRaises(cc.IDECapabilityError):
+                app.ide_require_capability(lan, "terminal")
+
+
+class IDEWorkspaceServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.files = self.root / "files"
+        self.files.mkdir()
+        self.app = cc.AppContext.__new__(cc.AppContext)
+        self.app.ide_state_lock = threading.RLock()
+        self.app.ide_terminal_lock = threading.RLock()
+        self.app.ide_terminals = {}
+        self.app.ide_extensions_root = self.root / "extensions"
+        self.app.ide_extensions_root.mkdir()
+        self.app.ide_resolve_workspace = lambda user_id, session_id, root_id, rel="": (
+            self.files,
+            cc.safe_path(cc.normalize_rel_preview_path(rel) or ".", self.files),
+            {"id": "session", "kind": "session"},
+        )
+        self.app._ide_reject_hard_snapshot_mutation = lambda *args: None
+        self.app._ide_emit_workspace_change = lambda *args, **kwargs: None
+        self.app.user_root = lambda user_id: self.root / str(user_id)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_terminal_output_base64_preserves_split_utf8_bytes(self):
+        raw = "山海绘卷".encode()
+        split = 2
+        terminal = {
+            "user_id": "account-a",
+            "output": bytearray(raw[:split]),
+            "output_start": 0,
+            "output_end": split,
+            "closed": False,
+            "returncode": None,
+            "last_activity": 0.0,
+            "lock": threading.RLock(),
+        }
+        self.app.ide_terminals["term-a"] = terminal
+
+        first = self.app.ide_terminal_output("account-a", "term-a", 0)
+        with terminal["lock"]:
+            terminal["output"].extend(raw[split:])
+            terminal["output_end"] = len(raw)
+            terminal["closed"] = True
+            terminal["returncode"] = 0
+        second = self.app.ide_terminal_output(
+            "account-a", "term-a", first["next_offset"]
+        )
+
+        joined = base64.b64decode(first["data_b64"]) + base64.b64decode(
+            second["data_b64"]
+        )
+        self.assertEqual(joined.decode("utf-8"), "山海绘卷")
+        self.assertEqual(second["encoding"], "utf-8")
+
+    def test_revision_aware_atomic_write_rejects_stale_editor(self):
+        target = self.files / "main.py"
+        target.write_text("value = 1\n", encoding="utf-8")
+        opened = self.app.ide_read_file("account-a", "session-a", rel="main.py")
+        target.write_text("value = 2\n", encoding="utf-8")
+        with self.assertRaises(cc.IDEFileConflict) as caught:
+            self.app.ide_write_file(
+                "account-a",
+                "session-a",
+                {
+                    "path": "main.py",
+                    "content": "value = 3\n",
+                    "expected_revision": opened["revision"],
+                },
+            )
+        self.assertEqual(caught.exception.code, "file_conflict")
+        self.assertEqual(target.read_text(encoding="utf-8"), "value = 2\n")
+
+    def test_quick_open_file_list_is_recursive_bounded_and_skips_generated_dirs(self):
+        (self.files / "src" / "nested").mkdir(parents=True)
+        (self.files / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
+        (self.files / "src" / "nested" / "页面.html").write_text(
+            "<h1>ok</h1>\n", encoding="utf-8"
+        )
+        (self.files / "node_modules" / "package").mkdir(parents=True)
+        (self.files / "node_modules" / "package" / "ignored.js").write_text(
+            "ignored\n", encoding="utf-8"
+        )
+
+        listed = self.app.ide_workspace_files(
+            "account-a", "session-a", root_id="session", max_files=10
+        )
+        paths = [row["path"] for row in listed["files"]]
+        self.assertEqual(paths, ["src/main.py", "src/nested/页面.html"])
+        self.assertFalse(listed["truncated"])
+
+        bounded = self.app.ide_workspace_files(
+            "account-a", "session-a", root_id="session", max_files=1
+        )
+        self.assertEqual(bounded["count"], 1)
+        self.assertTrue(bounded["truncated"])
+
+        snapshot = self.app._ide_prompt_workspace_snapshot(
+            self.files, max_entries=20, max_chars=4000
+        )
+        snapshot_paths = [row["path"] for row in snapshot["entries"]]
+        self.assertEqual(snapshot["awareness"], "always_on")
+        self.assertIn("src/main.py", snapshot_paths)
+        self.assertIn("src/nested/页面.html", snapshot_paths)
+        self.assertIn("node_modules", snapshot_paths)
+        self.assertNotIn("node_modules/package/ignored.js", snapshot_paths)
+        self.assertGreaterEqual(snapshot["skipped_directories"], 1)
+
+    def test_prompt_enhancement_uses_active_model_without_submitting_task(self):
+        (self.files / "notes.md").write_text("context\n", encoding="utf-8")
+
+        class FakeRuntime:
+            model = "test-model"
+            provider = "ollama"
+            base_url = "http://127.0.0.1:11434"
+
+        class FakeSession:
+            ui_language = "zh-CN"
+            active_profile_id = "local"
+            model_profiles = {
+                "local": {
+                    "provider": "ollama",
+                    "model": "test-model",
+                    "base_url": "http://127.0.0.1:11434",
+                    "request_timeout": 30,
+                }
+            }
+            ollama = FakeRuntime()
+            lock = threading.RLock()
+            telemetry_callback = None
+
+            def snapshot_safe(self, **_kwargs):
+                return {
+                    "conversation_feed": [
+                        {
+                            "role": "user",
+                            "text": "IDE programming request.\n\nEarlier context",
+                        }
+                    ]
+                }
+
+        session = FakeSession()
+        self.app._ide_session = lambda user_id, session_id: session
+        self.app.submit_user_message = mock.Mock(
+            side_effect=AssertionError("must not submit")
+        )
+        model_payload = {
+            "intent_summary": "修复并验证目标功能",
+            "deliverables": ["代码修改", "测试证据"],
+            "constraints": ["不扩大范围"],
+            "assumptions": [],
+            "acceptance_criteria": ["测试通过"],
+            "execution_steps": [
+                {
+                    "title": "定位",
+                    "action": "检查目标实现与现有测试。",
+                    "depends_on": [],
+                    "completion_check": "已确认修改点。",
+                },
+                {
+                    "title": "实现",
+                    "action": "完成目标功能修改。",
+                    "depends_on": ["定位"],
+                    "completion_check": "实现符合约束。",
+                },
+                {
+                    "title": "验证",
+                    "action": "运行相关测试并核对结果。",
+                    "depends_on": ["实现"],
+                    "completion_check": "测试通过。",
+                },
+            ],
+            "selected_skills": [],
+            "clarifications": [
+                {
+                    "question": "是否需要保持兼容？",
+                    "default_answer": "默认保持现有公开接口兼容。",
+                }
+            ],
+            "enhanced_prompt": "## 目标\n修复目标功能并完成验证。",
+        }
+        with (
+            mock.patch.object(
+                self.app,
+                "_ide_prompt_skill_catalog",
+                side_effect=AssertionError(
+                    "skills catalog must stay lazy when awareness is off"
+                ),
+            ) as skills_catalog,
+            mock.patch.object(
+                cc.OllamaClient,
+                "chat",
+                return_value={"content": json.dumps(model_payload, ensure_ascii=False)},
+            ) as chat,
+        ):
+            out = self.app.ide_enhance_agent_prompt(
+                "account-a",
+                "session-a",
+                {
+                    "root_id": "session",
+                    "active_path": "main.py",
+                    "attachments": ["notes.md"],
+                    "message": "请修复目标功能",
+                },
+            )
+        self.assertEqual(out["source"], "model")
+        self.assertEqual(out["model"], "test-model")
+        self.assertIn("修复目标功能并完成验证", out["enhanced_prompt"])
+        self.assertIn("请修复目标功能", out["enhanced_prompt"])
+        self.assertIn("默认保持现有公开接口兼容", out["enhanced_prompt"])
+        self.assertEqual(out["open_questions"], ["是否需要保持兼容？"])
+        self.assertEqual(out["clarifications"], model_payload["clarifications"])
+        self.assertEqual(out["acceptance_criteria"], ["测试通过"])
+        self.assertEqual(len(out["execution_steps"]), 3)
+        self.assertEqual(out["workspace_context"]["awareness"], "always_on")
+        self.assertFalse(out["skills_awareness"])
+        self.app.submit_user_message.assert_not_called()
+        skills_catalog.assert_not_called()
+        kwargs = chat.call_args.kwargs
+        self.assertFalse(kwargs["think"])
+        self.assertFalse(kwargs["response_stream"])
+        self.assertEqual(kwargs["temperature"], 0.15)
+        self.assertEqual(kwargs["max_tokens"], 3600)
+        prompt = chat.call_args.args[0][0]["content"]
+        self.assertIn('"directory_snapshot"', prompt)
+        self.assertIn('"skills_awareness"', prompt)
+
+    def test_prompt_enhancement_selects_valid_skills_and_refines_with_full_instructions(
+        self,
+    ):
+        (self.files / "src").mkdir()
+        (self.files / "src" / "app.js").write_text(
+            "console.log('ok')\n", encoding="utf-8"
+        )
+
+        class FakeRuntime:
+            model = "test-model"
+            provider = "ollama"
+            base_url = "http://127.0.0.1:11434"
+
+        class FakeSession:
+            ui_language = "en"
+            active_profile_id = "local"
+            model_profiles = {
+                "local": {
+                    "provider": "ollama",
+                    "model": "test-model",
+                    "base_url": "http://127.0.0.1:11434",
+                }
+            }
+            ollama = FakeRuntime()
+            lock = threading.RLock()
+            telemetry_callback = None
+
+            def snapshot_safe(self, **_kwargs):
+                return {"conversation_feed": []}
+
+        class FakeSkillStore:
+            def _resolve_name(self, name):
+                return (
+                    ("frontend", None)
+                    if name in {"frontend", "Frontend"}
+                    else (None, "unknown")
+                )
+
+            def load(self, name):
+                self.loaded = name
+                return (
+                    "<skill>Inspect existing components, then implement and run "
+                    "browser validation.</skill>"
+                )
+
+        store = FakeSkillStore()
+        catalog = [
+            {
+                "id": "frontend",
+                "name": "Frontend",
+                "description": "Build and validate browser interfaces.",
+                "provider": "local",
+                "triggers": ["frontend"],
+                "entrypoints": [],
+            }
+        ]
+        first = {
+            "intent_summary": "Implement the requested interface safely.",
+            "deliverables": ["Updated interface"],
+            "constraints": [],
+            "assumptions": [],
+            "acceptance_criteria": ["Browser flow passes"],
+            "clarifications": [],
+            "execution_steps": [
+                {
+                    "title": "Inspect",
+                    "action": "Inspect src/app.js.",
+                    "depends_on": [],
+                    "completion_check": "Current behavior is known.",
+                }
+            ],
+            "selected_skills": [
+                {
+                    "id": "frontend",
+                    "rationale": "The task changes a browser interface.",
+                },
+                {"id": "invented-skill", "rationale": "This id is not real."},
+            ],
+            "enhanced_prompt": "## Goal\nImplement the interface.",
+        }
+        refined = {
+            "execution_steps": [
+                {
+                    "title": "Inspect",
+                    "action": "Inspect src/app.js and its tests.",
+                    "depends_on": [],
+                    "completion_check": "Current behavior is known.",
+                },
+                {
+                    "title": "Implement",
+                    "action": "Implement one bounded UI increment.",
+                    "depends_on": ["Inspect"],
+                    "completion_check": "The increment works.",
+                },
+                {
+                    "title": "Verify",
+                    "action": "Run browser validation.",
+                    "depends_on": ["Implement"],
+                    "completion_check": "The browser flow passes.",
+                },
+            ],
+            "final_prompt": (
+                "## Goal\nImplement the interface in three verified stages."
+            ),
+        }
+        self.app._ide_session = lambda user_id, session_id: FakeSession()
+        self.app._ide_prompt_skill_catalog = lambda: (store, catalog, False)
+        with mock.patch.object(
+            cc.OllamaClient,
+            "chat",
+            side_effect=[
+                {"content": json.dumps(first)},
+                {"content": json.dumps(refined)},
+            ],
+        ) as chat:
+            out = self.app.ide_enhance_agent_prompt(
+                "account-a",
+                "session-a",
+                {
+                    "message": "Improve the frontend",
+                    "budget": "medium",
+                    "skills_awareness": True,
+                },
+            )
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(store.loaded, "frontend")
+        self.assertEqual([row["id"] for row in out["selected_skills"]], ["frontend"])
+        self.assertNotIn("invented-skill", out["enhanced_prompt"])
+        self.assertIn("`frontend`", out["enhanced_prompt"])
+        self.assertEqual(len(out["execution_steps"]), 3)
+        first_prompt = chat.call_args_list[0].args[0][0]["content"]
+        second_prompt = chat.call_args_list[1].args[0][0]["content"]
+        self.assertIn("src/app.js", first_prompt)
+        self.assertIn("Build and validate browser interfaces", first_prompt)
+        self.assertIn("Inspect existing components", second_prompt)
+
+    def test_prompt_enhancement_uses_budget_aware_template_when_model_is_unavailable(
+        self,
+    ):
+        class FakeRuntime:
+            model = "offline-model"
+            provider = "ollama"
+            base_url = "http://127.0.0.1:11434"
+
+        class FakeSession:
+            ui_language = "zh-CN"
+            active_profile_id = "local"
+            model_profiles = {
+                "local": {
+                    "provider": "ollama",
+                    "model": "offline-model",
+                    "base_url": "http://127.0.0.1:11434",
+                }
+            }
+            ollama = FakeRuntime()
+            lock = threading.RLock()
+            telemetry_callback = None
+
+            def snapshot_safe(self, **_kwargs):
+                return {"conversation_feed": []}
+
+        self.app._ide_session = lambda user_id, session_id: FakeSession()
+        with mock.patch.object(
+            cc.OllamaClient, "chat", side_effect=RuntimeError("offline")
+        ):
+            out = self.app.ide_enhance_agent_prompt(
+                "account-a",
+                "session-a",
+                {"message": "实现导出按钮", "budget": "high"},
+            )
+        self.assertEqual(out["source"], "fallback")
+        self.assertEqual(out["fallback_reason"], "model_error")
+        self.assertEqual(out["budget"], "high")
+        self.assertIn("任务目标", out["enhanced_prompt"])
+        self.assertIn("实现导出按钮", out["enhanced_prompt"])
+        self.assertIn("工作区目录（始终感知）", out["enhanced_prompt"])
+        self.assertEqual(len(out["execution_steps"]), 3)
+        self.assertIn("offline", out["warning"])
+
+    def test_prompt_enhancement_preserves_unbounded_original_input(self):
+        class FakeRuntime:
+            model = "test-model"
+            provider = "ollama"
+            base_url = "http://127.0.0.1:11434"
+
+        class FakeSession:
+            ui_language = "zh-CN"
+            active_profile_id = "local"
+            model_profiles = {
+                "local": {
+                    "provider": "ollama",
+                    "model": "test-model",
+                    "base_url": "http://127.0.0.1:11434",
+                }
+            }
+            ollama = FakeRuntime()
+            lock = threading.RLock()
+            telemetry_callback = None
+
+            def snapshot_safe(self, **_kwargs):
+                return {"conversation_feed": []}
+
+        original = "开始-" + ("完整输入内容" * 12000) + "-结束"
+        model_payload = {
+            "intent_summary": "完整保留并处理用户输入。",
+            "deliverables": [],
+            "constraints": [],
+            "assumptions": [],
+            "acceptance_criteria": [],
+            "clarifications": [],
+            "execution_steps": [
+                {
+                    "title": "执行",
+                    "action": "处理完整请求。",
+                    "depends_on": [],
+                    "completion_check": "请求已完整处理。",
+                }
+            ],
+            "selected_skills": [],
+            "enhanced_prompt": "## 目标\n处理完整请求。",
+        }
+        self.app._ide_session = lambda user_id, session_id: FakeSession()
+        with mock.patch.object(
+            cc.OllamaClient,
+            "chat",
+            return_value={"content": json.dumps(model_payload, ensure_ascii=False)},
+        ) as chat:
+            out = self.app.ide_enhance_agent_prompt(
+                "account-a",
+                "session-a",
+                {"message": original, "budget": "low"},
+            )
+        sent = chat.call_args.args[0][0]["content"]
+        self.assertIn(original, sent)
+        self.assertEqual(out["original_prompt"], original)
+        self.assertIn(original, out["enhanced_prompt"])
+        self.assertEqual(len(out["execution_steps"]), 1)
+
+    def test_prompt_enhancement_parser_accepts_complete_flexible_formats(self):
+        nested = self.app._ide_parse_prompt_enhancement_response(
+            json.dumps(
+                {
+                    "result": {
+                        "interpreted_intent": "Repair the parser.",
+                        "outputs": ["Parser update"],
+                        "steps": ["Inspect", "Implement", "Verify"],
+                        "final_prompt": "## Goal\nRepair the parser.",
+                    }
+                }
+            )
+        )
+        self.assertEqual(nested["intent_summary"], "Repair the parser.")
+        self.assertEqual(nested["deliverables"], ["Parser update"])
+        self.assertEqual(nested["execution_steps"], ["Inspect", "Implement", "Verify"])
+        self.assertIn("Repair the parser", nested["enhanced_prompt"])
+
+        markdown = self.app._ide_parse_prompt_enhancement_response(
+            "# INTERPRETED INTENT\nHandle the request safely.\n\n"
+            "## Deliverables\n- Updated parser\n- Regression tests\n\n"
+            "## Execution Steps\n1. Inspect formats\n2. Implement tolerance\n\n"
+            "## Final Agent Prompt\nImplement and verify the parser update."
+        )
+        self.assertEqual(markdown["_format"], "markdown")
+        self.assertEqual(markdown["intent_summary"], "Handle the request safely.")
+        self.assertEqual(
+            markdown["deliverables"], ["Updated parser", "Regression tests"]
+        )
+        self.assertEqual(
+            markdown["execution_steps"], ["Inspect formats", "Implement tolerance"]
+        )
+        self.assertEqual(
+            markdown["enhanced_prompt"], "Implement and verify the parser update."
+        )
+
+    def test_prompt_enhancement_parser_rejects_incomplete_json(self):
+        malformed = '{"intent_summary":"ok","enhanced_prompt":"unterminated"'
+        prefixed = "Here is the requested JSON:\n" + malformed
+        fenced = "```json\n" + malformed + "\n```"
+        incomplete_array = (
+            'Here is the requested JSON:\n[{"enhanced_prompt":"complete inner object"}'
+        )
+        self.assertEqual(self.app._ide_parse_prompt_enhancement_response(malformed), {})
+        self.assertEqual(self.app._ide_parse_prompt_enhancement_response(prefixed), {})
+        self.assertEqual(self.app._ide_parse_prompt_enhancement_response(fenced), {})
+        self.assertEqual(
+            self.app._ide_parse_prompt_enhancement_response(incomplete_array), {}
+        )
+
+    def test_prompt_enhancement_preference_is_persisted(self):
+        saved = self.app.ide_save_workbench_state(
+            "account-a",
+            {
+                "state": {
+                    "active_session_id": "session-a",
+                    "prompt_enhance_persistent": True,
+                    "prompt_enhance_enabled": True,
+                    "prompt_enhance_skills_awareness": True,
+                    "prompt_enhance_budget": "high",
+                }
+            },
+        )
+        self.assertTrue(saved["state"]["prompt_enhance_persistent"])
+        self.assertTrue(saved["state"]["prompt_enhance_enabled"])
+        self.assertTrue(saved["state"]["prompt_enhance_skills_awareness"])
+        self.assertEqual(saved["state"]["prompt_enhance_budget"], "high")
+        loaded = self.app.ide_get_workbench_state("account-a")
+        self.assertTrue(loaded["state"]["prompt_enhance_persistent"])
+        self.assertTrue(loaded["state"]["prompt_enhance_enabled"])
+        self.assertTrue(loaded["state"]["prompt_enhance_skills_awareness"])
+        self.assertEqual(loaded["state"]["prompt_enhance_budget"], "high")
+
+        one_shot = self.app.ide_save_workbench_state(
+            "account-a",
+            {
+                "state": {
+                    "prompt_enhance_persistent": False,
+                    "prompt_enhance_enabled": True,
+                    "prompt_enhance_budget": "xhigh",
+                }
+            },
+        )
+        self.assertFalse(one_shot["state"]["prompt_enhance_persistent"])
+        self.assertFalse(one_shot["state"]["prompt_enhance_enabled"])
+        self.assertEqual(one_shot["state"]["prompt_enhance_budget"], "xhigh")
+
+        invalid = self.app.ide_save_workbench_state(
+            "account-a", {"state": {"prompt_enhance_budget": "unbounded"}}
+        )
+        self.assertEqual(invalid["state"]["prompt_enhance_budget"], "medium")
+
+    def test_prompt_enhancement_fallback_matches_all_supported_ui_languages(self):
+        markers = {
+            "zh-CN": "任务目标",
+            "zh-TW": "任務目標",
+            "ja": "タスク目標",
+            "en": "Task Goal",
+        }
+        for language, marker in markers.items():
+            with self.subTest(language=language):
+                out = self.app._ide_prompt_enhancement_fallback(
+                    "Keep literal/path.py unchanged",
+                    language=language,
+                    active_path="literal/path.py",
+                )
+                self.assertIn(marker, out["enhanced_prompt"])
+                self.assertIn("Keep literal/path.py unchanged", out["enhanced_prompt"])
+                self.assertTrue(out["acceptance_criteria"])
+
+        variants = {
+            budget: self.app._ide_prompt_enhancement_fallback(
+                "Implement the feature", language="en", budget=budget
+            )
+            for budget in ("low", "medium", "high", "xhigh")
+        }
+        self.assertLess(
+            len(variants["low"]["enhanced_prompt"]),
+            len(variants["medium"]["enhanced_prompt"]),
+        )
+        self.assertLess(
+            len(variants["medium"]["enhanced_prompt"]),
+            len(variants["high"]["enhanced_prompt"]),
+        )
+        self.assertLess(
+            len(variants["high"]["enhanced_prompt"]),
+            len(variants["xhigh"]["enhanced_prompt"]),
+        )
+        self.assertEqual(
+            [
+                len(variants[budget]["execution_steps"])
+                for budget in ("low", "medium", "high", "xhigh")
+            ],
+            [3, 3, 3, 3],
+        )
+        profiles = [
+            cc.IDE_PROMPT_ENHANCEMENT_BUDGETS[budget]
+            for budget in ("low", "medium", "high", "xhigh")
+        ]
+        self.assertEqual(
+            [row["max_tokens"] for row in profiles], [1800, 3600, 6000, 8200]
+        )
+        self.assertEqual([row["max_skills"] for row in profiles], [1, 3, 5, 8])
+        self.assertTrue(
+            all("complex" in row["step_guidance"].lower() for row in profiles)
+        )
+        self.assertIn(
+            "materially viable",
+            cc.IDE_PROMPT_ENHANCEMENT_BUDGETS["high"]["solution_diversity"],
+        )
+        self.assertIn(
+            "rollback", cc.IDE_PROMPT_ENHANCEMENT_BUDGETS["xhigh"]["planning_depth"]
+        )
+
+    def test_ide_preview_html_reuses_workspace_safe_artifact_renderers(self):
+        target = self.files / "results.csv"
+        target.write_text("planet,distance\nEarth,1\nMars,1.52\n", encoding="utf-8")
+
+        class PreviewSession:
+            def _preview_csv_html(self, fp):
+                return f"<html><body>{fp.name}</body></html>"
+
+        self.app._ide_session = lambda user_id, session_id: PreviewSession()
+        rendered = self.app.ide_preview_html(
+            "account-a", "session-a", rel="results.csv"
+        )
+        self.assertIn("results.csv", rendered)
+        with self.assertRaises(FileNotFoundError):
+            self.app.ide_preview_html("account-a", "session-a", rel="missing.csv")
+
+    def test_docx_and_pptx_preview_render_real_html(self):
+        try:
+            import docx
+            import pptx
+            from pptx.util import Inches
+        except ImportError:
+            self.skipTest("python-docx and python-pptx are required")
+
+        preview_session = cc.SessionState.__new__(cc.SessionState)
+        preview_session._module_cache = {}
+        self.app._ide_session = lambda user_id, session_id: preview_session
+
+        document = docx.Document()
+        document.add_heading("Rendered DOCX", 0)
+        document.add_paragraph("Office document body")
+        document.save(self.files / "report.docx")
+
+        presentation = pptx.Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+        shape = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+        shape.text = "Rendered PPTX"
+        presentation.save(self.files / "slides.pptx")
+
+        doc_html = self.app.ide_preview_html(
+            "account-a", "session-a", rel="report.docx"
+        )
+        ppt_html = self.app.ide_preview_html(
+            "account-a", "session-a", rel="slides.pptx"
+        )
+        self.assertIn("Rendered DOCX", doc_html)
+        self.assertIn("pv-doc-page", doc_html)
+        self.assertIn("Rendered PPTX", ppt_html)
+        self.assertIn("pv-slide-stage", ppt_html)
+
+    def test_large_previewable_artifact_opens_readonly_without_loading_content(self):
+        target = self.files / "large.pdf"
+        target.write_bytes(b"%PDF-1.4\n" + b"0" * 32)
+        original_limit = cc.IDE_FILE_MAX_BYTES
+        try:
+            cc.IDE_FILE_MAX_BYTES = 16
+            opened = self.app.ide_read_file("account-a", "session-a", rel="large.pdf")
+        finally:
+            cc.IDE_FILE_MAX_BYTES = original_limit
+        self.assertTrue(opened["readonly"])
+        self.assertEqual(opened["encoding"], "base64")
+        self.assertEqual(opened["content_b64"], "")
+        self.assertEqual(opened["file"]["preview_kind"], "pdf")
+
+    def test_large_text_and_markdown_use_bounded_server_previews(self):
+        preview_session = cc.SessionState.__new__(cc.SessionState)
+        self.app._ide_session = lambda user_id, session_id: preview_session
+        text_target = self.files / "large.txt"
+        text_target.write_text(
+            "# DFT Hamiltonian\n\n$$ \\hat H = -\\frac12\\sum_i \\nabla_i^2 $$\n\n"
+            + ("payload\n" * 500_000),
+            encoding="utf-8",
+        )
+        markdown_target = self.files / "complex.md"
+        markdown_target.write_text(
+            "# Report\n\n<script>alert('unsafe')</script>\n\n"
+            + "| A | B |\n|---|---|\n| 1 | 2 |\n" * 200_000,
+            encoding="utf-8",
+        )
+        original_limit = cc.IDE_TEXT_PREVIEW_MAX_BYTES
+        try:
+            cc.IDE_TEXT_PREVIEW_MAX_BYTES = 256 * 1024
+            text_opened = self.app.ide_read_file(
+                "account-a", "session-a", rel="large.txt"
+            )
+            markdown_opened = self.app.ide_read_file(
+                "account-a", "session-a", rel="complex.md"
+            )
+            text_preview = self.app.ide_preview_html(
+                "account-a", "session-a", rel="large.txt"
+            )
+            markdown_preview = self.app.ide_preview_html(
+                "account-a", "session-a", rel="complex.md"
+            )
+        finally:
+            cc.IDE_TEXT_PREVIEW_MAX_BYTES = original_limit
+        self.assertTrue(text_opened["readonly"])
+        self.assertTrue(markdown_opened["readonly"])
+        self.assertTrue(text_opened["content_omitted"])
+        self.assertIn("showing the first", text_preview)
+        self.assertIn("<h1", text_preview)
+        self.assertIn("$$", text_preview)
+        self.assertIn("<h1", markdown_preview)
+        for preview in (text_preview, markdown_preview):
+            self.assertNotIn("<script>alert", preview.lower())
+            self.assertIn("/assets/js_lib/katex/dist/katex.min.css", preview)
+            self.assertIn("/assets/js_lib/katex/dist/katex.min.js", preview)
+            self.assertIn(
+                "/assets/js_lib/katex/dist/contrib/auto-render.min.js", preview
+            )
+            self.assertIn("renderMathInElement", preview)
+            self.assertNotIn("https://", preview)
+
+    def test_markdown_preview_renders_structured_blocks_and_local_enhancers(self):
+        preview_session = cc.SessionState.__new__(cc.SessionState)
+        self.app._ide_session = lambda user_id, session_id: preview_session
+        target = self.files / "structured.md"
+        target.write_text(
+            "---\n"
+            "title: Structured report\n"
+            "tags:\n"
+            "  - markdown\n"
+            "  - preview\n"
+            "---\n"
+            "# Overview\n\n"
+            "- [x] completed\n- [ ] pending\n\n"
+            "> A quoted finding\n\n"
+            "| Name | Value |\n| --- | --- |\n| Alpha | 1 |\n\n"
+            "Inline formula $x^2$ and block formula:\n\n"
+            "$$\\sum_i x_i$$\n\n"
+            "```mermaid\n"
+            "graph TD\n"
+            "  A[Input] --> B[Output]\n"
+            "```\n",
+            encoding="utf-8",
+        )
+        preview = self.app.ide_preview_html(
+            "account-a", "session-a", rel="structured.md"
+        )
+        for marker in (
+            "Document metadata",
+            "pv-task-checkbox",
+            "<blockquote>",
+            "<table",
+            "language-mermaid",
+            "/assets/js_lib/marked.min.js",
+            "/assets/js_lib/mermaid.min.js",
+            "/assets/js_lib/katex/dist/katex.min.js",
+            "pv-markdown-source",
+        ):
+            self.assertIn(marker, preview)
+        self.assertNotIn("https://", preview)
+
+    def test_markdown_fallback_keeps_common_structure_readable(self):
+        rendered = cc._preview_markdown_fallback_html(
+            "# Heading\n\n- [x] done\n- [ ] todo\n\n"
+            "> quote\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n"
+            '```json\n{"ok": true}\n```'
+        )
+        self.assertIn("<h1>Heading</h1>", rendered)
+        self.assertIn("pv-task-checkbox", rendered)
+        self.assertIn("<blockquote>", rendered)
+        self.assertIn("<table", rendered)
+        self.assertIn("language-json", rendered)
+        self.assertNotIn("<script", rendered.lower())
+
+    def test_image_preview_streams_original_or_safe_thumbnail_without_base64_json(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
+        target = self.files / "large.png"
+        Image.new("RGB", (5000, 3000), (20, 120, 220)).save(target, format="PNG")
+        opened = self.app.ide_read_file("account-a", "session-a", rel="large.png")
+        data, content_type = self.app.ide_image_preview(
+            "account-a", "session-a", rel="large.png"
+        )
+        self.assertTrue(opened["readonly"])
+        self.assertTrue(opened["content_omitted"])
+        self.assertIn(content_type.split(";", 1)[0], {"image/png", "image/jpeg"})
+        self.assertGreater(len(data), 100)
+
+    def test_xlsx_preview_has_archive_and_table_budgets(self):
+        try:
+            import openpyxl
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        preview_session = cc.SessionState.__new__(cc.SessionState)
+        self.app._ide_session = lambda user_id, session_id: preview_session
+        target = self.files / "large.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Data"
+        for row in range(1, 260):
+            ws.append([f"cell-{row}-{col}" for col in range(1, 55)])
+        wb.save(target)
+        wb.close()
+        opened = self.app.ide_read_file("account-a", "session-a", rel="large.xlsx")
+        preview = self.app.ide_preview_html("account-a", "session-a", rel="large.xlsx")
+        self.assertTrue(opened["readonly"])
+        self.assertTrue(opened["content_omitted"])
+        self.assertIn("Data", preview)
+        self.assertIn("truncated", preview)
+
+    def test_workspace_path_escape_and_symlink_escape_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.app.ide_resolve_workspace(
+                "account-a", "session-a", "session", "../outside.txt"
+            )
+        outside = self.root / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        link = self.files / "link.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("symlinks unavailable")
+        with self.assertRaises(ValueError):
+            self.app.ide_resolve_workspace(
+                "account-a", "session-a", "session", "link.txt"
+            )
+
+    def test_workspace_archive_preserves_tree_and_empty_dirs_but_skips_symlinks(self):
+        (self.files / "project" / "empty").mkdir(parents=True)
+        (self.files / "project" / "src").mkdir()
+        (self.files / "project" / "src" / "main.py").write_text(
+            "print('ok')\n", encoding="utf-8"
+        )
+        outside = self.root / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        link = self.files / "project" / "outside-link.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            self.skipTest("symlinks unavailable")
+
+        archive = self.app.ide_workspace_archive(
+            "account-a", "session-a", root_id="session", rel="project"
+        )
+        archive_path = Path(archive["path"])
+        try:
+            with zipfile.ZipFile(archive_path) as bundle:
+                names = set(bundle.namelist())
+                self.assertIn("project/", names)
+                self.assertIn("project/empty/", names)
+                self.assertIn("project/src/main.py", names)
+                self.assertNotIn("project/outside-link.txt", names)
+                self.assertEqual(bundle.read("project/src/main.py"), b"print('ok')\n")
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+    def test_workspace_copy_and_move_preserve_tree_and_avoid_overwrite(self):
+        (self.files / "project" / "empty").mkdir(parents=True)
+        (self.files / "project" / "src").mkdir()
+        (self.files / "project" / "src" / "main.py").write_text(
+            "print('ok')\n", encoding="utf-8"
+        )
+        (self.files / "destination").mkdir()
+
+        copied = self.app.ide_copy_workspace_entry(
+            "account-a",
+            "session-a",
+            {
+                "root_id": "session",
+                "source_path": "project",
+                "destination_dir": "",
+                "operation": "copy",
+            },
+        )
+        self.assertEqual(copied["destination_path"], "project copy")
+        self.assertTrue((self.files / "project copy" / "empty").is_dir())
+        self.assertEqual(
+            (self.files / "project copy" / "src" / "main.py").read_text(
+                encoding="utf-8"
+            ),
+            "print('ok')\n",
+        )
+        copied_again = self.app.ide_copy_workspace_entry(
+            "account-a",
+            "session-a",
+            {
+                "source_path": "project",
+                "destination_dir": "",
+                "operation": "copy",
+            },
+        )
+        self.assertEqual(copied_again["destination_path"], "project copy 2")
+
+        moved = self.app.ide_copy_workspace_entry(
+            "account-a",
+            "session-a",
+            {
+                "source_path": "project\\src\\main.py",
+                "destination_dir": "destination",
+                "operation": "move",
+            },
+        )
+        self.assertEqual(moved["destination_path"], "destination/main.py")
+        self.assertFalse((self.files / "project" / "src" / "main.py").exists())
+        self.assertTrue((self.files / "destination" / "main.py").is_file())
+
+        noop = self.app.ide_copy_workspace_entry(
+            "account-a",
+            "session-a",
+            {
+                "source_path": "destination/main.py",
+                "destination_dir": "destination",
+                "operation": "move",
+            },
+        )
+        self.assertTrue(noop["noop"])
+        with self.assertRaisesRegex(ValueError, "into itself"):
+            self.app.ide_copy_workspace_entry(
+                "account-a",
+                "session-a",
+                {
+                    "source_path": "project",
+                    "destination_dir": "project/empty",
+                    "operation": "copy",
+                },
+            )
+
+    def test_workspace_copy_rejects_symbolic_links(self):
+        source = self.files / "source"
+        source.mkdir()
+        target = source / "target.txt"
+        target.write_text("safe", encoding="utf-8")
+        link = source / "link.txt"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            self.skipTest("symlinks unavailable")
+        with self.assertRaisesRegex(ValueError, "symbolic links"):
+            self.app.ide_copy_workspace_entry(
+                "account-a",
+                "session-a",
+                {
+                    "source_path": "source",
+                    "destination_dir": "",
+                    "operation": "copy",
+                },
+            )
+
+    def test_directory_upload_preserves_empty_directories_and_rejects_escape(self):
+        out = self.app.ide_upload(
+            "account-a",
+            "session-a",
+            {
+                "root_id": "session",
+                "dest": "imports",
+                "directories": ["sample", "sample/empty"],
+                "items": [
+                    {
+                        "path": "sample/readme.txt",
+                        "content_b64": cc.base64.b64encode(
+                            "目录内容".encode()
+                        ).decode(),
+                    }
+                ],
+            },
+        )
+        self.assertEqual(out["count"], 1)
+        self.assertEqual(out["directory_count"], 2)
+        self.assertTrue((self.files / "imports" / "sample" / "empty").is_dir())
+        self.assertEqual(
+            (self.files / "imports" / "sample" / "readme.txt").read_text(
+                encoding="utf-8"
+            ),
+            "目录内容",
+        )
+        with self.assertRaises(ValueError):
+            self.app.ide_upload(
+                "account-a",
+                "session-a",
+                {"dest": "", "directories": ["../escaped"], "items": []},
+            )
+        self.assertFalse((self.root / "escaped").exists())
+
+    def test_chunked_upload_is_idempotent_atomic_and_normalizes_windows_paths(self):
+        self.assertEqual(
+            cc.normalize_upload_rel_path("/C:/Users/demo/Drop/file.txt"),
+            "Users/demo/Drop/file.txt",
+        )
+        self.assertEqual(
+            cc.normalize_upload_rel_path(r"C:\Users\demo\Drop\file.txt"),
+            "Users/demo/Drop/file.txt",
+        )
+        self.assertEqual(
+            cc.normalize_upload_rel_path(r"\\server\share\Drop\file.txt"),
+            "Drop/file.txt",
+        )
+        target = self.files / "imports" / "样例" / "子目录" / "数据.txt"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old-content")
+        raw = "跨平台目录内容".encode()
+        first, second = raw[:9], raw[9:]
+        base = {
+            "root_id": "session",
+            "dest": "imports",
+            "path": "样例\\子目录\\数据.txt",
+            "upload_id": "up_0123456789abcdef0123456789abcdef",
+            "size": len(raw),
+        }
+        first_payload = {
+            **base,
+            "offset": 0,
+            "chunk_b64": cc.base64.b64encode(first).decode("ascii"),
+            "action": "append",
+        }
+        out = self.app.ide_upload_chunk("account-a", "session-a", first_payload)
+        self.assertEqual(out["received"], len(first))
+        self.assertEqual(target.read_bytes(), b"old-content")
+        retry = self.app.ide_upload_chunk("account-a", "session-a", first_payload)
+        self.assertEqual(retry["received"], len(first))
+        completed = self.app.ide_upload_chunk(
+            "account-a",
+            "session-a",
+            {
+                **base,
+                "offset": len(first),
+                "chunk_b64": cc.base64.b64encode(second).decode("ascii"),
+                "action": "complete",
+            },
+        )
+        self.assertTrue(completed["complete"])
+        self.assertEqual(target.read_bytes(), raw)
+        self.assertEqual(completed["file"]["path"], "imports/样例/子目录/数据.txt")
+
+    def test_chunked_upload_abort_removes_partial_file(self):
+        payload = {
+            "root_id": "session",
+            "path": "partial.bin",
+            "upload_id": "up_abcdef0123456789abcdef0123456789",
+            "size": 6,
+            "offset": 0,
+            "chunk_b64": cc.base64.b64encode(b"abc").decode("ascii"),
+            "action": "append",
+        }
+        self.app.ide_upload_chunk("account-a", "session-a", payload)
+        self.app.ide_upload_chunk(
+            "account-a", "session-a", {**payload, "action": "abort", "chunk_b64": ""}
+        )
+        self.assertFalse((self.files / "partial.bin").exists())
+        self.assertFalse(list(self.files.glob(".clouds-upload-*.part")))
+
+    def test_multi_chunk_binary_upload_round_trips_through_zip(self):
+        raw = bytes(range(256)) * 5000
+        upload_id = "up_00112233445566778899aabbccddeeff"
+        chunk_size = 512 * 1024
+        for offset in range(0, len(raw), chunk_size):
+            chunk = raw[offset : offset + chunk_size]
+            complete = offset + len(chunk) == len(raw)
+            out = self.app.ide_upload_chunk(
+                "account-a",
+                "session-a",
+                {
+                    "root_id": "session",
+                    "dest": "跨平台",
+                    "path": "二进制\\payload.bin",
+                    "upload_id": upload_id,
+                    "size": len(raw),
+                    "offset": offset,
+                    "chunk_b64": cc.base64.b64encode(chunk).decode("ascii"),
+                    "action": "complete" if complete else "append",
+                },
+            )
+        self.assertTrue(out["complete"])
+        self.assertEqual(
+            (self.files / "跨平台" / "二进制" / "payload.bin").read_bytes(), raw
+        )
+        archive = self.app.ide_workspace_archive(
+            "account-a", "session-a", root_id="session", rel="跨平台"
+        )
+        archive_path = Path(archive["path"])
+        try:
+            with zipfile.ZipFile(archive_path) as bundle:
+                self.assertEqual(bundle.read("跨平台/二进制/payload.bin"), raw)
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+    def test_agent_task_accepts_only_existing_workspace_attachments(self):
+        attachment = self.files / ".clouds_coder" / "attachments" / "brief.txt"
+        attachment.parent.mkdir(parents=True)
+        attachment.write_text("solar system requirements", encoding="utf-8")
+        submitted = []
+
+        class FakeSession:
+            pass
+
+        self.app._ide_session = lambda user_id, session_id: FakeSession()
+        self.app.submit_user_message = lambda user_id, session_id, message: (
+            submitted.append(message) or {"ok": True}
+        )
+        out = self.app.ide_agent_task(
+            "account-a",
+            "session-a",
+            {
+                "root_id": "session",
+                "message": "Build the model",
+                "attachments": [".clouds_coder/attachments/brief.txt"],
+            },
+        )
+        self.assertTrue(out["ok"])
+        self.assertIn("Attached workspace files", submitted[0])
+        self.assertIn(".clouds_coder/attachments/brief.txt", submitted[0])
+        with self.assertRaises(FileNotFoundError):
+            self.app.ide_agent_task(
+                "account-a",
+                "session-a",
+                {"message": "Build", "attachments": ["missing.txt"]},
+            )
+
+    def _vsix(self, entries):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return output.getvalue()
+
+    def test_vsix_zip_slip_is_rejected(self):
+        manifest = json.dumps(
+            {"publisher": "sample", "name": "safe", "version": "1.0.0"}
+        )
+        data = self._vsix(
+            [
+                ("extension/package.json", manifest),
+                ("extension/../../escaped.txt", "bad"),
+            ]
+        )
+        with self.assertRaises(ValueError):
+            self.app._ide_safe_extract_vsix(data, self.root / "install")
+        self.assertFalse((self.root / "escaped.txt").exists())
+
+    def test_declarative_vsix_manifest_is_exposed_without_host_apis(self):
+        manifest = json.dumps(
+            {
+                "publisher": "sample",
+                "name": "theme",
+                "version": "1.0.0",
+                "browser": "dist/extension.js",
+                "contributes": {
+                    "commands": [{"command": "sample.hello", "title": "Hello"}]
+                },
+            }
+        )
+        data = self._vsix(
+            [
+                ("extension/package.json", manifest),
+                ("extension/dist/extension.js", "self.onmessage=()=>{}"),
+            ]
+        )
+        public = self.app._ide_safe_extract_vsix(data, self.root / "install")
+        self.assertEqual(public["id"], "sample.theme")
+        self.assertTrue(public["worker_supported"])
+        self.assertIn("commands", public["contributes"])
+        self.assertNotIn("scripts", public)
+
+    def test_packaged_ide_assets_fallback_from_an_isolated_workspace(self):
+        workspace_assets = self.root / "workspace-js"
+        packaged_root = self.root / "package"
+        packaged_assets = packaged_root / "js_lib"
+        loader = packaged_assets / "monaco" / "min" / "vs" / "loader.js"
+        worker = (
+            packaged_assets
+            / "monaco"
+            / "min"
+            / "vs"
+            / "assets"
+            / "editor.worker-test.js"
+        )
+        loader.parent.mkdir(parents=True)
+        worker.parent.mkdir(parents=True)
+        loader.write_text("loader", encoding="utf-8")
+        worker.write_text("worker", encoding="utf-8")
+        workspace_assets.mkdir()
+        self.app.js_lib_root = workspace_assets
+
+        with mock.patch.object(cc, "SCRIPT_DIR", packaged_root):
+            self.assertEqual(
+                self.app.rag_js_lib_asset_path("monaco/min/vs/loader.js"),
+                loader.resolve(),
+            )
+            self.assertEqual(self.app.ide_monaco_worker_path(), worker.resolve())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX shell isolation required")
+    def test_remote_workspace_sandbox_blocks_outside_read_and_write(self):
+        backend = cc._detect_ide_sandbox_backend(force=True)
+        if not backend.get("available"):
+            self.skipTest(backend.get("reason") or "Native isolation backend unavailable")
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = self.files
+        shared_skills = self.root / "shared-skills"
+        shared_js = self.root / "shared-js"
+        shared_skills.mkdir()
+        shared_js.mkdir()
+        (shared_skills / "SKILL.md").write_text("shared skill", encoding="utf-8")
+        (shared_js / "library.js").write_text("shared library", encoding="utf-8")
+        session.skills = types.SimpleNamespace(skills_root=shared_skills, shell_virtual_mappings=lambda: [])
+        session.js_lib_root = shared_js
+        session.ide_remote_sandbox_required = True
+        (self.files / "inside.txt").write_text("inside", encoding="utf-8")
+        outside = self.root / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        prefix = session._workspace_sandbox_shell_prefix()
+        self.assertTrue(prefix, backend)
+
+        def run(command):
+            return cc.subprocess.run(
+                [*prefix, "/bin/sh", "-c", session._sandbox_virtualize_command(command)],
+                cwd=self.files, env=session._shell_process_env(), capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+
+        allowed = run("cat inside.txt && echo changed > made.txt")
+        self.assertEqual(allowed.returncode, 0, f"{backend['name']}: {allowed.stderr} {allowed.stdout}")
+        nested = run("mkdir -p nested/deeper && cd nested/deeper && printf checked > result.txt")
+        self.assertEqual(nested.returncode, 0, nested.stderr)
+        self.assertEqual((self.files / "nested/deeper/result.txt").read_text(encoding="utf-8"), "checked")
+        self.assertEqual((self.files / "made.txt").read_text(encoding="utf-8").strip(), "changed")
+        blocked_read = run(f"cat {cc.shlex.quote(str(outside))}")
+        blocked_write = run(f"echo escaped > {cc.shlex.quote(str(outside))}")
+        allowed_shared_read = run(f"cat {cc.shlex.quote(str(shared_skills / 'SKILL.md'))} {cc.shlex.quote(str(shared_js / 'library.js'))}")
+        blocked_shared_write = run(f"echo escaped > {cc.shlex.quote(str(shared_skills / 'SKILL.md'))}")
+        self.assertNotEqual(blocked_read.returncode, 0)
+        self.assertNotEqual(blocked_write.returncode, 0)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+        self.assertEqual(allowed_shared_read.returncode, 0, allowed_shared_read.stderr)
+        self.assertIn("shared skill", allowed_shared_read.stdout)
+        self.assertIn("shared library", allowed_shared_read.stdout)
+        self.assertNotEqual(blocked_shared_write.returncode, 0)
+        self.assertEqual((shared_skills / "SKILL.md").read_text(encoding="utf-8"), "shared skill")
+
+    def test_remote_process_environment_uses_workspace_private_temp(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = self.files
+        session.ide_remote_sandbox_required = True
+        env = session._shell_process_env()
+        expected = str(self.files / ".clouds_coder" / "tmp")
+        virtual = cc._detect_ide_sandbox_backend().get("name") in {
+            "bubblewrap",
+            "docker",
+            "podman",
+        }
+        self.assertEqual(env["HOME"], "/workspace" if virtual else str(self.files))
+        self.assertEqual(env["TMPDIR"], "/tmp" if virtual else expected)
+        self.assertEqual(env["TMP"], "/tmp" if virtual else expected)
+        self.assertEqual(env["TEMP"], "/tmp" if virtual else expected)
+        self.assertTrue(Path(expected).is_dir())
+        allowed_roots = [self.files.resolve(), *session._remote_runtime_read_roots()]
+        for entry in env["PATH"].split(os.pathsep):
+            resolved = Path(entry).resolve()
+            if resolved == Path("/Users") or resolved.is_relative_to(Path("/Users")):
+                self.assertTrue(
+                    any(
+                        resolved == root or resolved.is_relative_to(root)
+                        for root in allowed_roots
+                    )
+                )
+
+    def test_remote_agent_file_tools_read_shared_roots_but_reject_writes(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = self.files
+        session.ide_remote_sandbox_required = True
+        session.skill_mode = "dynamic"
+        session.skills = cc.SkillStore(self.root / "skills")
+        session.js_lib_root = self.root / "js_lib"
+        (self.root / "skills" / "private").mkdir(parents=True)
+        (self.root / "skills" / "private" / "SKILL.md").write_text("skill", encoding="utf-8")
+        (self.root / "js_lib" / "monaco" / "min" / "vs").mkdir(parents=True)
+        (self.root / "js_lib" / "monaco" / "min" / "vs" / "loader.js").write_text("loader", encoding="utf-8")
+
+        for path, expected in (
+            ("/skills/private/SKILL.md", "skill"),
+            ("/js_lib/monaco/min/vs/loader.js", "loader"),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(session._remote_agent_file_scope_error(path, "read"), "")
+                result = session._run_read(path)
+                self.assertIn(expected, result)
+
+        for path in (
+            "file_buffer/long-output.txt",
+            "[file_buffer:long-output]",
+        ):
+            with self.subTest(path=path):
+                result = session._dispatch_tool_inner(
+                    "read_file", {"path": path}, "developer"
+                )
+                if "file_buffer" in path:
+                    self.assertIn("limited to the isolated session workspace", result)
+
+        write_result = session._dispatch_tool_inner(
+            "write_file",
+            {"path": "/js_lib/escaped.js", "content": "escaped"},
+            "developer",
+        )
+        edit_result = session._dispatch_tool_inner(
+            "edit_file",
+            {
+                "path": "file_buffer/long-output.txt",
+                "old_text": "old",
+                "new_text": "new",
+            },
+            "developer",
+        )
+        self.assertIn("cannot modify shared Skills", write_result)
+        self.assertIn("limited to the isolated session workspace", edit_result)
+
+    def test_remote_agent_file_scope_allows_workspace_paths_only(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = self.files
+        session.ide_remote_sandbox_required = True
+
+        self.assertEqual(
+            session._remote_agent_file_scope_error("src/main.py", "read"), ""
+        )
+        self.assertEqual(
+            session._remote_agent_file_scope_error("/workspace/src/main.py", "write"),
+            "",
+        )
+        escaped = session._remote_agent_file_scope_error("../outside.txt", "read")
+        self.assertIn("path escapes workspace", escaped)
+
+    def test_remote_agent_can_use_controlled_skills_libraries_and_ready_mcp(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.ide_remote_sandbox_required = True
+        session.skill_mode = "dynamic"
+        session.skills = types.SimpleNamespace(
+            skills={},
+            list_metadata=lambda: [{"id": "local:shared-skill", "canonical_id": "local:shared-skill", "name": "shared-skill"}],
+        )
+        session.blackboard = {"loaded_skills": {}}
+        session._ensure_blackboard = lambda: session.blackboard
+        session._active_skill_step_id = lambda board=None: "remote-step"
+        session._ensure_skills_ready = lambda force=False: None
+        session.query_code_library_callback = lambda _session, args: f"code:{args['query']}"
+        session.query_knowledge_library_callback = lambda _session, args: f"knowledge:{args['query']}"
+        session.rag_remember_callback = lambda _session, args: f"remembered:{args['text']}"
+        session._emit = lambda *_args, **_kwargs: None
+
+        class ReadyMcp:
+            @staticmethod
+            def is_mcp_tool(name):
+                return name == "mcp__shared__lookup"
+
+            @staticmethod
+            def call(name, args):
+                return f"mcp:{name}:{args['query']}"
+
+        session.mcp = ReadyMcp()
+        self.assertEqual(
+            json.loads(session._dispatch_tool_inner("list_skills", {}, "developer"))["skills"][0]["canonical_id"],
+            "local:shared-skill",
+        )
+        self.assertEqual(
+            session._dispatch_tool_inner("query_code_library", {"query": "api"}, "developer"),
+            "code:api",
+        )
+        self.assertEqual(
+            session._dispatch_tool_inner("query_knowledge_library", {"query": "paper"}, "developer"),
+            "knowledge:paper",
+        )
+        self.assertEqual(
+            session._dispatch_tool_inner("rag_remember", {"text": "fact"}, "developer"),
+            "remembered:fact",
+        )
+        self.assertIn(
+            "mcp:mcp__shared__lookup:value",
+            session._dispatch_tool_inner(
+                "mcp__shared__lookup", {"query": "value"}, "developer"
+            ),
+        )
+        self.assertIn(
+            "unavailable to remote Program sessions",
+            session._dispatch_tool_inner("write_skill", {}, "developer"),
+        )
+
+
+class IDEHTTPAuthTests(unittest.TestCase):
+    class FakeApp:
+        def __init__(self, root):
+            self.ide_auth = cc.IDEAuthStore(root / "auth.sqlite")
+            self.ide_password_login_enabled = True
+            self.saved = None
+            self.resource_skill_write = None
+            self.resource_mcp_action = None
+            self.application_calls = []
+
+            class Applications:
+                def __init__(applications_self, owner):
+                    applications_self.owner = owner
+                    applications_self.rows = {}
+                    applications_self.submissions = {}
+                    applications_self.next_id = 1
+
+                @staticmethod
+                def list_shared():
+                    return [{"id": "shared-app", "name": "Shared App", "status": "published"}]
+
+                @staticmethod
+                def skill_catalog():
+                    return [{"id": "shared-skill", "name": "Shared Skill", "description": "Test"}]
+
+                def list_personal(applications_self, user_id):
+                    return [dict(row) for row in applications_self.rows.get(user_id, {}).values()]
+
+                def save_personal(applications_self, user_id, payload, app_id=""):
+                    applications_self.owner.application_calls.append(("save", user_id, app_id))
+                    rows = applications_self.rows.setdefault(user_id, {})
+                    if app_id and app_id not in rows:
+                        raise KeyError(app_id)
+                    old = rows.get(app_id, {})
+                    new_id = app_id or f"app-{applications_self.next_id}"
+                    if not app_id:
+                        applications_self.next_id += 1
+                    row = {
+                        "id": new_id,
+                        "name": str(payload.get("name", "")),
+                        "description": str(payload.get("description", "")),
+                        "icon": str(payload.get("icon", "")),
+                        "scope": "personal",
+                        "status": "draft",
+                        "revision": int(old.get("revision", 0)) + 1,
+                        "skills": [
+                            {"id": str(skill), "name": str(skill), "order": index}
+                            for index, skill in enumerate(payload.get("skills", []), 1)
+                        ],
+                    }
+                    rows[new_id] = row
+                    return dict(row)
+
+                def submit(applications_self, user_id, app_id):
+                    applications_self.owner.application_calls.append(("submit", user_id, app_id))
+                    row = applications_self.rows.get(user_id, {}).get(app_id)
+                    if row is None:
+                        raise KeyError(app_id)
+                    key = (user_id, app_id, row["revision"])
+                    return applications_self.submissions.setdefault(
+                        key,
+                        {
+                            **row,
+                            "id": f"submission-{len(applications_self.submissions) + 1}",
+                            "scope": "shared",
+                            "status": "pending",
+                            "source_app_id": app_id,
+                            "submitted_revision": row["revision"],
+                        },
+                    )
+
+                def delete_personal(applications_self, user_id, app_id):
+                    applications_self.owner.application_calls.append(("delete", user_id, app_id))
+                    return applications_self.rows.get(user_id, {}).pop(app_id, None) is not None
+
+            self.applications = Applications(self)
+
+        ide_is_loopback_address = staticmethod(cc.AppContext.ide_is_loopback_address)
+        ide_require_capability = staticmethod(cc.AppContext.ide_require_capability)
+
+        def ide_request_capabilities(self, account, *, client_ip, direct_loopback):
+            return cc.AppContext.ide_request_capabilities(
+                self, account, client_ip=client_ip, direct_loopback=direct_loopback
+            )
+
+        def ide_auth_status(self, *, local_setup_allowed):
+            return {
+                "setup_required": not self.ide_auth.configured(),
+                "local_setup_allowed": local_setup_allowed,
+                "local_auto_login": not self.ide_password_login_enabled,
+                "password_login_enabled": self.ide_password_login_enabled,
+            }
+
+        def local_ide_login(self, *, local_allowed, client_ip):
+            return cc.AppContext.local_ide_login(
+                self,
+                local_allowed=local_allowed,
+                client_ip=client_ip,
+            )
+
+        def setup_ide_admin(self, username, password, *, local_setup_allowed):
+            if not local_setup_allowed:
+                raise cc.IDEAuthError("setup_local_only", "local only", 403)
+            return self.ide_auth.setup_admin(
+                username, password, legacy_user_id=cc.user_id_from_ip("127.0.0.1")
+            )
+
+        def login_ide(self, username, password, client_ip):
+            return self.ide_auth.login(username, password, client_ip)
+
+        def register_ide_device(self, payload, *, client_ip):
+            return self.ide_auth.register_device(
+                payload.get("device_key"),
+                label=payload.get("label", "Web browser"),
+                fingerprint=payload.get("fingerprint", ""),
+                client_ip=client_ip,
+            )
+
+        def ide_get_workbench_state(self, user_id):
+            return {"ok": True, "state": {}}
+
+        def ide_save_workbench_state(self, user_id, payload):
+            self.saved = (user_id, payload)
+            return {"ok": True, "state": payload.get("state", {})}
+
+        def ide_applications_payload(self, user_id, *, client_ip, collaboration=False):
+            return {
+                "ok": True,
+                "personal": [] if collaboration else self.applications.list_personal(user_id),
+                "shared": self.applications.list_shared(),
+                "legacy_personal": [],
+                "web_sessions": [],
+                "skill_catalog": [] if collaboration else self.applications.skill_catalog(),
+                "collaboration": collaboration,
+            }
+
+        def ide_llm_config_status(self, user_id, *, client_ip=""):
+            return {
+                "ok": True,
+                "scope": "main_web_ui_user",
+                "source": "current_ip_user",
+                "profile_count": 1,
+                "independent": False,
+                "shared": True,
+                "active_profile": {"provider": "ollama", "model": "test"},
+                "server_side_credentials": True,
+            }
+
+        def ide_use_shared_llm_config(self, user_id, *, client_ip="", session_id=""):
+            self.llm_shared = (user_id, client_ip, session_id)
+            return self.ide_llm_config_status(user_id, client_ip=client_ip)
+
+        def shared_resource_manifest(self, user_id, *, collaboration=False):
+            return {
+                "skills": {"enabled": True, "count": 1, "read_only": True, "admin_write": True},
+                "js_libraries": {"enabled": True, "count": 2, "read_only": True},
+                "mcp": {"enabled": True, "ready": 1, "total": 1, "tool_count": 1},
+                "api_paths": {"resources": "/api/ide/v2/resources"},
+                "services": {},
+            }
+
+        @staticmethod
+        def skills_catalog():
+            return [{"id": "shared-skill", "name": "Shared Skill"}]
+
+        @staticmethod
+        def skill_providers_catalog():
+            return []
+
+        @staticmethod
+        def skill_protocols_catalog():
+            return []
+
+        @staticmethod
+        def skill_protocol_examples():
+            return {}
+
+        @staticmethod
+        def scan_skills():
+            return {"skills_count": 1, "skill_names": ["shared-skill"]}
+
+        @staticmethod
+        def skill_detail(skill_file):
+            return {"skill_file": skill_file, "content": "shared detail"}
+
+        @staticmethod
+        def shared_mcp_health():
+            return {
+                "enabled": True,
+                "ready": 1,
+                "total": 1,
+                "tool_count": 1,
+                "servers": [{"name": "shared", "state": "ready", "alive": True}],
+            }
+
+        @staticmethod
+        def shared_mcp_tools():
+            return {"count": 1, "names": ["mcp__shared__lookup"], "tools": []}
+
+        def write_skill_file(self, path, content, overwrite=False):
+            self.resource_skill_write = (path, content, overwrite)
+            return {"ok": True, "path": f"{path}/SKILL.md"}
+
+        def manage_shared_mcp(self, action, payload):
+            self.resource_mcp_action = (action, payload)
+            return {"ok": True, "action": action}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.app = self.FakeApp(Path(self.tmp.name))
+        self.server = cc.AgentHTTPServer(("127.0.0.1", 0), cc.IdeHandler, self.app)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.tmp.cleanup()
+
+    def request(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        payload = json.dumps(body).encode() if body is not None else None
+        request_headers = {"Host": f"127.0.0.1:{self.port}"}
+        request_headers.update(headers or {})
+        if payload is not None:
+            request_headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=payload, headers=request_headers)
+        response = conn.getresponse()
+        raw = response.read()
+        result = json.loads(raw.decode() or "{}")
+        response_headers = dict(response.getheaders())
+        conn.close()
+        return response.status, response_headers, result
+
+    def test_cookie_session_and_csrf_protect_state_writes(self):
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "local-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 201)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        csrf = setup["csrf_token"]
+        status, _, me = self.request(
+            "GET", "/api/ide/v2/auth/me", headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(me["account"]["username"], "local-admin")
+        status, _, error = self.request(
+            "POST",
+            "/api/ide/v2/workbench/state",
+            {"state": {"active_view": "search"}},
+            {"Cookie": cookie, "Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(error["code"], "csrf_required")
+        status, _, saved = self.request(
+            "POST",
+            "/api/ide/v2/workbench/state",
+            {"state": {"active_view": "search"}},
+            {
+                "Cookie": cookie,
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-CSRF-Token": csrf,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["state"]["active_view"], "search")
+        self.assertEqual(self.app.saved[0], setup["account"]["user_id"])
+
+    def test_application_authoring_routes_use_authenticated_account_and_pending_review(self):
+        origin = f"http://127.0.0.1:{self.port}"
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "app-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": origin},
+        )
+        self.assertEqual(status, 201)
+        owner_id = setup["account"]["user_id"]
+        owner_headers = {
+            "Cookie": headers["Set-Cookie"].split(";", 1)[0],
+            "Origin": origin,
+            "X-CSRF-Token": setup["csrf_token"],
+        }
+
+        status, _, created = self.request(
+            "POST",
+            "/api/ide/v2/applications",
+            {"name": "IDE App", "description": "draft", "icon": "A", "skills": ["shared-skill"]},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(created["revision"], 1)
+        app_id = created["id"]
+        self.assertIn(("save", owner_id, ""), self.app.application_calls)
+
+        status, _, catalog = self.request(
+            "GET",
+            "/api/ide/v2/applications",
+            headers={"Cookie": owner_headers["Cookie"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([row["id"] for row in catalog["personal"]], [app_id])
+        self.assertEqual([row["id"] for row in catalog["skill_catalog"]], ["shared-skill"])
+
+        status, _, updated = self.request(
+            "PATCH",
+            f"/api/ide/v2/applications/{app_id}",
+            {"name": "IDE App v2", "description": "edited", "skills": ["shared-skill"]},
+            owner_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["revision"], 2)
+
+        status, _, first_submission = self.request(
+            "POST",
+            f"/api/ide/v2/applications/{app_id}/submit",
+            {},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(first_submission["scope"], "shared")
+        self.assertEqual(first_submission["status"], "pending")
+        self.assertEqual(first_submission["submitted_revision"], 2)
+        status, _, duplicate = self.request(
+            "POST",
+            f"/api/ide/v2/applications/{app_id}/submit",
+            {},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(duplicate["id"], first_submission["id"])
+
+        status, _, edited = self.request(
+            "PATCH",
+            f"/api/ide/v2/applications/{app_id}",
+            {"name": "IDE App v3", "description": "new revision", "skills": ["shared-skill"]},
+            owner_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(edited["revision"], 3)
+        status, _, next_submission = self.request(
+            "POST",
+            f"/api/ide/v2/applications/{app_id}/submit",
+            {},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(next_submission["status"], "pending")
+        self.assertNotEqual(next_submission["id"], first_submission["id"])
+
+        self.app.ide_auth.create_user(
+            "other-user", "Another-Passphrase-42!", must_change_password=False
+        )
+        status, other_headers, other = self.request(
+            "POST",
+            "/api/ide/v2/auth/login",
+            {"username": "other-user", "password": "Another-Passphrase-42!"},
+            {"Origin": origin},
+        )
+        self.assertEqual(status, 200)
+        other_write_headers = {
+            "Cookie": other_headers["Set-Cookie"].split(";", 1)[0],
+            "Origin": origin,
+            "X-CSRF-Token": other["csrf_token"],
+        }
+        for method, suffix, body in (
+            ("PATCH", "", {"name": "Stolen", "skills": ["shared-skill"]}),
+            ("POST", "/submit", {}),
+            ("DELETE", "", None),
+        ):
+            status, _, _ = self.request(
+                method,
+                f"/api/ide/v2/applications/{app_id}{suffix}",
+                body,
+                other_write_headers,
+            )
+            self.assertEqual(status, 404)
+
+        status, _, deleted = self.request(
+            "DELETE",
+            f"/api/ide/v2/applications/{app_id}",
+            None,
+            owner_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(deleted["ok"])
+
+    def test_auth_database_failure_returns_structured_503(self):
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "local-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 201)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        with mock.patch.object(
+            self.app.ide_auth,
+            "_connect",
+            side_effect=sqlite3.OperationalError("storage unavailable"),
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/ide/v2/workbench/state",
+                {"state": {"active_view": "search"}},
+                {
+                    "Cookie": cookie,
+                    "Origin": f"http://127.0.0.1:{self.port}",
+                    "X-CSRF-Token": setup["csrf_token"],
+                },
+            )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(error["code"], "auth_store_unavailable")
+        self.assertNotIn("storage unavailable", error["error"])
+
+    def test_health_reports_missing_auth_database(self):
+        self.app.ide_auth.path.unlink()
+
+        status, _, payload = self.request("GET", "/api/health")
+
+        self.assertEqual(status, 503)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["storage"]["code"], "ide_store_unavailable")
+
+    def test_llm_config_status_is_authenticated_and_shared_reset_requires_csrf(self):
+        status, _, _ = self.request("GET", "/api/ide/v2/llm-config")
+        self.assertEqual(status, 401)
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "llm-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 201)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, _, payload = self.request(
+            "GET", "/api/ide/v2/llm-config", headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["scope"], "main_web_ui_user")
+
+        write_headers = {
+            "Cookie": cookie,
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }
+        status, _, error = self.request(
+            "POST",
+            "/api/ide/v2/llm-config/shared",
+            {"session_id": "sess-test"},
+            write_headers,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(error["code"], "csrf_required")
+        write_headers["X-CSRF-Token"] = setup["csrf_token"]
+        status, _, payload = self.request(
+            "POST",
+            "/api/ide/v2/llm-config/shared",
+            {"session_id": "sess-test"},
+            write_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["shared"])
+        self.assertEqual(self.app.llm_shared[2], "sess-test")
+
+    def test_shared_resource_apis_are_consistent_and_admin_writes_require_csrf(self):
+        status, _, _ = self.request("GET", "/api/ide/v2/resources")
+        self.assertEqual(status, 401)
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "resource-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 201)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        read_headers = {"Cookie": cookie}
+
+        status, _, resources = self.request("GET", "/api/ide/v2/resources", headers=read_headers)
+        self.assertEqual(status, 200)
+        self.assertTrue(resources["skills"]["can_write"])
+        self.assertEqual(resources["js_libraries"]["count"], 2)
+        status, _, skills = self.request("GET", "/api/skills", headers=read_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(skills[0]["id"], "shared-skill")
+        status, _, mcp = self.request(
+            "GET", "/api/ide/v2/resources/mcp/health", headers=read_headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(mcp["ready"], 1)
+
+        write_headers = {
+            "Cookie": cookie,
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }
+        status, _, error = self.request(
+            "POST",
+            "/api/ide/v2/resources/skills",
+            {"path": "custom", "content": "body"},
+            write_headers,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(error["code"], "csrf_required")
+        write_headers["X-CSRF-Token"] = setup["csrf_token"]
+        status, _, saved = self.request(
+            "POST",
+            "/api/ide/v2/resources/skills",
+            {"path": "custom", "content": "body", "overwrite": True},
+            write_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertTrue(saved["ok"])
+        self.assertEqual(self.app.resource_skill_write, ("custom", "body", True))
+        status, _, restarted = self.request(
+            "POST",
+            "/api/ide/v2/resources/mcp/restart",
+            {"server": "shared"},
+            write_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(restarted["ok"])
+        self.assertEqual(self.app.resource_mcp_action[0], "restart")
+
+    def test_local_auto_login_isolates_clients_and_rejects_ip_reuse(self):
+        previous = os.environ.get("CLOUDS_CODER_TRUST_PROXY")
+        os.environ["CLOUDS_CODER_TRUST_PROXY"] = "1"
+        try:
+            self.app.ide_password_login_enabled = False
+
+            def login(ip):
+                status, headers, result = self.request(
+                    "POST",
+                    "/api/ide/v2/auth/local",
+                    {},
+                    {
+                        "Origin": f"http://127.0.0.1:{self.port}",
+                        "X-Forwarded-For": ip,
+                    },
+                )
+                self.assertEqual(status, 200)
+                return headers["Set-Cookie"].split(";", 1)[0], result
+
+            cookie_a, auth_a = login("192.168.1.21")
+            _cookie_b, auth_b = login("192.168.1.22")
+            self.assertNotEqual(auth_a["account"]["user_id"], auth_b["account"]["user_id"])
+            self.assertEqual(auth_a["account"]["role"], "user")
+            self.assertEqual(auth_b["account"]["role"], "user")
+
+            status, _, _ = self.request(
+                "GET",
+                "/api/ide/v2/auth/me",
+                headers={"Cookie": cookie_a, "X-Forwarded-For": "192.168.1.22"},
+            )
+            self.assertEqual(status, 401)
+
+            cookie_same, auth_same = login("192.168.1.21")
+            status, _, error = self.request(
+                "POST",
+                "/api/ide/v2/workbench/state",
+                {"state": {"active_view": "search"}},
+                {
+                    "Cookie": cookie_same,
+                    "Origin": f"http://127.0.0.1:{self.port}",
+                    "X-Forwarded-For": "192.168.1.21",
+                    "X-CSRF-Token": auth_a["csrf_token"],
+                },
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(error["code"], "csrf_required")
+
+            status, _, current = self.request(
+                "GET",
+                "/api/ide/v2/auth/me",
+                headers={"Cookie": cookie_same, "X-Forwarded-For": "192.168.1.21"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(current["csrf_token"], auth_same["csrf_token"])
+        finally:
+            if previous is None:
+                os.environ.pop("CLOUDS_CODER_TRUST_PROXY", None)
+            else:
+                os.environ["CLOUDS_CODER_TRUST_PROXY"] = previous
+
+    def test_plain_http_lan_device_session_is_allowed_and_ip_bound(self):
+        previous = os.environ.get("CLOUDS_CODER_TRUST_PROXY")
+        os.environ["CLOUDS_CODER_TRUST_PROXY"] = "1"
+        try:
+            device_key = "cc_device_" + "B" * 43
+            status, headers, authenticated = self.request(
+                "POST",
+                "/api/ide/v2/auth/device",
+                {
+                    "device_key": device_key,
+                    "label": "LAN browser",
+                    "fingerprint": "test",
+                },
+                headers={
+                    "Host": f"192.168.1.20:{self.port}",
+                    "Origin": f"http://192.168.1.20:{self.port}",
+                    "X-Forwarded-For": "192.168.1.55",
+                },
+            )
+            cookie = headers["Set-Cookie"].split(";", 1)[0]
+            self.assertEqual(status, 200)
+            self.assertEqual(authenticated["account"]["role"], "user")
+            self.assertFalse(authenticated["capabilities"]["mounts"])
+            status, _, me = self.request(
+                "GET",
+                "/api/ide/v2/auth/me",
+                headers={
+                    "Host": f"192.168.1.20:{self.port}",
+                    "Cookie": cookie,
+                    "X-Forwarded-For": "192.168.1.55",
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                me["account"]["user_id"], authenticated["account"]["user_id"]
+            )
+            status, _, error = self.request(
+                "GET",
+                "/api/ide/v2/auth/me",
+                headers={
+                    "Host": f"192.168.1.20:{self.port}",
+                    "Cookie": cookie,
+                    "X-Forwarded-For": "192.168.1.56",
+                },
+            )
+            self.assertEqual(status, 401)
+            self.assertEqual(error["code"], "authentication_required")
+        finally:
+            if previous is None:
+                os.environ.pop("CLOUDS_CODER_TRUST_PROXY", None)
+            else:
+                os.environ["CLOUDS_CODER_TRUST_PROXY"] = previous
+
+
+class IDEWorkbenchSourceTests(unittest.TestCase):
+    def test_automatic_auth_is_identity_bound_and_csrf_can_resync(self):
+        self.assertIn("legacy_user_id=user_id_from_ip(client_ip)", inspect.getsource(cc.AppContext.local_ide_login))
+        self.assertIn("session_kind=\"local_auto\"", inspect.getsource(cc.IDEAuthStore.local_session))
+        self.assertIn("if(res.status===403&&data.code==='csrf_required'", cc.IDE_JS)
+        self.assertIn("async function refreshCsrfToken()", cc.IDE_JS)
+        self.assertIn("await refreshCsrfToken();", cc.IDE_JS)
+
+    def test_bash_read_loop_intervention_allows_ten_identical_reads(self):
+        self.assertEqual(cc.BASH_READ_LOOP_THRESHOLD, 10)
+
+    def test_terminal_renderer_has_incremental_utf8_and_dependency_free_ansi_fallback(
+        self,
+    ):
+        self.assertIn("data_b64", inspect.getsource(cc.AppContext.ide_terminal_output))
+        self.assertIn("new TextDecoder", cc.IDE_JS)
+        self.assertIn(
+            "function stripTerminalControlChunk(text,state,final=false)", cc.IDE_JS
+        )
+        self.assertIn("appendTerminalPlainText(E('terminalFallback'),plain)", cc.IDE_JS)
+        self.assertNotIn("host.textContent+=out.data", cc.IDE_JS)
+
+        node = cc.shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable for the frontend parser check")
+        start = cc.IDE_JS.index("function stripTerminalControlChunk")
+        end = cc.IDE_JS.index("\nfunction appendTerminalPlainText", start)
+        parser = cc.IDE_JS[start:end]
+        script = (
+            parser
+            + r"""
+const state={pending:''};
+const chunks=['\x1b[31','m红\x1b]0;标题','\x07色\x1b[0m'];
+const output=chunks.map((chunk,index)=>stripTerminalControlChunk(
+chunk,state,index===chunks.length-1)).join('');
+process.stdout.write(JSON.stringify({output,pending:state.pending}));
+"""
+        )
+        completed = cc.subprocess.run(
+            [node, "-e", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        parsed = json.loads(completed.stdout)
+        self.assertEqual(parsed, {"output": "红色", "pending": ""})
+
+    def test_python_debug_uses_stdlib_pdb_when_debugpy_is_missing(self):
+        self.assertIn("error.code==='debugpy_unavailable'", cc.IDE_JS)
+        self.assertIn("python} -m pdb", cc.IDE_JS)
+        self.assertIn("Using the built-in Python pdb compatibility debugger", cc.IDE_JS)
+        with mock.patch.object(cc.importlib.util, "find_spec", return_value=None):
+            tool = next(
+                row
+                for row in cc.AppContext.__new__(cc.AppContext).ide_toolchains()
+                if row["name"] == "python-debug"
+            )
+        self.assertFalse(tool["available"])
+        self.assertIn("pdb compatibility debugger", tool["install_hint"])
+
+    def test_recovery_hard_break_allows_ten_debug_rounds(self):
+        self.assertEqual(cc.HARD_BREAK_RECOVERY_ROUND_THRESHOLD, 10)
+        source = inspect.getsource(cc.SessionState._agent_worker)
+        self.assertIn(
+            "recovery_retry_rounds >= HARD_BREAK_RECOVERY_ROUND_THRESHOLD",
+            source,
+        )
+        self.assertIn("recovery instructions repeated without progress", source)
+
+    def test_hidden_panel_state_survives_panel_tab_restoration(self):
+        source = cc.IDE_JS
+        restore_start = source.index("async function restoreWorkbenchState(")
+        restore_end = source.index("async function runSearch()", restore_start)
+        restore = source[restore_start:restore_end]
+
+        self.assertIn("const panelVisible=state.panel_visible!==false", restore)
+        self.assertIn("showPanel(S.panel);S.panelVisible=panelVisible", restore)
+        self.assertIn("classList.toggle('panel-hidden',!panelVisible)", restore)
+        self.assertNotIn("if(!S.panelVisible)togglePanel()", restore)
+
+    def test_agent_polling_and_thinking_exclusion_are_present(self):
+        self.assertIn("/agent-state", cc.IDE_JS)
+        self.assertIn("scheduleAgentPoll", cc.IDE_JS)
+        self.assertIn("refreshAgentEditedFile", cc.IDE_JS)
+        self.assertNotIn(
+            '"live_thinking"', inspect.getsource(cc.AppContext.ide_agent_state)
+        )
+
+    def test_public_model_text_is_kept_when_the_same_turn_calls_tools(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            source.count("if text.strip() or (thinking_text and not tool_calls):"), 2
+        )
+        self.assertNotIn(
+            "if (text.strip() or thinking_text) and not tool_calls:", source
+        )
+
+    def test_tool_rounds_keep_real_approach_but_disable_synthetic_progress(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        self.assertFalse(cc.PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED)
+        self.assertGreaterEqual(
+            source.count("_public_tool_progress_summary(tool_calls"), 2
+        )
+        self.assertIn("function agentApproach(text,role='Agent')", cc.IDE_JS)
+        self.assertIn("function renderAgentPlanCard(tools,role='Agent')", cc.IDE_JS)
+        self.assertIn("function isSyntheticPublicProgress(text)", cc.IDE_JS)
+        self.assertIn("progress&&!isSyntheticPublicProgress(progress)", cc.IDE_JS)
+        self.assertIn("S.agentPlanCards.get(signature)", cc.IDE_JS)
+        self.assertIn("Planned ×${count}", cc.IDE_JS)
+        self.assertIn(
+            "if(type==='approach'){agentApproach(text,role);continue}", cc.IDE_JS
+        )
+        self.assertNotIn("String(S.agentState?.live_thinking", cc.IDE_JS)
+
+    def test_public_tool_progress_summary_is_disabled_without_touching_tool_calls(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.ui_language = "zh-CN"
+        session.last_public_progress_signature = ""
+        session.last_public_progress_ts = 0.0
+        session.todo = cc.TodoManager("zh-CN")
+        session.todo.update(
+            [
+                {"content": "提取 PDF 文本并梳理论文结构", "status": "in_progress"},
+                {"content": "编写 HTML 报告", "status": "pending"},
+            ]
+        )
+        summary = session._public_tool_progress_summary(
+            [
+                {
+                    "function": {
+                        "name": "bash",
+                        "arguments": {"command": "pdftotext input.pdf output.txt"},
+                    }
+                }
+            ]
+        )
+        self.assertEqual(summary, "")
+        self.assertEqual(session._public_progress_prompt_instruction(), "")
+        self.assertEqual(session.last_public_progress_signature, "")
+        self.assertEqual(
+            session._public_tool_progress_summary(
+                [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": {"command": "pdftotext input.pdf output.txt"},
+                        }
+                    }
+                ]
+            ),
+            "",
+        )
+        self.assertEqual(
+            session._public_tool_progress_summary(
+                [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": "input.txt"},
+                        }
+                    }
+                ]
+            ),
+            "",
+        )
+        self.assertTrue(
+            cc.is_synthetic_public_progress(
+                "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，"
+                "结果将用于确定下一步。"
+            )
+        )
+        self.assertFalse(
+            cc.is_synthetic_public_progress("模型自主输出的真实阶段说明。")
+        )
+
+        client = cc.OllamaClient("http://127.0.0.1:11434", "test")
+        prepared = client._prepare_request_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，"
+                        "结果将用于确定下一步。"
+                    ),
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": {"command": "pwd"},
+                            },
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "模型自主输出的真实阶段说明。"},
+            ],
+            "ollama",
+        )
+        self.assertEqual(prepared[0]["content"], "")
+        self.assertEqual(prepared[0]["tool_calls"][0]["function"]["name"], "bash")
+        self.assertEqual(prepared[1]["content"], "模型自主输出的真实阶段说明。")
+
+    def test_four_languages_keep_independent_preferences_while_progress_fallback_is_off(
+        self,
+    ):
+        expected = {
+            "zh-CN": "zh-cn-concise-milestones",
+            "zh-TW": "zh-tw-concise-milestones",
+            "ja": "ja-polite-milestones",
+            "en": "en-concise-milestones",
+        }
+        for language, preference_id in expected.items():
+            with self.subTest(language=language):
+                payload = cc.agent_language_preference_payload(language)
+                self.assertEqual(payload["language"], language)
+                self.assertEqual(payload["id"], preference_id)
+                self.assertEqual(payload["public_progress_mode"], "off")
+                session = cc.SessionState.__new__(cc.SessionState)
+                session.ui_language = language
+                session.last_public_progress_signature = ""
+                session.last_public_progress_ts = 0.0
+                session.todo = cc.TodoManager(language)
+                summary = session._public_tool_progress_summary(
+                    [
+                        {
+                            "function": {
+                                "name": "bash",
+                                "arguments": {"command": "run-tests"},
+                            }
+                        }
+                    ]
+                )
+                self.assertEqual(summary, "")
+
+    def test_program_ide_layout_panels_previews_and_new_task_are_wired(self):
+        self.assertIn(
+            'side-view[data-side-view="explorer"]{grid-template-rows:35px auto '
+            "auto 22px minmax(0,1fr)}",
+            cc.IDE_CSS,
+        )
+        self.assertIn(".editor-group>.editor-host{grid-row:4}", cc.IDE_CSS)
+        self.assertIn('id="artifactPreview0"', cc.IDE_INDEX_HTML)
+        self.assertIn('title="New Task"', cc.IDE_INDEX_HTML)
+        self.assertIn("refreshWorkspaceSnapshot", cc.IDE_JS)
+        self.assertIn("function artifactUrl(file,kind='raw')", cc.IDE_JS)
+        self.assertIn(
+            'r"^/api/ide/sessions/([^/]+)/workspace/raw$"',
+            inspect.getsource(cc.IdeHandler.do_GET),
+        )
+        self.assertIn(
+            'r"^/api/ide/sessions/([^/]+)/workspace/preview$"',
+            inspect.getsource(cc.IdeHandler.do_GET),
+        )
+        self.assertIn("E('newAgentChatBtn').onclick=()=>createSession()", cc.IDE_JS)
+        self.assertIn("async function debugActiveFile()", cc.IDE_JS)
+        self.assertNotIn("Binary files cannot be edited in the text editor.", cc.IDE_JS)
+
+    def test_empty_editor_actions_open_files_and_commands(self):
+        self.assertIn('data-command="file.open">Open File', cc.IDE_INDEX_HTML)
+        self.assertIn(
+            'data-command="workbench.action.quickOpen">Go to File', cc.IDE_INDEX_HTML
+        )
+        self.assertIn(
+            'data-command="workbench.action.showCommands">Command Palette',
+            cc.IDE_INDEX_HTML,
+        )
+        self.assertIn(".empty-actions [data-command]", cc.IDE_JS)
+        self.assertIn("button.dataset.command", cc.IDE_JS)
+        self.assertIn("beginFileUpload(activeDir(),true)", cc.IDE_JS)
+        self.assertIn("openAfter&&firstPath?openFile(firstPath)", cc.IDE_JS)
+        self.assertIn("async function loadQuickFiles()", cc.IDE_JS)
+        self.assertIn("workspace/files?root_id=", cc.IDE_JS)
+        self.assertIn(
+            "S.paletteMode=value.startsWith('>')?'commands':'files'", cc.IDE_JS
+        )
+        self.assertIn("if(row.kind==='file')openFile", cc.IDE_JS)
+        self.assertIn('/workspace/files$"', inspect.getsource(cc.IdeHandler.do_GET))
+
+    def test_prompt_enhancement_review_flow_is_fully_wired(self):
+        self.assertIn('id="promptEnhanceBtn"', cc.IDE_INDEX_HTML)
+        self.assertIn("codicon-lightbulb", cc.IDE_INDEX_HTML)
+        self.assertIn('aria-pressed="false"', cc.IDE_INDEX_HTML)
+        for element_id in (
+            "promptEnhanceOverlay",
+            "promptEnhanceLoading",
+            "promptEnhanceAnalysis",
+            "promptEnhanceIntent",
+            "promptEnhanceDetails",
+            "promptUseOriginal",
+            "promptRegenerate",
+            "promptEnhanceEditor",
+            "promptUseEnhanced",
+        ):
+            self.assertIn(f'id="{element_id}"', cc.IDE_INDEX_HTML)
+        self.assertNotIn('id="promptEnhanceEdit"', cc.IDE_INDEX_HTML)
+        self.assertIn("Final Agent Prompt", cc.IDE_INDEX_HTML)
+        self.assertIn("agent-enhance-button.is-active", cc.IDE_CSS)
+        self.assertIn("prompt-enhance-analysis", cc.IDE_CSS)
+        self.assertIn("function togglePromptEnhancement()", cc.IDE_JS)
+        self.assertIn("async function requestPromptEnhancement", cc.IDE_JS)
+        self.assertIn("async function usePromptReview(original=false)", cc.IDE_JS)
+        self.assertIn("usePromptReview(true)", cc.IDE_JS)
+        self.assertIn("regeneratePromptReview()", cc.IDE_JS)
+        self.assertIn("editor.readOnly=false", cc.IDE_JS)
+        self.assertIn("promptClarificationGroup(result.clarifications)", cc.IDE_JS)
+        self.assertIn("new AbortController()", cc.IDE_JS)
+        self.assertIn("signal:controller?.signal", cc.IDE_JS)
+        self.assertIn(
+            "E('promptEnhanceOverlay').classList.remove('is-hidden')", cc.IDE_JS
+        )
+        self.assertIn("promptEnhancePersistent:false", cc.IDE_JS)
+        self.assertIn("prompt_enhance_persistent:S.promptEnhancePersistent", cc.IDE_JS)
+        self.assertIn(
+            "prompt_enhance_enabled:S.promptEnhancePersistent&&S.promptEnhanceEnabled",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "S.promptEnhancePersistent=state.prompt_enhance_persistent===true",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "S.promptEnhanceEnabled=S.promptEnhancePersistent&&"
+            "state.prompt_enhance_enabled===true",
+            cc.IDE_JS,
+        )
+        self.assertIn("promptEnhanceBudget:'medium'", cc.IDE_JS)
+        self.assertIn("prompt_enhance_budget:S.promptEnhanceBudget", cc.IDE_JS)
+        self.assertIn("promptEnhanceSkillsAware:false", cc.IDE_JS)
+        self.assertIn(
+            "prompt_enhance_skills_awareness:S.promptEnhanceSkillsAware", cc.IDE_JS
+        )
+        self.assertIn("skills_awareness:!!draft.skills_aware", cc.IDE_JS)
+        self.assertIn("function setPromptEnhanceSkillsAware(enabled)", cc.IDE_JS)
+        self.assertIn("Workspace awareness", cc.IDE_JS)
+        self.assertIn("function promptExecutionGroup(rows)", cc.IDE_JS)
+        self.assertIn("function promptSkillGroup(rows)", cc.IDE_JS)
+        self.assertIn("function bindPromptEnhanceButton()", cc.IDE_JS)
+        self.assertIn("showPromptEnhanceBudgetMenu(button)", cc.IDE_JS)
+        self.assertIn("function setPromptEnhancePersistent(enabled)", cc.IDE_JS)
+        self.assertIn("Remember across tasks and reloads", cc.IDE_JS)
+        self.assertIn("draft.enhance_requested&&!S.promptEnhancePersistent", cc.IDE_JS)
+        self.assertIn("enhance_requested:S.promptEnhanceEnabled", cc.IDE_JS)
+        self.assertIn("prompt-budget-persistent", cc.IDE_CSS)
+        self.assertIn("prompt-persistent-switch", cc.IDE_CSS)
+        self.assertIn("['low','medium','high','xhigh']", cc.IDE_JS)
+        self.assertIn("budget:S.promptEnhanceBudget", cc.IDE_JS)
+        self.assertIn("/prompt-enhance", cc.IDE_JS)
+        post_source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn('/prompt-enhance$"', post_source)
+        self.assertIn("ide_enhance_agent_prompt", post_source)
+        backend_source = inspect.getsource(cc.AppContext.ide_enhance_agent_prompt)
+        self.assertIn("Do not reveal chain-of-thought", backend_source)
+        self.assertIn("The original request remains authoritative", backend_source)
+        self.assertIn("default_answer", backend_source)
+        self.assertIn("planning_depth", backend_source)
+        self.assertIn("solution_diversity", backend_source)
+        self.assertIn("scope_breadth", backend_source)
+        self.assertIn('max_tokens=min(int(budget_spec["max_tokens"])', backend_source)
+        self.assertIn("client.timeout = None", backend_source)
+        self.assertIn("_ide_prompt_enhancement_fallback(", backend_source)
+        self.assertIn("Local template", cc.IDE_JS)
+
+    def test_session_switches_discard_stale_async_results(self):
+        self.assertIn("sessionSwitchSeq:0", cc.IDE_JS)
+        self.assertIn("function sessionRequestCurrent(session,seq=null)", cc.IDE_JS)
+        self.assertIn("const seq=++S.sessionSwitchSeq", cc.IDE_JS)
+        self.assertIn("if(seq!==S.sessionSwitchSeq)return false", cc.IDE_JS)
+        self.assertIn(
+            "const session=S.activeSession,switchSeq=S.sessionSwitchSeq", cc.IDE_JS
+        )
+        self.assertIn("switchSeq!==S.sessionSwitchSeq", cc.IDE_JS)
+        self.assertIn("workspaceRefreshSeq", cc.IDE_JS)
+        self.assertIn("const sid=S.activeSession,seq=S.sessionSwitchSeq", cc.IDE_JS)
+        self.assertIn(
+            "if(S.agentPollBusy){S.agentPollRequested=true;return}", cc.IDE_JS
+        )
+
+    def test_workbench_restore_selects_session_before_live_agent_updates(self):
+        start = cc.IDE_JS.index("async function startWorkbench()")
+        end = cc.IDE_JS.index(
+            "window.addEventListener('pagehide'", start
+        )
+        source = cc.IDE_JS[start:end]
+
+        select = source.index("workbenchSessionFromState(savedWorkbench.state||{})")
+        reset = source.index("resetAgentSessionUI(S.activeSession)")
+        connect = source.index("connectAgentEvents()")
+        poll = source.index("scheduleAgentPoll(40)")
+        self.assertLess(select, reset)
+        self.assertLess(reset, connect)
+        self.assertLess(connect, poll)
+        self.assertIn(
+            "expectedSession:bootSession,expectedSeq:bootSessionSeq", source
+        )
+
+    def test_delayed_workbench_restore_cannot_replace_a_user_session_switch(self):
+        start = cc.IDE_JS.index("async function restoreWorkbenchState(")
+        end = cc.IDE_JS.index("async function runSearch()", start)
+        source = cc.IDE_JS[start:end]
+
+        self.assertIn("expectedSession=String(opt.expectedSession||'')", source)
+        self.assertIn("S.sessionSwitchSeq!==expectedSeq", source)
+        self.assertIn("await switchSession(restoredSession,false)", source)
+        self.assertNotIn("S.activeSession=restoredSession", source)
+        self.assertIn("sessionRequestCurrent(session,seq)", source)
+
+        switch_start = cc.IDE_JS.rindex(
+            "async function switchSession(sessionId,isNew=false,opt={})"
+        )
+        switch_end = cc.IDE_JS.index("async function newFile()", switch_start)
+        switch_source = cc.IDE_JS[switch_start:switch_end]
+        self.assertIn("await saveWorkbenchState()", switch_source)
+
+    def test_text_markdown_image_and_excel_preview_paths_are_wired(self):
+        self.assertEqual(cc.preview_kind_for_path("notes.txt"), "markdown")
+        self.assertEqual(cc.preview_kind_for_path("report.mdx"), "markdown")
+        self.assertEqual(cc.preview_kind_for_path("plot.png"), "image")
+        self.assertEqual(cc.preview_kind_for_path("data.xlsx"), "excel")
+        self.assertIn("'image-preview'", cc.IDE_JS)
+        self.assertIn("'markdown','text'].includes(kind)", cc.IDE_JS)
+        self.assertIn("media.onerror=()=>showArtifactPreviewError", cc.IDE_JS)
+        self.assertIn("frame.src=artifactUrl(file,'preview')", cc.IDE_JS)
+        self.assertIn("if(kind==='html')frame.sandbox='allow-scripts'", cc.IDE_JS)
+        self.assertIn("['html','pdf'].includes(file.previewKind)", cc.IDE_JS)
+        self.assertIn("else if(kind==='pdf'||kind==='html')", cc.IDE_JS)
+        self.assertIn(
+            ".artifact-stage img{display:block;width:100%;height:100%", cc.IDE_CSS
+        )
+        self.assertIn(".artifact-preview-error", cc.IDE_CSS)
+
+    def test_html_preview_token_cache_is_declared_in_ide_bundle(self):
+        declaration = "const PREVIEW_TOKENS=new Map();"
+        self.assertIn(declaration, cc.IDE_JS)
+        self.assertLess(cc.IDE_JS.index(declaration), cc.IDE_JS.index("async function previewToken(file)"))
+        self.assertIn("PREVIEW_TOKENS.get(key)", cc.IDE_JS)
+        self.assertIn("/preview-token?root_id=", cc.IDE_JS)
+
+    def test_program_agent_todo_model_attachment_and_diff_controls_are_wired(self):
+        self.assertIn('id="agentTodoPanel"', cc.IDE_INDEX_HTML)
+        self.assertIn('id="agentModelBtn"', cc.IDE_INDEX_HTML)
+        self.assertIn('id="agentAttachmentInput"', cc.IDE_INDEX_HTML)
+        self.assertIn("uploadAgentAttachments", cc.IDE_JS)
+        self.assertIn("showAgentModelMenu", cc.IDE_JS)
+        self.assertIn("renderFilePatchCard", cc.IDE_JS)
+        self.assertIn("data-agent-open-file", cc.IDE_JS)
+        self.assertIn("context_left_percent", cc.IDE_JS)
+
+    def test_program_agent_stop_live_input_and_file_paste_are_wired(self):
+        self.assertIn('id="stopAgentBtn"', cc.IDE_INDEX_HTML)
+        self.assertIn('id="agentDropHint"', cc.IDE_INDEX_HTML)
+        self.assertIn("async function stopAgent()", cc.IDE_JS)
+        self.assertIn("/agent/interrupt", cc.IDE_JS)
+        self.assertIn("function agentClipboardFiles(event)", cc.IDE_JS)
+        self.assertIn("agentComposer.addEventListener('drop'", cc.IDE_JS)
+        self.assertIn("agentPrompt.addEventListener('paste'", cc.IDE_JS)
+        self.assertNotIn("E('agentPrompt').disabled=S.agentSubmitting", cc.IDE_JS)
+        self.assertNotIn("input.disabled=true", cc.IDE_JS)
+        self.assertIn("input.value=''", cc.IDE_JS)
+        self.assertIn("input.value=input.value.trim()?", cc.IDE_JS)
+        self.assertIn("starting=!!state.scheduler_starting", cc.IDE_JS)
+        self.assertIn("S.agentSubmissionStatus='submitting'", cc.IDE_JS)
+        self.assertIn("S.agentSubmissionStatus='starting'", cc.IDE_JS)
+        self.assertNotIn("if(!busy&&!awaiting&&S.agentSubmitting)S.agentSubmitting=false", cc.IDE_JS)
+        self.assertIn(".agent-stop-button", cc.IDE_CSS)
+        self.assertIn(".agent-drop-hint", cc.IDE_CSS)
+
+    def test_program_agent_ask_user_options_and_free_text_are_wired(self):
+        self.assertIn('id="agentAskUser"', cc.IDE_INDEX_HTML)
+        self.assertIn("function renderAgentAskUser(state)", cc.IDE_JS)
+        self.assertIn("async function answerAgentQuestion(answer)", cc.IDE_JS)
+        self.assertIn("/ask-user/answer", cc.IDE_JS)
+        self.assertIn("pending.allow_free_text===false", cc.IDE_JS)
+        self.assertIn("if(pending)return answerAgentQuestion(message)", cc.IDE_JS)
+        self.assertIn("Awaiting input", cc.IDE_JS)
+        self.assertIn(".agent-ask-user-option", cc.IDE_CSS)
+
+    def test_agent_cards_structure_controls_roles_commands_and_file_diffs(self):
+        self.assertIn("function parseAgentControl(text)", cc.IDE_JS)
+        self.assertIn("function renderCompactCard(data)", cc.IDE_JS)
+        self.assertIn("function agentRoleKey(role='')", cc.IDE_JS)
+        self.assertIn("agent-role-manager", cc.IDE_CSS)
+        self.assertIn("agent-role-reviewer", cc.IDE_CSS)
+        self.assertIn("Changed files:", cc.IDE_JS)
+        self.assertIn("Working directory:", cc.IDE_JS)
+        self.assertIn("data.diff_numbered||data.diff", cc.IDE_JS)
+        self.assertIn("line-mark", cc.IDE_JS)
+        self.assertNotIn(
+            "fileTool&&!/error|failed|malformed/i.test(resultText)", cc.IDE_JS
+        )
+
+    def test_agent_tool_events_render_directly_from_sse_and_merge_shell_cards(self):
+        self.assertIn("function renderAgentOperationOnce(op)", cc.IDE_JS)
+        self.assertIn("renderAgentOperationOnce({id:String(event?.id||'')", cc.IDE_JS)
+        self.assertIn(
+            "['tool_start','tool_result','file_patch','command','compact',"
+            "'error'].includes(type)",
+            cc.IDE_JS,
+        )
+        self.assertIn("data.tool_call_id", cc.IDE_JS)
+        self.assertIn("existing?.dataset.commandComplete==='true'", cc.IDE_JS)
+        self.assertIn("S.agentRendered.add(key)", cc.IDE_JS)
+        self.assertNotIn(
+            "lower==='bash'||lower==='worktree_run')return null", cc.IDE_JS
+        )
+
+    def test_agent_poll_deadline_is_not_postponed_by_continuous_sse(self):
+        self.assertIn("agentPollDue:0", cc.IDE_JS)
+        self.assertIn("if(S.agentPoll&&S.agentPollDue<=due)return", cc.IDE_JS)
+        self.assertIn("const wait=Math.max(40,Number(delay)||0)", cc.IDE_JS)
+        self.assertIn(
+            "clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0", cc.IDE_JS
+        )
+
+    def test_final_agent_text_uses_sanitized_markdown_and_deduplicates_role_prefix(
+        self,
+    ):
+        self.assertIn("/assets/js_lib/marked.min.js", cc.IDE_INDEX_HTML)
+        self.assertIn("function renderAgentMarkdown(text)", cc.IDE_JS)
+        self.assertIn("sanitizePreviewHtml(html)", cc.IDE_JS)
+        self.assertIn("function stripAgentRolePrefix(text,role='')", cc.IDE_JS)
+        self.assertIn("body.className='agent-markdown'", cc.IDE_JS)
+        self.assertIn(
+            ".agent-markdown h1,.agent-markdown h2,.agent-markdown h3", cc.IDE_CSS
+        )
+
+    def test_agent_sidebar_pins_todo_and_composer_around_scrolling_history(self):
+        self.assertIn("height:100%;min-height:0;border-right:0", cc.IDE_CSS)
+        self.assertIn(
+            'grid-template-areas:"agent-header" "agent-context" "agent-todo" '
+            '"agent-messages" "agent-composer"',
+            cc.IDE_CSS,
+        )
+        self.assertIn(
+            ".secondary-sidebar>.agent-messages{grid-area:agent-messages}", cc.IDE_CSS
+        )
+        self.assertIn(
+            ".secondary-sidebar>.agent-composer{grid-area:agent-composer}", cc.IDE_CSS
+        )
+        self.assertIn(
+            ".agent-messages{min-height:0;overflow:auto;overscroll-behavior:contain",
+            cc.IDE_CSS,
+        )
+        self.assertIn(
+            ".agent-composer{min-height:0;max-height:min(420px,52vh);overflow:auto",
+            cc.IDE_CSS,
+        )
+        self.assertIn("resize:none", cc.IDE_CSS)
+
+    def test_run_has_non_pty_fallback_and_utf8_platform_selection(self):
+        self.assertIn(
+            "if(S.panel==='terminal'&&S.capabilities.terminal){await "
+            "newTerminal(file.dir||'.')",
+            cc.IDE_JS,
+        )
+        self.assertIn("/terminal/run", cc.IDE_JS)
+        self.assertIn("S.config?.platform", cc.IDE_JS)
+        handler_source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn(
+            'ide_require_capability(context["capabilities"], "processes")',
+            handler_source,
+        )
+
+    def test_all_history_mode_only_shows_modified_line_numbers(self):
+        self.assertIn("renderIndicators:false", cc.IDE_JS)
+        self.assertNotIn("renderIndicators:true", cc.IDE_JS)
+        self.assertIn("renderGutterMenu:false", cc.IDE_JS)
+        self.assertIn("renderMarginRevertIcon:false", cc.IDE_JS)
+        self.assertIn("compactMode:true", cc.IDE_JS)
+        self.assertIn("lineDecorationsWidth:8", cc.IDE_JS)
+        self.assertIn(
+            "S.codeHistoryMode==='all'||S.codeHistoryMode==='changes'", cc.IDE_JS
+        )
+        self.assertIn(".history-diff-host .inline-deleted-margin-view-zone", cc.IDE_CSS)
+        self.assertIn(
+            "diff.getOriginalEditor().updateOptions({lineNumbers:'off'",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "diff.getModifiedEditor().updateOptions({lineNumbers:'on',"
+            "lineNumbersMinChars:5,lineDecorationsWidth:24})",
+            cc.IDE_JS,
+        )
+        self.assertIn("lineNumbersMinChars:5,lineDecorationsWidth:8", cc.IDE_JS)
+        self.assertIn("function protectDeletedReviewZones(host)", cc.IDE_JS)
+        self.assertIn("'selectstart','dragstart','contextmenu','copy'", cc.IDE_JS)
+        self.assertIn("protectDeletedReviewZones(E(`diffEditor${group}`))", cc.IDE_JS)
+        self.assertIn(
+            ".history-diff-host .monaco-editor .line-delete-selectable", cc.IDE_CSS
+        )
+        self.assertIn("user-select:none!important", cc.IDE_CSS)
+        self.assertIn("pointer-events:none!important", cc.IDE_CSS)
+        self.assertIn(
+            "const model=S.models.get(file.key);return model?model.getValue():"
+            "file.content",
+            cc.IDE_JS,
+        )
+        self.assertIn("const commonEditorOptions=", cc.IDE_JS)
+        self.assertIn("function captureHistoryView(group,file)", cc.IDE_JS)
+        self.assertIn("source.getModel()!==targetModel", cc.IDE_JS)
+        self.assertIn("function restoreHistoryView(group,state)", cc.IDE_JS)
+        self.assertIn(
+            "anchorOffset:source.getTopForLineNumber(anchorLine)-source.getScrollTop()",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "target.getTopForLineNumber(anchorLine)-Number(state.anchorOffset||0)",
+            cc.IDE_JS,
+        )
+        self.assertIn("onDidUpdateDiff", cc.IDE_JS)
+        self.assertIn("S.monaco.ScrollType?.Immediate??1", cc.IDE_JS)
+        self.assertNotIn("S.monaco.ScrollType.Immediate", cc.IDE_JS)
+
+    def test_ide_assets_use_content_revision_urls(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        html = app.web_ui_ide_index_html()
+        self.assertRegex(html, r'href="/assets/ide\.css\?v=[0-9a-f]{12}"')
+        self.assertRegex(html, r'src="/assets/ide\.js\?v=[0-9a-f]{12}"')
+
+    def test_session_switch_resets_agent_history_and_editor_split_state(self):
+        self.assertIn("function resetAgentSessionUI(sessionId='')", cc.IDE_JS)
+        self.assertIn("E('agentMessages').innerHTML=''", cc.IDE_JS)
+        self.assertIn("function syncEditorGroupLayout()", cc.IDE_JS)
+        self.assertIn("if(!split)S.activeGroup=0", cc.IDE_JS)
+        self.assertIn("setEditorModel(1,null);setEditorModel(0,null)", cc.IDE_JS)
+        self.assertIn(
+            "if(session!==S.activeSession||switchSeq!==S.sessionSwitchSeq)return null",
+            cc.IDE_JS,
+        )
+
+    def test_sse_connection_loads_selected_session_history_once(self):
+        self.assertIn(
+            "S.agentEventsConnected=true;S.agentPollRequested=true;"
+            "scheduleAgentPoll(0)",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "if(S.agentPollRequested||!current())scheduleAgentPoll(0)",
+            cc.IDE_JS,
+        )
+
+    def test_sse_burst_is_coalesced_before_agent_state_render(self):
+        node = cc.shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable for the frontend scheduler check")
+        start = cc.IDE_JS.index("function scheduleAgentEventFrame()")
+        end = cc.IDE_JS.index("\nfunction handleAgentEvent", start)
+        scheduler = cc.IDE_JS[start:end]
+        script = (
+            "const S={agentEventRaf:0,agentFileRefresh:new Set()};"
+            "const document={hidden:false};let pending=null,timers=[],polls=[];"
+            "function setTimeout(fn,delay){pending=fn;timers.push(delay);return 1}"
+            "function scheduleWorkspaceRefresh(){}"
+            "function scheduleAgentPoll(delay){polls.push(delay)}\n"
+            + scheduler
+            + "\nfor(let i=0;i<100;i++)scheduleAgentEventFrame();"
+            "pending();process.stdout.write(JSON.stringify({timers,polls}));"
+        )
+        completed = cc.subprocess.run(
+            [node, "-e", script], capture_output=True, text=True, check=True
+        )
+        self.assertEqual(json.loads(completed.stdout), {"timers": [120], "polls": [40]})
+
+
+class IDEAutoTitleTests(unittest.TestCase):
+    @staticmethod
+    def make_session(title="Program 12:34", model_title="宝可梦精灵球绘制"):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.id = "sess_auto_title"
+        session.title = title
+        session.title_origin = (
+            "default"
+            if session._is_default_session_title(title)
+            else ("auto" if session._is_low_quality_auto_title(title) else "legacy")
+        )
+        session.last_auto_title_source = ""
+        session.last_auto_title_ts = 0.0
+        session.auto_title_revision = 0
+        session.auto_title_last_goal_digest = ""
+        session.auto_title_refine_pending = False
+        session.auto_title_refine_generation = 0
+        session.auto_title_refine_attempt_digest = ""
+        session.auto_title_refine_attempt_ts = 0.0
+        session.auto_title_refine_lock = threading.RLock()
+        session.cancel_requested = False
+        session.lock = threading.RLock()
+        session.root = Path(tempfile.gettempdir())
+        session.ui_language = "zh-CN"
+        session.messages = [
+            {
+                "role": "user",
+                "content": (
+                    "IDE programming request.\n"
+                    "Workspace root: Demo (session)\n"
+                    "Writable path: /tmp/demo\n"
+                    "Active file: plot.py\n\n"
+                    "制作一个宝可梦精灵球的图片，用matplot设计制作显示"
+                ),
+            }
+        ]
+        session.todo = types.SimpleNamespace(snapshot=lambda: [])
+        session.tasks = types.SimpleNamespace(list_objects=lambda: [])
+        prompts = []
+
+        class FakeModel:
+            def chat(self, messages, **_kwargs):
+                prompts.append(messages[0]["content"])
+                return {"content": model_title}
+
+        session.ollama = FakeModel()
+        session._build_auto_title_client = lambda: session.ollama
+        session._inject_runtime_environment_context = lambda text="": text
+        session._persist = mock.Mock()
+        session._schedule_persist_delayed = mock.Mock()
+        session._emit = mock.Mock()
+        return session, prompts
+
+    def wait_for_auto_title(self, session):
+        deadline = time.time() + 2.0
+        while session.auto_title_refine_pending and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(session.auto_title_refine_pending)
+
+    def test_program_ide_task_envelope_is_removed_before_title_generation(self):
+        session, prompts = self.make_session()
+        self.assertEqual(
+            session._latest_user_goal_text(),
+            "制作一个宝可梦精灵球的图片，用matplot设计制作显示",
+        )
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
+        self.assertEqual(session.title_origin, "auto")
+        self.assertEqual(session.last_auto_title_source, "model")
+        self.assertEqual(len(prompts), 1)
+
+    def test_auto_title_is_not_a_visible_or_interruptible_startup_phase(self):
+        worker_source = inspect.getsource(cc.SessionState._agent_worker)
+        submit_source = inspect.getsource(cc.SessionState.submit_user_message)
+        self.assertNotIn('_startup_phase("auto-title")', worker_source)
+        self.assertNotIn('progress_label="startup session title"', worker_source)
+        self.assertIn('_maybe_auto_rename_session_title("run-start")', worker_source)
+        self.assertIn('_maybe_auto_rename_session_title("message-accepted")', submit_source)
+
+    def test_manual_rename_wins_over_inflight_model_title(self):
+        session, _ = self.make_session()
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked_chat(*_args, **_kwargs):
+            started.set()
+            release.wait(1.0)
+            finished.set()
+            return {"content": "模型生成标题"}
+
+        session._build_auto_title_client = lambda: types.SimpleNamespace(chat=blocked_chat)
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.assertTrue(started.wait(1.0))
+        with session.lock:
+            session.title = "用户命名"
+            session.title_origin = "manual"
+            session.auto_title_refine_generation += 1
+            session.auto_title_refine_pending = False
+        release.set()
+        self.assertTrue(finished.wait(1.0))
+        time.sleep(0.02)
+        self.assertEqual(session.title, "用户命名")
+        session._emit.assert_not_called()
+
+    def test_disabled_or_failed_title_model_uses_local_fallback(self):
+        session, prompts = self.make_session()
+        with mock.patch.object(cc, "AUTO_TITLE_MODEL_REFINE", False):
+            self.assertTrue(session._maybe_auto_rename_session_title("test"))
+            self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
+        self.assertEqual(session.last_auto_title_source, "fallback")
+        self.assertEqual(prompts, [])
+
+    def test_generic_greeting_does_not_hide_later_concrete_title_goal(self):
+        session, _ = self.make_session()
+        session.messages.insert(0, {"role": "user", "content": "hello"})
+        self.assertEqual(
+            session._best_session_title_goal_text(),
+            "制作一个宝可梦精灵球的图片，用matplot设计制作显示",
+        )
+
+    def test_generic_model_title_falls_back_to_concrete_user_task(self):
+        session, _ = self.make_session(model_title="IDE编程请求处理")
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
+        self.assertEqual(session.last_auto_title_source, "fallback")
+        self.assertFalse(session._is_low_quality_auto_title(session.title))
+
+    def test_application_session_title_keeps_app_name_prefix(self):
+        session, _ = self.make_session(title="Image Studio")
+        session.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        session.title_origin = "application"
+        self.assertTrue(session._maybe_auto_rename_session_title("application-start"))
+        self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "Image Studio-宝可梦精灵球绘制")
+        self.assertEqual(session.title_origin, "auto")
+        self.assertEqual(session.last_auto_title_source, "model")
+
+    def test_model_title_application_prefix_is_normalized_before_truncation(self):
+        session, _ = self.make_session()
+        app_name = "Long Image Creation Application"
+        session.app_binding = {"app_id": "app_image", "name": app_name}
+        self.assertEqual(
+            session._normalize_auto_title(f"{app_name} ： 修复IDE气泡实时刷新"),
+            "修复IDE气泡实时刷新",
+        )
+        for separator in ("-", " — ", ":", "："):
+            with self.subTest(separator=separator):
+                self.assertEqual(
+                    session._application_title_suffix(f"{app_name}{separator}修复气泡"),
+                    "修复气泡",
+                )
+        self.assertEqual(
+            session._application_title(session._normalize_auto_title(f"{app_name} — 修复IDE气泡实时刷新")),
+            f"{app_name}-修复IDE气泡实时刷新",
+        )
+
+    def test_partial_title_profile_inherits_active_provider_connection(self):
+        session, _ = self.make_session()
+        del session._build_auto_title_client
+        session.model_profiles = {"active": {"model": "title-model"}}
+        session.active_profile_id = "active"
+        session.ollama = types.SimpleNamespace(
+            base_url="https://models.example/v1",
+            model="main-model",
+            provider="openai_compat",
+            endpoint="https://models.example/v1/chat/completions",
+            api_key="secret",
+            headers={"X-Tenant": "demo"},
+            payload_template="",
+        )
+        session.telemetry_callback = None
+        client = session._build_auto_title_client()
+        self.assertEqual(client.model, "title-model")
+        self.assertEqual(client.provider, "openai_compat")
+        self.assertEqual(client.endpoint, "https://models.example/v1/chat/completions")
+        self.assertEqual(client.api_key, "secret")
+        self.assertEqual(client.headers, {"X-Tenant": "demo"})
+
+    def test_model_refine_keeps_one_application_prefix(self):
+        session, _ = self.make_session(title="Image Studio-IDE编程请求处理")
+        session.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        session.title_origin = "auto"
+        session.auto_title_refine_lock = threading.RLock()
+        session.auto_title_refine_generation = 3
+        session.auto_title_refine_pending = True
+        session.auto_title_last_goal_digest = "goal-digest"
+        session.auto_title_revision = 1
+        session.root = Path(tempfile.mkdtemp(prefix="clouds-title-test-"))
+        self.addCleanup(cc.shutil.rmtree, session.root, True)
+        session._build_auto_title_client = lambda: types.SimpleNamespace(
+            chat=lambda *_args, **_kwargs: {"content": "Image Studio：IDE气泡实时刷新"}
+        )
+        session._auto_title_model_refine_worker(
+            "修复IDE气泡实时刷新",
+            "goal-digest",
+            "宝可梦精灵球绘制",
+            "test",
+            3,
+        )
+        self.assertEqual(session.title, "Image Studio-IDE气泡实时刷新")
+        self.assertEqual(session.last_auto_title_source, "model")
+        self.assertFalse(session.auto_title_refine_pending)
+
+    def test_legacy_application_title_and_placeholder_suffix_are_replaceable(self):
+        exact, _ = self.make_session(title="Image Studio")
+        exact.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        exact.title_origin = "legacy"
+        self.assertTrue(exact._migrate_legacy_auto_title_on_load())
+        self.assertEqual(exact.title, "Image Studio-制作一个宝可梦精灵球的图片")
+        self.assertEqual(exact.title_origin, "auto")
+
+        placeholder, _ = self.make_session(title="Image Studio-IDE编程请求处理")
+        placeholder.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        placeholder.title_origin = "auto"
+        self.assertTrue(placeholder._maybe_auto_rename_session_title("application-repair"))
+        self.wait_for_auto_title(placeholder)
+        self.assertEqual(placeholder.title, "Image Studio-宝可梦精灵球绘制")
+
+    def test_manual_application_session_title_is_never_overwritten(self):
+        session, _ = self.make_session(title="我的图片工作")
+        session.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        session.title_origin = "manual"
+        self.assertFalse(session._maybe_auto_rename_session_title("application-start"))
+        self.assertEqual(session.title, "我的图片工作")
+
+    def test_continuation_message_does_not_replace_title_goal(self):
+        session, _ = self.make_session(model_title="继续")
+        session.messages.append(
+            {"role": "user", "content": "我现在无法操作，请你检查发生了什么"}
+        )
+        session.messages.append({"role": "user", "content": "继续"})
+        self.assertEqual(session._latest_user_goal_text(), "继续")
+        self.assertEqual(
+            session._best_session_title_goal_text(),
+            "制作一个宝可梦精灵球的图片，用matplot设计制作显示",
+        )
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
+        self.assertEqual(session.last_auto_title_source, "fallback")
+
+    def test_legacy_default_and_bad_auto_titles_are_replaceable(self):
+        session, _ = self.make_session(title="IDE编程会话 / IDE编程会话")
+        self.assertEqual(session.title_origin, "default")
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
+
+        bad, _ = self.make_session(title="编程任务进行中")
+        self.assertEqual(bad.title_origin, "auto")
+        self.assertTrue(bad._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(bad)
+        self.assertEqual(bad.title, "宝可梦精灵球绘制")
+
+    def test_windows_localized_program_titles_are_replaceable_defaults(self):
+        for title in (
+            "Program 10:30 AM",
+            "Program 上午10:30",
+            "Program １０：３０",
+            "Program \u200e10:30 PM",
+        ):
+            with self.subTest(title=title):
+                session, _ = self.make_session(title=title)
+                self.assertEqual(session.title_origin, "default")
+                self.assertTrue(session._maybe_auto_rename_session_title("test"))
+                self.wait_for_auto_title(session)
+                self.assertEqual(session.title, "宝可梦精灵球绘制")
+
+    def test_shared_workspace_is_replaceable_and_legacy_sessions_are_migrated(self):
+        session, _ = self.make_session(title="Shared workspace")
+        self.assertEqual(session.title_origin, "default")
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.wait_for_auto_title(session)
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
+
+        legacy, _ = self.make_session(title="Shared workspace")
+        legacy.title_origin = "legacy"
+        self.assertTrue(legacy._migrate_legacy_auto_title_on_load())
+        self.assertEqual(legacy.title_origin, "auto")
+
+    def test_manual_title_is_never_overwritten(self):
+        session, _ = self.make_session(title="Program 12:34")
+        session.title_origin = "manual"
+        self.assertFalse(session._maybe_auto_rename_session_title("test"))
+        self.assertEqual(session.title, "Program 12:34")
+        session.ollama.chat = mock.Mock(
+            side_effect=AssertionError("model should not be called")
+        )
+        self.assertFalse(session._maybe_auto_rename_session_title("test"))
+
+    def test_load_migration_repairs_only_replaceable_legacy_titles(self):
+        session, _ = self.make_session(title="IDE编程请求初始化")
+        self.assertTrue(session._migrate_legacy_auto_title_on_load())
+        self.assertEqual(session.title, "制作一个宝可梦精灵球的图片")
+        self.assertEqual(session.title_origin, "auto")
+        self.assertEqual(session.last_auto_title_source, "migration")
+
+        manual, _ = self.make_session(title="IDE编程请求初始化")
+        manual.title_origin = "manual"
+        self.assertFalse(manual._migrate_legacy_auto_title_on_load())
+        self.assertEqual(manual.title, "IDE编程请求初始化")
+
+    def test_manager_rename_marks_title_as_manual(self):
+        manager = cc.SessionManager.__new__(cc.SessionManager)
+        manager.lock = threading.RLock()
+        manager.session_index = {}
+        session = types.SimpleNamespace(
+            id="sess_manual",
+            title="Program 10:00",
+            title_origin="default",
+            last_auto_title_source="model",
+            updated_at=0.0,
+            _persist=mock.Mock(),
+        )
+        manager._load_session_locked = lambda _session_id: session
+        manager._session_message_count = lambda _session: 0
+        manager.rename("sess_manual", "我的太阳系模型")
+        self.assertEqual(session.title, "我的太阳系模型")
+        self.assertEqual(session.title_origin, "manual")
+        self.assertEqual(session.last_auto_title_source, "")
+        self.assertEqual(session.auto_title_revision, 1)
+        self.assertEqual(session.auto_title_refine_generation, 1)
+        self.assertFalse(session.auto_title_refine_pending)
+
+
+class EventHubCursorTests(unittest.TestCase):
+    def test_publish_preserves_restored_session_sequence(self):
+        hub = cc.EventHub()
+        subscriber = hub.subscribe()
+        restored_event = {"type": "message", "seq": 417, "data": {"role": "user"}}
+        hub.publish(restored_event)
+        self.assertEqual(subscriber.get_nowait()["seq"], 417)
+        next_local_event = {"type": "status", "data": {}}
+        hub.publish(next_local_event)
+        self.assertEqual(subscriber.get_nowait()["seq"], 418)
+
+    def test_session_event_commits_message_before_publish(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.id = "sess_live"
+        session.lock = threading.RLock()
+        session.running = False
+        session.event_seq = 416
+        session.messages = [{"role": "user", "content": "new message", "ts": cc.now_ts()}]
+        session.scheduler_visible_inputs = []
+        session.operations = []
+        session.activity = []
+        session._maybe_persist_after_event = mock.Mock()
+        session._publish_collaboration_event_heartbeat = mock.Mock()
+
+        class ObservingHub:
+            def publish(self, event):
+                self.event = event
+                self.operation_seq = session.operations[-1]["seq"]
+                self.message_seq = session.messages[-1]["seq"]
+
+        session.events = ObservingHub()
+        event = session._emit("message", {"role": "user", "text": "new message"})
+        self.assertEqual(event["seq"], 417)
+        self.assertEqual(session.events.operation_seq, 417)
+        self.assertEqual(session.events.message_seq, 417)
+
+
+class IDEAgentStateTests(unittest.TestCase):
+    def test_runtime_controls_have_separate_origin_and_ui_projection(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        self.assertTrue(
+            session._is_ui_hidden_runtime_message(
+                {"role": "user", "content": "<intent-fusion type='continuation'>internal context</intent-fusion>"}
+            )
+        )
+        self.assertTrue(
+            session._is_ui_hidden_runtime_message(
+                {"role": "user", "content": "<compact-resume>archived context</compact-resume>"}
+            )
+        )
+        recalled = {"role": "user", "content": "<auto-context-recall>internal context</auto-context-recall>"}
+        self.assertTrue(session._is_runtime_internal_message(recalled))
+        projected = session._runtime_message_ui_projection(recalled)
+        self.assertEqual(projected["role"], "system")
+        self.assertEqual(projected["type"], "runtime_hint")
+        self.assertEqual(projected["data"]["control_tag"], "auto-context-recall")
+        self.assertTrue(
+            session._is_ui_hidden_runtime_message(
+                {"role": "user", "content": "<auto-continue>retry tool</auto-continue>"}
+            )
+        )
+        self.assertFalse(
+            session._is_runtime_internal_message(
+                {"role": "user", "content": "APPROACH / USER / DEVELOPER are ordinary words here"}
+            )
+        )
+
+    def test_ide_agent_state_drops_hidden_and_empty_rows_and_stabilizes_operations(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        session = cc.SessionState.__new__(cc.SessionState)
+
+        def snapshot_safe(**_kwargs):
+            return {
+                "running": False,
+                "event_seq": 3,
+                "message_count": 4,
+                "conversation_feed": [
+                    {
+                        "id": "hidden",
+                        "role": "user",
+                        "type": "message",
+                        "text": "<intent-fusion>internal</intent-fusion>",
+                        "ts": 1,
+                    },
+                    {"id": "empty", "role": "assistant", "type": "message", "text": "", "ts": 2},
+                    {
+                        "id": "natural",
+                        "role": "user",
+                        "type": "message",
+                        "text": "APPROACH is part of my request",
+                        "ts": 3,
+                    },
+                    {
+                        "id": "runtime-recall",
+                        "role": "system",
+                        "type": "runtime_hint",
+                        "text": "Archived context evidence was recalled for the active work.",
+                        "data": {
+                            "control_tag": "auto-context-recall",
+                            "origin": "runtime",
+                            "query": "engine invariant",
+                            "returned": 2,
+                            "default_collapsed": True,
+                        },
+                        "ts": 3.5,
+                    },
+                ],
+                "operations": [
+                    {"type": "status", "ts": 4, "data": {"summary": "stable status"}},
+                ],
+            }
+
+        session.snapshot_safe = snapshot_safe
+        session.lock = threading.Lock()
+        app._ide_session = lambda _user_id, _session_id: session
+        state = app.ide_agent_state("user-a", "session-a")
+        self.assertEqual([row["id"] for row in state["feed"]], ["natural", "runtime-recall"])
+        runtime = state["feed"][-1]
+        self.assertEqual(runtime["role"], "system")
+        self.assertEqual(runtime["type"], "runtime_hint")
+        self.assertEqual(runtime["data"]["query"], "engine invariant")
+        self.assertTrue(runtime["data"]["default_collapsed"])
+        self.assertEqual(len(state["operations"]), 1)
+        self.assertTrue(state["operations"][0]["id"].startswith("operation:"))
+
+    def test_frontend_row_identity_prefers_stable_id_or_sequence(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        key_start = source.index("function _chatVirtRowKey")
+        key_end = source.index("function _chatVirtFormatElapsed", key_start)
+        key_source = source[key_start:key_end]
+        self.assertIn("if(id)return`id:${id}`", key_source)
+        self.assertIn("if(seq>0)return`seq:${seq}`", key_source)
+        self.assertNotIn(":${idx}", key_source)
+
+    def test_web_and_ide_render_runtime_hint_from_structured_metadata(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        web_start = source.index("function _chatVirtRuntimeHintFromMessage")
+        web_end = source.index("function _chatVirtBuildMessageNode", web_start)
+        web_source = source[web_start:web_end]
+        self.assertIn("m?.type||'').toLowerCase()==='runtime_hint'", web_source)
+        self.assertIn("data.control_tag", web_source)
+        self.assertIn("data.details||m?.text", web_source)
+        self.assertIn("msg-runtime-details", source)
+
+        ide_start = source.index("function renderAgentRuntimeHint")
+        ide_end = source.index("function renderCompactCard", ide_start)
+        ide_source = source[ide_start:ide_end]
+        self.assertIn("data.control_tag", ide_source)
+        self.assertIn("data.default_collapsed===false", ide_source)
+        render_start = source.index("function renderAgentState(state)")
+        render_end = source.index("async function pollAgent", render_start)
+        self.assertIn("if(type==='runtime_hint'){renderAgentRuntimeHint(row);continue}", source[render_start:render_end])
+
+    def test_runtime_projection_uses_metadata_before_legacy_envelope(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        message = session._runtime_control_message(
+            "opaque provider-compatible evidence without an XML tag",
+            control_tag="auto-context-recall",
+            ui_data={"query": "semantic locator", "returned": 3},
+        )
+        projection = session._runtime_message_ui_projection(message)
+        self.assertEqual(projection["role"], "system")
+        self.assertEqual(projection["type"], "runtime_hint")
+        self.assertEqual(projection["data"]["query"], "semantic locator")
+        self.assertEqual(projection["data"]["returned"], 3)
+        self.assertEqual(message["content"], "opaque provider-compatible evidence without an XML tag")
+
+    def test_web_snapshot_refresh_discards_response_after_session_switch(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        refresh_start = source.index("async function refreshSnapshot(opt={})")
+        refresh_end = source.index("function scheduleSnapshot", refresh_start)
+        refresh_source = source[refresh_start:refresh_end]
+        self.assertIn("const requestedSessionId=String(S.activeId||'')", refresh_source)
+        self.assertIn("const nextSnapshot=await api('/api/sessions/'+requestedSessionId+q)", refresh_source)
+        self.assertIn("if(String(S.activeId||'')!==requestedSessionId)return", refresh_source)
+
+    def test_collaboration_run_with_open_todos_is_blocked_not_completed(self):
+        todos = cc.TodoManager("zh-CN")
+        todos.update(
+            [
+                {"content": "实现核心模块", "status": "completed"},
+                {"content": "运行 QA 验证", "status": "in_progress"},
+                {"content": "发布验证证据", "status": "pending"},
+            ]
+        )
+        session = types.SimpleNamespace(
+            blackboard={},
+            todo=todos,
+            cancel_requested=False,
+            pending_user_question=None,
+            run_started_at=0.0,
+            operations=[],
+        )
+
+        status, summary = cc.AppContext._collaboration_run_outcome(session)
+
+        self.assertEqual(status, "blocked")
+        self.assertIn("Outstanding Todos: 2 of 3", summary)
+
+    def test_collaboration_tool_event_refreshes_agent_heartbeat_details(self):
+        coordinator = types.SimpleNamespace(heartbeat=mock.Mock(return_value={"ok": True}))
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.id = "sess_live"
+        session.running = True
+        session.current_tool_name = "edit_file"
+        session.collaboration_write_coordinator = coordinator
+        session.collaboration_agent_last_heartbeat = 0.0
+        session.collaboration_agent_current_file = ""
+
+        session._publish_collaboration_event_heartbeat(
+            "tool_start",
+            {"name": "edit_file", "path": "js/live.js", "summary": "tool start: edit_file"},
+        )
+
+        call = coordinator.heartbeat.call_args
+        self.assertEqual(call.args[0], "sess_live")
+        self.assertEqual(call.kwargs["status"], "running")
+        self.assertEqual(call.kwargs["current_file"], "js/live.js")
+        self.assertIn("edit_file", call.kwargs["tool_summary"])
+
+    def test_collaboration_agent_lifecycle_is_published(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        app.collaboration = types.SimpleNamespace(
+            update_agent=mock.Mock(return_value={"ok": True})
+        )
+        principal = cc.CollaborationPrincipal(
+            project_id="project-a",
+            member_id="member-a",
+            device_id="device-a",
+            session_digest="digest-a",
+            csrf_token="csrf-a",
+            nickname="Alice",
+            expires_at=999999.0,
+        )
+        session = types.SimpleNamespace(
+            id="sess_shared",
+            operations=[],
+            collaboration_write_coordinator=types.SimpleNamespace(principal=principal),
+        )
+
+        self.assertTrue(
+            app._publish_collaboration_agent_state(
+                session, "running", result_summary="Agent run started"
+            )
+        )
+        call = app.collaboration.update_agent.call_args
+        self.assertEqual(call.kwargs["status"], "running")
+        self.assertEqual(call.kwargs["session_id"], "sess_shared")
+        self.assertEqual(call.kwargs["agent_id"], "agent:sess_shared")
+
+    def test_interrupt_agent_cancels_only_matching_queued_rows(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        app._lock = threading.RLock()
+        app._task_queue = cc.deque(
+            [
+                {
+                    "id": 11,
+                    "user_id": "user-a",
+                    "session_id": "session-a",
+                    "content": "one",
+                },
+                {
+                    "id": 12,
+                    "user_id": "user-b",
+                    "session_id": "session-b",
+                    "content": "two",
+                },
+            ]
+        )
+        session = types.SimpleNamespace(
+            running=True,
+            interrupted=0,
+            visible=[],
+        )
+        session.interrupt = lambda: setattr(
+            session, "interrupted", session.interrupted + 1
+        )
+        session.update_scheduler_visible_message = lambda queue_id, **state: (
+            session.visible.append((queue_id, state))
+        )
+        app._ide_session = lambda user_id, session_id: session
+        refreshed = []
+        app._refresh_scheduler_visible_positions = lambda: refreshed.append(True)
+
+        out = app.ide_interrupt_agent("user-a", "session-a")
+
+        self.assertTrue(out["cancel_requested"])
+        self.assertEqual(out["cancelled_queued"], 1)
+        self.assertEqual(session.interrupted, 1)
+        self.assertEqual(session.visible, [(11, {"status": "cancelled"})])
+        self.assertEqual([row["id"] for row in app._task_queue], [12])
+        self.assertEqual(refreshed, [True])
+
+    def test_session_interrupt_does_not_wait_for_a_busy_session_lock(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.lock = threading.RLock()
+        session.cancel_requested = False
+        session.current_phase = "tool:bash"
+        session.current_tool_name = "bash"
+        session._running_bash_proc = None
+        session._emit = mock.Mock()
+        session._persist = mock.Mock()
+        acquired = threading.Event()
+
+        def hold_lock():
+            with session.lock:
+                acquired.set()
+                time.sleep(0.3)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        self.assertTrue(acquired.wait(1))
+        started = time.monotonic()
+        session.interrupt()
+        elapsed = time.monotonic() - started
+        holder.join(1)
+
+        self.assertTrue(session.cancel_requested)
+        self.assertLess(elapsed, 0.2)
+        session._emit.assert_not_called()
+        session._persist.assert_not_called()
+
+    def test_interrupt_agent_http_route_is_wired(self):
+        source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn('/agent/interrupt$"', source)
+        self.assertIn("ide_interrupt_agent", source)
+
+    def test_program_ide_manual_compact_requires_idle_session(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+
+        class FakeSession:
+            running = False
+            compacted = 0
+
+            def manual_compact(self):
+                self.compacted += 1
+
+            def snapshot_safe(self, **_kwargs):
+                return {
+                    "context_tokens_estimate": 1200,
+                    "context_left_tokens": 8800,
+                    "context_left_percent": 88.0,
+                }
+
+        session = FakeSession()
+        app._ide_session = lambda user_id, session_id: session
+        out = app.ide_compact_agent("user-a", "session-a")
+        self.assertTrue(out["ok"])
+        self.assertEqual(session.compacted, 1)
+        self.assertEqual(out["context_left_tokens"], 8800)
+        session.running = True
+        with self.assertRaises(ValueError):
+            app.ide_compact_agent("user-a", "session-a")
+        self.assertEqual(session.compacted, 1)
+
+    def test_workspace_transfer_and_compact_ui_routes_are_wired(self):
+        get_source = inspect.getsource(cc.IdeHandler.do_GET)
+        post_source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn('/workspace/archive$"', get_source)
+        self.assertIn("ide_workspace_archive", get_source)
+        self.assertIn('/workspace/upload-chunk$"', post_source)
+        self.assertIn("ide_upload_chunk", post_source)
+        self.assertIn('/compact$"', post_source)
+        self.assertIn("ide_compact_agent", post_source)
+        self.assertIn('id="workspaceSectionLabel"', cc.IDE_INDEX_HTML)
+        self.assertIn('id="downloadWorkspaceBtn"', cc.IDE_INDEX_HTML)
+        self.assertIn("showWorkspaceMenu", cc.IDE_JS)
+        self.assertIn("downloadWorkspaceBtn').onclick", cc.IDE_JS)
+        self.assertIn("Download Folder as ZIP", cc.IDE_JS)
+        self.assertIn("Download File", cc.IDE_JS)
+        self.assertIn("scanDirectoryHandle", cc.IDE_JS)
+        self.assertIn("showDirectoryPicker", cc.IDE_JS)
+        self.assertIn("directories", cc.IDE_JS)
+        self.assertIn("uploadFileStream", cc.IDE_JS)
+        self.assertIn("chunkSize=512*1024", cc.IDE_JS)
+        self.assertIn("workspace/upload-chunk", cc.IDE_JS)
+        self.assertIn("compactAgentContext", cc.IDE_JS)
+        self.assertIn("agent-model-compact", cc.IDE_CSS)
+        self.assertIn("min-width:52px!important", cc.IDE_CSS)
+        self.assertIn("compact.textContent='Compact'", cc.IDE_JS)
+        self.assertIn("context_effective_token_limit", cc.IDE_JS)
+
+    def test_agent_model_config_control_and_mode_aware_dialog_are_wired(self):
+        self.assertIn("agent-model-actions", cc.IDE_CSS)
+        self.assertIn("agent-model-config", cc.IDE_CSS)
+        self.assertIn("codicon-settings-gear", cc.IDE_JS)
+        self.assertIn("actions.append(compact,config)", cc.IDE_JS)
+        self.assertIn("async function showLlmConfigModal()", cc.IDE_JS)
+        self.assertIn("/api/ide/v2/llm-config", cc.IDE_JS)
+        self.assertIn("/llm-config`,{method:'POST'", cc.IDE_JS)
+        self.assertIn("Use Shared Config", cc.IDE_JS)
+        self.assertIn("Sync Main Config", cc.IDE_JS)
+        self.assertIn("accept=\".json,application/json\"", cc.IDE_JS)
+        self.assertIn("maximum 512 KB", cc.IDE_JS)
+        self.assertIn("Credentials remain server-side", cc.IDE_JS)
+        get_source = inspect.getsource(cc.IdeHandler.do_GET)
+        post_source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn('path == "/api/ide/v2/llm-config"', get_source)
+        self.assertIn('path == "/api/ide/v2/llm-config/shared"', post_source)
+        self.assertIn('/llm-config$", path)', post_source)
+
+    def test_workspace_drag_drop_clipboard_and_context_actions_are_wired(self):
+        post_source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn('/workspace/copy$"', post_source)
+        self.assertIn("ide_copy_workspace_entry", post_source)
+        self.assertIn(
+            'id="tree" class="tree" role="tree" tabindex="0"', cc.IDE_INDEX_HTML
+        )
+        self.assertIn('id="workspaceSectionLabel"', cc.IDE_INDEX_HTML)
+        self.assertIn('tabindex="0" role="button"', cc.IDE_INDEX_HTML)
+
+        for marker in (
+            "workspaceClipboard:null",
+            "explorerSelection:null",
+            "scanDroppedDataTransfer",
+            "getAsFileSystemHandle",
+            "webkitGetAsEntry",
+            "bindWorkspaceDropZone(tree)",
+            "bindWorkspaceDropZone(workspaceLabel,{rootOnly:true})",
+            "copyExplorerEntry",
+            "pasteWorkspaceClipboard",
+            "explorerHasKeyboardFocus",
+            "addCommand('explorer.copy'",
+            "addCommand('explorer.cut'",
+            "addCommand('explorer.paste'",
+            "addCommand('explorer.rename'",
+            "addCommand('explorer.delete'",
+            "Paste into Parent",
+            "Upload Files Here",
+            "Upload Folder Here",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, cc.IDE_JS)
+        self.assertIn("fallbackEntries", cc.IDE_JS)
+        self.assertIn("handleTasks=items.map", cc.IDE_JS)
+        self.assertIn("replace(/^file:\\/+/i,'')", cc.IDE_JS)
+
+        self.assertIn(
+            "S.workspaceClipboard=null;S.explorerSelection=null;"
+            "clearWorkspaceDropState()",
+            cc.IDE_JS,
+        )
+        self.assertIn("event.key==='Delete'||event.key==='Backspace'", cc.IDE_JS)
+        self.assertIn(".tree-row.is-drop-target", cc.IDE_CSS)
+        self.assertIn(".tree-row.is-cut", cc.IDE_CSS)
+
+    def test_html_preview_and_history_refresh_are_event_driven(self):
+        self.assertTrue(cc.is_code_preview_candidate("index.html"))
+        self.assertIn("kind==='code'||kind==='html'?'latest':''", cc.APP_JS)
+        self.assertIn("_refreshActivePreviewForPath", cc.APP_JS)
+        self.assertIn(
+            "if(typ==='file_patch')_refreshActivePreviewForPath", cc.APP_JS
+        )
+        self.assertIn("async function _renderHtmlPreviewTab", cc.APP_JS)
+        self.assertIn("frame.srcdoc=_htmlPreviewStageDocument", cc.APP_JS)
+        self.assertIn("file.previewKind==='html'", cc.IDE_JS)
+
+    def test_program_session_creation_uses_server_default_title(self):
+        self.assertIn(
+            "api('/api/ide/sessions',{method:'POST',body:'{}'})",
+            cc.IDE_JS,
+        )
+        self.assertNotIn("Program ${new Date().toLocaleTimeString", cc.IDE_JS)
+
+    def test_agent_state_exposes_sanitized_pending_user_question(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+
+        class FakeSession:
+            operations = []
+            lock = threading.RLock()
+
+            def snapshot_safe(self, **_kwargs):
+                return {
+                    "running": False,
+                    "pending_user_question": {
+                        "id": "ask-42",
+                        "question": "Choose a renderer",
+                        "options": ["Canvas", "WebGL"],
+                        "allow_free_text": False,
+                        "role": "planner",
+                        "ts": 12.5,
+                        "private": "hidden",
+                    },
+                    "conversation_feed": [],
+                    "todos": [],
+                    "tasks": [],
+                }
+
+        app._ide_session = lambda user_id, session_id: FakeSession()
+        state = app.ide_agent_state("user-a", "session-a")
+        self.assertEqual(
+            state["pending_user_question"],
+            {
+                "id": "ask-42",
+                "question": "Choose a renderer",
+                "options": ["Canvas", "WebGL"],
+                "allow_free_text": False,
+                "role": "planner",
+                "ts": 12.5,
+            },
+        )
+
+    def test_answer_agent_question_rejects_stale_or_invalid_answers(
+        self,
+    ):
+        app = cc.AppContext.__new__(cc.AppContext)
+        session = types.SimpleNamespace(
+            pending_user_question={
+                "id": "ask-current",
+                "question": "Choose one",
+                "options": ["A", "B"],
+                "allow_free_text": False,
+            }
+        )
+        app._ide_session = lambda user_id, session_id: session
+        submitted = []
+        app.submit_user_message = lambda user_id, session_id, content: (
+            submitted.append(content) or {"ok": True}
+        )
+
+        out = app.ide_answer_agent_question(
+            "user-a", "session-a", {"question_id": "ask-current", "answer": "B"}
+        )
+        self.assertEqual(submitted, ["B"])
+        self.assertEqual(out["answer"], "B")
+        with self.assertRaisesRegex(ValueError, "stale"):
+            app.ide_answer_agent_question(
+                "user-a", "session-a", {"question_id": "ask-old", "answer": "A"}
+            )
+        with self.assertRaisesRegex(ValueError, "stale"):
+            app.ide_answer_agent_question("user-a", "session-a", {"answer": "A"})
+        with self.assertRaisesRegex(ValueError, "available options"):
+            app.ide_answer_agent_question(
+                "user-a", "session-a", {"question_id": "ask-current", "answer": "C"}
+            )
+
+    def test_ask_user_answer_http_route_is_wired(self):
+        source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn('/ask-user/answer$"', source)
+        self.assertIn("ide_answer_agent_question", source)
+
+    def test_ide_public_operation_data_is_shared_by_state_and_sse(self):
+        public = cc.ide_public_operation_data(
+            {
+                "name": "bash",
+                "tool_call_id": "call-42",
+                "agent_role": "developer",
+                "command": "python verify.py",
+                "cwd": "/workspace/session",
+                "output": "验证通过",
+                "exit_code": 0,
+                "duration_ms": 42,
+                "changed_files": ["verify.py"],
+                "secret": "do-not-publish",
+            }
+        )
+        self.assertEqual(public["tool_call_id"], "call-42")
+        self.assertEqual(public["command"], "python verify.py")
+        self.assertEqual(public["output"], "验证通过")
+        self.assertEqual(public["exit_code"], 0)
+        self.assertEqual(public["changed_files"], ["verify.py"])
+        self.assertNotIn("secret", public)
+        stream_source = inspect.getsource(cc.IdeHandler._stream_ide_events)
+        state_source = inspect.getsource(cc.AppContext.ide_agent_state)
+        self.assertIn('"id": str(event.get("id", "")', stream_source)
+        self.assertIn('"ts": float(event.get("ts", 0.0)', stream_source)
+        self.assertIn("ide_public_operation_data(data)", stream_source)
+        self.assertIn("ide_public_operation_data(data)", state_source)
+
+    def test_ide_sse_stream_emits_complete_live_command_operation(self):
+        class FakeHub:
+            def __init__(self):
+                self.queue = __import__("queue").Queue()
+                self.queue.put(
+                    {
+                        "id": "evt-command-1",
+                        "seq": 17,
+                        "ts": 123.5,
+                        "type": "command",
+                        "data": {
+                            "name": "bash",
+                            "tool_call_id": "call-17",
+                            "agent_role": "developer",
+                            "command": "printf 验证通过",
+                            "cwd": "/workspace/session",
+                            "output": "验证通过",
+                            "exit_code": 0,
+                            "duration_ms": 9,
+                            "changed_files": [],
+                            "secret": "do-not-publish",
+                        },
+                    }
+                )
+
+            def subscribe(self):
+                return self.queue
+
+            def unsubscribe(self, _queue):
+                return None
+
+        class FakeSession:
+            id = "sess-live"
+            event_seq = 16
+            files_root = Path(tempfile.mkdtemp())
+            events = FakeHub()
+
+        class FakeHandler:
+            def __init__(self):
+                self.payloads = []
+
+            def send_response(self, _status):
+                return None
+
+            def send_header(self, _key, _value):
+                return None
+
+            def end_headers(self):
+                return None
+
+            def _sse_write(self, payload):
+                self.payloads.append(payload)
+                return len(self.payloads) < 2
+
+        handler = FakeHandler()
+        cc.IdeHandler._stream_ide_events(handler, FakeSession())
+        raw = b"".join(handler.payloads).decode("utf-8")
+        event_lines = [
+            line[6:] for line in raw.splitlines() if line.startswith("data: ")
+        ]
+        event = json.loads(event_lines[-1])
+        self.assertEqual(event["id"], "evt-command-1")
+        self.assertEqual(event["seq"], 17)
+        self.assertEqual(event["type"], "command")
+        self.assertEqual(event["data"]["tool_call_id"], "call-17")
+        self.assertEqual(event["data"]["command"], "printf 验证通过")
+        self.assertEqual(event["data"]["output"], "验证通过")
+        self.assertEqual(event["data"]["exit_code"], 0)
+        self.assertNotIn("secret", event["data"])
+
+    def test_shell_command_event_keeps_tool_call_id_for_live_card_replacement(self):
+        source = inspect.getsource(cc.SessionState._dispatch_tool_inner)
+        self.assertIn('"tool_call_id": trim(str(tool_call_id or ""), 240)', source)
+
+    def test_agent_state_filters_thinking_and_preserves_public_evidence(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+
+        class FakeSession:
+            def snapshot_safe(self, **_kwargs):
+                return {
+                    "running": True,
+                    "agent_phase": "agent:developer:tool:write_file",
+                    "agent_active_role": "developer",
+                    "agent_active_tool": "write_file",
+                    "event_seq": 8,
+                    "message_count": 3,
+                    "live_thinking": "private reasoning",
+                    "live_response_text": "Editing the model.",
+                    "model": "coder-model",
+                    "provider": "test-provider",
+                    "context_tokens_estimate": 1200,
+                    "context_left_tokens": 6800,
+                    "context_left_percent": 85.0,
+                    "context_effective_token_limit": 8000,
+                    "conversation_feed": [
+                        {
+                            "role": "assistant",
+                            "agent_role": "developer",
+                            "type": "message",
+                            "text": "Implementing the model.",
+                            "thinking": "private reasoning",
+                            "ts": 1,
+                        },
+                        {
+                            "role": "system",
+                            "type": "file_patch",
+                            "text": "[file_patch] solar.py",
+                            "data": {"path": "solar.py", "diff": "secretly large diff"},
+                            "ts": 2,
+                        },
+                        {
+                            "role": "assistant",
+                            "agent_role": "developer",
+                            "type": "tool_calls",
+                            "text": (
+                                "正在推进「提取 PDF 文本」；本轮将运行命令"
+                                "以提取或验证证据，结果将用于确定下一步。"
+                            ),
+                            "data": {
+                                "tools": ["bash"],
+                                "public_progress": (
+                                    "正在推进「提取 PDF 文本」；本轮将运行命令"
+                                    "以提取或验证证据，结果将用于确定下一步。"
+                                ),
+                            },
+                            "ts": 2.5,
+                        },
+                    ],
+                    "operations": [
+                        {
+                            "id": "evt-1",
+                            "seq": 8,
+                            "ts": 2,
+                            "type": "tool_result",
+                            "data": {
+                                "name": "write_file",
+                                "tool_call_id": "call-1",
+                                "path": "solar.py",
+                                "result": "ok",
+                                "thinking": "private",
+                            },
+                        },
+                        {
+                            "id": "evt-2",
+                            "seq": 9,
+                            "ts": 3,
+                            "type": "file_patch",
+                            "data": {
+                                "path": "solar.py",
+                                "session_rel_path": "solar.py",
+                                "change_type": "modify",
+                                "added": 2,
+                                "deleted": 1,
+                                "diff_numbered": "@@ -1 +1,2 @@\n-old\n+new",
+                                "code_stage": {"id": "stage-1", "private": "hidden"},
+                            },
+                        },
+                        {
+                            "id": "evt-3",
+                            "seq": 10,
+                            "ts": 4,
+                            "type": "compact",
+                            "data": {
+                                "reason": "auto",
+                                "tier": 2,
+                                "context_used_before": 7000,
+                                "context_used_after": 4000,
+                                "context_used_reduction": 3000,
+                                "effective": True,
+                            },
+                        },
+                    ],
+                    "todos": [{"content": "Build model", "status": "in_progress"}],
+                    "tasks": [],
+                }
+
+        app._ide_session = lambda user_id, session_id: FakeSession()
+        state = app.ide_agent_state("user-a", "session-a")
+        serialized = json.dumps(state)
+        self.assertNotIn("private reasoning", serialized)
+        self.assertNotIn("live_thinking", state)
+        self.assertEqual(state["feed"][0]["agent_role"], "developer")
+        self.assertEqual(state["operations"][0]["data"]["name"], "write_file")
+        self.assertEqual(state["operations"][0]["data"]["path"], "solar.py")
+        self.assertEqual(state["operations"][0]["data"]["tool_call_id"], "call-1")
+        self.assertEqual(state["model"], "coder-model")
+        self.assertEqual(state["context_left_tokens"], 6800)
+        self.assertEqual(
+            state["operations"][1]["data"]["diff_numbered"], "@@ -1 +1,2 @@\n-old\n+new"
+        )
+        self.assertNotIn("private", state["operations"][1]["data"]["code_stage"])
+        self.assertEqual(state["operations"][2]["type"], "compact")
+        self.assertEqual(state["operations"][2]["data"]["context_used_reduction"], 3000)
+        progress_row = next(row for row in state["feed"] if row["type"] == "tool_calls")
+        self.assertEqual(progress_row["data"]["tools"], ["bash"])
+        self.assertEqual(progress_row["text"], "")
+        self.assertNotIn("public_progress", progress_row["data"])
+
+    def test_agent_state_keeps_persisted_operation_history(self):
+        source = inspect.getsource(cc.AppContext.ide_agent_state)
+        self.assertIn("sess.operations[-500:]", source)
+        self.assertIn('"operations": operations[-500:]', source)
+
+    def test_tool_event_context_exposes_only_safe_execution_summary(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = Path("/workspace/session")
+        session._tool_result_local = threading.local()
+        data = session._tool_event_context(
+            "bash",
+            {"command": "python verify.py", "secret": "do-not-publish"},
+            {"exit_code": 0, "duration_ms": 42, "changed_files": ["verify.py"]},
+        )
+        self.assertEqual(data["command"], "python verify.py")
+        self.assertEqual(data["cwd"], "/workspace/session")
+        self.assertEqual(data["exit_code"], 0)
+        self.assertEqual(data["changed_files"], ["verify.py"])
+        self.assertNotIn("secret", data)
+
+    def test_shell_environment_forces_utf8_for_local_and_remote_processes(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = Path(tempfile.mkdtemp())
+        session.ide_remote_sandbox_required = False
+        local = session._shell_process_env()
+        self.assertEqual(local["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(local["PYTHONUTF8"], "1")
+        if os.name != "nt":
+            self.assertIn("UTF-8", local["LC_ALL"])
+        completed = cc.subprocess.run(
+            [cc.sys.executable, "-c", "print('山海绘卷')"],
+            env=local,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        self.assertEqual(completed.stdout.strip(), "山海绘卷")
+
+    def test_shutdown_interrupt_cancels_and_kills_running_bash_without_session_lock(
+        self,
+    ):
+        app = cc.AppContext.__new__(cc.AppContext)
+        app._lock = threading.RLock()
+        process = mock.Mock()
+        process.pid = 4242
+        process.poll.return_value = None
+        session = types.SimpleNamespace(
+            running=True, cancel_requested=False, _running_bash_proc=process
+        )
+        manager = types.SimpleNamespace(lock=threading.RLock(), sessions={"s": session})
+        app._session_mgrs = {"u": manager}
+        with (
+            mock.patch.object(cc.os, "killpg") as killpg,
+            mock.patch.object(cc.os, "getpgid", return_value=4242),
+        ):
+            report = app.interrupt_all_sessions_for_shutdown()
+        self.assertTrue(session.cancel_requested)
+        self.assertEqual(report["running"], 1)
+        self.assertEqual(report["bash_terminated"], 1)
+        if os.name == "posix":
+            killpg.assert_called_once_with(4242, cc.signal.SIGKILL)
+
+
+class IDERegressionFixTests(unittest.TestCase):
+    def test_markdown_preview_removes_only_document_wide_indent(self):
+        source = (
+            "    # 标题\n\n    正文段落\n    第二行\n\n    ```python\n    "
+            "print('ok')\n    ```"
+        )
+        normalized = cc.normalize_markdown_preview_text(source)
+        self.assertTrue(normalized.startswith("# 标题"))
+        self.assertIn("\n正文段落\n第二行", normalized)
+        self.assertIn("```python\nprint('ok')", normalized)
+        mixed = "# 标题\n    ```python\n    print('ok')\n    ```"
+        self.assertEqual(cc.normalize_markdown_preview_text(mixed), mixed)
+
+    def test_structured_ask_user_options_survive_state_and_answer_validation(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        pending = {
+            "id": "ask-structured",
+            "question": "Choose a renderer",
+            "options": [
+                {"label": "Canvas", "value": "canvas", "description": "2D fallback"},
+                {"label": "WebGL", "value": "webgl"},
+            ],
+            "allow_free_text": False,
+            "role": "planner",
+        }
+
+        class FakeSession:
+            operations = []
+            lock = threading.RLock()
+            pending_user_question = pending
+
+            def snapshot_safe(self, **_kwargs):
+                return {
+                    "running": False,
+                    "pending_user_question": pending,
+                    "conversation_feed": [],
+                    "todos": [],
+                    "tasks": [],
+                }
+
+        session = FakeSession()
+        app._ide_session = lambda _user_id, _session_id: session
+        state = app.ide_agent_state("user-a", "session-a")
+        self.assertEqual(
+            state["pending_user_question"]["options"][0]["value"], "canvas"
+        )
+        submitted = []
+        app.submit_user_message = lambda _u, _s, content: (
+            submitted.append(content) or {"ok": True}
+        )
+        out = app.ide_answer_agent_question(
+            "user-a", "session-a", {"question_id": "ask-structured", "answer": "webgl"}
+        )
+        self.assertEqual(submitted, ["webgl"])
+        self.assertEqual(out["answer"], "webgl")
+        with self.assertRaisesRegex(ValueError, "available options"):
+            app.ide_answer_agent_question(
+                "user-a",
+                "session-a",
+                {"question_id": "ask-structured", "answer": "WebGL"},
+            )
+
+    def test_session_list_does_not_lock_or_rescan_loaded_history(self):
+        manager = cc.SessionManager.__new__(cc.SessionManager)
+        manager.lock = threading.RLock()
+        manager.user_language = "zh-CN"
+        manager.session_index = {
+            f"s-{i}": {
+                "id": f"s-{i}",
+                "title": f"Old {i}",
+                "updated_at": float(i),
+                "message_count": i,
+            }
+            for i in range(2500)
+        }
+
+        class ExplodingLock:
+            def acquire(self, *_args, **_kwargs):
+                raise AssertionError("session list must not lock every loaded session")
+
+        manager.sessions = {
+            "s-2499": types.SimpleNamespace(
+                id="s-2499",
+                title="Current",
+                running=False,
+                updated_at=2500.0,
+                lock=ExplodingLock(),
+            )
+        }
+        page = manager.list(limit=20)
+        self.assertEqual(len(page["sessions"]), 20)
+        self.assertEqual(page["sessions"][0]["id"], "s-2499")
+        self.assertEqual(page["sessions"][0]["message_count"], 2499)
+
+    def test_code_preview_index_recovers_from_persisted_file_patch_operations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = cc.SessionState.__new__(cc.SessionState)
+            session.root = root
+            session.code_preview_dir = root / "code_preview"
+            session.code_preview_dir.mkdir()
+            session.code_preview_index = {}
+            session.operations = [
+                {
+                    "type": "file_patch",
+                    "ts": 12.0,
+                    "data": {
+                        "path": "main.py",
+                        "added": 1,
+                        "deleted": 1,
+                        "code_stage": {
+                            "id": "stage_old",
+                            "ts": 12.0,
+                            "change_type": "modified",
+                        },
+                    },
+                }
+            ]
+            bucket = session._code_preview_bucket_dir("main.py")
+            (bucket / "stage_old.before.txt").write_text(
+                "print('old')\n", encoding="utf-8"
+            )
+            (bucket / "stage_old.after.txt").write_text(
+                "print('new')\n", encoding="utf-8"
+            )
+            session._recover_code_preview_index_from_operations()
+            self.assertEqual(
+                session.code_preview_index["main.py"][0]["id"], "stage_old"
+            )
+            self.assertEqual(session.code_preview_index["main.py"][0]["added"], 1)
+
+    def test_latest_code_preview_reads_authoritative_file_after_last_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = cc.SessionState.__new__(cc.SessionState)
+            session.root = root
+            session.files_root = root / "files"
+            session.files_root.mkdir()
+            session.code_preview_dir = root / "code_preview"
+            session.code_preview_dir.mkdir()
+            session.code_preview_index = {}
+            session.lock = threading.RLock()
+            target = session.files_root / "index.html"
+            target.write_text("<h1>one</h1>\n", encoding="utf-8")
+            stage = session._record_code_preview_stage(
+                rel_path="index.html",
+                before_text="",
+                after_text="<h1>one</h1>\n",
+                change_type="added",
+                tool_name="test",
+                added=1,
+                deleted=0,
+            )
+            target.write_text("<h1>two</h1>\n", encoding="utf-8")
+
+            latest = session.code_preview_payload("index.html", "latest")
+            historical = session.code_preview_payload("index.html", stage["id"])
+
+            self.assertEqual(latest["full_text"], "<h1>two</h1>\n")
+            self.assertEqual(historical["full_text"], "<h1>one</h1>\n")
+
+    def test_windows_low_integrity_access_denied_is_cached_as_optional_degradation(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            key = os.path.normcase(str(root.resolve()))
+            cc._WINDOWS_LOW_INTEGRITY_ROOTS.discard(key)
+            cc._WINDOWS_LOW_INTEGRITY_FAILED_ROOTS.discard(key)
+            try:
+                with mock.patch.object(
+                    cc,
+                    "_windows_set_low_integrity_label",
+                    side_effect=PermissionError(5, "Access is denied"),
+                ) as label:
+                    self.assertFalse(cc._windows_prepare_low_integrity_workspace(root))
+                    self.assertFalse(cc._windows_prepare_low_integrity_workspace(root))
+                label.assert_called_once()
+                self.assertIn(key, cc._WINDOWS_LOW_INTEGRITY_FAILED_ROOTS)
+            finally:
+                cc._WINDOWS_LOW_INTEGRITY_FAILED_ROOTS.discard(key)
+
+
+class SubprocessTextSafetyTests(unittest.TestCase):
+    def test_shell_process_invocation_is_platform_correct(self):
+        with mock.patch.object(cc.os, "name", "nt"):
+            command, use_shell, windows_job = cc.shell_process_invocation("echo 中文")
+            self.assertEqual(command, "chcp 65001>nul & echo 中文")
+            self.assertTrue(use_shell)
+            self.assertFalse(windows_job)
+
+            command, use_shell, windows_job = cc.shell_process_invocation(
+                "echo ok", [cc.WINDOWS_JOB_SANDBOX_MARKER]
+            )
+            self.assertEqual(command, "chcp 65001>nul & echo ok")
+            self.assertTrue(use_shell)
+            self.assertTrue(windows_job)
+
+        with mock.patch.object(cc.os, "name", "posix"):
+            command, use_shell, windows_job = cc.shell_process_invocation("echo ok")
+            self.assertEqual(command, "echo ok")
+            self.assertTrue(use_shell)
+            self.assertFalse(windows_job)
+
+            command, use_shell, windows_job = cc.shell_process_invocation(
+                "echo ok", ["/usr/bin/bwrap", "--unshare-all"]
+            )
+            self.assertEqual(
+                command,
+                ["/usr/bin/bwrap", "--unshare-all", "/bin/sh", "-c", "echo ok"],
+            )
+            self.assertFalse(use_shell)
+            self.assertFalse(windows_job)
+
+    def test_task_command_uses_platform_specific_quoting(self):
+        with mock.patch.object(cc.os, "name", "nt"):
+            windows = cc.join_shell_task_command(
+                r"C:\Program Files\Python\python.exe", ["script name.py", "plain"]
+            )
+        self.assertEqual(
+            windows,
+            '"C:\\Program Files\\Python\\python.exe" "script name.py" plain',
+        )
+        with mock.patch.object(cc.os, "name", "posix"):
+            posix = cc.join_shell_task_command("python3", ["script name.py", "plain"])
+        self.assertEqual(posix, "python3 'script name.py' plain")
+
+    def test_decode_subprocess_bytes_never_raises_for_mixed_output(self):
+        raw = "Windows 中文输出".encode("utf-8") + b"\xad"
+        with (
+            mock.patch.object(cc, "_windows_subprocess_encodings", return_value=["cp936"]),
+            mock.patch.object(cc.locale, "getpreferredencoding", return_value="gbk"),
+        ):
+            text, diagnostics = cc.decode_subprocess_bytes(raw)
+        self.assertIsInstance(text, str)
+        self.assertTrue(text)
+        self.assertIn("encoding", diagnostics)
+
+    def test_run_subprocess_text_preserves_exit_stderr_and_timeout_output(self):
+        completed = cc.run_subprocess_text(
+            [
+                cc.sys.executable,
+                "-c",
+                "import os,sys; os.write(1, '中文'.encode()); os.write(2, b'bad\\xad'); sys.exit(7)",
+            ],
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 7)
+        self.assertIn("中文", completed.stdout)
+        self.assertIsInstance(completed.stderr, str)
+        self.assertTrue(hasattr(completed, "decoding_diagnostics"))
+
+        with self.assertRaises(cc.subprocess.TimeoutExpired) as raised:
+            cc.run_subprocess_text(
+                [cc.sys.executable, "-c", "import os,time; os.write(1,b'partial\\xad'); time.sleep(2)"],
+                capture_output=True,
+                timeout=0.05,
+            )
+        self.assertIsInstance(raised.exception.stdout, str)
+        self.assertTrue(hasattr(raised.exception, "decoding_diagnostics"))
+
+    def test_captured_subprocesses_do_not_use_implicit_text_decoding(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        pattern = re.compile(
+            r"subprocess\.run\([\s\S]{0,600}?(?:capture_output=True|stdout=subprocess\.PIPE)"
+            r"[\s\S]{0,300}?(?:text=True|universal_newlines=True)"
+        )
+        self.assertIsNone(pattern.search(source))
+
+
+class HardApplicationSnapshotIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "session"
+        self.files = self.root / "files"
+        self.snapshot = self.files / ".application_skills"
+        (self.snapshot / "01").mkdir(parents=True)
+        self.resource = self.snapshot / "01" / "SKILL.md"
+        self.resource.write_text("approved skill\n", encoding="utf-8")
+        digest = cc._sha256_file(self.resource)
+        (self.snapshot / "MANIFEST.json").write_text(
+            json.dumps(
+                {
+                    "resources": [
+                        {
+                            "skill_id": "demo",
+                            "skill_order": 1,
+                            "kind": "skill_source",
+                            "path": "SKILL.md",
+                            "digest": digest,
+                            "size": self.resource.stat().st_size,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.id = "sess_hard"
+        session.root = self.root
+        session.files_root = self.files
+        session.skill_mode = "hard"
+        session.app_binding = {
+            "app_id": "app_demo",
+            "capsule_digest": "capsule",
+            "resources_digest": "",
+            "resource_count": 1,
+        }
+        session.crypto = cc.CryptoBox(Path(self.tmp.name) / "Codes")
+        session._application_snapshot_integrity_lock = threading.RLock()
+        self.session = session
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fallback_allows_workspace_and_restores_snapshot_tampering(self):
+        self.assertEqual(self.session._hard_snapshot_integrity_callback("before", "echo ok > normal.txt"), "")
+        (self.files / "normal.txt").write_text("workspace is writable", encoding="utf-8")
+        os.chmod(self.resource, 0o600)
+        self.resource.write_text("tampered", encoding="utf-8")
+        error = self.session._hard_snapshot_integrity_callback("after", "python mutate.py")
+        self.assertIn("restored", error)
+        self.assertEqual(self.resource.read_text(encoding="utf-8"), "approved skill\n")
+        self.assertEqual((self.files / "normal.txt").read_text(encoding="utf-8"), "workspace is writable")
+
+    def test_explicit_snapshot_mutation_is_rejected_before_execution(self):
+        error = self.session._hard_snapshot_integrity_callback(
+            "before", "rm -rf .application_skills"
+        )
+        self.assertIn("read-only", error)
+        scripted = self.session._hard_snapshot_integrity_callback(
+            "before",
+            "python -c \"from pathlib import Path; Path('.application_skills/01/SKILL.md').unlink()\"",
+        )
+        self.assertIn("read-only", scripted)
+
+    def test_hard_bubblewrap_prefix_overlays_snapshot_readonly(self):
+        self.session.skills = types.SimpleNamespace(
+            skills_root=Path(self.tmp.name) / "skills",
+            shell_virtual_mappings=lambda: [],
+        )
+        self.session.skills.skills_root.mkdir()
+        self.session.js_lib_root = Path(self.tmp.name) / "js_lib"
+        self.session.js_lib_root.mkdir()
+        self.session._remote_runtime_read_roots = lambda: []
+        backend = {"available": True, "name": "bubblewrap", "processes": True}
+        with (
+            mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend),
+            mock.patch.object(cc.shutil, "which", return_value="/usr/bin/bwrap"),
+        ):
+            prefix = self.session._workspace_sandbox_shell_prefix(self.files)
+        overlay = ["--ro-bind", str(self.snapshot.resolve()), "/workspace/.application_skills"]
+        self.assertIn(" ".join(overlay), " ".join(prefix))
+
+
+class IDEApplicationBridgeTests(unittest.TestCase):
+    def test_application_launch_marks_default_title_for_prefixed_auto_rename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capsule = "{}"
+            app_row = {
+                "id": "app_demo",
+                "name": "Demo App",
+                "scope": "personal",
+                "revision": 1,
+                "capsule": capsule,
+                "capsule_digest": cc.hashlib.sha256(capsule.encode()).hexdigest(),
+                "skills": [{"id": "demo", "order": 1}],
+                "resources": [],
+                "resources_digest": cc.hashlib.sha256(b"").hexdigest(),
+                "snapshot_version": 1,
+            }
+
+            class FakeApplications:
+                resolve_launch = staticmethod(lambda _user_id, _app_id: dict(app_row))
+                _resources_digest = staticmethod(cc.ApplicationRegistry._resources_digest)
+                _verify_v2_runtime_contract_manifest = staticmethod(lambda *_args: None)
+
+            def fake_session(title):
+                session_root = root / f"session-{len(list(root.iterdir()))}"
+                files_root = session_root / "files"
+                files_root.mkdir(parents=True)
+                session = cc.SessionState.__new__(cc.SessionState)
+                session.id = session_root.name
+                session.root = session_root
+                session.files_root = files_root
+                session.title = title
+                session.title_origin = (
+                    "default"
+                    if session._is_default_session_title(title)
+                    else "legacy"
+                )
+                session.last_auto_title_source = ""
+                session.app_binding = {}
+                session.bound_skill_ids = []
+                session.bound_skill_capsule = ""
+                session.skill_mode = "dynamic"
+                session.updated_at = 0.0
+                session.ui_language = "zh-CN"
+                session.lock = threading.RLock()
+                session._persist = mock.Mock()
+                session._restore_application_snapshot_permissions = mock.Mock()
+                session._write_application_snapshot_recovery = mock.Mock()
+                return session
+
+            app = cc.AppContext.__new__(cc.AppContext)
+            app.applications = FakeApplications()
+            app.telemetry = types.SimpleNamespace(record=lambda *_args, **_kwargs: None)
+            sessions = []
+
+            def create(_user_id, title, client_ip="", *, title_origin=None):
+                session = fake_session(title)
+                session.title_origin = title_origin or session.title_origin
+                sessions.append(session)
+                return session, {"remaining": 10}
+
+            app.create_session_for_user = create
+            automatic = app.launch_application_for_user("user-a", "app_demo")
+            self.assertEqual(automatic["title"], "Demo App")
+            self.assertEqual(sessions[-1].title_origin, "application")
+
+            explicit = app.launch_application_for_user(
+                "user-a", "app_demo", title="My Manual Session"
+            )
+            self.assertEqual(explicit["title"], "My Manual Session")
+            self.assertEqual(sessions[-1].title_origin, "manual")
+
+    def test_personal_application_submissions_remain_pending_and_revision_scoped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            class Store:
+                skills = {
+                    "demo": {
+                        "name": "Demo",
+                        "description": "Demo workflow",
+                        "protocol": "builtin",
+                        "meta": {},
+                        "body": "Always return a checked result.",
+                    }
+                }
+
+                @staticmethod
+                def _resolve_name(ref):
+                    return (ref, "") if ref == "demo" else (None, "unknown skill")
+
+                @staticmethod
+                def load(ref):
+                    return "---\nname: Demo\ndescription: Demo workflow\n---\nAlways return a checked result.\n" if ref == "demo" else ""
+
+                @staticmethod
+                def list_metadata():
+                    return [{"qualified_name": "demo", "name": "Demo", "description": "Demo workflow"}]
+
+                @staticmethod
+                def _skill_runtime_contract(_meta):
+                    return ""
+
+            fake_app = types.SimpleNamespace(
+                user_root=lambda user_id: root / user_id,
+                _ensure_skills_store=lambda force=False: Store(),
+                _lock=threading.RLock(),
+            )
+            registry = cc.ApplicationRegistry(fake_app, root / "system.json")
+            created = registry.save_personal(
+                "ide-owner",
+                {"name": "Review App", "description": "v1", "skills": ["demo"]},
+            )
+            first = registry.submit("ide-owner", created["id"])
+            duplicate = registry.submit("ide-owner", created["id"])
+            self.assertEqual(first["status"], "pending")
+            self.assertEqual(first["scope"], "shared")
+            self.assertEqual(first["id"], duplicate["id"])
+            self.assertEqual(registry.list_shared(), [])
+
+            edited = registry.save_personal(
+                "ide-owner",
+                {"name": "Review App", "description": "v2", "skills": ["demo"]},
+                app_id=created["id"],
+            )
+            second = registry.submit("ide-owner", created["id"])
+            self.assertEqual(edited["revision"], 2)
+            self.assertEqual(second["status"], "pending")
+            self.assertEqual(second["submitted_revision"], 2)
+            self.assertNotEqual(second["id"], first["id"])
+            self.assertEqual(registry.list_shared(), [])
+            with self.assertRaises(KeyError):
+                registry.submit("other-owner", created["id"])
+            self.assertFalse(registry.delete_personal("other-owner", created["id"]))
+
+    def test_personal_import_copies_owner_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake_app = types.SimpleNamespace(user_root=lambda user_id: root / user_id)
+            registry = cc.ApplicationRegistry(fake_app, root / "system.json")
+            source_path = registry._personal_path("source")
+            source = {
+                "id": "app_source",
+                "owner": "source",
+                "name": "Source App",
+                "scope": "personal",
+                "status": "draft",
+                "revision": 4,
+                "skills": [{"id": "demo"}],
+                "capsule": "{}",
+                "capsule_digest": "abc",
+                "resources": [],
+                "resources_digest": "def",
+                "snapshot_version": 2,
+                "created_at": 1.0,
+                "updated_at": 2.0,
+            }
+            registry._write_rows(source_path, [source])
+            result = registry.import_personal("source", "target", "app_source")
+            copied_id = result["application"]["id"]
+            self.assertNotEqual(copied_id, "app_source")
+            copied = registry._read_rows(registry._personal_path("target"))[0]
+            self.assertEqual(copied["owner"], "target")
+            self.assertEqual(copied["imported_from"]["app_id"], "app_source")
+            self.assertEqual(registry._read_rows(source_path), [source])
+
+    def test_application_listing_uses_authenticated_account_and_current_ip_only(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        source_user = cc.user_id_from_ip(cc._normalize_ip("10.0.0.8"))
+        app.applications = types.SimpleNamespace(
+            list_shared=lambda: [{"id": "shared"}],
+            list_personal=lambda uid: [{"id": "target"}] if uid == "ide_account" else ([{"id": "legacy"}] if uid == source_user else [{"id": "wrong"}]),
+        )
+        app.manager_for_user = lambda uid: types.SimpleNamespace(list=lambda **_kwargs: {"sessions": []})
+        payload = app.ide_applications_payload("ide_account", client_ip="10.0.0.8")
+        self.assertEqual([row["id"] for row in payload["personal"]], ["target"])
+        self.assertEqual([row["id"] for row in payload["legacy_personal"]], ["legacy"])
+        self.assertEqual([row["id"] for row in payload["shared"]], ["shared"])
+
+    def test_session_import_rewrites_encrypted_identity_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codes = root / "Codes"
+            crypto = cc.CryptoBox(codes)
+            source_user = cc.user_id_from_ip(cc._normalize_ip("10.0.0.9"))
+            source_root = root / "source-session"
+            (source_root / "files").mkdir(parents=True)
+            (source_root / "files" / "work.txt").write_text("preserved", encoding="utf-8")
+            source_binding = {"app_id": "app_source", "name": "App", "scope": "personal"}
+            crypto.write_json(source_root / "state.json", {"id": "sess_source", "title": "Imported", "app_binding": source_binding, "bound_skill_ids": ["demo"], "bound_skill_capsule": "{}"})
+            crypto.write_json(source_root / "meta.json", {"id": "sess_source", "title": "Imported", "message_count": 3})
+
+            class SourceSession:
+                id = "sess_source"
+                title = "Imported"
+                skill_mode = "hard"
+                app_binding = source_binding
+                root = source_root
+                lock = threading.RLock()
+
+                @staticmethod
+                def _verify_application_snapshot_integrity(restore=True):
+                    return ""
+
+                @staticmethod
+                def _persist():
+                    return None
+
+            class Manager:
+                def __init__(self, manager_root, source=None):
+                    self.root = manager_root
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    self.source = source
+                    self.lock = threading.RLock()
+                    self.sessions = {}
+                    self.session_index = {}
+
+                def get(self, session_id):
+                    if self.source is not None:
+                        return self.source if session_id == self.source.id else None
+                    path = self.root / session_id / "state.json"
+                    if not path.exists():
+                        return None
+                    state = crypto.read_json(path, {})
+                    return types.SimpleNamespace(
+                        id=session_id,
+                        title=state.get("title", "Imported"),
+                        ui_language="zh-CN",
+                        app_binding=state.get("app_binding", {}),
+                        _ensure_application_snapshot_recovery=lambda: "",
+                    )
+
+            source_manager = Manager(root / "source-manager", SourceSession())
+            target_manager = Manager(root / "target-manager")
+            app = cc.AppContext.__new__(cc.AppContext)
+            app.crypto = crypto
+            app._lock = threading.RLock()
+            app.ide_terminal_lock = threading.RLock()
+            app.ide_terminals = {}
+            app.ide_debug_lock = threading.RLock()
+            app.ide_debug_sessions = {}
+            app.applications = types.SimpleNamespace(
+                import_personal=lambda *_args: {"application": {"id": "app_imported"}},
+                resolve_launch=lambda *_args: {},
+                remove_imported_copy=lambda *_args: True,
+            )
+            app.manager_for_user = lambda uid: source_manager if uid == source_user else target_manager
+            app._ide_legacy_session_running = lambda *_args: False
+            app._rollback_session_quota_reservation = lambda _uid: None
+
+            def create_target(_uid, title, client_ip=""):
+                target = types.SimpleNamespace(id="sess_target", title=title, root=target_manager.root / "sess_target")
+                target.root.mkdir(parents=True)
+                return target, {"remaining": 4}
+
+            app.create_session_for_user = create_target
+            result = app.ide_import_application_session("ide_account", "sess_source", client_ip="10.0.0.9")
+            copied_state = crypto.read_json(target_manager.root / result["id"] / "state.json", {})
+            source_state = crypto.read_json(source_root / "state.json", {})
+            self.assertEqual(copied_state["id"], "sess_target")
+            self.assertEqual(copied_state["app_binding"]["app_id"], "app_imported")
+            self.assertEqual((target_manager.root / result["id"] / "files" / "work.txt").read_text(encoding="utf-8"), "preserved")
+            self.assertEqual(source_state["id"], "sess_source")
+            self.assertEqual(source_state["app_binding"]["app_id"], "app_source")
+
+    def test_ide_assets_expose_applications_view_and_bridge_actions(self):
+        self.assertIn('data-view="applications"', cc.IDE_INDEX_HTML)
+        self.assertIn('data-side-view="applications"', cc.IDE_INDEX_HTML)
+        self.assertIn('id="newIdeApplicationBtn"', cc.IDE_INDEX_HTML)
+        self.assertRegex(
+            cc.IDE_INDEX_HTML,
+            r"<strong>Personal</strong><button id=\"newIdeApplicationBtn\"",
+        )
+        self.assertIn('class="application-create-glyph" aria-hidden="true">+</span>', cc.IDE_INDEX_HTML)
+        self.assertIn(".application-create-button", cc.IDE_CSS)
+        self.assertIn("background:transparent!important", cc.IDE_CSS)
+        self.assertNotIn(".application-empty-create", cc.IDE_CSS)
+        self.assertIn(".modal.is-application-editor", cc.IDE_CSS)
+        self.assertIn("overflow-y:scroll", cc.IDE_CSS)
+        self.assertIn("scrollbar-gutter:stable", cc.IDE_CSS)
+        self.assertIn("applicationEditor:true", cc.IDE_JS)
+        self.assertIn('/api/ide/v2/applications', cc.IDE_JS)
+        self.assertIn('/api/ide/v2/application-sessions/import', cc.IDE_JS)
+        self.assertIn('function openIdeApplicationEditor(', cc.IDE_JS)
+        self.assertIn('function renderIdeApplicationSkillEditor(', cc.IDE_JS)
+        self.assertIn('function saveIdeApplication(', cc.IDE_JS)
+        self.assertIn('function submitIdeApplication(', cc.IDE_JS)
+        self.assertIn('function deleteIdeApplication(', cc.IDE_JS)
+        self.assertIn('Submit for Shared Review', cc.IDE_JS)
+        self.assertIn('switchSession(out.id,true)', cc.IDE_JS)
+
+    def test_ide_assets_bound_long_running_views_and_theme_scrollbars(self):
+        for marker in (
+            "PANEL_LOG_MAX_CHARS",
+            "appendPanelText",
+            "AGENT_MESSAGES_DOM_LIMIT",
+            "trimAgentMessages",
+            "agentTimelineSignature",
+            "agentProgressSignature",
+            "finishAgentMessagesRender",
+            "timelineChanged",
+        ):
+            self.assertIn(marker, cc.IDE_JS)
+        self.assertIn("scrollbar-width:thin", cc.IDE_CSS)
+        self.assertIn("::-webkit-scrollbar-thumb", cc.IDE_CSS)
+        self.assertIn("scrollbar-gutter:stable", cc.IDE_CSS)
+        self.assertIn("--ide-scrollbar-thumb", cc.IDE_CSS)
+        self.assertIn("@media(hover:none),(pointer:coarse)", cc.IDE_CSS)
+        self.assertIn("--web-scrollbar-thumb", cc.APP_CSS)
+        self.assertIn("#chat,#sessionList", cc.APP_CSS)
+
+
+if __name__ == "__main__":
+    unittest.main()
