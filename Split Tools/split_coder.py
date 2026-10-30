@@ -126,6 +126,7 @@ class ImportStatement:
 # Keep state, locks, helpers and their owner together instead of hiding private
 # names in a generic constants module or accepting an unclassified owner.
 SHARED_RUNTIME_LAYOUT: dict[str, list[str]] = {
+    "config/bootstrap.py": ["sync_embedded_liquid_kernel_bundle"],
     "llm/gate.py": [
         "SessionLLMGate", "LLMGateBusy", "TodoLLMBudgetExhausted",
         "~^_?SESSION_LLM_(?:CONCURRENCY|GATE)", "DEFAULT_SESSION_LLM_CONCURRENCY",
