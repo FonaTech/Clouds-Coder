@@ -9,6 +9,10 @@ include = [
 ]
 
 exclude = [
+    "backups",
+    "build",
+    "dist",
+    "*.egg-info",
     "Code_Structure",
     "Code_Library",
     "RAG_Library",
