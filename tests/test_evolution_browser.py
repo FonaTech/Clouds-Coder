@@ -127,7 +127,15 @@ class EvolutionBrowserTests(unittest.TestCase):
                 fixture.app.global_profiles['gen']['api_key'] = 'changed-key'
                 page.click('#runEvolutionBtn')
                 page.wait_for_function("A.evolutionError.includes('configuration changed')")
-                self.assertIn('configuration changed', page.locator('#evolutionPolicyNote').inner_text())
+                for language, message in (
+                    ('zh-CN', '所选模型配置已更改'),
+                    ('zh-TW', '所選模型設定已變更'),
+                    ('ja', 'モデル設定が変更'),
+                    ('en', 'configuration changed'),
+                ):
+                    with self.subTest(language=language):
+                        page.evaluate('(language)=>{applyAdminLanguage(language);evolutionControls()}', language)
+                        self.assertIn(message, page.locator('#evolutionPolicyNote').inner_text())
                 self.assertEqual(errors, [])
                 browser.close()
         finally:
