@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=977 original-lines=17674-17797 hash=079b9bb4662f7886
+# split-source: order=977 original-lines=17441-17564 hash=079b9bb4662f7886
 
 
 def _admin_config_schema() -> list[dict]:
@@ -131,13 +131,13 @@ def _admin_config_schema() -> list[dict]:
         row("rag_file_name", "runtime", "Use filenames as RAG entities", "boolean", False, true_flag="--RAG_File_Name=on", false_flag="--RAG_File_Name=off"),
     ]
 
-# split-source: order=978 original-lines=17798-17801 hash=40890890ea051821
+# split-source: order=978 original-lines=17565-17568 hash=40890890ea051821
 
 
 def _admin_factory_config() -> dict:
     return {row["key"]: row.get("factory_default") for row in _admin_config_schema()}
 
-# split-source: order=979 original-lines=17802-17957 hash=e4ee3c750cce4f1e
+# split-source: order=979 original-lines=17569-17724 hash=e4ee3c750cce4f1e
 
 
 def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
@@ -295,7 +295,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
     out["_effective_ports"] = effective_ports
     return out, errors
 
-# split-source: order=980 original-lines=17958-17994 hash=80095834e40509e0
+# split-source: order=980 original-lines=17725-17765 hash=63ed1152d4003ed4
 
 
 def _admin_config_to_argv(config: dict) -> list[str]:
@@ -312,6 +312,10 @@ def _admin_config_to_argv(config: dict) -> list[str]:
     argv: list[str] = []
     for spec in schema:
         key = str(spec["key"])
+        # Live evolution policy has its own persistent store. Restart argv
+        # must not replay cached factory defaults over that policy or Canary.
+        if key in {"liquid_kernel_mode", "evolution_schedule"}:
+            continue
         value = clean.get(key, spec.get("factory_default"))
         typ = str(spec.get("type", "text"))
         if typ == "boolean":
@@ -334,7 +338,7 @@ def _admin_config_to_argv(config: dict) -> list[str]:
                 argv.extend([flag, value_text])
     return argv
 
-# split-source: order=981 original-lines=17995-18010 hash=12dc636b75f461e9
+# split-source: order=981 original-lines=17766-17781 hash=12dc636b75f461e9
 
 
 def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot_id: str) -> str:
@@ -352,7 +356,7 @@ def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot
     )
     return f"http://{host}:{port}/api/health?{query}"
 
-# split-source: order=982 original-lines=18011-18116 hash=f04c32403deb9b43
+# split-source: order=982 original-lines=17782-17893 hash=f159b742e6d3f95a
 
 
 def _admin_supervised_restart(
@@ -369,6 +373,11 @@ def _admin_supervised_restart(
     restart_env["CLOUDS_CODER_RESTART_NONCE"] = str(restart_nonce or "")
     restart_env["CLOUDS_CODER_RESTART_FROM_BOOT_ID"] = str(restart_from_boot_id or "")
     restart_env.pop("CLOUDS_CODER_RESTART_ROLLED_BACK", None)
+    overrides = {
+        key: config[key] for key in ("liquid_kernel_mode", "evolution_schedule")
+        if key in config and config.get(key) != fallback_config.get(key)
+    }
+    restart_env["CLOUDS_CODER_EVOLUTION_STARTUP_OVERRIDES"] = json.dumps(overrides)
     restart_env["PYTHONUNBUFFERED"] = "1"
     command = [*_SPLIT_ENTRY_COMMAND, *_admin_config_to_argv(config)]
     process: subprocess.Popen | None = None
@@ -452,6 +461,7 @@ def _admin_supervised_restart(
     fallback_env["CLOUDS_CODER_RESTART_NONCE"] = str(restart_nonce or "")
     fallback_env["CLOUDS_CODER_RESTART_FROM_BOOT_ID"] = str(restart_from_boot_id or "")
     fallback_env["CLOUDS_CODER_RESTART_ROLLED_BACK"] = "1"
+    fallback_env.pop("CLOUDS_CODER_EVOLUTION_STARTUP_OVERRIDES", None)
     os.execve(
         sys.executable,
         [*_SPLIT_ENTRY_COMMAND, *_admin_config_to_argv(fallback_config)],
@@ -459,7 +469,7 @@ def _admin_supervised_restart(
     )
     return False
 
-# split-source: order=984 original-lines=18135-18156 hash=1bc6ac699682e60b
+# split-source: order=984 original-lines=17912-17935 hash=d71699ae2f57e772
 
 def _admin_argparse_defaults(config: dict) -> dict:
     """Map canonical Admin config keys to argparse destinations."""
@@ -481,9 +491,11 @@ def _admin_argparse_defaults(config: dict) -> dict:
     })
     for key in ("skills_ui_enabled", "rag_admin_enabled", "code_admin_enabled", "ide_enabled", "mcp_service_enabled", "collaboration_enabled"):
         out.pop(key, None)
+    out.pop("liquid_kernel_mode", None)
+    out.pop("evolution_schedule", None)
     return out
 
-# split-source: order=985 original-lines=18157-18177 hash=77b9b0b9223e21aa
+# split-source: order=985 original-lines=17936-17956 hash=77b9b0b9223e21aa
 
 def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
     values = _admin_factory_config()

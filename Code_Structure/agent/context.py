@@ -5,13 +5,13 @@
 
 from __future__ import annotations
 
-# split-source: order=345 original-lines=5881-5884 hash=9468e0bab852c3ed
+# split-source: order=345 original-lines=5648-5651 hash=9468e0bab852c3ed
 # Per-thread dispatch context for read bookkeeping. Teammate and subagent
 # threads dispatch tools concurrently with the main loop, so the current
 # tool_call_id and read role must not be shared instance attributes.
 _READ_DISPATCH_CONTEXT = threading.local()
 
-# split-source: order=901 original-lines=14062-14065 hash=b73d192c0c84a8ba
+# split-source: order=901 original-lines=13829-13832 hash=b73d192c0c84a8ba
 
 def compact_successful_write_history(messages: list[dict]) -> list[dict]:
     from liquid_kernel.context import compact_successful_writes

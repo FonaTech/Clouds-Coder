@@ -53,7 +53,7 @@ def _connect_sqlite(
         raise
     return conn
 
-# split-source: order=1272 original-lines=143706-143790 hash=3479ea8c39f73747
+# split-source: order=1272 original-lines=143537-143621 hash=3479ea8c39f73747
 
 
 # 第九层：进程入口与服务启动。

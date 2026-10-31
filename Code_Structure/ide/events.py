@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=836 original-lines=10704-10755 hash=b7fe1c15b54aa534
+# split-source: order=836 original-lines=10471-10522 hash=b7fe1c15b54aa534
 
 def ide_public_operation_data(data: object) -> dict:
     """Project a runtime event into the safe fields used by IDE history and SSE."""

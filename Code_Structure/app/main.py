@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1275 original-lines=143884-145870 hash=db649264a37c3d73
+# split-source: order=1275 original-lines=143715-145715 hash=275e8532810b66a5
 
 
 def main():
@@ -1183,6 +1183,21 @@ def main():
         or web_evolution.get("schedule", "")
         or ""
     ).strip().lower()
+    # Only real CLI flags or a changed Admin restart draft override a saved
+    # policy. Config-file/default snapshots initialize a new installation.
+    explicit_evolution_mode = any(arg == "--liquid-kernel-mode" or arg.startswith("--liquid-kernel-mode=") for arg in sys.argv[1:])
+    explicit_evolution_schedule = any(arg == "--evolution-schedule" or arg.startswith("--evolution-schedule=") for arg in sys.argv[1:])
+    try:
+        restart_evolution = json.loads(os.environ.pop("CLOUDS_CODER_EVOLUTION_STARTUP_OVERRIDES", "{}"))
+    except (ValueError, TypeError):
+        restart_evolution = {}
+    if isinstance(restart_evolution, dict):
+        if not explicit_evolution_mode and "liquid_kernel_mode" in restart_evolution:
+            resolved_liquid_kernel_mode = str(restart_evolution["liquid_kernel_mode"] or "").strip()
+            explicit_evolution_mode = True
+        if not explicit_evolution_schedule and "evolution_schedule" in restart_evolution:
+            resolved_evolution_schedule = str(restart_evolution["evolution_schedule"] or "").strip().lower()
+            explicit_evolution_schedule = True
     resolved_liquid_kernel_startup_policy = normalize_liquid_kernel_startup_policy(
         getattr(args, "liquid_kernel_startup_policy", "")
         or external_config.get("liquid_kernel_startup_policy", "")
@@ -1270,15 +1285,14 @@ def main():
         ide_password_login_enabled=bool(getattr(args, "ide_password_login_enabled", False)),
         max_run_tokens=max(0, int(args.max_run_tokens)), max_task_tokens=max(0, int(args.max_task_tokens)),
     )
-    try:
-        startup_evolution = app.liquid_kernel.apply_startup_config(
-            resolved_liquid_kernel_mode,
-            resolved_evolution_schedule,
-        )
-        active_evolution_config = dict(startup_evolution.get("config", {}) or app.liquid_kernel.config())
-    except LiquidKernelError as exc:
-        print(f"[web-agent] invalid liquid-kernel startup configuration: {exc}")
-        sys.exit(2)
+    startup_evolution = app.restore_liquid_kernel_startup(
+        resolved_liquid_kernel_mode, resolved_evolution_schedule,
+        explicit_mode=explicit_evolution_mode, explicit_schedule=explicit_evolution_schedule,
+    )
+    active_evolution_config = dict(startup_evolution.get("config", {}) or app.liquid_kernel.config())
+    if startup_evolution.get("warning"):
+        print("[web-agent] liquid-kernel startup warning; saved policy and Canary retained: "
+              + str(startup_evolution["warning"]["error"]), flush=True)
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
@@ -1994,7 +2008,7 @@ def main():
             error_path=app.admin_restart_error_path,
         )
 
-# split-source: order=1276 original-lines=145871-145873 hash=032e6922518465de
+# split-source: order=1276 original-lines=145716-145718 hash=032e6922518465de
 
 if __name__ == "__main__":
     main()

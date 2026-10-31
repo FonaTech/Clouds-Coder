@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1080 original-lines=27999-28040 hash=a96e2959358e40d8
+# split-source: order=1080 original-lines=27778-27819 hash=a96e2959358e40d8
 
 
 class OllamaError(RuntimeError):
@@ -49,7 +49,7 @@ class OllamaError(RuntimeError):
                 **({'last_http_status': causal_status, 'cause_code': 'model_rate_limited' if causal_status == 429 else 'model_http_error'}
                    if deadline and causal_status else {})}
 
-# split-source: order=1100 original-lines=28477-31336 hash=266f6065082e5b6d
+# split-source: order=1100 original-lines=28256-31115 hash=266f6065082e5b6d
 
 
 class OllamaClient:

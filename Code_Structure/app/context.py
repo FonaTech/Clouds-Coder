@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1259 original-lines=125328-136866 hash=aca49269c9ab8147
+# split-source: order=1259 original-lines=125107-136695 hash=1f816a1e61e286f3
 
 
 class AppContext:
@@ -1472,6 +1472,55 @@ class AppContext:
     def logout_admin(self, token: str) -> None:
         self.admin_auth.revoke_session(token)
 
+    def restore_liquid_kernel_startup(
+        self, mode: str = "", schedule: str = "", *, explicit_mode: bool = False, explicit_schedule: bool = False,
+    ) -> dict:
+        plane = self.liquid_kernel
+        if getattr(plane, "had_saved_config", True):
+            mode = mode if explicit_mode else ""
+            schedule = schedule if explicit_schedule else ""
+        try:
+            return plane.apply_startup_config(mode, schedule)
+        except LiquidKernelError as exc:
+            # Model bindings gate new computations, not HTTP readiness or
+            # observation of an already evaluated Canary deployment.
+            warning = {"code": exc.code, "error": str(exc), "trigger": "startup", "at": now_ts()}
+            plane.last_trigger_error = warning
+            return {"ok": True, "config": plane.config(), "changed": False, "warning": warning}
+
+    def _sync_evolution_admin_config(self, config: dict | None = None) -> None:
+        plane = getattr(self, "liquid_kernel", None)
+        lock = getattr(self, "admin_config_lock", None)
+        if plane is None or lock is None:
+            return
+        policy = config if isinstance(config, dict) else plane.config()
+        values = {"liquid_kernel_mode": policy["mode"], "evolution_schedule": policy["schedule"]}
+        with lock:
+            self.admin_active_config.update(values)
+            path = self.admin_config_path
+            if not path.is_file():
+                return
+            stored = _read_json_file(path, {})
+            changed = False
+            for name in ("draft", "defaults"):
+                row = stored.get(name)
+                if isinstance(row, dict):
+                    for key, value in values.items():
+                        if row.get(key) != value:
+                            row[key] = value
+                            changed = True
+            if changed:
+                stored["updated_at"] = now_ts()
+                try:
+                    _write_json_file(path, stored)
+                except OSError as exc:
+                    self.liquid_kernel_bootstrap["startup_config_sync_warning"] = type(exc).__name__
+
+    def save_evolution_config(self, values: object, expected_revision: int = 0, *, context=None) -> dict:
+        saved = self.liquid_kernel.save_config(values, expected_revision, context=context)
+        self._sync_evolution_admin_config(saved["config"])
+        return saved
+
     def configure_admin_runtime(self, active_config: dict, initial_config: dict | None = None) -> None:
         clean, errors = _admin_coerce_config(active_config)
         if not errors:
@@ -1482,6 +1531,7 @@ class AppContext:
             if not initial_errors:
                 initial.pop("_effective_ports", None)
                 self.admin_initial_config = initial
+        self._sync_evolution_admin_config()
 
     def admin_config_payload(self) -> dict:
         with self.admin_config_lock:

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=556 original-lines=6559-6579 hash=ac9abd71292008a3
+# split-source: order=556 original-lines=6326-6346 hash=ac9abd71292008a3
 
 
 def _skill_term_match(haystack: str, term: str) -> bool:
@@ -28,7 +28,7 @@ def _skill_term_match(haystack: str, term: str) -> bool:
             return True
         start = index + max(1, len(term))
 
-# split-source: order=1052 original-lines=23186-23294 hash=745fa615d6fc251e
+# split-source: order=1052 original-lines=22965-23073 hash=745fa615d6fc251e
 
 # ---------------------------------------------------------------------------
 # Built-in skill guides injected into SkillStore on reload.
@@ -139,7 +139,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
     },
 }
 
-# split-source: order=1053 original-lines=23295-25210 hash=8ed09b6b17bf4395
+# split-source: order=1053 original-lines=23074-24989 hash=8ed09b6b17bf4395
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ

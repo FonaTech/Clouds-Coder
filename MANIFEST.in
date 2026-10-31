@@ -1,0 +1,20 @@
+include Clouds_Coder.py split_coder.py requirements.txt README.md README-zh.md README-ja.md LICENSE
+include RELEASE_NOTES.md ruff.toml setup.cfg
+recursive-include .github/workflows *.yml
+include docs/enhancement_ci_plan_20261030.md docs/enhancement_ci_verification_20261030.md
+recursive-include docs/enhancement_ci_logs_20261030 *.txt *.json
+recursive-include liquid_kernel *.py README.md
+recursive-include tests *.py *.md
+recursive-include tools *.py
+recursive-include Split?Tools *.py *.sh *.bat *.command
+recursive-include log *.md
+global-exclude *.pyc __pycache__ .DS_Store
+prune liquid_kernel/.package-backups
+prune backups
+include docs/liquid_kernel_delivery_verification_20261030.md
+recursive-include docs/ci_repair_20261030_logs *.txt *.json
+include docs/evolution_release_ci_repair_20261030.json docs/evolution_release_manifest.json
+include docs/ci_selfcontained_verification_20261030.md docs/evolution_release_ci_selfcontained_20261030.json
+recursive-include docs/ci_selfcontained_20261030_logs *.txt *.json
+include docs/kernel_restart_verification_20261031.md docs/evolution_release_kernel_restart_20261031.json
+recursive-include docs/kernel_restart_20261031_logs *.txt *.json

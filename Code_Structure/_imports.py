@@ -226,7 +226,7 @@ try:
 except Exception:
     _AESGCM = None
 
-# split-source: order=77 original-lines=1713-1718 hash=e941c12c2f4901ba
+# split-source: order=77 original-lines=1480-1485 hash=e941c12c2f4901ba
 
 from liquid_kernel import (  # noqa: E402
     EVOLUTION_MODES,
@@ -234,7 +234,7 @@ from liquid_kernel import (  # noqa: E402
     LiquidKernelError,
 )
 
-# split-source: order=79 original-lines=1735-1741 hash=8cddaf6a4630eba5
+# split-source: order=79 original-lines=1502-1508 hash=8cddaf6a4630eba5
 
 
 # A standalone main-file update can leave an older local liquid_kernel package.
@@ -243,7 +243,7 @@ from liquid_kernel.control import (  # noqa: E402
     LiquidKernelRegistry as _LiquidKernelRegistry,
 )
 
-# split-source: order=120 original-lines=5123-5132 hash=42ec21eda00bbe87
+# split-source: order=120 original-lines=4890-4899 hash=42ec21eda00bbe87
 # END EMBEDDED COLLABORATION WEB ASSETS
 
 try:
@@ -255,14 +255,14 @@ except ImportError:
     _pty = None
     _termios = None
 
-# split-source: order=121 original-lines=5133-5137 hash=2bd8ec70b5d6db71
+# split-source: order=121 original-lines=4900-4904 hash=2bd8ec70b5d6db71
 
 try:
     import certifi as _certifi
 except Exception:
     _certifi = None
 
-# split-source: order=122 original-lines=5138-5141 hash=cba211345467525c
+# split-source: order=122 original-lines=4905-4908 hash=cba211345467525c
 try:
     import yaml as _yaml
 except Exception:

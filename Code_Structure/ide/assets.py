@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1229 original-lines=122173-122328 hash=f490e3d524fccc73
+# split-source: order=1229 original-lines=121952-122107 hash=f490e3d524fccc73
 
 IDE_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -163,7 +163,7 @@ IDE_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=1230 original-lines=122329-122370 hash=d2602799710d1614
+# split-source: order=1230 original-lines=122108-122149 hash=d2602799710d1614
 
 IDE_CSS = """
 .icons-fallback .codicon::before{display:inline-block;min-width:1em;font-family:"Segoe UI Symbol","Apple Symbols",Arial,sans-serif!important;font-style:normal;font-weight:400;line-height:1;text-align:center;content:"□"!important}
@@ -207,7 +207,7 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 .session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:grid;place-items:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{position:relative;display:block;width:9px;height:9px;margin:0;font-size:0;line-height:9px;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;inset:0;border:1px solid currentColor;border-radius:50%;box-sizing:border-box}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:2px;width:1px;height:4px;background:currentColor;box-shadow:2px 3px 0 -0.25px currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.new-session-button{position:relative}.session-history-menu{min-width:250px;max-width:min(340px,calc(100vw - 16px));padding:5px}.session-history-heading{display:flex;align-items:center;gap:6px;padding:5px 8px 6px;border-bottom:1px solid #454545;color:#ccc;font-size:11px}.session-history-heading small{margin-left:auto;color:#858585}.session-history-row{height:auto!important;min-height:34px!important;display:grid!important;grid-template-columns:minmax(0,1fr) 24px;align-items:center;gap:4px!important;padding:2px 4px!important}.session-history-row>button:first-child{min-width:0;width:100%;height:30px;display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border:0;background:transparent;color:inherit;text-align:left;padding:5px 4px}.session-history-row>button:first-child:hover{background:#30343a}.session-history-delete{width:24px;height:26px;display:grid;place-items:center;border:0;background:transparent;color:#858585;padding:0}.session-history-delete:hover{background:#4a2525;color:#f48771}.session-history-row .session-history-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-history-row small{color:#858585;font-size:10px}.session-history-row.is-current{color:#75beff}.session-history-empty{padding:10px 8px;color:#858585;font-size:11px}
     """
 
-# split-source: order=1231 original-lines=122371-122564 hash=8de1c72f24ea8922
+# split-source: order=1231 original-lines=122150-122343 hash=8de1c72f24ea8922
 
 IDE_JS = """
 const E=id=>document.getElementById(id);
@@ -403,7 +403,7 @@ function bind(){
 window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshConfig();setStatus('ready')}catch(err){setStatus(err.message,true)}});
 """
 
-# split-source: order=1232 original-lines=122565-122586 hash=ba7e0f8e7fe1d311
+# split-source: order=1232 original-lines=122344-122365 hash=ba7e0f8e7fe1d311
 
 IDE_CSS += r"""
 .session-history-badge{display:flex;align-items:center;justify-content:center}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
@@ -427,7 +427,7 @@ html,body{scrollbar-gutter:stable}
 .agent-model-menu button{color:#ddd}.agent-model-menu button:hover{color:#fff}.agent-model-config .codicon,.agent-model-config .codicon:before{font-size:18px!important}.agent-model-config{color:#d4d4d4!important}
 """
 
-# split-source: order=1233 original-lines=122587-122850 hash=48206e7f02916b09
+# split-source: order=1233 original-lines=122366-122629 hash=48206e7f02916b09
 
 IDE_JS = r"""
 const E=id=>document.getElementById(id);
@@ -693,7 +693,7 @@ function downloadWorkspacePath(path=''){triggerDownload(workspaceArchiveUrl(path
 function downloadExplorerEntry(row){if(row.type==='dir')downloadWorkspacePath(row.path);else triggerDownload(workspaceRawDownloadUrl(row.path),row.name||'')}
 """
 
-# split-source: order=1234 original-lines=122851-122979 hash=eda79106c584d24e
+# split-source: order=1234 original-lines=122630-122758 hash=eda79106c584d24e
 
 IDE_JS += r"""
 function scheduleDiagnostics(file){clearTimeout(S.diagnosticTimer);if(file&&languageFor(file.path)==='python')S.diagnosticTimer=setTimeout(()=>runDiagnostics(file).catch(error=>logOutput(error.message)),450)}
@@ -824,7 +824,7 @@ async function handleDebugMessage(msg){if(msg.type==='response'&&msg.command==='
 async function stopDebug(closeRemote=true){clearTimeout(S.debugPoll);const current=S.debug;S.debug=null;if(closeRemote&&current)try{await api(`/api/ide/v2/debug/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logDebug(error.message)}}
 """
 
-# split-source: order=1235 original-lines=122980-123203 hash=22d85d18712cd488
+# split-source: order=1235 original-lines=122759-122982 hash=22d85d18712cd488
 
 IDE_JS += r"""
 async function refreshExtensions(query=''){if(query.trim()){const out=await api(`/api/ide/v2/extensions/search?query=${qs(query)}&size=40`);renderExtensions(out.extensions||[],false);E('extensionSummary').textContent=`${out.totalSize||0} Open VSX results`}else{const out=await api('/api/ide/v2/extensions');S.installedExtensions=out.extensions||[];renderExtensions(S.installedExtensions,true);E('extensionSummary').textContent=`${S.installedExtensions.length} installed`}}
@@ -1050,7 +1050,7 @@ const MENUS={file:['file.new','file.open','file.uploadFolder','file.downloadWork
 function showError(error){const message=error?.message||String(error);toast(message,error?.status===403?'warning':'error');setStatus(message,'error');logOutput(message)}
 """
 
-# split-source: order=1236 original-lines=123204-123330 hash=d676dc3af5870885
+# split-source: order=1236 original-lines=122983-123109 hash=d676dc3af5870885
 
 IDE_JS += r"""
 function collaborationDeviceKey(){let key=localStorage.getItem('clouds_collab_device_key')||'';if(key.length<32){const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);key='device_'+Array.from(bytes,value=>value.toString(16).padStart(2,'0')).join('');localStorage.setItem('clouds_collab_device_key',key)}return key}

@@ -5,20 +5,20 @@
 
 from __future__ import annotations
 
-# split-source: order=399 original-lines=6023-6027 hash=3dd500c1136e7fde
+# split-source: order=399 original-lines=5790-5794 hash=3dd500c1136e7fde
 # In-session model request concurrency: how many model HTTP requests one
 # session may have in flight at once (main loop, sub-agents, teammates and
 # auxiliary background calls share the budget).  Sessions never share a gate;
 # max_user / max_user_sessions and the session scheduler are unaffected.
 SESSION_LLM_CONCURRENCY_MIN = 1
 
-# split-source: order=400 original-lines=6028-6028 hash=71a1b56d9a3d8ea2
+# split-source: order=400 original-lines=5795-5795 hash=71a1b56d9a3d8ea2
 SESSION_LLM_CONCURRENCY_MAX = 16
 
-# split-source: order=401 original-lines=6029-6029 hash=285b2a08e567258f
+# split-source: order=401 original-lines=5796-5796 hash=285b2a08e567258f
 SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT = 2
 
-# split-source: order=402 original-lines=6030-6038 hash=3417cfb7c212b1bc
+# split-source: order=402 original-lines=5797-5805 hash=3417cfb7c212b1bc
 
 
 def _session_llm_concurrency_env_default() -> int:
@@ -29,31 +29,31 @@ def _session_llm_concurrency_env_default() -> int:
         value = SESSION_LLM_CONCURRENCY_FACTORY_DEFAULT
     return max(SESSION_LLM_CONCURRENCY_MIN, min(SESSION_LLM_CONCURRENCY_MAX, value))
 
-# split-source: order=403 original-lines=6039-6041 hash=d346bbeba32e6375
+# split-source: order=403 original-lines=5806-5808 hash=d346bbeba32e6375
 
 
 DEFAULT_SESSION_LLM_CONCURRENCY = _session_llm_concurrency_env_default()
 
-# split-source: order=1082 original-lines=28046-28046 hash=53cfdffd2f63053f
+# split-source: order=1082 original-lines=27825-27825 hash=53cfdffd2f63053f
 SESSION_LLM_GATE_POLL_SECONDS = 0.25
 
-# split-source: order=1083 original-lines=28047-28047 hash=bc32c6971cda553e
+# split-source: order=1083 original-lines=27826-27826 hash=bc32c6971cda553e
 SESSION_LLM_GATE_SNAPSHOT_MAX_REQUESTS = 16
 
-# split-source: order=1084 original-lines=28048-28050 hash=738e7ef9d18c28e8
+# split-source: order=1084 original-lines=27827-27829 hash=738e7ef9d18c28e8
 # Gate changes are pushed to the WebUI as one coalesced transient
 # ``llm_concurrency`` event per session per interval (trailing timer).
 SESSION_LLM_CONCURRENCY_PUSH_INTERVAL_SECONDS = 1.0
 
-# split-source: order=1085 original-lines=28051-28053 hash=0b24411be493c1be
+# split-source: order=1085 original-lines=27830-27832 hash=0b24411be493c1be
 # Model calls a single TodoWrite may make (intent, audit and review helpers
 # included) before the caller has to fall back to deterministic rules.
 TODO_LLM_CALL_BUDGET = 5
 
-# split-source: order=1086 original-lines=28054-28054 hash=a75e8551a50b8cb5
+# split-source: order=1086 original-lines=27833-27833 hash=a75e8551a50b8cb5
 TODO_LLM_TIMEOUT_FACTORY_DEFAULT = 15.0
 
-# split-source: order=1088 original-lines=28058-28068 hash=d788ccc3bc4059b5
+# split-source: order=1088 original-lines=27837-27847 hash=d788ccc3bc4059b5
 
 
 def _todo_llm_timeout_env_default() -> float:
@@ -66,7 +66,7 @@ def _todo_llm_timeout_env_default() -> float:
         value = TODO_LLM_TIMEOUT_FACTORY_DEFAULT
     return max(2.0, min(120.0, value))
 
-# split-source: order=1089 original-lines=28069-28074 hash=b283ac5150748507
+# split-source: order=1089 original-lines=27848-27853 hash=b283ac5150748507
 
 
 # Socket timeout of model calls made inside a TodoWrite budget scope.  They run
@@ -74,7 +74,7 @@ def _todo_llm_timeout_env_default() -> float:
 # the caller applies its deterministic fallback instead of waiting.
 TODO_LLM_TIMEOUT_SECONDS = _todo_llm_timeout_env_default()
 
-# split-source: order=1090 original-lines=28075-28084 hash=8f5b4c1807cffc2d
+# split-source: order=1090 original-lines=27854-27863 hash=8f5b4c1807cffc2d
 
 
 class LLMGateBusy(RuntimeError):
@@ -86,18 +86,18 @@ class LLMGateBusy(RuntimeError):
     "skip this time": no failure is recorded and nothing is cached.
     """
 
-# split-source: order=1091 original-lines=28085-28088 hash=68863c6fbc1f84ba
+# split-source: order=1091 original-lines=27864-27867 hash=68863c6fbc1f84ba
 
 
 class TodoLLMBudgetExhausted(LLMGateBusy):
     """The per-TodoWrite model-call budget on this thread is used up."""
 
-# split-source: order=1092 original-lines=28089-28091 hash=2d9477ad0f8c40af
+# split-source: order=1092 original-lines=27868-27870 hash=2d9477ad0f8c40af
 
 
 _TODO_LLM_BUDGET_LOCAL = threading.local()
 
-# split-source: order=1093 original-lines=28092-28117 hash=aaa31f7fb2cc3c06
+# split-source: order=1093 original-lines=27871-27896 hash=aaa31f7fb2cc3c06
 
 
 @contextlib.contextmanager
@@ -125,7 +125,7 @@ def todo_llm_budget_scope(limit: int = TODO_LLM_CALL_BUDGET):
     finally:
         _TODO_LLM_BUDGET_LOCAL.state = None
 
-# split-source: order=1094 original-lines=28118-28129 hash=5e8324aab33f3436
+# split-source: order=1094 original-lines=27897-27908 hash=5e8324aab33f3436
 
 
 def _consume_todo_llm_budget() -> None:
@@ -139,14 +139,14 @@ def _consume_todo_llm_budget() -> None:
         )
     state["used"] = int(state.get("used", 0) or 0) + 1
 
-# split-source: order=1095 original-lines=28130-28134 hash=d47d08b55a28ec62
+# split-source: order=1095 original-lines=27909-27913 hash=d47d08b55a28ec62
 
 
 def todo_llm_budget_active() -> bool:
     """True while this thread is inside a ``todo_llm_budget_scope``."""
     return isinstance(getattr(_TODO_LLM_BUDGET_LOCAL, "state", None), dict)
 
-# split-source: order=1096 original-lines=28135-28162 hash=82e719a60d8fd036
+# split-source: order=1096 original-lines=27914-27941 hash=82e719a60d8fd036
 
 
 def todo_llm_skip_reason(exc: BaseException | None) -> str:
@@ -176,7 +176,7 @@ def todo_llm_skip_reason(exc: BaseException | None) -> str:
         return "timeout"
     return ""
 
-# split-source: order=1097 original-lines=28163-28463 hash=3ce9f9610d526697
+# split-source: order=1097 original-lines=27942-28242 hash=3ce9f9610d526697
 
 
 class SessionLLMGate:
@@ -479,12 +479,12 @@ class SessionLLMGate:
                 "requests": requests,
             }
 
-# split-source: order=1098 original-lines=28464-28466 hash=034077ae26d346ad
+# split-source: order=1098 original-lines=28243-28245 hash=034077ae26d346ad
 
 
 _SESSION_LLM_GATE_INIT_LOCK = threading.Lock()
 
-# split-source: order=1099 original-lines=28467-28476 hash=db84748c7fecba40
+# split-source: order=1099 original-lines=28246-28255 hash=db84748c7fecba40
 
 
 def set_session_llm_concurrency_on_runtime(target: object, value: object) -> int:

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1179 original-lines=111850-111857 hash=5d7e3b56ad555273
+# split-source: order=1179 original-lines=111629-111636 hash=5d7e3b56ad555273
 
 
 def _rag_trigram_set(text: str) -> frozenset[str]:
@@ -15,7 +15,7 @@ def _rag_trigram_set(text: str) -> frozenset[str]:
         return frozenset()
     return frozenset(t[i : i + 3] for i in range(len(t) - 2))
 
-# split-source: order=1180 original-lines=111858-111867 hash=3e0b7bebf461ef3a
+# split-source: order=1180 original-lines=111637-111646 hash=3e0b7bebf461ef3a
 
 
 def _rag_jaccard_sim(a: frozenset[str], b: frozenset[str]) -> float:
@@ -27,7 +27,7 @@ def _rag_jaccard_sim(a: frozenset[str], b: frozenset[str]) -> float:
         return 0.0
     return len(a & b) / union
 
-# split-source: order=1181 original-lines=111868-111917 hash=e08e51593a71899a
+# split-source: order=1181 original-lines=111647-111696 hash=e08e51593a71899a
 
 
 def _rag_mmr_select(
@@ -79,7 +79,7 @@ def _rag_mmr_select(
             doc_counts[doc_id] = doc_counts.get(doc_id, 0) + 1
     return selected
 
-# split-source: order=1186 original-lines=112052-112075 hash=d1e1621ec71300b9
+# split-source: order=1186 original-lines=111831-111854 hash=d1e1621ec71300b9
 
 
 def _rag_embed_text(text: str, session: object, *, model: str = "") -> list[float] | None:
@@ -105,7 +105,7 @@ def _rag_embed_text(text: str, session: object, *, model: str = "") -> list[floa
     except Exception:
         return None
 
-# split-source: order=1187 original-lines=112076-112084 hash=9cf8e6f26f2ac2b4
+# split-source: order=1187 original-lines=111855-111863 hash=9cf8e6f26f2ac2b4
 
 
 def _rag_embed_batch(texts: list[str], session: object, *, model: str = "") -> list[list[float] | None]:
@@ -116,7 +116,7 @@ def _rag_embed_batch(texts: list[str], session: object, *, model: str = "") -> l
         results.append(vec)
     return results
 
-# split-source: order=1188 original-lines=112085-112099 hash=d46b73a257f35bbd
+# split-source: order=1188 original-lines=111864-111878 hash=d46b73a257f35bbd
 
 
 def _rag_window_for_query(query: str) -> int:
@@ -133,7 +133,7 @@ def _rag_window_for_query(query: str) -> int:
         return 750   # Medium specificity
     return 1200      # Broad query: full chunk
 
-# split-source: order=1189 original-lines=112100-112142 hash=03301040adc4b4ac
+# split-source: order=1189 original-lines=111879-111921 hash=03301040adc4b4ac
 
 
 def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 800, dense_match: bool = False) -> str:
@@ -178,7 +178,7 @@ def _rag_focused_excerpt(text: str, query_tokens: list[str], *, window: int = 80
     suffix = "…" if end < len(text) else ""
     return prefix + excerpt + suffix
 
-# split-source: order=1190 original-lines=112143-112182 hash=22892faa76b837fd
+# split-source: order=1190 original-lines=111922-111961 hash=22892faa76b837fd
 
 
 def _rag_query_variants(query: str, *, max_variants: int = 4) -> list[str]:
@@ -220,7 +220,7 @@ def _rag_query_variants(query: str, *, max_variants: int = 4) -> list[str]:
         _add(" ".join(path_terms[:8]))
     return variants[: max(1, int(max_variants or 4))]
 
-# split-source: order=1191 original-lines=112183-112245 hash=d925a5af1586c31f
+# split-source: order=1191 original-lines=111962-112024 hash=d925a5af1586c31f
 
 
 def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
@@ -285,7 +285,7 @@ def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
             out.append(("text", 0, "", body))
     return out
 
-# split-source: order=1192 original-lines=112246-112303 hash=5f5ab2594fcf7a64
+# split-source: order=1192 original-lines=112025-112082 hash=5f5ab2594fcf7a64
 
 
 def _rag_boundary_split(body: str, *, max_chars: int, overlap: int) -> list[str]:
@@ -345,7 +345,7 @@ def _rag_boundary_split(body: str, *, max_chars: int, overlap: int) -> list[str]
         pos = next_pos if next_pos > pos else cut
     return pieces
 
-# split-source: order=1218 original-lines=117780-117796 hash=fe6f17d3ab1aa923
+# split-source: order=1218 original-lines=117559-117575 hash=fe6f17d3ab1aa923
 
 
 def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override: str, include_filename_entities: bool):
@@ -364,7 +364,7 @@ def _rag_parse_file_worker(send_conn, source_path: str, mime: str, text_override
         except Exception:
             pass
 
-# split-source: order=1219 original-lines=117797-118680 hash=1edeb2c975256424
+# split-source: order=1219 original-lines=117576-118459 hash=1edeb2c975256424
 
 
 class RAGIngestionService:
@@ -1250,7 +1250,7 @@ class RAGIngestionService:
                     self._drop_job_payload(task_id)
                 self.queue.task_done()
 
-# split-source: order=1222 original-lines=119461-119548 hash=7f3981e0091c0732
+# split-source: order=1222 original-lines=119240-119327 hash=7f3981e0091c0732
 
 
 class CodeIngestionService(RAGIngestionService):

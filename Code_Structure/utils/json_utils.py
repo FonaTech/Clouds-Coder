@@ -5,16 +5,16 @@
 
 from __future__ import annotations
 
-# split-source: order=175 original-lines=5512-5512 hash=48865d9a7490efb5
+# split-source: order=175 original-lines=5279-5279 hash=48865d9a7490efb5
 JSON_FSYNC_ENABLED = str(os.getenv("AGENT_JSON_FSYNC", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 
-# split-source: order=795 original-lines=9763-9766 hash=e1513981a13c723f
+# split-source: order=795 original-lines=9530-9533 hash=e1513981a13c723f
 
 def json_dumps(obj: object, *, indent: int | None = None, ensure_ascii: bool = False) -> str:
     raw = json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent)
     return escape_invalid_utf8_text(raw)
 
-# split-source: order=873 original-lines=13493-13503 hash=5307c5450c8ad587
+# split-source: order=873 original-lines=13260-13270 hash=5307c5450c8ad587
 
 def parse_tool_arguments(raw: object) -> dict:
     if isinstance(raw, dict):
@@ -27,7 +27,7 @@ def parse_tool_arguments(raw: object) -> dict:
             return {}
     return {}
 
-# split-source: order=874 original-lines=13504-13558 hash=ba4ea688566de9b0
+# split-source: order=874 original-lines=13271-13325 hash=ba4ea688566de9b0
 
 def repair_truncated_json_object(raw: object) -> str:
     src = str(raw or "").strip()
@@ -84,7 +84,7 @@ def repair_truncated_json_object(raw: object) -> str:
     src = re.sub(r",(\s*[}\]])", r"\1", src)
     return src.strip()
 
-# split-source: order=875 original-lines=13559-13590 hash=7d2fb800ce2aba73
+# split-source: order=875 original-lines=13326-13357 hash=7d2fb800ce2aba73
 
 def parse_tool_arguments_with_error(raw: object) -> tuple[dict, str]:
     if isinstance(raw, dict):
@@ -118,7 +118,7 @@ def parse_tool_arguments_with_error(raw: object) -> tuple[dict, str]:
             return {}, f"arguments JSON parse failed: {exc}; raw={brief}"
     return {}, f"unsupported arguments type: {type(raw).__name__}"
 
-# split-source: order=876 original-lines=13591-13596 hash=0edae7a6e375829d
+# split-source: order=876 original-lines=13358-13363 hash=0edae7a6e375829d
 
 def _is_valid_json_object(text: object) -> bool:
     try:
@@ -126,7 +126,7 @@ def _is_valid_json_object(text: object) -> bool:
     except Exception:
         return False
 
-# split-source: order=877 original-lines=13597-13620 hash=fd22a71d21becf3d
+# split-source: order=877 original-lines=13364-13387 hash=fd22a71d21becf3d
 
 def _scan_top_level_json_objects(text: str) -> list[str]:
     """Return every top-level {...} substring in text that decodes to an object.
@@ -152,7 +152,7 @@ def _scan_top_level_json_objects(text: str) -> list[str]:
             i = end if end > i else i + 1
     return out
 
-# split-source: order=878 original-lines=13621-13665 hash=a020af34209979c8
+# split-source: order=878 original-lines=13388-13432 hash=a020af34209979c8
 
 def reconstruct_streamed_tool_args(fragments: object) -> str:
     """Rebuild a tool call's argument JSON from the per-delta fragments captured
@@ -199,7 +199,7 @@ def reconstruct_streamed_tool_args(fragments: object) -> str:
     # (5) genuinely truncated/garbled: hand the concatenation to repair downstream.
     return joined
 
-# split-source: order=899 original-lines=14020-14026 hash=107b133e877d9d78
+# split-source: order=899 original-lines=13787-13793 hash=107b133e877d9d78
 
 def parse_json_object(text: str, default: dict | None = None) -> dict:
     try:
@@ -208,7 +208,7 @@ def parse_json_object(text: str, default: dict | None = None) -> dict:
     except Exception:
         return default or {}
 
-# split-source: order=900 original-lines=14027-14061 hash=c23580720ab4cb1e
+# split-source: order=900 original-lines=13794-13828 hash=c23580720ab4cb1e
 
 def decode_model_json_object(text: object) -> dict:
     """Accept one complete JSON object; never salvage a nested partial object."""
@@ -245,7 +245,7 @@ def decode_model_json_object(text: object) -> dict:
         raise ValueError("json_root_is_not_object")
     return result
 
-# split-source: order=902 original-lines=14066-14129 hash=6e462b325f50cf41
+# split-source: order=902 original-lines=13833-13896 hash=6e462b325f50cf41
 
 
 def standard_model_json_object(text: object) -> dict:
@@ -311,7 +311,7 @@ def standard_model_json_object(text: object) -> dict:
     # Reject NaN/Infinity and non-JSON types instead of silently converting them.
     return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
 
-# split-source: order=903 original-lines=14130-14146 hash=bcfb704406cb7e1b
+# split-source: order=903 original-lines=13897-13913 hash=bcfb704406cb7e1b
 
 
 def semantic_json_repair_request(contract: str, damaged: str, reason: str) -> tuple[str, list[dict]]:
@@ -330,7 +330,7 @@ def semantic_json_repair_request(contract: str, damaged: str, reason: str) -> tu
         "request": str(contract), "damaged_output": str(damaged), "parse_diagnostic": str(reason)[:200],
     })}]
 
-# split-source: order=904 original-lines=14147-14176 hash=a73fa2d0c685698b
+# split-source: order=904 original-lines=13914-13943 hash=a73fa2d0c685698b
 
 
 def validate_semantic_json_repair(text: object, damaged: object = "", *, preserve_all_values: bool = False) -> dict:
@@ -362,7 +362,7 @@ def validate_semantic_json_repair(text: object, damaged: object = "", *, preserv
     preserve(value)
     return value
 
-# split-source: order=906 original-lines=14229-14253 hash=7a158faf4c06a6e0
+# split-source: order=906 original-lines=13996-14020 hash=7a158faf4c06a6e0
 
 
 def extract_json_object_from_text(text: str, default: dict | None = None) -> dict:
@@ -389,7 +389,7 @@ def extract_json_object_from_text(text: str, default: dict | None = None) -> dic
             return obj
     return default or {}
 
-# split-source: order=962 original-lines=16524-16530 hash=447a2de5bc82a133
+# split-source: order=962 original-lines=16291-16297 hash=447a2de5bc82a133
 
 def _json_default_copy(default: object) -> object:
     if isinstance(default, dict):
@@ -398,7 +398,7 @@ def _json_default_copy(default: object) -> object:
         return list(default)
     return default
 
-# split-source: order=963 original-lines=16531-16552 hash=3bf3649f6416e766
+# split-source: order=963 original-lines=16298-16319 hash=3bf3649f6416e766
 
 def _read_json_file(path: Path, default: object) -> object:
     bak = path.with_name(f"{path.name}.bak")
@@ -422,7 +422,7 @@ def _read_json_file(path: Path, default: object) -> object:
         return obj
     return _json_default_copy(default)
 
-# split-source: order=964 original-lines=16553-16581 hash=a8537823069e1ffa
+# split-source: order=964 original-lines=16320-16348 hash=a8537823069e1ffa
 
 def _write_json_file(path: Path, obj: object):
     path.parent.mkdir(parents=True, exist_ok=True)

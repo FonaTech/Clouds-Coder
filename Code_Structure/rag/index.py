@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1200 original-lines=112528-112544 hash=bc81238fa4cef592
+# split-source: order=1200 original-lines=112307-112323 hash=bc81238fa4cef592
 
 
 def _code_module_name(rel_path: str, language: str = "") -> str:
@@ -24,7 +24,7 @@ def _code_module_name(rel_path: str, language: str = "") -> str:
         parts = parts[:-1] + [stem]
     return ".".join(part for part in parts if part)
 
-# split-source: order=1201 original-lines=112545-112554 hash=4f22991749d8d80d
+# split-source: order=1201 original-lines=112324-112333 hash=4f22991749d8d80d
 
 
 def _code_choose_community(rel_path: str, language: str, labels: list[str] | None = None) -> str:
@@ -36,7 +36,7 @@ def _code_choose_community(rel_path: str, language: str, labels: list[str] | Non
         return f"test:{top}"
     return f"{str(language or 'code').strip() or 'code'}:{top}"
 
-# split-source: order=1202 original-lines=112555-112569 hash=497286dfec9f9fc5
+# split-source: order=1202 original-lines=112334-112348 hash=497286dfec9f9fc5
 
 
 def _code_query_terms(text: str, limit: int = 48) -> set[str]:
@@ -53,7 +53,7 @@ def _code_query_terms(text: str, limit: int = 48) -> set[str]:
             break
     return set(out)
 
-# split-source: order=1211 original-lines=113700-115394 hash=97877150ec596b87
+# split-source: order=1211 original-lines=113479-115173 hash=97877150ec596b87
 
 
 class TFGraphIDFIndex:
@@ -1750,7 +1750,7 @@ class TFGraphIDFIndex:
             "communities": dict(self.community_counts),
         }
 
-# split-source: order=1220 original-lines=118681-119169 hash=a9656c2b2bfdf2c1
+# split-source: order=1220 original-lines=118460-118948 hash=a9656c2b2bfdf2c1
 
 
 class CodeGraphIndex(TFGraphIDFIndex):

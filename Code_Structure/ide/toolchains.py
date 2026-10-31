@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=549 original-lines=6540-6546 hash=8c8357e7e09d961a
+# split-source: order=549 original-lines=6307-6313 hash=8c8357e7e09d961a
 
 # IDE toolchain discovery is an expensive filesystem operation on machines
 # with long PATHs (especially conda, nvm and cargo installations).  Keep one
@@ -14,16 +14,16 @@ from __future__ import annotations
 # changed environment is detected without platform-specific path assumptions.
 IDE_TOOLCHAIN_CACHE_TTL_SECONDS = 60.0
 
-# split-source: order=550 original-lines=6547-6547 hash=4a841df6f3dba311
+# split-source: order=550 original-lines=6314-6314 hash=4a841df6f3dba311
 _IDE_TOOLCHAIN_CACHE_LOCK = threading.RLock()
 
-# split-source: order=551 original-lines=6548-6548 hash=3a8791a2843f518c
+# split-source: order=551 original-lines=6315-6315 hash=3a8791a2843f518c
 _IDE_TOOLCHAIN_CACHE: dict[tuple[str, str, str, str], tuple[float, list[dict]]] = {}
 
-# split-source: order=552 original-lines=6549-6549 hash=070f53d216881e48
+# split-source: order=552 original-lines=6316-6316 hash=070f53d216881e48
 _IDE_TOOLCHAIN_REFRESHING: set[tuple[str, str, str, str]] = set()
 
-# split-source: order=1256 original-lines=125263-125273 hash=89ceac600e1f929f
+# split-source: order=1256 original-lines=125042-125052 hash=89ceac600e1f929f
 
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.
@@ -36,7 +36,7 @@ def _ide_toolchain_cache_key() -> tuple[str, str, str, str]:
         str(sys.executable or ""),
     )
 
-# split-source: order=1257 original-lines=125274-125317 hash=f75c16ab05bcbe27
+# split-source: order=1257 original-lines=125053-125096 hash=f75c16ab05bcbe27
 
 
 def _probe_ide_toolchains() -> list[dict]:
@@ -82,7 +82,7 @@ def _probe_ide_toolchains() -> list[dict]:
     )
     return rows
 
-# split-source: order=1258 original-lines=125318-125327 hash=1a20a319f39aaa6f
+# split-source: order=1258 original-lines=125097-125106 hash=1a20a319f39aaa6f
 
 
 def _refresh_ide_toolchains_in_background(cache_key: tuple[str, str, str, str]) -> None:

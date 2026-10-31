@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1140 original-lines=32728-33064 hash=fa9c6aa541bbe962
+# split-source: order=1140 original-lines=32507-32843 hash=fa9c6aa541bbe962
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
@@ -344,7 +344,7 @@ class EvidenceRetrievalController:
                 db.execute('UPDATE memories SET accessed=? WHERE id=?', (time.time(), row['id']))
             return rows
 
-# split-source: order=1141 original-lines=33065-33067 hash=22f840f3dcad02ce
+# split-source: order=1141 original-lines=32844-32846 hash=22f840f3dcad02ce
 
 
 _EVIDENCE_CONTROLLER_INIT_LOCK = threading.Lock()

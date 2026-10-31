@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1144 original-lines=99494-99755 hash=aae1c6954fefa396
+# split-source: order=1144 original-lines=99273-99534 hash=aae1c6954fefa396
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -269,7 +269,7 @@ window.MathJax={
 </html>
 """
 
-# split-source: order=1145 original-lines=99756-100298 hash=cba40a0d4d11e270
+# split-source: order=1145 original-lines=99535-100077 hash=cba40a0d4d11e270
 
 APP_CSS = """@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
 :root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b}
@@ -814,7 +814,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 @media (max-width:720px){.application-editor-body{grid-template-columns:1fr}.application-skill-catalog{min-height:240px}.application-dialog{max-height:94vh}}
 """
 
-# split-source: order=1146 original-lines=100299-105082 hash=3933537d516fa1a5
+# split-source: order=1146 original-lines=100078-104861 hash=3933537d516fa1a5
 
 APP_JS = """/* clouds-coder-app-store-v1 */
 const S={sessions:[],sessionById:new Map(),sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionCatalogRevision:0,sessionSearch:'',sessionSearchTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},submissionBySession:new Map(),submissionRenderRaf:0,previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
@@ -5600,7 +5600,7 @@ window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)
 window.addEventListener('DOMContentLoaded',()=>{const search=E('sessionSearch');if(search){search.value=S.sessionSearch;search.addEventListener('input',()=>scheduleSessionSearch(search.value))}});
 """
 
-# split-source: order=1147 original-lines=105083-105103 hash=3b888bdce6fda722
+# split-source: order=1147 original-lines=104862-104882 hash=3b888bdce6fda722
 
 APP_CSS += r"""
 :root{--web-scrollbar-size:8px;--web-scrollbar-thumb:rgba(98,116,142,.44);--web-scrollbar-thumb-hover:rgba(76,98,128,.7)}
@@ -5623,7 +5623,7 @@ html,body{scrollbar-gutter:stable}
 .agent-model-menu button{height:34px!important;min-height:34px!important;padding:6px 9px!important;border-radius:7px!important}.agent-model-option{height:36px!important}.agent-model-option .agent-model-config{width:32px!important;min-width:32px!important;height:32px!important;min-height:32px!important}.agent-model-actions{gap:6px;padding:5px 4px}.agent-model-actions .agent-model-config{height:34px!important;min-height:34px!important}.agent-model-config-text{display:inline-flex!important;align-items:center!important;justify-content:center!important;place-items:unset!important;width:auto!important;min-width:104px!important;height:34px!important;min-height:34px!important;padding:0 8px!important;gap:5px!important;color:var(--brand,#1f6feb)!important;font-size:11px!important;line-height:1!important;white-space:nowrap!important}.agent-model-config-text .codicon{display:inline-block!important;flex:0 0 auto}
 """
 
-# split-source: order=1148 original-lines=105104-105143 hash=3bb1241d6a6545d4
+# split-source: order=1148 original-lines=104883-104922 hash=3bb1241d6a6545d4
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number};
 type Msg={role:string;text:string;type?:string;data?:Record<string,unknown>;thinking?:string;agent_role?:string;[key:string]:unknown};

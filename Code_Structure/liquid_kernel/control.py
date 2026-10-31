@@ -1121,59 +1121,77 @@ class LiquidKernelRegistry:
             bucket["durations"] = durations
             now = _now()
             conn.execute("UPDATE deployments SET metrics_json=?,updated_at=? WHERE deployment_id=?", (_json(metrics), now, deployment_id))
-        candidate_metrics = metrics.get(candidate, {})
-        incumbent_metrics = metrics.get(incumbent, {})
-        candidate_count = int(candidate_metrics.get("completed", 0) or 0)
-        incumbent_count = int(incumbent_metrics.get("completed", 0) or 0)
-        if candidate_count <= 0 or incumbent_count <= 0:
-            return {"ok": True, "observed": True, "metrics": metrics}
-        candidate_success = float(candidate_metrics.get("success", 0) or 0) / candidate_count
-        incumbent_success = float(incumbent_metrics.get("success", 0) or 0) / incumbent_count
-        candidate_errors = float(candidate_metrics.get("errors", 0) or 0) / candidate_count
-        incumbent_errors = float(incumbent_metrics.get("errors", 0) or 0) / incumbent_count
-        candidate_p95 = self._p95(candidate_metrics.get("durations", []))
-        incumbent_p95 = self._p95(incumbent_metrics.get("durations", []))
-        policy = canary_policy if isinstance(canary_policy, dict) else default_evolution_config()["canary"]
-        regression = candidate_count >= 5 and incumbent_count >= 5 and (
-            candidate_success < incumbent_success - float(policy.get("success_drop_limit", 0.05) or 0.05)
-            or candidate_errors > incumbent_errors + float(policy.get("error_increase_limit", 0.05) or 0.05)
-            or (
-                incumbent_p95 > 0
-                and candidate_p95 > incumbent_p95 * (1.0 + float(policy.get("p95_latency_increase_limit", 0.20) or 0.20))
-            )
-        )
-        comparison = {
-            "candidate_success": candidate_success,
-            "incumbent_success": incumbent_success,
-            "candidate_error_rate": candidate_errors,
-            "incumbent_error_rate": incumbent_errors,
-            "candidate_p95_seconds": candidate_p95,
-            "incumbent_p95_seconds": incumbent_p95,
-        }
-        if regression:
-            rollback = self.abort_canary(reason="automatic canary regression threshold")
-            return {"ok": True, "observed": True, "action": "rolled_back", "comparison": comparison, "rollback": rollback}
-        stage = int(canary.get("percent", 5) or 5)
-        stages = [int(item) for item in policy.get("stages", [5, 25, 100]) if int(item) in {5, 25, 100}]
-        stages = stages or [5, 25, 100]
-        stage_index = stages.index(stage) if stage in stages else 0
-        minimum_completed = [max(0, int(item)) for item in policy.get("minimum_completed", [20, 50, 0])]
-        minimum_hours = [max(0, int(item)) for item in policy.get("minimum_hours", [24, 48, 0])]
-        required_count = minimum_completed[stage_index] if stage_index < len(minimum_completed) else 0
-        required_hours = minimum_hours[stage_index] if stage_index < len(minimum_hours) else 0
-        elapsed_hours = max(0.0, (_now() - float(canary.get("started_at", 0) or 0)) / 3600.0)
-        if candidate_count >= required_count and elapsed_hours >= required_hours:
-            if stage_index >= len(stages) - 1:
-                promoted = self.promote(candidate)
-                return {"ok": True, "observed": True, "action": "promoted", "comparison": comparison, "promotion": promoted}
-            next_stage = stages[stage_index + 1]
-            canary["percent"] = next_stage
-            canary["started_at"] = _now()
-            _atomic_json(self.active_path, {"version": incumbent, "canary": canary})
+        return self.evaluate_canary(canary_policy=canary_policy)
+
+    def evaluate_canary(self, *, canary_policy: dict | None = None) -> dict:
+        """Check durable observations and elapsed time without inventing a task result."""
+        with self.lock:
+            state = self.active_state()
+            canary = state.get("canary")
+            if not isinstance(canary, dict):
+                return {"ok": True, "observed": False}
+            candidate = str(canary.get("version", "") or "")
+            incumbent = str(state.get("version", "") or "")
+            deployment_id = str(canary.get("deployment_id", "") or "")
             with self._connect() as conn:
-                conn.execute("UPDATE deployments SET stage_percent=?,updated_at=? WHERE deployment_id=?", (next_stage, _now(), deployment_id))
-            return {"ok": True, "observed": True, "action": "advanced", "percent": next_stage, "comparison": comparison}
-        return {"ok": True, "observed": True, "action": "continue", "comparison": comparison, "metrics": metrics}
+                row = conn.execute("SELECT * FROM deployments WHERE deployment_id=?",
+                                   (deployment_id,)).fetchone()
+                if not row or str(row["status"]) != "canary":
+                    return {"ok": True, "observed": False}
+                metrics = json.loads(str(row["metrics_json"] or "{}"))
+            candidate_metrics = metrics.get(candidate, {})
+            incumbent_metrics = metrics.get(incumbent, {})
+            candidate_count = int(candidate_metrics.get("completed", 0) or 0)
+            incumbent_count = int(incumbent_metrics.get("completed", 0) or 0)
+            if candidate_count <= 0 or incumbent_count <= 0:
+                return {"ok": True, "observed": True, "metrics": metrics}
+            candidate_success = float(candidate_metrics.get("success", 0) or 0) / candidate_count
+            incumbent_success = float(incumbent_metrics.get("success", 0) or 0) / incumbent_count
+            candidate_errors = float(candidate_metrics.get("errors", 0) or 0) / candidate_count
+            incumbent_errors = float(incumbent_metrics.get("errors", 0) or 0) / incumbent_count
+            candidate_p95 = self._p95(candidate_metrics.get("durations", []))
+            incumbent_p95 = self._p95(incumbent_metrics.get("durations", []))
+            policy = canary_policy if isinstance(canary_policy, dict) else default_evolution_config()["canary"]
+            regression = candidate_count >= 5 and incumbent_count >= 5 and (
+                candidate_success < incumbent_success - float(policy.get("success_drop_limit", 0.05) or 0.05)
+                or candidate_errors > incumbent_errors + float(policy.get("error_increase_limit", 0.05) or 0.05)
+                or (
+                    incumbent_p95 > 0
+                    and candidate_p95 > incumbent_p95 * (1.0 + float(policy.get("p95_latency_increase_limit", 0.20) or 0.20))
+                )
+            )
+            comparison = {
+                "candidate_success": candidate_success,
+                "incumbent_success": incumbent_success,
+                "candidate_error_rate": candidate_errors,
+                "incumbent_error_rate": incumbent_errors,
+                "candidate_p95_seconds": candidate_p95,
+                "incumbent_p95_seconds": incumbent_p95,
+            }
+            if regression:
+                rollback = self.abort_canary(reason="automatic canary regression threshold")
+                return {"ok": True, "observed": True, "action": "rolled_back", "comparison": comparison, "rollback": rollback}
+            stage = int(canary.get("percent", 5) or 5)
+            stages = [int(item) for item in policy.get("stages", [5, 25, 100]) if int(item) in {5, 25, 100}]
+            stages = stages or [5, 25, 100]
+            stage_index = stages.index(stage) if stage in stages else 0
+            minimum_completed = [max(0, int(item)) for item in policy.get("minimum_completed", [20, 50, 0])]
+            minimum_hours = [max(0, int(item)) for item in policy.get("minimum_hours", [24, 48, 0])]
+            required_count = minimum_completed[stage_index] if stage_index < len(minimum_completed) else 0
+            required_hours = minimum_hours[stage_index] if stage_index < len(minimum_hours) else 0
+            elapsed_hours = max(0.0, (_now() - float(canary.get("started_at", 0) or 0)) / 3600.0)
+            if candidate_count >= required_count and elapsed_hours >= required_hours:
+                if stage_index >= len(stages) - 1:
+                    promoted = self.promote(candidate)
+                    return {"ok": True, "observed": True, "action": "promoted", "comparison": comparison, "promotion": promoted}
+                next_stage = stages[stage_index + 1]
+                canary["percent"] = next_stage
+                canary["started_at"] = _now()
+                _atomic_json(self.active_path, {"version": incumbent, "canary": canary})
+                with self._connect() as conn:
+                    conn.execute("UPDATE deployments SET stage_percent=?,updated_at=? WHERE deployment_id=?", (next_stage, _now(), deployment_id))
+                return {"ok": True, "observed": True, "action": "advanced", "percent": next_stage, "comparison": comparison}
+            return {"ok": True, "observed": True, "action": "continue", "comparison": comparison, "metrics": metrics}
 
     def notice(self, user_id: str, device_id: str, surface: str) -> dict | None:
         version = self.active_version()
@@ -1755,6 +1773,7 @@ class LiquidKernelControlPlane:
         self.validator = StructuredPatchValidator()
         self.benchmark = KernelBenchmark(self.runtime)
         self.config_path = self.root / "config.json"
+        self.had_saved_config = self.config_path.is_file()
         self.config_lock = threading.RLock()
         self.run_lock = threading.Lock()
         self.active_run_id = ""
@@ -1822,6 +1841,7 @@ class LiquidKernelControlPlane:
             clean = self._apply_task_runtime_limits(clean)
             clean["revision"] = int(current.get("revision", 0)) + 1
             _atomic_json(self.config_path, clean)
+            self.last_trigger_error = None
             if clean["mode"] == "Off":
                 if self.active_run_id:
                     self.cancelled.add(self.active_run_id)
@@ -1838,11 +1858,13 @@ class LiquidKernelControlPlane:
             if normalized_mode not in EVOLUTION_MODES:
                 raise LiquidKernelError("invalid_mode", "mode must be Off, Tuning, Thinking, or Aggressive")
             values["mode"] = normalized_mode
-            if not normalized_schedule:
+            if not normalized_schedule and normalized_mode != current["mode"]:
                 values["schedule"] = str(MODE_PRESETS[normalized_mode]["schedule"])
         if normalized_schedule:
             values["schedule"] = normalized_schedule
         if not normalized_mode and not normalized_schedule:
+            return {"ok": True, "config": current, "changed": False}
+        if values == current:
             return {"ok": True, "config": current, "changed": False}
         saved = self.save_config(values, expected_revision=int(current.get("revision", 0) or 0))
         saved["changed"] = True
@@ -1877,6 +1899,16 @@ class LiquidKernelControlPlane:
         while not self._stop.wait(30):
             try:
                 config = self.config()
+                if self.registry.active_state().get("canary"):
+                    with self.config_lock:
+                        # Recheck under the same lock used by explicit Off so
+                        # a stale scheduler snapshot cannot authorize progress.
+                        config = self.config()
+                        if config["mode"] != "Off":
+                            self.registry.evaluate_canary(canary_policy=config.get("canary", {}))
+                    # Canary recovery does not require model configuration and
+                    # must not compete with a new scheduled experiment.
+                    continue
                 runs = self.registry.list_runs(limit=1).get("runs", [])
                 last_created = float(runs[0].get("created_at", 0) or 0) if runs else 0.0
                 if self._schedule_due(config, last_created) and not self.active_run_id:
