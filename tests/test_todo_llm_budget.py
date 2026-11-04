@@ -313,7 +313,13 @@ class TodoLLMBudgetTests(unittest.TestCase):
 
         # One request per audit at the short TodoWrite socket timeout: no
         # HTTP retry, no retry delay and no shared endpoint cooldown.
-        self.assertEqual(seen, [cc.TODO_LLM_TIMEOUT_SECONDS] * 2)
+        self.assertEqual(len(seen), 2)
+        for timeout in seen:
+            # The shared deadline subtracts time spent preparing the request.
+            # Scheduler load must not turn millisecond accounting into a CI failure.
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, cc.TODO_LLM_TIMEOUT_SECONDS)
+            self.assertAlmostEqual(timeout, cc.TODO_LLM_TIMEOUT_SECONDS, delta=0.05)
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertEqual(cc.OllamaClient._endpoint_cooldowns, {})
         self.assertIn("revision rejected", rejected.lower())
@@ -353,7 +359,7 @@ class TodoLLMBudgetTests(unittest.TestCase):
         # Invalid JSON is not a skip: even a revision the deterministic rule
         # would approve stays rejected.
         session = self.seeded_session(3)
-        session.ollama = recording_client(["not-json"])
+        session.ollama = recording_client(["not-json", "not-json"])
         result = session._dispatch_todo_update(self.safe_root_revision(), role="developer")
 
         self.assertIn("invalid structured JSON", result)

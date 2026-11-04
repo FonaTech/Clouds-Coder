@@ -20,6 +20,43 @@ from liquid_kernel.control import normalize_evolution_config
 
 
 class SharedContextRuntimeTests(unittest.TestCase):
+    def test_editing_report_preserves_other_file_reads_but_editing_source_invalidates_them(self):
+        with tempfile.TemporaryDirectory() as temp:
+            s = self.session(Path(temp))
+            read = {'id':'read-source','step_id':'step','tool':'read_file','kind':'file',
+                    'path':'server.py','ok':True,'ts':10.0,'summary':'observed API source'}
+            report = {'id':'edit-report','step_id':'step','tool':'edit_file','kind':'file',
+                      'path':'docs/report.md','ok':True,'ts':20.0}
+            board = {'plan_step_evidence':{'step':[read,report]}}
+            self.assertIn('read-source',[r['id'] for r in s._plan_step_evidence_records('step',board=board)])
+            board['plan_step_evidence']['step'].append({**report,'id':'edit-source','path':'server.py','ts':30.0})
+            self.assertNotIn('read-source',[r['id'] for r in s._plan_step_evidence_records('step',board=board)])
+
+    def test_todo_semantic_audit_sees_immutable_output_beyond_short_ledger_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            s = self.session(Path(temp))
+            s._ensure_llm_gate()
+            body = 'setup diagnostics\n' * 180 + 'HTML_TITLE_FOUND; API_SUMMARY_MATCHED; exit=0\n'
+            eid = s._evidence_controller().remember('', '', 'bash', 'developer', {'command':'python check.py'}, body, 'ok')
+            step = {'id':'step','content':'Verify public service','activated_at':1.0}
+            row = {'content':'Inspect the served HTML and JSON API','created_at':1.0}
+            record = {'id':'observation','step_id':'step','tool':'bash','kind':'runtime',
+                      'ok':True,'exit_code':0,'command':'python check.py','summary':body[:900],
+                      'evidence_ref':eid,'ts':2.0}
+            s.blackboard = {'plan_step_evidence':{'step':[record]}}
+            seen = []
+            def chat(messages, **kwargs):
+                seen.append(json.dumps(messages))
+                self.assertIn('HTML_TITLE_FOUND', seen[-1])
+                return {'content':json.dumps({'decision':'pass','passed':True,'confidence':'high',
+                    'reason':'Observed exact result','evidence':'HTML_TITLE_FOUND; API_SUMMARY_MATCHED',
+                    'evidence_ids':['observation']})}
+            with mock.patch.object(s.ollama, '_chat_impl', side_effect=chat):
+                verdict = s._llm_review_plan_subtask_completion(step,row,board=s.blackboard)
+            self.assertTrue(verdict['passed'])
+            self.assertEqual(len(seen),1)
+            self.assertEqual(s._normalize_plan_evidence_record(record)['evidence_ref'],eid)
+
     def test_repeated_premature_finals_receive_frozen_body_in_both_review_paths(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -57,6 +94,25 @@ class SharedContextRuntimeTests(unittest.TestCase):
             self.assertEqual(scores['incumbent'], 90)
             self.assertEqual(len(calls), 4)
             self.assertIn('host_read_only_frozen_evidence', json.dumps(calls[-1]))
+
+    def test_frozen_review_can_recall_complete_blackboard_report_beyond_inline_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = self.session(Path(temp))
+            step = {'id': 'pt:delivery:001', 'content': 'Review delivery',
+                    'full_content': 'Verify the delivery report and real command results',
+                    'status': 'in_progress', 'category': 'plan_step', 'activated_at': 10.0}
+            report = 'File list and observations\n' * 500 + 'FINAL_DELIVERY_COMMAND: python -m unittest discover -s tests -v\n'
+            board = session._new_blackboard('Verify the service delivery report')
+            board['project_todos'] = [step]
+            board['execution_logs'] = [{'actor': 'reviewer', 'plan_step_id': step['id'],
+                                        'ts': 20.0, 'content': report}]
+            session.blackboard = board
+            with mock.patch.object(session, '_plan_step_quality_path_inference', return_value={}):
+                context, reader = session._build_plan_step_quality_review_context(step, {}, board, return_runtime=True)
+            self.assertNotIn('FINAL_DELIVERY_COMMAND:', context)
+            recalled = reader.recall({'mode': 'search', 'query': 'FINAL_DELIVERY_COMMAND:'})
+            self.assertIn('python -m unittest discover -s tests -v', json.dumps(recalled))
+            self.assertIn('blackboard/execution_logs/', context)
 
     def test_long_task_compute_quota_does_not_expand_edit_strength(self):
         config = normalize_evolution_config({'mode': 'Tuning', 'budget': {'max_tokens': 800000, 'max_files': 999, 'max_changed_lines': 99999}})

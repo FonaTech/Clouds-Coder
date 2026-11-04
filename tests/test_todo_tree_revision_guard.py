@@ -580,7 +580,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         )
 
     def test_invalid_review_json_fails_closed(self):
-        session = self.bare_session("single", ["not-json"])
+        session = self.bare_session("single", ["not-json", "not-json"])
         session._dispatch_todo_update({"todos": self.stages(3)}, role="developer")
         result = session._dispatch_todo_update(
             {

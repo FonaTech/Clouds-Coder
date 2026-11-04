@@ -222,7 +222,7 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         session.runtime_task_level = 3
         session.single_no_plan_todo_enabled = False
         self.assertEqual(session._runtime_task_level_for_todo_policy(), 3)
-        self.assertFalse(session._todo_contract_prompt_block())
+        self.assertIn("MANDATORY L3 TODO CONTRACT", session._todo_contract_prompt_block())
 
     def test_l2_force_auto_and_off_resolve_without_overriding_other_levels(self):
         session = self.bare_session("single")

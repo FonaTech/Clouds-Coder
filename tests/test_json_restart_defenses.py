@@ -116,6 +116,22 @@ class StructuredOutputDefenses(unittest.TestCase):
         self.assertEqual(len(calls),3)
         self.assertIsNone(calls[2]['tools'])
         self.assertIn('semantic normalization engine', calls[2]['system'])
+        self.assertTrue(all(6000 < call['max_tokens'] < 8000 for call in calls))
+
+    def test_normal_review_uses_admin_output_when_context_has_room(self):
+        session = bootstrap.SingleNoPlanTodoBootstrapTests().bare_session()
+        session.context_token_upper_bound = 200000
+        session.max_output_tokens = 48000
+        session.max_agent_rounds = 10
+        calls = []
+        def chat(*args, **kwargs):
+            calls.append(kwargs)
+            return {'content':'{"passed":true}'}
+        session.ollama = types.SimpleNamespace(chat=chat)
+        with tempfile.TemporaryDirectory() as directory:
+            reader = ReviewEvidence(HistoryArchive(Path(directory)/'history.jsonl'))
+            self.assertTrue(session._read_only_review_json('Check evidence.', 'Return JSON.', reader)['passed'])
+        self.assertEqual(calls[0]['max_tokens'], 48000)
 
     def test_normal_tool_recovery_uses_semantic_engine_and_large_writes_stay_blocked(self):
         session = bootstrap.SingleNoPlanTodoBootstrapTests().bare_session()
