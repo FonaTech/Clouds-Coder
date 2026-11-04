@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=977 original-lines=17441-17564 hash=079b9bb4662f7886
+# split-source: order=977 original-lines=17447-17570 hash=079b9bb4662f7886
 
 
 def _admin_config_schema() -> list[dict]:
@@ -131,13 +131,13 @@ def _admin_config_schema() -> list[dict]:
         row("rag_file_name", "runtime", "Use filenames as RAG entities", "boolean", False, true_flag="--RAG_File_Name=on", false_flag="--RAG_File_Name=off"),
     ]
 
-# split-source: order=978 original-lines=17565-17568 hash=40890890ea051821
+# split-source: order=978 original-lines=17571-17574 hash=40890890ea051821
 
 
 def _admin_factory_config() -> dict:
     return {row["key"]: row.get("factory_default") for row in _admin_config_schema()}
 
-# split-source: order=979 original-lines=17569-17724 hash=e4ee3c750cce4f1e
+# split-source: order=979 original-lines=17575-17730 hash=e4ee3c750cce4f1e
 
 
 def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
@@ -295,7 +295,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
     out["_effective_ports"] = effective_ports
     return out, errors
 
-# split-source: order=980 original-lines=17725-17765 hash=63ed1152d4003ed4
+# split-source: order=980 original-lines=17731-17771 hash=63ed1152d4003ed4
 
 
 def _admin_config_to_argv(config: dict) -> list[str]:
@@ -338,7 +338,7 @@ def _admin_config_to_argv(config: dict) -> list[str]:
                 argv.extend([flag, value_text])
     return argv
 
-# split-source: order=981 original-lines=17766-17781 hash=12dc636b75f461e9
+# split-source: order=981 original-lines=17772-17787 hash=12dc636b75f461e9
 
 
 def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot_id: str) -> str:
@@ -356,7 +356,7 @@ def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot
     )
     return f"http://{host}:{port}/api/health?{query}"
 
-# split-source: order=982 original-lines=17782-17893 hash=f159b742e6d3f95a
+# split-source: order=982 original-lines=17788-17899 hash=f159b742e6d3f95a
 
 
 def _admin_supervised_restart(
@@ -469,7 +469,7 @@ def _admin_supervised_restart(
     )
     return False
 
-# split-source: order=984 original-lines=17912-17935 hash=d71699ae2f57e772
+# split-source: order=984 original-lines=17918-17941 hash=d71699ae2f57e772
 
 def _admin_argparse_defaults(config: dict) -> dict:
     """Map canonical Admin config keys to argparse destinations."""
@@ -495,7 +495,7 @@ def _admin_argparse_defaults(config: dict) -> dict:
     out.pop("evolution_schedule", None)
     return out
 
-# split-source: order=985 original-lines=17936-17956 hash=77b9b0b9223e21aa
+# split-source: order=985 original-lines=17942-17962 hash=77b9b0b9223e21aa
 
 def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
     values = _admin_factory_config()

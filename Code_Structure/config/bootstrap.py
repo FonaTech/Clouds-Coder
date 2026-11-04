@@ -1383,14 +1383,14 @@ def _ensure_liquid_kernel_sqlite_lifecycle(registry_class) -> None:
     registry_class._connect = managed_connect
     registry_class.SQLITE_CONNECTIONS_CLOSE_ON_EXIT = True
 
-# split-source: order=968 original-lines=16358-16362 hash=5cd9aacc032a0f5b
+# split-source: order=968 original-lines=16364-16368 hash=5cd9aacc032a0f5b
 
 
 def _liquid_kernel_history_present(runtime_root: Path) -> bool:
     root = Path(runtime_root)
     return root.is_dir() and any((root / name).exists() for name in ("registry.sqlite", "active.json", "artifacts"))
 
-# split-source: order=969 original-lines=16363-16392 hash=af942e21e79e26a3
+# split-source: order=969 original-lines=16369-16398 hash=af942e21e79e26a3
 
 
 def prepare_liquid_kernel_runtime(runtime_root: Path, startup_policy: object = "inherit") -> dict:
@@ -1422,7 +1422,7 @@ def prepare_liquid_kernel_runtime(runtime_root: Path, startup_policy: object = "
         pass
     return status
 
-# split-source: order=970 original-lines=16393-16406 hash=bc332d47a0e9051a
+# split-source: order=970 original-lines=16399-16412 hash=bc332d47a0e9051a
 
 
 def _persist_liquid_kernel_bootstrap(runtime_root: Path, status: dict) -> dict:

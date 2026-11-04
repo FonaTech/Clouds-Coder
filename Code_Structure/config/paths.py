@@ -287,7 +287,7 @@ CODES_ROOT = WORKDIR / "Codes"
 # split-source: order=162 original-lines=5266-5266 hash=29dd970e5b14e924
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 
-# split-source: order=801 original-lines=9572-9586 hash=1c8289e3f7ac60a2
+# split-source: order=801 original-lines=9578-9592 hash=1c8289e3f7ac60a2
 
 def detect_repo_root(cwd: Path) -> Path | None:
     try:
@@ -304,6 +304,6 @@ def detect_repo_root(cwd: Path) -> Path | None:
     except Exception:
         return None
 
-# split-source: order=802 original-lines=9587-9588 hash=abb03f0e9fd37533
+# split-source: order=802 original-lines=9593-9594 hash=abb03f0e9fd37533
 
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR

@@ -49,12 +49,12 @@ def urlopen(url, *args, **kwargs):
                 pass
     return _URL_OPEN_ORIGINAL(url, *args, **kwargs)
 
-# split-source: order=796 original-lines=9534-9536 hash=45f4d1c3ae2bda86
+# split-source: order=796 original-lines=9540-9542 hash=45f4d1c3ae2bda86
 
 def json_response_bytes(obj: object) -> bytes:
     return safe_utf8_bytes(json_dumps(obj))
 
-# split-source: order=797 original-lines=9537-9550 hash=b8e0fcf45e3a740c
+# split-source: order=797 original-lines=9543-9556 hash=b8e0fcf45e3a740c
 
 def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0") or "0")
@@ -70,7 +70,7 @@ def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     parsed = sanitize_utf8_surrogates(parsed)
     return parsed if isinstance(parsed, dict) else {}
 
-# split-source: order=798 original-lines=9551-9564 hash=d097208eea9ea225
+# split-source: order=798 original-lines=9557-9570 hash=d097208eea9ea225
 
 def close_if_http_request_body_unread(handler: BaseHTTPRequestHandler) -> bool:
     """Prevent an unread write body from becoming the next keep-alive request line."""

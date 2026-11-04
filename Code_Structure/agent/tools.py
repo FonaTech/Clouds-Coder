@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1008 original-lines=18562-18595 hash=494ce756bc5b35d8
+# split-source: order=1008 original-lines=18568-18601 hash=494ce756bc5b35d8
 
 
 def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object]:
@@ -41,7 +41,7 @@ def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object
             break
     return rows
 
-# split-source: order=1009 original-lines=18596-18601 hash=4bfe2fe5ea6ce1a8
+# split-source: order=1009 original-lines=18602-18607 hash=4bfe2fe5ea6ce1a8
 
 
 def _ask_user_option_value(option: object) -> str:
@@ -49,7 +49,7 @@ def _ask_user_option_value(option: object) -> str:
         return trim(str(option.get("value", option.get("id", option.get("label", ""))) or "").strip(), 400)
     return trim(str(option or "").strip(), 400)
 
-# split-source: order=1101 original-lines=31116-31129 hash=f19c222e839c27ec
+# split-source: order=1101 original-lines=31122-31135 hash=f19c222e839c27ec
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -65,20 +65,20 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
-# split-source: order=1106 original-lines=31210-31213 hash=c37d208910e042cd
+# split-source: order=1106 original-lines=31216-31219 hash=c37d208910e042cd
 
 
 def bash_operation_is_observation(value: object) -> bool:
     return normalize_bash_operation(value, default="execute") in BASH_OBSERVATION_OPERATION_CODES
 
-# split-source: order=1107 original-lines=31214-31218 hash=f87dded082c0416a
+# split-source: order=1107 original-lines=31220-31224 hash=f87dded082c0416a
 
 
 def bash_operation_is_marked_observation(value: object) -> bool:
     operation = normalize_bash_operation(value, default="execute")
     return operation in BASH_OBSERVATION_OPERATION_CODES or operation.startswith("custom:")
 
-# split-source: order=1108 original-lines=31219-31810 hash=ac5708345bac97b2
+# split-source: order=1108 original-lines=31225-31848 hash=f799a52c88d0ff7e
 
 
 TOOLS = [
@@ -152,6 +152,8 @@ TOOLS = [
             "(e.g. {\"id\": \"t3\", \"status\": \"completed\"}). Preserve ids of retained rows in revisions; "
             "omit an id only for genuinely new work. Unknown or out-of-scope ids reject the update. "
             "A partial update selecting in_progress moves that owner's active cursor."
+            " In Sync mode submit only the active role's rows: peers are preserved automatically "
+            "and remain part of the independent review's full proposed tree."
         ),
         {
             "items": {"type": "array", "items": {}},
@@ -175,6 +177,16 @@ TOOLS = [
             "continue": {"type": "boolean"},
             "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
+            "preparation": {
+                "type": "object",
+                "description": "For the first list of this task/role/plan step, summarize understanding after sufficient context and skill consideration; do not include private reasoning. Existing progress updates do not need another preparation.",
+                "properties": {
+                    "goal": {"type": "string"}, "state": {"type": "string"},
+                    "skills": {"type": "string"}, "ready": {"type": "boolean"},
+                    "basis": {"type": "string", "enum": ["user_context", "observed_context", "continuation"]},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+            },
             "update_mode": {
                 "type": "string",
                 "enum": ["status_update", "revise_open", "rework_completed"],
@@ -213,6 +225,16 @@ TOOLS = [
             "continue": {"type": "boolean"},
             "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
+            "preparation": {
+                "type": "object",
+                "description": "For the first list of this task/role/plan step, summarize understanding after sufficient context and skill consideration; do not include private reasoning. Existing progress updates do not need another preparation.",
+                "properties": {
+                    "goal": {"type": "string"}, "state": {"type": "string"},
+                    "skills": {"type": "string"}, "ready": {"type": "boolean"},
+                    "basis": {"type": "string", "enum": ["user_context", "observed_context", "continuation"]},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+            },
             "update_mode": {"type": "string", "enum": ["status_update", "revise_open", "rework_completed"]},
             "revision_reason": {"type": "string"},
             "revision_evidence": {},
@@ -248,6 +270,16 @@ TOOLS = [
             "continue": {"type": "boolean"},
             "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
+            "preparation": {
+                "type": "object",
+                "description": "For the first list of this task/role/plan step, summarize understanding after sufficient context and skill consideration; do not include private reasoning. Existing progress updates do not need another preparation.",
+                "properties": {
+                    "goal": {"type": "string"}, "state": {"type": "string"},
+                    "skills": {"type": "string"}, "ready": {"type": "boolean"},
+                    "basis": {"type": "string", "enum": ["user_context", "observed_context", "continuation"]},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+            },
             "update_mode": {"type": "string"},
             "mode": {"type": "string"},
             "operation": {"type": "string"},
@@ -672,14 +704,14 @@ TOOLS = [
     ),
 ]
 
-# split-source: order=1109 original-lines=31811-31812 hash=3ee29b226eaf3576
+# split-source: order=1109 original-lines=31849-31850 hash=3ee29b226eaf3576
 
 TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
 
-# split-source: order=1110 original-lines=31813-31813 hash=08ea091c248842a3
+# split-source: order=1110 original-lines=31851-31851 hash=08ea091c248842a3
 TOOL_SPEC_BY_NAME: dict[str, dict] = {}
 
-# split-source: order=1111 original-lines=31814-31823 hash=5b49546953f9369c
+# split-source: order=1111 original-lines=31852-31861 hash=5b49546953f9369c
 for _tool in TOOLS:
     try:
         _fn = _tool.get("function", {})
@@ -691,17 +723,17 @@ for _tool in TOOLS:
     except Exception:
         continue
 
-# split-source: order=1112 original-lines=31824-31825 hash=bfed07d2aedc6126
+# split-source: order=1112 original-lines=31862-31863 hash=bfed07d2aedc6126
 
 TOOL_NAME_FUZZY_MAP: dict[str, str] = {}
 
-# split-source: order=1113 original-lines=31826-31829 hash=61dd6436d3455b98
+# split-source: order=1113 original-lines=31864-31867 hash=61dd6436d3455b98
 for _name in TOOL_SPEC_BY_NAME.keys():
     _key = re.sub(r"[^a-z0-9]+", "", str(_name or "").lower())
     if _key and _key not in TOOL_NAME_FUZZY_MAP:
         TOOL_NAME_FUZZY_MAP[_key] = str(_name)
 
-# split-source: order=1114 original-lines=31830-31847 hash=8c7992dc17a67107
+# split-source: order=1114 original-lines=31868-31885 hash=8c7992dc17a67107
 
 for _alias, _target in {
     "writefile": "write_file",
@@ -721,7 +753,7 @@ for _alias, _target in {
 }.items():
     TOOL_NAME_FUZZY_MAP[_alias] = _target
 
-# split-source: order=1115 original-lines=31848-31864 hash=a168e414b363725e
+# split-source: order=1115 original-lines=31886-31902 hash=a168e414b363725e
 
 
 def is_todo_resume_tool_name(raw: object) -> bool:
@@ -740,7 +772,7 @@ def is_todo_resume_tool_name(raw: object) -> bool:
         "resumetodos",
     }
 
-# split-source: order=1116 original-lines=31865-31883 hash=b3e6ffc2768f20fa
+# split-source: order=1116 original-lines=31903-31921 hash=b3e6ffc2768f20fa
 
 
 def canonicalize_tool_name(raw: object) -> str:
@@ -761,7 +793,7 @@ def canonicalize_tool_name(raw: object) -> str:
         return lowered
     return mapped or name
 
-# split-source: order=1117 original-lines=31884-31899 hash=b445806005f59898
+# split-source: order=1117 original-lines=31922-31937 hash=b445806005f59898
 
 
 def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
@@ -779,7 +811,7 @@ def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enable
         out.append(tool)
     return out
 
-# split-source: order=1118 original-lines=31900-31910 hash=9ed4253b5af25719
+# split-source: order=1118 original-lines=31938-31948 hash=9ed4253b5af25719
 
 
 # Fix F: orchestration / worktree / teammate-management tools a sync-mode developer
@@ -792,7 +824,7 @@ DEVELOPER_TOOL_DROP: set[str] = {
     "shutdown_request", "plan_approval", "scan_skills", "write_skill",
 }
 
-# split-source: order=1119 original-lines=31911-31974 hash=c3efb64c9011ad20
+# split-source: order=1119 original-lines=31949-32012 hash=c3efb64c9011ad20
 
 AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
     "explorer": {

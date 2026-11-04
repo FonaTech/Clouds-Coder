@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1152 original-lines=105325-105642 hash=f5d7f23e5c7ed3cd
+# split-source: order=1152 original-lines=106193-106510 hash=f5d7f23e5c7ed3cd
 
 ADMIN_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -325,7 +325,7 @@ ADMIN_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=1153 original-lines=105643-105805 hash=108bd2aea5f4f594
+# split-source: order=1153 original-lines=106511-106673 hash=108bd2aea5f4f594
 
 ADMIN_CSS = """
 :root{--bg:#f3f6fb;--surface:#fff;--surface2:#f7f9fc;--text:#172033;--muted:#667085;--line:#dce3ee;--brand:#2563eb;--brand2:#0f9f8f;--danger:#b42318;--warn:#b54708;--shadow:0 18px 44px rgba(27,39,71,.09)}
@@ -490,7 +490,7 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 @media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head,.collab-detail-head,.collab-service-bar{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid,.process-toolbar,.evolution-form-grid{grid-template-columns:1fr}.evolution-span{grid-column:auto}.admin-nav{overflow:auto}.admin-nav .nav-tab{flex:0 0 auto;white-space:nowrap}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}.collab-filter-row,.collab-member-filter{grid-template-columns:1fr}.collab-service-actions{justify-content:flex-start}.collab-service-actions>*{flex:1 1 180px;text-align:center}}
 """
 
-# split-source: order=1154 original-lines=105806-106317 hash=d79488e90225dfcb
+# split-source: order=1154 original-lines=106674-107185 hash=d79488e90225dfcb
 
 ADMIN_JS = r"""
 const ADMIN_LANGUAGE_CODES=['zh-CN','zh-TW','ja','en'];

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1059 original-lines=26183-26395 hash=b20ebea8e953a4f2
+# split-source: order=1059 original-lines=26189-26401 hash=b20ebea8e953a4f2
 
 class WorktreeManager:
     def __init__(

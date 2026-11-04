@@ -5535,6 +5535,8 @@ SESSION_DEFERRED_START_QUEUE_MAX = max(
 SESSION_SUBMISSION_DEDUPE_MAX = 32
 SESSION_SUBMISSION_DEDUPE_SECONDS = 0.75
 SCHEDULER_SUBMISSION_DEDUPE_MAX = 256
+# This selects only the inexpensive complexity pre-screen. The task-level
+# router always asks for a semantic decision unless the user pinned a level.
 FAST_START_LOCAL_CLASSIFICATION = str(
     os.getenv("AGENT_FAST_START_LOCAL_CLASSIFICATION", "true") or "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -5903,9 +5905,12 @@ DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
 # whose default is ``force`` and whose explicit alternatives are ``auto`` and
 # ``off``.
 DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT = (
-    "Use the evidence from the completed read-only perception round to think "
-    "through the actual user goal for one planning turn. Then call TodoWrite "
-    "(or TodoWriteRescue) now and create a realistic list of 1-40 next actions. "
+    "Understand the actual user goal, relevant current state and available skills "
+    "before committing a checklist. One read or directory listing does not establish readiness. "
+    "Continue read-only discovery, read selected workflows completely, or ask_user "
+    "while material gaps remain. Existing user-provided or recalled state can be sufficient; "
+    "there is no fixed read count or preparation turn count. Once ready, call TodoWrite "
+    "(or TodoWriteRescue) with a brief preparation assessment and a realistic list of 1-40 next actions. "
     "When the request contains explicit ordered stages, preserve them one-for-one "
     "in the same order instead of merging them to fit a smaller list. Keep exactly "
     "one item in_progress, base items on observed "
@@ -6216,6 +6221,7 @@ BLACKBOARD_STATUSES = (
     "TESTING",
     "REVIEWING",
     "COMPLETED",
+    "ABORTED",
     "PAUSED",
 )
 TASK_COMPLEXITY_LEVELS = ("simple", "moderate", "complex", "expert")
@@ -6485,7 +6491,7 @@ PLAN_STEP_FULL_CONTENT_MAX_CHARS = 24_000
 PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "bash", "read_file", "context_recall", "task_get", "task_list",
     "check_background", "list_background_processes", "read_from_blackboard", "write_to_blackboard",
-    "list_skills", "load_skill", "unload_skill", "compress", "agent_web_search",
+    "list_skills", "load_skill", "unload_skill", "compress", "agent_web_search", "ask_user",
     # rag_remember writes only to the RAG knowledge library (never user files), so it is
     # safe during read-only planning — analogous to write_to_blackboard scratch persistence.
     "rag_remember",
@@ -7763,7 +7769,7 @@ BACKEND_I18N["en"].update(
         "plan_risk_medium": "medium",
         "plan_risk_high": "high",
         "plan_read_instruction": "Plan approved. `{path}` is a read-only execution mirror; use it to inspect step order and current status.\nRuntime todos and tool-evidence events remain authoritative. Execute steps in order, finish the current step before advancing, and load any referenced skill or workflow before starting.",
-        "plan_read_todo_note": "\nTODO PLANNING: At the START of work, call TodoWrite to create 3-6 subtasks for {step_label} only (parent_step_id='{parent_step_id}'), exactly one in_progress, and a final Acceptance item with its check and evidence shape. The initial subplan is a rolling execution hypothesis, not an immutable script. Before every update, read CANONICAL SUBTASKS plus the latest current-step tool/reviewer evidence; normally continue the current in_progress item. Only when concrete new evidence proves the OPEN portion is incomplete, obsolete, wrongly ordered, or poorly split, submit the complete revised open snapshot with update_mode='revise_open', revision_reason, and exact revision_evidence references; the runtime audits it atomically. Never revise for stylistic preference, cross parent steps, or erase completed evidence. Use update_mode='rework_completed' only when cited failure/reviewer evidence requires reopening completed work. Use update_mode='status_update' for ordinary progress and update immediately after each completed subtask. Do NOT use finish_current_task for a subtask or one plan step.\n",
+        "plan_read_todo_note": "\nTODO PLANNING: First understand the goal and actual current-step state, consider available skills and read selected full workflows; continue observation or clarification until ready. Then call TodoWrite with a preparation assessment to create the necessary subtasks for {step_label} only (parent_step_id='{parent_step_id}'), exactly one in_progress, and a final Acceptance item with its check and evidence shape. The initial subplan is a rolling execution hypothesis, not an immutable script. Before every update, read CANONICAL SUBTASKS plus the latest current-step tool/reviewer evidence; normally continue the current in_progress item. Only when concrete new evidence proves the OPEN portion is incomplete, obsolete, wrongly ordered, or poorly split, submit the complete revised open snapshot with update_mode='revise_open', revision_reason, and exact revision_evidence references; the runtime audits it atomically. Never revise for stylistic preference, cross parent steps, or erase completed evidence. Use update_mode='rework_completed' only when cited failure/reviewer evidence requires reopening completed work. Use update_mode='status_update' for ordinary progress and update immediately after each completed subtask. Do NOT use finish_current_task for a subtask or one plan step.\n",
         "plan_proposal_title": "## 📋 Execution Plans\n",
         "plan_proposal_background": "### Background Analysis\n{context}\n",
         "plan_proposal_option": "### Option {id}: {title}",
@@ -7864,7 +7870,7 @@ BACKEND_I18N["zh-CN"].update(
         "plan_risk_medium": "中",
         "plan_risk_high": "高",
         "plan_read_instruction": "计划已批准。`{path}` 是只读执行镜像，可用 `read_file {path}` 查看步骤顺序和当前状态；运行时 Todo 与工具证据事件才是权威状态。\n按顺序执行，完成当前步骤后再推进下一步；如果步骤引用了 skill 或 workflow，开始前先调用 load_skill。",
-        "plan_read_todo_note": "\nTODO 更新：一开始调用 TodoWrite，只为当前步骤（{step_label}）创建 3-6 个子任务，每项必须包含 parent_step_id='{parent_step_id}'，只能有一个 in_progress，最后一项必须是写明检查动作与证据形态的“验收”。初始子计划是可滚动修订的执行假设，不是不可改变的脚本。每次更新前，先阅读 CANONICAL SUBTASKS 和当前步骤最新的工具/审核证据；通常优先继续当前 in_progress。只有切实的新证据表明开放部分存在遗漏、失效、顺序错误或拆分不合理时，才提交完整的新开放清单，并设置 update_mode='revise_open'、revision_reason 和精确的 revision_evidence；运行时会原子审核。不要为了措辞或偏好盲目改动，不要跨母步骤，也不要抹掉已完成证据。只有失败证据或审核不通过要求返工时才使用 update_mode='rework_completed'。普通状态推进使用 update_mode='status_update'；每完成一项立即更新并把下一项切为 in_progress。不要用 finish_current_task 完成子任务或单个计划步骤。\n",
+        "plan_read_todo_note": "\nTODO 更新：先理解目标和当前步骤的真实状态，考虑可用技能并阅读选定技能的完整流程；缺少关键上下文时继续只读感知或澄清。准备充分后携带 preparation 评估调用 TodoWrite，只为当前步骤（{step_label}）创建必要的子任务，每项必须包含 parent_step_id='{parent_step_id}'，只能有一个 in_progress，最后一项必须是写明检查动作与证据形态的“验收”。初始子计划是可滚动修订的执行假设，不是不可改变的脚本。每次更新前，先阅读 CANONICAL SUBTASKS 和当前步骤最新的工具/审核证据；通常优先继续当前 in_progress。只有切实的新证据表明开放部分存在遗漏、失效、顺序错误或拆分不合理时，才提交完整的新开放清单，并设置 update_mode='revise_open'、revision_reason 和精确的 revision_evidence；运行时会原子审核。不要为了措辞或偏好盲目改动，不要跨母步骤，也不要抹掉已完成证据。只有失败证据或审核不通过要求返工时才使用 update_mode='rework_completed'。普通状态推进使用 update_mode='status_update'；每完成一项立即更新并把下一项切为 in_progress。不要用 finish_current_task 完成子任务或单个计划步骤。\n",
         "plan_proposal_title": "## 📋 执行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 方案 {id}：{title}",
@@ -7965,7 +7971,7 @@ BACKEND_I18N["zh-TW"].update(
         "plan_risk_medium": "中",
         "plan_risk_high": "高",
         "plan_read_instruction": "計畫已核准。`{path}` 是唯讀執行鏡像，可用 `read_file {path}` 查看步驟順序與目前狀態；執行階段 Todo 與工具證據事件才是權威狀態。\n請依序執行，完成目前步驟後再推進下一步；如果步驟引用了 skill 或 workflow，開始前先呼叫 load_skill。",
-        "plan_read_todo_note": "\nTODO 更新：一開始呼叫 TodoWrite，只為目前步驟（{step_label}）建立 3-6 個子任務，每項包含 parent_step_id='{parent_step_id}'，只能有一個 in_progress，最後一項是寫明檢查動作與證據形態的「驗收」。初始子計畫是可滾動修訂的執行假設。每次更新前先閱讀 CANONICAL SUBTASKS 與目前步驟最新工具/審核證據；通常先延續目前 in_progress。只有具體新證據證明開放部分有遺漏、失效、順序錯誤或拆分不合理時，才提交完整新開放清單，並設定 update_mode='revise_open'、revision_reason 與精確 revision_evidence；執行階段會原子審核。不要為措辭或偏好盲目修改，不要跨母步驟，也不要抹除已完成證據。只有失敗證據或審核未通過要求返工時才使用 update_mode='rework_completed'。普通狀態推進使用 update_mode='status_update'；每完成一項立即更新並切換下一項為 in_progress。不要用 finish_current_task 完成子任務或單一計畫步驟。\n",
+        "plan_read_todo_note": "\nTODO 更新：先理解目標和目前步驟的真實狀態，考慮可用技能並閱讀選定技能的完整流程；關鍵上下文不足時繼續唯讀觀察或澄清。準備充分後附帶 preparation 評估呼叫 TodoWrite，只為目前步驟（{step_label}）建立必要子任務，每項包含 parent_step_id='{parent_step_id}'，只能有一個 in_progress，最後一項是寫明檢查動作與證據形態的「驗收」。初始子計畫是可滾動修訂的執行假設。每次更新前先閱讀 CANONICAL SUBTASKS 與目前步驟最新工具/審核證據；通常先延續目前 in_progress。只有具體新證據證明開放部分有遺漏、失效、順序錯誤或拆分不合理時，才提交完整新開放清單，並設定 update_mode='revise_open'、revision_reason 與精確 revision_evidence；執行階段會原子審核。不要為措辭或偏好盲目修改，不要跨母步驟，也不要抹除已完成證據。只有失敗證據或審核未通過要求返工時才使用 update_mode='rework_completed'。普通狀態推進使用 update_mode='status_update'；每完成一項立即更新並切換下一項為 in_progress。不要用 finish_current_task 完成子任務或單一計畫步驟。\n",
         "plan_proposal_title": "## 📋 執行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 方案 {id}：{title}",
@@ -8066,7 +8072,7 @@ BACKEND_I18N["ja"].update(
         "plan_risk_medium": "中",
         "plan_risk_high": "高",
         "plan_read_instruction": "計画が承認されました。`{path}` は読み取り専用の実行ミラーです。`read_file {path}` で手順と現在状態を確認できますが、正式な状態はランタイム Todo とツール証拠イベントです。\n必ず順番に実行し、現在のステップを完了してから次へ進んでください。ステップが skill や workflow を参照している場合は、開始前に load_skill を呼び出してください。",
-        "plan_read_todo_note": "\nTODO 更新: 最初に TodoWrite で現在のステップ（{step_label}）だけを 3-6 件に分解し、各行に parent_step_id='{parent_step_id}' を含め、in_progress は 1 件、最後は確認内容と証拠形を明記した「受入確認」にします。初期サブプランは固定スクリプトではなく、証拠に基づくローリング仮説です。更新前に CANONICAL SUBTASKS と現在ステップの最新ツール/レビュー証拠を読み、通常は現在の in_progress を続行します。具体的な新証拠が未完了部分の不足・陳腐化・順序誤り・分割不良を示す場合だけ、完全な新しい未完了スナップショットを update_mode='revise_open'、revision_reason、revision_evidence とともに提出してください。ランタイムが原子的に監査します。表現上の好みだけで変更せず、親ステップを越えず、完了済み証拠を消さないでください。失敗証拠またはレビュー不合格で完了作業の再実行が必要な場合のみ update_mode='rework_completed' を使います。通常の進捗は update_mode='status_update' とし、各サブタスク完了直後に更新して次を in_progress にしてください。\n",
+        "plan_read_todo_note": "\nTODO 更新: 目標と現在の状態を理解し、利用可能なスキルを検討して選択した手順の全文を読みます。重要な情報が不足する場合は観察や確認を続け、準備が整ってから preparation 評価を添えた TodoWrite で現在のステップ（{step_label}）だけを必要な項目に分解し、各行に parent_step_id='{parent_step_id}' を含め、in_progress は 1 件、最後は確認内容と証拠形を明記した「受入確認」にします。初期サブプランは固定スクリプトではなく、証拠に基づくローリング仮説です。更新前に CANONICAL SUBTASKS と現在ステップの最新ツール/レビュー証拠を読み、通常は現在の in_progress を続行します。具体的な新証拠が未完了部分の不足・陳腐化・順序誤り・分割不良を示す場合だけ、完全な新しい未完了スナップショットを update_mode='revise_open'、revision_reason、revision_evidence とともに提出してください。ランタイムが原子的に監査します。表現上の好みだけで変更せず、親ステップを越えず、完了済み証拠を消さないでください。失敗証拠またはレビュー不合格で完了作業の再実行が必要な場合のみ update_mode='rework_completed' を使います。通常の進捗は update_mode='status_update' とし、各サブタスク完了直後に更新して次を in_progress にしてください。\n",
         "plan_proposal_title": "## 📋 実行プラン\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 案 {id}: {title}",
@@ -31289,6 +31295,8 @@ TOOLS = [
             "(e.g. {\"id\": \"t3\", \"status\": \"completed\"}). Preserve ids of retained rows in revisions; "
             "omit an id only for genuinely new work. Unknown or out-of-scope ids reject the update. "
             "A partial update selecting in_progress moves that owner's active cursor."
+            " In Sync mode submit only the active role's rows: peers are preserved automatically "
+            "and remain part of the independent review's full proposed tree."
         ),
         {
             "items": {"type": "array", "items": {}},
@@ -31312,6 +31320,16 @@ TOOLS = [
             "continue": {"type": "boolean"},
             "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
+            "preparation": {
+                "type": "object",
+                "description": "For the first list of this task/role/plan step, summarize understanding after sufficient context and skill consideration; do not include private reasoning. Existing progress updates do not need another preparation.",
+                "properties": {
+                    "goal": {"type": "string"}, "state": {"type": "string"},
+                    "skills": {"type": "string"}, "ready": {"type": "boolean"},
+                    "basis": {"type": "string", "enum": ["user_context", "observed_context", "continuation"]},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+            },
             "update_mode": {
                 "type": "string",
                 "enum": ["status_update", "revise_open", "rework_completed"],
@@ -31350,6 +31368,16 @@ TOOLS = [
             "continue": {"type": "boolean"},
             "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
+            "preparation": {
+                "type": "object",
+                "description": "For the first list of this task/role/plan step, summarize understanding after sufficient context and skill consideration; do not include private reasoning. Existing progress updates do not need another preparation.",
+                "properties": {
+                    "goal": {"type": "string"}, "state": {"type": "string"},
+                    "skills": {"type": "string"}, "ready": {"type": "boolean"},
+                    "basis": {"type": "string", "enum": ["user_context", "observed_context", "continuation"]},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+            },
             "update_mode": {"type": "string", "enum": ["status_update", "revise_open", "rework_completed"]},
             "revision_reason": {"type": "string"},
             "revision_evidence": {},
@@ -31385,6 +31413,16 @@ TOOLS = [
             "continue": {"type": "boolean"},
             "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
+            "preparation": {
+                "type": "object",
+                "description": "For the first list of this task/role/plan step, summarize understanding after sufficient context and skill consideration; do not include private reasoning. Existing progress updates do not need another preparation.",
+                "properties": {
+                    "goal": {"type": "string"}, "state": {"type": "string"},
+                    "skills": {"type": "string"}, "ready": {"type": "boolean"},
+                    "basis": {"type": "string", "enum": ["user_context", "observed_context", "continuation"]},
+                    "missing": {"type": "array", "items": {"type": "string"}},
+                },
+            },
             "update_mode": {"type": "string"},
             "mode": {"type": "string"},
             "operation": {"type": "string"},
@@ -33383,6 +33421,7 @@ class SessionState:
             default_llm_config or {}
         )
         self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+        self._task_preparation_required = True
         self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
         self.single_no_plan_todo_bootstrap_state = "idle"
         self.single_no_plan_todo_bootstrap_attempts = 0
@@ -36811,6 +36850,11 @@ class SessionState:
 
     def _previous_task_context_snapshot(self, board: dict | None = None) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+        try:
+            previous_level = int(profile.get("task_level", getattr(self, "runtime_task_level", 0)) or 0)
+        except (TypeError, ValueError):
+            previous_level = 0
         completion = self._normalize_completion_state(bb.get("completion", {}))
         approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
         artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
@@ -36849,6 +36893,8 @@ class SessionState:
                     break
         out = {
             "goal": trim(str(bb.get("original_goal", "") or ""), 800),
+            "task_level": previous_level if previous_level in TASK_LEVEL_CHOICES else None,
+            "execution_mode": str(profile.get("execution_mode", "") or ""),
             "status": self._normalize_blackboard_status(bb.get("status", "INITIALIZING")),
             "summary": summary,
             "artifact_paths": artifact_paths,
@@ -36867,6 +36913,10 @@ class SessionState:
         if not ctx:
             return ""
         lines: list[str] = []
+        if ctx.get("task_level") in TASK_LEVEL_CHOICES:
+            lines.append(f"previous_task_level: L{ctx['task_level']}")
+        if ctx.get("status"):
+            lines.append(f"previous_task_status: {ctx['status']}")
         goal = trim(str(ctx.get("goal", "") or ""), 240)
         if goal:
             lines.append(f"previous_goal: {goal}")
@@ -36933,6 +36983,10 @@ class SessionState:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if self._blackboard_is_finished_or_aborted(bb):
             return False
+        if str(bb.get("original_goal", "") or "").strip() and self._unfinished_task_level(bb):
+            # A classified task may be paused before its first artifact/tool.
+            # Absence of progress evidence is not evidence of task completion.
+            return True
         if self._has_resumable_plan_state():
             return True
         todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
@@ -37707,6 +37761,169 @@ class SessionState:
         if prev_fp and self.skills.fingerprint and prev_fp != self.skills.fingerprint:
             self.skill_load_cache = {}
 
+    def _prepare_skill_execution_workspace(self, skill_id: str) -> dict:
+        """Materialize selected resources with their original relative layout.
+
+        Published/global sources stay immutable. Directories in the verified
+        task-local mirror are writable for script caches and generated outputs;
+        source files are verified separately from those generated files.
+        """
+        if not getattr(self, "files_root", None):
+            return {}
+        gate = getattr(self, "_skill_execution_workspace_lock", None)
+        if gate is None:
+            gate = self._skill_execution_workspace_lock = threading.RLock()
+        with gate:
+            sources: dict[str, bytes] = {}
+            hard = getattr(self, "skill_mode", "dynamic") == "hard"
+            if hard:
+                bound = list(getattr(self, "bound_skill_ids", []))
+                if skill_id not in bound:
+                    raise ValueError("Only bound application skills have execution resources")
+                order = bound.index(skill_id) + 1
+                snapshot = self._application_snapshot_root()
+                source = snapshot / f"{order:02d}"
+                if not (source / "SKILL.md").is_file():
+                    return {"skill_id": skill_id, "status": "legacy-instructions-only"}
+                valid, error = self._application_snapshot_manifest_valid()
+                if not valid:
+                    raise ValueError(error)
+                manifest = json.loads((snapshot / "MANIFEST.json").read_text(encoding="utf-8"))
+                for row in manifest.get("resources", []):
+                    if int(row.get("skill_order", 0) or 0) == order:
+                        rel = str(row.get("path", "") or "")
+                        sources[rel] = safe_path(rel, source).read_bytes()
+                source_path = f"/workspace/.application_skills/{order:02d}/SKILL.md"
+            else:
+                skill = getattr(getattr(self, "skills", None), "skills", {}).get(skill_id, {})
+                if not skill:
+                    raise ValueError("Skill is not in the current catalog")
+                source_path = str(skill.get("skill_path", "") or "")
+                raw_source = str(skill.get("skill_abs_path", "") or "")
+                source = Path(raw_source) if raw_source and not _is_http_url(raw_source) else None
+                if source is not None and source.is_file() and not source.is_symlink():
+                    sources["SKILL.md"] = source.read_bytes()
+                    base = source.resolve().parent
+                    for row in skill.get("attachments", []):
+                        rel = str(row.get("path", "") or "")
+                        raw_path = str(row.get("abs_path", "") or "")
+                        if not rel or not raw_path:
+                            continue
+                        target = Path(raw_path)
+                        resolved = target.resolve()
+                        if target.is_symlink() or not resolved.is_relative_to(base):
+                            raise ValueError("Skill resource is outside its approved source directory")
+                        if target.is_file():
+                            sources[rel] = target.read_bytes()
+                else:
+                    # Remote and builtin instructions can still be read in
+                    # full; this does not grant their scripts host access.
+                    body = str(skill.get("body", "") or "")
+                    if body:
+                        sources["SKILL.md"] = body.encode("utf-8", errors="backslashreplace")
+            if not sources:
+                return {"skill_id": skill_id, "status": "instructions-only"}
+            if len(sources) > ADMIN_MAX_APP_RESOURCE_FILES or sum(map(len, sources.values())) > ADMIN_MAX_APP_RESOURCE_BYTES:
+                raise ValueError("Selected skill resources exceed the configured snapshot capacity; no partial copy was made")
+            hashes, seen = {}, set()
+            for rel, raw in sources.items():
+                normalized = rel.replace("\\", "/")
+                parts = PurePosixPath(normalized).parts
+                folded = unicodedata.normalize("NFC", normalized).casefold()
+                if (not parts or normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized)
+                        or any(part in {".", ".."} for part in parts) or folded in seen):
+                    raise ValueError("Invalid or cross-platform ambiguous skill resource path")
+                seen.add(folded)
+                hashes[normalized] = hashlib.sha256(raw).hexdigest()
+            bundle = hashlib.sha256(json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            slug = hashlib.sha256(skill_id.encode("utf-8", errors="backslashreplace")).hexdigest()[:12]
+            relative = f".skill_runtime/skill-{slug}-{bundle[:12]}"
+            target_root = safe_path(relative, self.files_root)
+            target_root.mkdir(parents=True, exist_ok=True)
+            for rel, raw in sources.items():
+                rel = rel.replace("\\", "/")
+                target = safe_path(rel, target_root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    raise ValueError("Skill execution resource must not be a symlink")
+                if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == hashes[rel]:
+                    continue
+                if target.exists():
+                    raise ValueError("Verified execution source changed; reload in a fresh task instead of executing modified skill code")
+                temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+                try:
+                    temporary.write_bytes(raw)
+                    os.replace(temporary, target)
+                    try:
+                        os.chmod(target, 0o500 if target.suffix.lower() in {".py", ".sh", ".js", ".mjs"} else 0o400)
+                    except OSError:
+                        # Windows permissions are enforced by workspace scope
+                        # and content checks, not POSIX executable mode bits.
+                        pass
+                finally:
+                    if temporary.exists():
+                        temporary.unlink()
+            record = {"skill_id": skill_id, "root": f"/workspace/{relative}", "relative_root": relative,
+                      "workflow": f"/workspace/{relative}/SKILL.md", "authoritative_source": source_path,
+                      "source_directory": str(source.resolve().parent) if not hard and source is not None and source.is_file() else "",
+                      "bundle_digest": bundle, "files": hashes, "status": "ready"}
+            records = getattr(self, "_skill_execution_workspaces", None)
+            if not isinstance(records, dict):
+                records = self._skill_execution_workspaces = {}
+            records[skill_id] = record
+            return dict(record)
+
+    def _skill_execution_workspace_note(self, skill_ids: list[str]) -> str:
+        rows = []
+        for skill_id in skill_ids:
+            try:
+                row = self._prepare_skill_execution_workspace(skill_id)
+                if row.get("status") == "ready":
+                    rows.append({key: row[key] for key in ("skill_id", "root", "workflow", "authoritative_source")})
+            except Exception as exc:
+                rows.append({"skill_id": skill_id, "error": str(exc)[:400]})
+        if not rows:
+            return ""
+        return ("\nSELECTED SKILL EXECUTION RESOURCES: " + json_dumps(rows, ensure_ascii=False)
+                + "\nUse read_file(mode='full') on the workflow locator to read the COMPLETE procedure before committing Todos or substantive execution. "
+                "Excerpts are navigation hints, not the full procedure. Run the supplied unchanged scripts "
+                "from these verified task-local mirrors; their relative resource layout is preserved. "
+                "Use task workspace paths for inputs/outputs and keep the ordinary task working directory. "
+                "Cache files beside scripts are allowed in the mirror, never in the original global or frozen source. "
+                "In ordinary sessions, selected /skills shell aliases also resolve to this mirror; seeing a cache there is not evidence of a global-source write. "
+                "Do not retype the source, chmod the published snapshot, or broaden host permissions.\n")
+
+    def _verify_skill_execution_workspaces(self) -> str:
+        for row in list(getattr(self, "_skill_execution_workspaces", {}).values()):
+            try:
+                root = safe_path(row["relative_root"], self.files_root)
+                for rel, expected in row["files"].items():
+                    path = safe_path(rel, root)
+                    if path.is_symlink() or not path.is_file() or not hmac.compare_digest(_sha256_file(path), expected):
+                        return "verified skill execution source changed: " + rel
+            except Exception as exc:
+                return "skill execution resources are inaccessible: " + type(exc).__name__
+        return ""
+
+    def _selected_skill_shell_mappings(self) -> list[tuple[str, str]]:
+        """Selected global aliases resolve to verified copies, never to host grants."""
+        if getattr(self, "skill_mode", "dynamic") == "hard":
+            return []
+        records = getattr(self, "_skill_execution_workspaces", {})
+        if not isinstance(records, dict) or not records:
+            return []
+        active = self._loaded_skill_rows()
+        mappings = []
+        for key, row in records.items():
+            if key not in active or not row.get("source_directory"):
+                continue
+            target = str(safe_path(row["relative_root"], self.files_root))
+            source = str(row.get("authoritative_source", "")).partition("#")[0]
+            if source.startswith("/skills/"):
+                mappings.append((str(PurePosixPath(source).parent), target))
+            mappings.append((str(row["source_directory"]), target))
+        return sorted(mappings, key=lambda pair: len(pair[0]), reverse=True)
+
     def _load_skill_with_cache(self, name: str, load_source: str = "manual", *, purpose: str = "", evidence: list | None = None, keep_for_step: bool = False) -> str:
         if self.skill_mode == "hard":
             requested = str(name or "").strip()
@@ -37715,7 +37932,8 @@ class SessionState:
             order = self.bound_skill_ids.index(requested) + 1
             frozen = f"/workspace/.application_skills/{order:02d}/SKILL.md"
             if (self._application_snapshot_root() / f"{order:02d}" / "SKILL.md").exists():
-                return f"Skill is hard-bound and active. Its complete immutable source is {frozen}; read that file before execution."
+                return (f"Skill is hard-bound and active. Its complete immutable source is {frozen}; read that file before execution."
+                        + self._skill_execution_workspace_note([requested]))
             return "Skill is already active from the legacy immutable application snapshot."
         self._ensure_skills_ready(force=False)
         resolution = self.skills.canonicalize_id(name)
@@ -37751,7 +37969,7 @@ class SessionState:
             self.blackboard = board
         self._record_skill_operation("load", key, source=load_source, purpose=purpose, evidence=evidence,
                                      keep_for_step=keep_for_step or was_active)
-        return text
+        return self._skill_execution_workspace_note([key]) + text
 
     def _record_skill_operation(self, operation: str, skill_id: str, *, source: str, purpose: str = "", evidence: list | None = None, keep_for_step: bool = False):
         board = self._ensure_blackboard()
@@ -38677,7 +38895,8 @@ class SessionState:
                     "`/workspace/.application_skills/MANIFEST.json` and use only those immutable copies. "
                     "Do not access the mutable global `/skills` tree.\n"
                 )
-            return header + str(self.bound_skill_capsule or "")
+            return (header + self._skill_execution_workspace_note(list(getattr(self, "bound_skill_ids", [])))
+                    + str(self.bound_skill_capsule or ""))
         loaded = self._loaded_skill_rows()
         if not loaded:
             return ""
@@ -38685,8 +38904,10 @@ class SessionState:
         parts: list[str] = [
             "ACTIVE SKILL WORKFLOWS (rehydrated):",
             "Treat these instructions as active operating procedure for matching steps. "
-            "If they conflict with a generic plan, the skill workflow wins.",
+            "Follow the complete workflow, subject to the user's request and runtime permissions. "
+            "Do not replace its concrete tools or checks with a generic plan.",
         ]
+        execution_note = self._skill_execution_workspace_note(list(loaded))
         remaining = budget
         for skill_key, row_obj in list(loaded.items())[:10]:
             row = row_obj if isinstance(row_obj, dict) else {}
@@ -38725,7 +38946,9 @@ class SessionState:
                 "\nWorker duty: before acting, map the current step to the active skill workflow and "
                 "use the specified tools/scripts/files when applicable."
             )
-        return ("\n".join(parts) + role_note + "\n")[:budget]
+        # Keep the complete-workflow locator outside the excerpt truncation so
+        # compaction or a long first skill cannot hide it from later roles.
+        return execution_note + ("\n".join(parts) + role_note + "\n")[:budget]
 
     def _clear_loaded_skill_contexts(self):
         def _filter_rows(rows: list[dict]) -> list[dict]:
@@ -39249,6 +39472,29 @@ class SessionState:
     def _todo_contract_prompt_block(self) -> str:
         """Build the level-driven Todo contract injected into agent prompts."""
         level = self._runtime_task_level_for_todo_policy()
+        preparation_note = (
+            " INITIAL LIST PREPARATION: understand the goal and actual state, consider available skills even outside "
+            "an application, and read selected workflows completely. Continue observation or ask_user until material "
+            "gaps are resolved; the first read is not a readiness signal. When ready, include preparation={goal, state, "
+            "skills, basis:user_context|observed_context|continuation, ready:true, missing:[]} in the first TodoWrite "
+            "for this role/current step. Use concise conclusions, not private reasoning. Omit ids for new rows; "
+            "never invent t1/t2. Existing progress updates keep their original ids and need no repeat assessment. "
+        )
+        if level >= 3 and self._runtime_level_requires_todos():
+            if bool(getattr(self, "runtime_plan_mode_needed", False)) and not bool(getattr(self, "runtime_plan_approved", False)):
+                return (f"MANDATORY L{level} TODO CONTRACT: complete the pending Plan and await its approval first. "
+                        "Do not invent an execution Todo graph or finish while the Plan is unapproved.")
+            if bool(getattr(self, "runtime_plan_approved", False)):
+                return (f"MANDATORY L{level} TODO CONTRACT: maintain the approved current-step Todo graph. "
+                        "Preserve parent scope, identities and peer ownership. Update progress after real changes. "
+                        "Use plan_updates plus revise_open for supported goal/acceptance changes; diagnose failures, "
+                        "repair and verify again. Do not finish with incomplete steps or subtasks." + preparation_note)
+            return (f"MANDATORY L{level} TODO CONTRACT: after read-only orientation, use TodoWrite to create "
+                    "a compact goal-based checklist for your own assigned work before side effects; another owner's "
+                    "rows do not initialize your tracking. Maintain the same IDs, keep peer-owned "
+                    "rows and exactly one current item per owner. Revise open goals when requirements change; "
+                    "on errors diagnose, repair and revalidate, then update the same rows. Never finish while "
+                    "the required list is absent or any owner still has unfinished work." + preparation_note)
         if level != 2 or not self._runtime_level_requires_todos():
             return ""
         l2_policy = normalize_l2_todo_policy(
@@ -39269,17 +39515,17 @@ class SessionState:
                 "represented by Todo rows. Because a plan is active, use the existing "
                 "plan/runtime step-local Todo graph and preserve its parent scope; do "
                 "not create a second flat graph. Keep exactly one current item "
-                "in_progress and update it after each real status change."
+                "in_progress and update it after each real status change." + preparation_note
             )
         return (
             f"{contract_label}: this run is level 2 and must have a compact, "
             "evidence-based Todo list even when the startup single/no-plan Todo option "
-            "is disabled. First perform a short read-only perception pass, then call "
+            "is disabled. First assess whether the actual context is sufficient, then call "
             "TodoWrite or TodoWriteRescue before any mutation. Create 1-40 realistic "
             "next actions with exactly one item in_progress. If the request defines ordered "
             "stages, preserve every stage one-for-one and in order; update the same list after "
             "each real status change. Do not write files or claim completion while the "
-            "required Todo list is absent."
+            "required Todo list is absent." + preparation_note
         )
 
     def _agent_language_preference(self) -> dict:
@@ -40401,6 +40647,7 @@ class SessionState:
             }
             compact_plan = {
                 "phase": plan.get("phase", ""),
+                "preparation_state": plan.get("preparation_state", ""),
                 "chosen": plan.get("chosen", ""),
                 "steps": plan.get("steps", []),
                 "charter": {
@@ -53810,8 +54057,8 @@ body{padding:18px}
         )
         short_instruction = (
             "The previous completed responses contained reasoning but no final action. "
-            "Use the existing reasoning and return the required TodoWrite/TodoWriteRescue call now. "
-            "Do not repeat analysis."
+            "Return one preparation action: observe or ask_user if material context is missing; "
+            "use TodoWrite with an honest preparation assessment only when ready. Do not invent readiness to escape this retry."
             if bootstrap
             else
             "The previous completed responses contained reasoning but no final action. "
@@ -53859,16 +54106,15 @@ body{padding:18px}
                 call for call in calls1
                 if canonicalize_tool_name(
                     (call.get("function", {}) if isinstance(call, dict) else {}).get("name", "")
-                ) in {"TodoWrite", "TodoWriteRescue"}
+                ) in {canonicalize_tool_name(spec.get("function", {}).get("name", "")) for spec in tools}
             ]
         if calls1 or (text1.strip() and not bootstrap):
             return {"ok": True, "response": {"content": text1, "thinking": thinking1, "tool_calls": calls1}, "stage": "short"}
 
-        forced_name = "TodoWrite" if bootstrap and self._provider_supports_native_tool_choice() else ""
         second_instruction = (
             "/no_think\nThinking is disabled for this compatibility retry. "
-            "Call TodoWrite now with 1-40 evidence-based items and exactly one in_progress item. "
-            "Output no prose."
+            "Take one real preparation action. Continue observation or ask_user for missing context; "
+            "submit TodoWrite with preparation only if ready. Output no analysis."
             if bootstrap
             else
             "/no_think\nThinking is disabled for this compatibility retry. "
@@ -53876,7 +54122,7 @@ body{padding:18px}
         )
         try:
             forced_kwargs = {
-                "tools": (self._single_no_plan_todo_bootstrap_tools() if bootstrap else tools),
+                "tools": tools,
                 "system": self._system_prompt(),
                 "max_tokens": max_tokens,
                 "think": False,
@@ -53887,8 +54133,6 @@ body{padding:18px}
                 "media_inputs": None,
                 "effort": EFFORT_OFF,
             }
-            if forced_name:
-                forced_kwargs["tool_choice"] = forced_name
             second = self._chat_with_same_model_retry(
                 list(self.messages) + [{"role": "user", "content": second_instruction, "ts": now_ts()}],
                 **forced_kwargs,
@@ -53906,7 +54150,7 @@ body{padding:18px}
                 call for call in calls2
                 if canonicalize_tool_name(
                     (call.get("function", {}) if isinstance(call, dict) else {}).get("name", "")
-                ) in {"TodoWrite", "TodoWriteRescue"}
+                ) in {canonicalize_tool_name(spec.get("function", {}).get("name", "")) for spec in tools}
             ]
         if calls2 or (text2.strip() and not bootstrap):
             return {"ok": True, "response": {"content": text2, "thinking": thinking2, "tool_calls": calls2}, "stage": "forced"}
@@ -55744,9 +55988,9 @@ body{padding:18px}
         if not raw:
             return raw
         try:
-            workspace_root = str(cwd.resolve())
+            workspace_root = str(self.files_root.resolve())
         except Exception:
-            workspace_root = str(cwd)
+            workspace_root = str(self.files_root)
         try:
             skills_root = str(self.skills.skills_root.resolve())
         except Exception:
@@ -55755,7 +55999,7 @@ body{padding:18px}
             js_lib_root = str(self.js_lib_root.resolve())
         except Exception:
             js_lib_root = str(self.js_lib_root)
-        mappings = self.skills.shell_virtual_mappings() + [
+        mappings = self._selected_skill_shell_mappings() + self.skills.shell_virtual_mappings() + [
             ("/workspace", workspace_root),
             (SKILLS_VIRTUAL_PREFIX, skills_root),
             ("/js_lib", js_lib_root),
@@ -55927,7 +56171,17 @@ body{padding:18px}
         if not raw.strip():
             return False
         low = raw.lower()
-        if re.search(r"(?<!<)>{1,2}(?![>&])", raw):
+        # Shell redirection is outside quoted program arguments. A comparison
+        # such as python -c "print(actual > expected)" does not write a file.
+        try:
+            lexer = shlex.shlex(raw, posix=True, punctuation_chars="<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            shell_tokens = list(lexer)
+            if any(token in {">", ">>"} and not (index + 1 < len(shell_tokens) and shell_tokens[index + 1].startswith("&"))
+                   for index, token in enumerate(shell_tokens)):
+                return True
+        except ValueError:
             return True
         if re.search(
             r"(?im)(?:^|[;&|]\s*)(?:command\s+|sudo\s+|env\s+)*"
@@ -55981,6 +56235,8 @@ body{padding:18px}
         text = str(command or "")
         if not text.strip():
             return False
+        if self._selected_skill_shell_mappings():
+            text = self._rewrite_shell_virtual_paths(text, self.files_root)
         try:
             skills_root = str(self.skills.skills_root.resolve()).rstrip(os.sep)
         except Exception:
@@ -56264,12 +56520,55 @@ body{padding:18px}
                 raw,
             )
         )
-        return bool(
-            references_snapshot
-            and (self._shell_command_has_mutation_intent(raw) or scripted_mutation)
-        )
+        if not references_snapshot:
+            return False
+        if scripted_mutation:
+            return True
+        # A read-only source in a compound command is not a write target.
+        # In particular cp SOURCE WORKSPACE and a validation command followed
+        # by ls SOURCE were rejected by the old whole-command heuristic. The
+        # OS read-only overlay and post-command integrity check remain the
+        # enforcement layer for indirect/obfuscated writes.
+        in_snapshot = False
+        for clause in re.split(r"&&|\|\||[;\n]", raw):
+            try:
+                tokens = shlex.split(clause)
+            except ValueError:
+                continue
+            if not tokens:
+                continue
+            if tokens[0] in {"if", "elif", "!"}:
+                tokens = tokens[1:]
+            if not tokens:
+                continue
+            executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+            args = [token for token in tokens[1:] if not token.startswith("-")]
+            def touches(value):
+                path_text = str(value).replace("\\", "/").casefold()
+                return ".application_skills" in path_text or bool(root and root in path_text)
+            if executable == "cd":
+                in_snapshot = bool(args and touches(args[-1]))
+                continue
+            if re.search(r">{1,2}\s*['\"]?[^\s;|]*\.application_skills", clause, flags=re.IGNORECASE):
+                return True
+            if executable in {"cp", "copy", "xcopy", "robocopy", "install"}:
+                if args and (touches(args[-1]) or in_snapshot):
+                    return True
+                continue
+            if executable in {"rm", "rmdir", "del", "erase", "mv", "move", "rename", "chmod", "chown", "touch", "mkdir", "truncate", "tee"}:
+                if in_snapshot or any(touches(token) for token in args):
+                    return True
+            if (in_snapshot or any(touches(token) for token in args)) and executable not in {
+                "ls", "dir", "cat", "type", "head", "tail", "wc", "stat", "file", "grep", "rg",
+                "sha256sum", "shasum", "echo", "printf", "diff", "cmp", "test", "[",
+            } and self._shell_command_has_mutation_intent(clause):
+                return True
+        return False
 
     def _hard_snapshot_integrity_callback(self, phase: str, command: str = "") -> str:
+        resource_error = self._verify_skill_execution_workspaces()
+        if resource_error:
+            return resource_error
         if self.skill_mode != "hard":
             return ""
         if str(phase or "") == "before":
@@ -56611,7 +56910,8 @@ body{padding:18px}
         return bool(self._hard_snapshot_shell_prefix())
 
     def _shell_process_env(self) -> dict:
-        if not bool(getattr(self, "ide_remote_sandbox_required", False)):
+        if not (bool(getattr(self, "ide_remote_sandbox_required", False))
+                or getattr(self, "skill_mode", "dynamic") == "hard"):
             env = os.environ.copy()
             env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
             if os.name == "nt":
@@ -56621,7 +56921,7 @@ body{padding:18px}
             else:
                 env.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "LC_CTYPE": "C.UTF-8"})
             return env
-        sandbox_tmp = self.files_root / ".clouds_coder" / "tmp"
+        sandbox_tmp = safe_path(".clouds_coder/tmp", self.files_root)
         sandbox_tmp.mkdir(parents=True, exist_ok=True)
         backend_name = str(_detect_ide_sandbox_backend().get("name", "") or "")
         virtual_root = backend_name in {"bubblewrap", "docker", "podman"}
@@ -56655,6 +56955,25 @@ body{padding:18px}
                 "PYTHONUTF8": "1",
             }
         )
+        # App sessions use the same workspace write sandbox even on a local
+        # connection. Host HOME/TMP defaults made tempfile and many libraries
+        # write outside it. Allocate real, symlink-checked private directories
+        # and expose their virtual paths when the backend mounts /workspace.
+        cache_dirs = {
+            "XDG_CACHE_HOME": ".clouds_coder/cache/xdg",
+            "XDG_CONFIG_HOME": ".clouds_coder/cache/config",
+            "XDG_DATA_HOME": ".clouds_coder/cache/data",
+            "MPLCONFIGDIR": ".clouds_coder/cache/matplotlib",
+            "PYTHONPYCACHEPREFIX": ".clouds_coder/cache/pycache",
+            "APPDATA": ".clouds_coder/cache/appdata",
+            "LOCALAPPDATA": ".clouds_coder/cache/localappdata",
+        }
+        for key, relative in cache_dirs.items():
+            target = safe_path(relative, self.files_root)
+            target.mkdir(parents=True, exist_ok=True)
+            env[key] = f"/workspace/{relative}" if virtual_root else str(target)
+        if os.name == "nt":
+            env["USERPROFILE"] = process_home
         shared_mounts = self._remote_shared_read_mounts()
         shared_roots = [host for host, _virtual in shared_mounts]
         virtual_shared = {os.path.normcase(str(host)): virtual for host, virtual in shared_mounts}
@@ -58646,7 +58965,7 @@ body{padding:18px}
             "Final output must be a structured markdown deep-analysis report."
         )
 
-    def _latest_user_goal_text(self) -> str:
+    def _latest_user_goal_text(self, max_chars: int = 220) -> str:
         for msg in reversed(self.messages):
             if msg.get("role") != "user":
                 continue
@@ -58657,7 +58976,7 @@ body{padding:18px}
                 continue
             task_text = self._unwrap_program_ide_task_text(text)
             if task_text:
-                return trim(task_text.replace("\n", " "), 220)
+                return trim(task_text.replace("\n", " "), max_chars)
         return "current task"
 
     @staticmethod
@@ -59045,6 +59364,7 @@ body{padding:18px}
         last_blocking_idx = -1
         last_success_idx = -1
         last_blocking_ts = 0.0
+        blocking_command = ""
         for idx, row in enumerate(recent):
             row_step_id = str(row.get("plan_step_id", "") or "")
             if current_step_id and row_step_id and row_step_id != current_step_id:
@@ -59057,11 +59377,21 @@ body{padding:18px}
                 continue
             if self._execution_log_entry_is_blocking_error(row):
                 last_blocking_idx = idx
+                header = re.match(r"^(?:bash|worktree_run|check_background)\s+([^\n]+)", str(row.get("content", "")).strip())
+                blocking_command = str(row.get("command", "") or (header.group(1) if header else ""))
                 try:
                     last_blocking_ts = float(row.get("ts", 0.0) or 0.0)
                 except Exception:
                     last_blocking_ts = 0.0
             if self._execution_log_entry_is_success_evidence(row):
+                header = re.match(r"^(?:bash|worktree_run|check_background)\s+([^\n]+)", str(row.get("content", "")).strip())
+                command = str(row.get("command", "") or (header.group(1) if header else ""))
+                if (last_blocking_idx >= 0 and command
+                    and self._single_no_plan_todo_bash_is_read_only(command)
+                    and (not blocking_command or not self._single_no_plan_todo_bash_is_read_only(blocking_command))):
+                    # A successful ls/cat/grep is not a repaired test or run.
+                    # Corrected read-only failures can still resolve each other.
+                    continue
                 last_success_idx = idx
         if last_blocking_idx < 0:
             return False
@@ -59244,7 +59574,10 @@ body{padding:18px}
         if self._todo_has_plan_steps(bb):
             active = self._current_plan_step_row(bb)
             if not isinstance(active, dict):
-                return []
+                parents = {str(row.get("id", "")) for row in bb.get("project_todos", [])
+                           if isinstance(row, dict) and row.get("category") == "plan_step"}
+                return [row for row in open_rows if self._todo_row_kind(row) == "plan_worker"
+                        and str(row.get("parent_step_id", "")) in parents]
             step_id = trim(str(active.get("id", "") or ""), 20)
             if not step_id:
                 return []
@@ -59255,7 +59588,7 @@ body{padding:18px}
             ]
         route_kind = self._todo_route_kind(board=bb)
         if route_kind == "pure_sync":
-            return [row for row in open_rows if self._todo_row_kind(row) == "owner_worker"]
+            return [row for row in open_rows if self._todo_row_kind(row) in {"owner_worker", "flat"}]
         if route_kind == "pure_single":
             # Single-mode TodoWrite stamps rows with the active owner for UI
             # attribution. Include those rows as well as legacy owner-less
@@ -59272,8 +59605,29 @@ body{padding:18px}
         mode = self._effective_execution_mode()
         profile = self._ensure_blackboard_task_profile(bb)
         assigned = self._sanitize_agent_role(profile.get("assigned_expert", "")) or "developer"
+        if reason_key == "required-todo-missing":
+            return {"target": assigned, "instruction": (
+                "Use TodoWrite to establish the required goal-based checklist from the actual task and observations. "
+                "Do not invent completion or repeat implementation. Track remaining work, verify actual results, "
+                "update the same identities and request finish only when all required work is complete."),
+                "reason": reason_key, "source": "finish-gate", "is_mandatory": True}
+        if reason_key == "plan-approval-pending":
+            return {"target": "explorer", "instruction": (
+                "Complete the pending Plan and request its user approval. Do not execute or finish the task "
+                "before approval; resume planning on the next continuation."),
+                "reason": reason_key, "source": "finish-gate", "is_mandatory": True}
         if reason_key.startswith("plan-steps-incomplete:") or reason_key.startswith("worker-todo-pending:"):
             step = self._current_plan_step_row(bb)
+            if not isinstance(step, dict) and reason_key.startswith("worker-todo-pending:"):
+                pending = self._completion_scoped_open_todo_rows(bb)
+                current = next((row for row in pending if row.get("status") == "in_progress"), pending[0] if pending else {})
+                target = self._sanitize_agent_role(current.get("owner", "")) or assigned
+                identity = current.get("short_id") or current.get("subtask_id") or current.get("id") or ""
+                return {"target": target, "instruction": (
+                    f"Finish is blocked by your unfinished canonical Todo {identity}: {trim(str(current.get('content', '')), 220)}. "
+                    "Inspect the latest actual evidence, complete or repair this work, then update your own existing "
+                    "Todo ID. Preserve peer rows; do not ask another owner to overwrite this row."),
+                    "reason": reason_key, "source": "finish-gate", "is_mandatory": True}
             if isinstance(step, dict):
                 snapshot = self._active_plan_progress_snapshot(bb)
                 step_idx = int(snapshot.get("step_index", 0) or 0) + 1
@@ -59385,11 +59739,18 @@ body{padding:18px}
     ) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         can_finish, reason = self._can_auto_finish_from_approval(bb, latest_user_ts=latest_user_ts)
+        requires_todos = self._runtime_task_level_for_todo_policy() >= 2 and self._runtime_level_requires_todos()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if reason not in {"goal-reset-pending", "approval-stale-new-user-input"}:
+            if str(plan.get("phase", "")) in {"research", "synthesis", "awaiting_choice"} and not bool(getattr(self, "runtime_plan_approved", False)):
+                can_finish, reason = False, "plan-approval-pending"
+            elif requires_todos and not self._todo_has_plan_steps(bb) and not self._single_no_plan_todo_has_rows():
+                can_finish, reason = False, "required-todo-missing"
         if can_finish:
             profile = self._ensure_blackboard_task_profile(bb)
             task_type = str(profile.get("task_type", "general") or "general")
             open_rows = self._completion_scoped_open_todo_rows(bb)
-            if open_rows and task_type != "simple_qa":
+            if open_rows and (task_type != "simple_qa" or requires_todos):
                 can_finish = False
                 reason = f"worker-todo-pending:{len(open_rows)}"
         if can_finish and self._manager_has_error_log(bb):
@@ -60850,9 +61211,12 @@ body{padding:18px}
             # and restart without retaining full tool output.
             "plan_subtask_evidence_bindings": {},
             "plan_step_evidence": {},
+            "plan_control_evidence": {},
             "plan_step_quality_reviews": {},
             "plan_step_recovery": {},
             "plan_todo_revisions": [],
+            "user_plan_adjustments": [],
+            "plan_subtask_semantic_reviews": {},
             # Root TodoWrite plans (single and sync without an approved Plan)
             # need the same durable revision protection as plan-step subtasks.
             # The baseline never changes inside a task epoch; accepted/rejected
@@ -60952,16 +61316,49 @@ body{padding:18px}
             board["version"] = 1
         board["updated_at"] = float(src.get("updated_at", now_ts()) or now_ts())
         board["status"] = self._normalize_blackboard_status(src.get("status", board["status"]))
+        preparation_rows = src.get("preparation_decisions", [])
+        if isinstance(preparation_rows, list):
+            board["preparation_decisions"] = [
+                {**{key: str(row.get(key, "") or "")[:limit]
+                    for key, limit in (("goal", 1000), ("state", 1600), ("skills", 1200),
+                                       ("basis", 32), ("owner", 32), ("step_id", 40), ("goal_digest", 64))},
+                 "ready": True,
+                 "ts": float(row.get("ts", 0)) if isinstance(row.get("ts", 0), (int, float)) else 0.0}
+                for row in preparation_rows[-40:]
+                if isinstance(row, dict) and row.get("ready") is True
+                and row.get("basis") in {"user_context", "observed_context", "continuation"}
+                and re.fullmatch(r"[a-f0-9]{64}", str(row.get("goal_digest", "") or ""))
+            ]
         previous = src.get("previous_task_context", {})
         if isinstance(previous, dict) and previous:
             board["previous_task_context"] = {
                 "goal": str(previous.get("goal", "") or "")[:800],
                 "summary": str(previous.get("summary", "") or "")[:800],
                 "status": str(previous.get("status", "") or "")[:40],
+                **({"task_level": int(previous["task_level"])}
+                   if str(previous.get("task_level", "")) in {"1", "2", "3", "4", "5"} else {}),
+                "execution_mode": normalize_execution_mode(previous.get("execution_mode", ""), default=""),
                 **{key: [str(value)[:300] for value in previous.get(key, [])[:12]]
                    for key in ("artifact_paths", "file_paths", "completed_plan_steps") if isinstance(previous.get(key), list)},
             }
         continuity = src.get("continuation_memory", {})
+        adjustments = src.get("user_plan_adjustments", [])
+        if isinstance(adjustments, list):
+            board["user_plan_adjustments"] = [
+                {"id": str(row["id"])[:80], "step_id": str(row.get("step_id", ""))[:40],
+                 "kind": "user_input", "tool": "user_request", "actor": "user", "ok": True,
+                 "summary": str(row.get("summary", ""))[:12000], "ts": float(row.get("ts", 0.0) or 0.0)}
+                for row in adjustments[-40:] if isinstance(row, dict)
+                and str(row.get("id", "")).startswith("user:") and row.get("actor") == "user"
+            ]
+        semantic_reviews = src.get("plan_subtask_semantic_reviews", {})
+        if isinstance(semantic_reviews, dict):
+            board["plan_subtask_semantic_reviews"] = {
+                str(step_id)[:40]: {str(row_id)[:100]: dict(review)
+                    for row_id, review in list(rows.items())[-40:] if isinstance(review, dict)
+                    and review.get("available") and review.get("evidence_signature")}
+                for step_id, rows in list(semantic_reviews.items())[-80:] if isinstance(rows, dict)
+            }
         if isinstance(continuity, dict) and isinstance(continuity.get("keys"), list):
             board["continuation_memory"] = {
                 "keys": [str(key)[:40] for key in continuity["keys"][:4]],
@@ -61229,6 +61626,14 @@ body{padding:18px}
             if clean_evidence:
                 board["plan_step_evidence"] = clean_evidence
         raw_bindings = src.get("plan_subtask_evidence_bindings")
+        raw_control = src.get("plan_control_evidence", {})
+        if isinstance(raw_control, dict):
+            board["plan_control_evidence"] = {
+                str(step_id)[:40]: [self._normalize_plan_evidence_record(row) for row in rows[-40:]
+                    if isinstance(row, dict) and row.get("kind") == "control" and row.get("id")
+                    and row.get("step_id") == step_id]
+                for step_id, rows in list(raw_control.items())[-80:] if isinstance(rows, list)
+            }
         if isinstance(raw_bindings, dict):
             clean_bindings: dict[str, dict[str, dict]] = {}
             for raw_step_id, raw_step_bindings in list(raw_bindings.items())[:80]:
@@ -62683,8 +63088,11 @@ body{padding:18px}
         preserved_worker_todos = old_bb.get("plan_worker_todos", {})
         preserved_subtask_bindings = old_bb.get("plan_subtask_evidence_bindings", {})
         preserved_step_evidence = old_bb.get("plan_step_evidence", {})
+        preserved_control_evidence = old_bb.get("plan_control_evidence", {})
         preserved_quality_reviews = old_bb.get("plan_step_quality_reviews", {})
         preserved_todo_revisions = old_bb.get("plan_todo_revisions", [])
+        preserved_user_adjustments = old_bb.get("user_plan_adjustments", [])
+        preserved_semantic_reviews = old_bb.get("plan_subtask_semantic_reviews", {})
         preserved_tree_baseline = old_bb.get("todo_tree_baseline", [])
         preserved_tree_revisions = old_bb.get("todo_tree_revisions", [])
         preserved_step_files = old_bb.get("step_files", {})
@@ -62729,10 +63137,13 @@ body{padding:18px}
                 self.blackboard["plan_subtask_evidence_bindings"] = preserved_subtask_bindings
             if isinstance(preserved_step_evidence, dict):
                 self.blackboard["plan_step_evidence"] = preserved_step_evidence
+            self.blackboard["plan_control_evidence"] = preserved_control_evidence
             if isinstance(preserved_quality_reviews, dict):
                 self.blackboard["plan_step_quality_reviews"] = preserved_quality_reviews
             if isinstance(preserved_todo_revisions, list):
                 self.blackboard["plan_todo_revisions"] = preserved_todo_revisions
+            self.blackboard["user_plan_adjustments"] = preserved_user_adjustments
+            self.blackboard["plan_subtask_semantic_reviews"] = preserved_semantic_reviews
             if isinstance(preserved_tree_baseline, list):
                 self.blackboard["todo_tree_baseline"] = preserved_tree_baseline
             if isinstance(preserved_tree_revisions, list):
@@ -64010,7 +64421,7 @@ body{padding:18px}
         row = raw if isinstance(raw, dict) else {}
         tool = canonicalize_tool_name(str(row.get("tool", "") or ""))
         kind = str(row.get("kind", "") or "").strip().lower()
-        if kind not in {"runtime", "file", "research", "blackboard", "generic"}:
+        if kind not in {"runtime", "file", "research", "blackboard", "generic", "control"}:
             kind = "generic"
         try:
             ts = float(row.get("ts", 0.0) or 0.0)
@@ -64032,6 +64443,7 @@ body{padding:18px}
             "command": trim(str(row.get("command", "") or ""), 500),
             "path": trim(str(row.get("path", "") or ""), 300),
             "summary": trim(str(row.get("summary", "") or ""), 900),
+            "evidence_ref": trim(str(row.get("evidence_ref", "") or ""), 80),
             "changed_files": [
                 normalize_rel_preview_path(str(value or ""))
                 for value in (row.get("changed_files", []) if isinstance(row.get("changed_files"), list) else [])[:12]
@@ -64094,6 +64506,25 @@ body{padding:18px}
             board=bb,
             since_ts=since_ts,
         )
+        path_revisions: dict[str, float] = {}
+        def path_key(value):
+            return os.path.normcase(str(value or "").replace("\\", "/"))
+        for raw in raw_rows:
+            mutation = self._normalize_plan_evidence_record(raw)
+            if mutation.get("tool") in {"write_file", "edit_file"}:
+                key = path_key(mutation["path"])
+                path_revisions[key] = max(path_revisions.get(key, 0.0), mutation["ts"])
+            for changed_path in mutation.get("changed_files", []):
+                key = path_key(changed_path)
+                path_revisions[key] = max(path_revisions.get(key, 0.0), mutation["ts"])
+        step_files = bb.get("step_files", {})
+        for mutation in step_files.get(str(step_id or ""), []) if isinstance(step_files, dict) else []:
+            if isinstance(mutation, dict) and mutation.get("op") in {"write_file", "edit_file"}:
+                key = path_key(mutation.get("path", ""))
+                try:
+                    path_revisions[key] = max(path_revisions.get(key, 0.0), float(mutation.get("ts", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    continue
         out: list[dict] = []
         for raw in raw_rows[-40:]:
             row = self._normalize_plan_evidence_record(raw)
@@ -64101,11 +64532,12 @@ body{padding:18px}
                 continue
             if since_ts > 0 and float(row.get("ts", 0.0) or 0.0) + 1e-6 < since_ts:
                 continue
+            revision_ts = path_revisions.get(path_key(row.get("path", "")), 0.0) if row.get("tool") == "read_file" else quality_since
             if (
-                quality_since > 0
+                revision_ts > 0
                 and str(row.get("kind", "") or "") in {"runtime", "file"}
                 and str(row.get("tool", "") or "") not in {"write_file", "edit_file"}
-                and float(row.get("ts", 0.0) or 0.0) + 1e-6 < quality_since
+                and float(row.get("ts", 0.0) or 0.0) + 1e-6 < revision_ts
             ):
                 continue
             out.append(row)
@@ -64153,13 +64585,27 @@ body{padding:18px}
                 if normalize_rel_preview_path(str(value or ""))
             ]
         elif tool == "read_file":
-            if self._is_plan_infrastructure_read_result(item):
-                return {}
-            kind = "file"
+            kind = "control" if self._is_plan_infrastructure_read_result(item) else "file"
             command = ""
             path = str(args.get("path", "") or "")
             ok = bool(item.get("ok", False)) and bool(self._tool_result_output_excerpt(item, 80))
             exit_code = None
+        elif tool in {"TodoWrite", "TodoWriteRescue"}:
+            kind = "control"
+            command = path = ""
+            ok = bool(item.get("ok", False)) and not output.lstrip().startswith(("Error:", "Control["))
+            exit_code = None
+            # Store the committed graph, never a model's completion claim.
+            scoped = [row for row in self.todo.snapshot() if row.get("parent_step_id") == step_id]
+            identities = [str(row.get("subtask_id", "") or row.get("short_id", "")) for row in scoped]
+            output = (
+                f"Runtime canonical Todo state: rows={len(scoped)}; unique_ids={len(set(identities)) == len(identities)}\n"
+                + "\n".join(
+                    f"{row.get('short_id', '')} [{row.get('status', '')}] {row.get('owner', '')}: "
+                    f"{trim(str(row.get('content', '') or ''), 65)}"
+                    for row in scoped
+                )
+            )
         elif tool in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
             kind = "research"
             command = ""
@@ -64230,6 +64676,7 @@ body{padding:18px}
                 ),
                 900,
             ),
+            "evidence_ref": next(iter(reversed(re.findall(r"\[evidence_ref id=([a-f0-9]{24})\b", str(item.get("output", "") or "")))), ""),
             "changed_files": changed_files,
             "exit_code": exit_code,
             "assertion_kind": trim(str(item.get("assertion_kind", "") or ""), 80),
@@ -64239,11 +64686,12 @@ body{padding:18px}
             "actor": self._sanitize_agent_role(role) or "developer",
             "ts": stamp,
         }
-        raw_map = dict(bb.get("plan_step_evidence", {}) if isinstance(bb.get("plan_step_evidence"), dict) else {})
+        ledger_key = "plan_control_evidence" if kind == "control" else "plan_step_evidence"
+        raw_map = dict(bb.get(ledger_key, {}) if isinstance(bb.get(ledger_key), dict) else {})
         rows = list(raw_map.get(step_id, []) if isinstance(raw_map.get(step_id), list) else [])
         rows.append(record)
         raw_map[step_id] = rows[-40:]
-        bb["plan_step_evidence"] = raw_map
+        bb[ledger_key] = raw_map
         self.blackboard = bb
         return record
 
@@ -66835,7 +67283,7 @@ body{padding:18px}
         plan_step: dict,
         *,
         limit: int = 6,
-        max_chars: int = 500,
+        max_chars: int | None = 500,
     ) -> list[dict]:
         rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
         if not rows:
@@ -66847,7 +67295,8 @@ body{padding:18px}
         for row in rows[-40:]:
             if not isinstance(row, dict):
                 continue
-            txt = trim(str(row.get("content", "") or "").strip(), max_chars)
+            full_text = str(row.get("content", "") or "").strip()
+            txt = full_text if max_chars is None else trim(full_text, max_chars)
             if not txt:
                 continue
             clean = {
@@ -66956,12 +67405,26 @@ body{padding:18px}
         for row in context["file_excerpts"]:
             if "_full_content" in row:
                 reader.add(row["path"], row.pop("_full_content"))
+        # Excerpts are an input-window optimization, not the archive itself.
+        # Delivery reports and reviewer findings often live on the blackboard;
+        # archiving only their 500-character summaries made their remaining
+        # evidence impossible to retrieve from an independent review context.
+        context["frozen_blackboard_sources"] = []
+        for section, limit in (("execution_logs", 6), ("review_feedback", 6), ("research_notes", 4)):
+            for number, row in enumerate(self._plan_step_quality_recent_rows(
+                bb, section, plan_step, limit=limit, max_chars=None,
+            )):
+                path = f"blackboard/{section}/{number + 1}.txt"
+                reader.add(path, row["content"])
+                context["frozen_blackboard_sources"].append({"path": path, "actor": row["actor"],
+                    "meaning": "Frozen report/observation; runtime success still requires actual execution evidence."})
         context["frozen_artifact_index"] = reader.index
         rendered = json_dumps(trajectory_model_view(context), indent=2)
         return (rendered, reader) if return_runtime else rendered
 
     def _read_only_review_json(self, prompt: str, system: str, reader, *, max_tokens: int = 420) -> dict:
-        from liquid_kernel.context import RECALL_TOOL, ContextWindow
+        from liquid_kernel.context import RECALL_TOOL, ContextWindow, estimate_tokens
+        max_tokens = max(1, int(getattr(self, "max_output_tokens", AGENT_MAX_OUTPUT_TOKENS) or AGENT_MAX_OUTPUT_TOKENS))
         messages = [{"role": "user", "content": prompt}]
         window = ContextWindow(reader.archive, self.context_token_upper_bound, "review")
         # Each review owns its conversation and JSON-mode flag; all clients
@@ -66977,8 +67440,14 @@ body{padding:18px}
             request_system, request_messages = system, messages
             if format_attempts == 2:
                 request_system, request_messages = semantic_json_repair_request(system + "\n" + prompt, damaged_output, "review_json_invalid")
-            visible = window.prepare(request_messages, request_system, tools, max_tokens)
-            response = client.chat(visible, tools=tools, system=request_system, max_tokens=max_tokens, temperature=0.1,
+            # Honor Admin's output ceiling whenever it fits. A smaller context
+            # cannot physically reserve a larger output window; compact first
+            # and use the actual remaining capacity, without a fixed token cap.
+            fixed_tokens = estimate_tokens(request_system) + estimate_tokens(tools or [])
+            reserve = min(max_tokens, max(128, window.context_limit - fixed_tokens - estimate_tokens(request_messages) - 1024))
+            visible = window.prepare(request_messages, request_system, tools, reserve)
+            request_max_tokens = min(max_tokens, max(1, window.context_limit - fixed_tokens - estimate_tokens(visible) - 128))
+            response = client.chat(visible, tools=tools, system=request_system, max_tokens=request_max_tokens, temperature=0.1,
                                    think=bool(getattr(self, "thinking", False)),
                                    effort="off" if format_attempts == 2 else self._profile_effort_bounds()[0], label="independent_review")
             calls = response.get("tool_calls") or []
@@ -68381,6 +68850,34 @@ body{padding:18px}
         except Exception:
             pass
 
+    def _todo_json_response(self, messages: list[dict], **kwargs) -> dict:
+        """Obtain a final JSON answer without treating reasoning as a verdict.
+
+        Reasoning and answer tokens share the output allowance on some APIs.
+        Small audit-only caps can therefore prevent a perfectly healthy model
+        from ever returning its verdict. Use the session's Admin output limit;
+        one format retry still consumes the existing TodoWrite call budget.
+        """
+        kwargs["max_tokens"] = max(1, int(getattr(self, "max_output_tokens", AGENT_MAX_OUTPUT_TOKENS) or AGENT_MAX_OUTPUT_TOKENS))
+        kwargs.setdefault("label", "todo_audit")
+        kwargs.setdefault("request_timeout", TODO_LLM_TIMEOUT_SECONDS)
+        original = [dict(row) for row in messages]
+        for attempt in range(2):
+            response = self.ollama.chat(messages, **kwargs)
+            text = str(response.get("content", "") or response.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(text, {})
+            if isinstance(payload, dict) and payload:
+                return response
+            if attempt == 0:
+                # Re-evaluate the same evidence. An unfinished reasoning trace
+                # is neither a submitted decision nor proof of completion.
+                messages = original + [{"role": "user", "content": (
+                    "Your previous response did not contain a complete final JSON object. "
+                    "Evaluate the same supplied evidence and submit the requested JSON now. "
+                    "Keep reasons concise. Return no prose outside JSON; do not invent missing evidence."
+                )}]
+        return response
+
     def _llm_verify_subtask_acceptance(self, plan_step: dict, completed_subtasks: list[dict], bb: dict) -> dict:
         """Use LLM semantic analysis to verify if subtasks are truly completed.
 
@@ -68420,7 +68917,7 @@ body{padding:18px}
                 "Reply ONLY as JSON: {\"all_passed\": true/false, \"rework_items\": [\"description of what failed\"]}\n"
                 "If all subtasks pass, return {\"all_passed\": true, \"rework_items\": []}"
             )
-            resp = self.ollama.chat(
+            resp = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context("You are a strict QA reviewer. Verify task completion against evidence. Reply ONLY valid JSON."),
                 max_tokens=300,
@@ -68567,7 +69064,7 @@ body{padding:18px}
                 "\"evidence\": \"<cite the specific evidence you relied on>\", "
                 "\"rework_items\": [\"<what concretely must still be fixed if FAIL>\"]}"
             )
-            resp = self.ollama.chat(
+            resp = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "You are a strict, evidence-driven QA judge for plan-step acceptance. "
@@ -69161,6 +69658,11 @@ body{padding:18px}
             "CURRENT PLAN:\n" + ("\n".join(lines) or "(none)")
             + "\n\nCURRENT WORKER TODOs:\n" + ("\n".join(worker_lines) or "(none)")
             + "\n\nRECENT PROGRESS EVIDENCE:\n" + ("\n".join(f"- {item}" for item in evidence[-16:]) or "(none)")
+            + "\n\nAUTHENTICATED USER ADJUSTMENTS (requirements, not completion proof):\n"
+            + ("\n".join(
+                f"- {row.get('id', '')}: {trim(str(row.get('summary', '') or ''), 1200)}"
+                for row in (bb.get("user_plan_adjustments", []) or [])[-8:] if isinstance(row, dict)
+            ) or "(none)")
         )
 
     def _semantic_audit_plan_step_updates(
@@ -69208,7 +69710,7 @@ body{padding:18px}
             + self._plan_step_revision_context(bb)
         )
         try:
-            response = self.ollama.chat(
+            response = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou audit multi-step execution-plan edits. Reply only valid JSON."
@@ -69338,7 +69840,7 @@ body{padding:18px}
                 try:
                     target = next(
                         row for row in plan_rows
-                        if int(row.get("plan_step_index", -1) or -1) == int(update.get("plan_step_index"))
+                        if int(row.get("plan_step_index", -1)) == int(update.get("plan_step_index"))
                     )
                 except Exception:
                     target = None
@@ -69379,6 +69881,8 @@ body{padding:18px}
             if (
                 normalize_embedded_newlines(str(proposal.get("content", "") or ""))
                 != normalize_embedded_newlines(str(target.get("content", "") or ""))
+                or normalize_embedded_newlines(str(proposal.get("full_content", "") or ""))
+                != normalize_embedded_newlines(str(target.get("full_content", "") or ""))
                 or proposal.get("status") != target.get("status")
             ):
                 changed_ids.append(target_id)
@@ -69586,7 +70090,7 @@ body{padding:18px}
             + self._plan_step_revision_context(bb)
         )
         try:
-            response = self.ollama.chat(
+            response = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "/no_think\nClassify Todo intent. Reply only valid JSON."
@@ -69692,7 +70196,7 @@ body{padding:18px}
             f"EXISTING CANONICAL ROOT TODOS:\n{rows_text}"
         )
         try:
-            response = self.ollama.chat(
+            response = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "/no_think\nResolve Todo identity from the supplied canonical rows. Reply only valid JSON."
@@ -70121,6 +70625,27 @@ body{padding:18px}
         )
         return bool(trusted)
 
+    def _plan_evidence_full_observation(self, record: dict) -> str:
+        """Resolve an immutable host tool result, never a current-file substitute."""
+        reference = str(record.get("evidence_ref", "") or "")
+        if not re.fullmatch(r"[a-f0-9]{24}", reference):
+            return ""
+        try:
+            matches = self._evidence_controller().recall(eid=reference, limit=1)
+            if not matches:
+                return ""
+            observation = matches[0]
+            if canonicalize_tool_name(observation.get("tool", "")) != record.get("tool"):
+                return ""
+            arguments = json.loads(observation.get("args", "{}"))
+            if record.get("command") and trim(str(arguments.get("command", "")), 500) != record["command"]:
+                return ""
+            if record.get("path") and trim(str(arguments.get("path", "")), 300) != record["path"]:
+                return ""
+            return str(observation.get("body", "") or "")
+        except (OSError, ValueError, TypeError, sqlite3.Error):
+            return ""
+
     def _plan_subtask_semantic_evidence_signature(
         self,
         plan_step: dict,
@@ -70144,7 +70669,16 @@ body{padding:18px}
             board=bb,
             since_ts=lower_bound,
         ) if step_id else []
+        # Planning operations are observable work only for a semantic audit
+        # of a planning/maintenance subtask. Keep them out of product/acceptance
+        # ledgers so editing a checklist cannot prove implementation or tests.
+        control_map = bb.get("plan_control_evidence", {})
+        controls = control_map.get(step_id, []) if isinstance(control_map, dict) else []
+        candidates.extend(dict(record) for record in controls if isinstance(record, dict)
+            and float(record.get("ts", 0.0) or 0.0) >= lower_bound)
+        candidates.sort(key=lambda record: float(record.get("ts", 0.0) or 0.0))
         payload = {
+            "protocol": "full-observation-v2",
             "step_id": step_id,
             "subtask_id": stable_id,
             "subtask": trim(str(row.get("content", "") or ""), 800),
@@ -70158,6 +70692,7 @@ body{padding:18px}
                     str(record.get("path", "") or ""),
                     tuple(str(value or "") for value in (record.get("changed_files", []) or [])),
                     trim(str(record.get("summary", "") or ""), 500),
+                    str(record.get("evidence_ref", "") or ""),
                 )
                 for record in candidates[-16:]
             ],
@@ -70291,6 +70826,19 @@ body{padding:18px}
             )
             for record in candidates
         ]
+        from liquid_kernel.context import HistoryArchive, ReviewEvidence
+        reader = None
+        for record in candidates:
+            body = self._plan_evidence_full_observation(record)
+            if not body:
+                continue
+            if reader is None:
+                reader = ReviewEvidence(HistoryArchive(self.root / "context_archive" / "todo_reviews" / uuid.uuid4().hex / "full_history.jsonl"),
+                                        excerpt_head=3000, excerpt_tail=1000, max_inline_chars=6000)
+            path = f"tool_observations/{record['id'].replace(':', '_')}.txt"
+            reader.add(path, body)
+            preview = body if len(body) <= 6000 else body[:3000] + "\n[omitted immutable output; use context_recall]\n" + body[-1000:]
+            evidence_lines.append(f"EXACT OBSERVATION ID={record['id']} path={path}:\n{preview}")
         review = dict(default)
         review["evidence_signature"] = signature
         review["subtask_id"] = stable_id
@@ -70301,6 +70849,11 @@ body{padding:18px}
                 "not the verdict. Decide pass only when the records concretely prove this subtask's intended result. "
                 "Equivalent implementation/verification methods are allowed, but evidence for another subtask is not. "
                 "Use verify when proof is insufficient and repair only when a real defect is shown. Never pass a claim without tool evidence.\n\n"
+                "Records marked control prove only the actual Todo/plan maintenance they show; "
+                "they cannot establish product implementation, test execution, or artifact correctness.\n\n"
+                "For a Todo-maintenance subtask, audit the recorded mutations and retained identities. "
+                "Do not require this target's completed bit to be set before this completion audit; "
+                "that would make the requested transition circular.\n\n"
                 f"PARENT STEP:\n{trim(str(plan_step.get('full_content', '') or plan_step.get('content', '') or ''), 1400)}\n\n"
                 f"SUBTASK:\n{trim(str(row.get('content', '') or ''), 800)}\n\n"
                 f"EVIDENCE RECORDS:\n{chr(10).join(evidence_lines)}\n\n"
@@ -70308,17 +70861,23 @@ body{padding:18px}
                 "\"confidence\":\"high|medium|low\",\"reason\":\"...\",\"evidence\":\"...\","
                 "\"evidence_ids\":[\"ID from records\"]}"
             )
-            resp = self.ollama.chat(
-                [{"role": "user", "content": prompt}],
-                system=self._inject_runtime_environment_context(
-                    "/no_think\nYou are a strict evidence-grounded subtask auditor. Reply only valid JSON."
-                ),
-                max_tokens=360,
-                temperature=0.1,
-                think=False,
-                label="todo_audit",
-                request_timeout=TODO_LLM_TIMEOUT_SECONDS,
+            audit_system = self._inject_runtime_environment_context(
+                "/no_think\nYou are a strict evidence-grounded subtask auditor. Reply only valid JSON."
             )
+            if reader is not None:
+                prompt += "\nFROZEN TOOL OBSERVATIONS:\n" + json_dumps(reader.index)
+                payload = self._read_only_review_json(prompt, audit_system, reader)
+                resp = {"content": json_dumps(payload)}
+            else:
+                resp = self._todo_json_response(
+                    [{"role": "user", "content": prompt}],
+                    system=audit_system,
+                    max_tokens=360,
+                    temperature=0.1,
+                    think=False,
+                    label="todo_audit",
+                    request_timeout=TODO_LLM_TIMEOUT_SECONDS,
+                )
             raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
             payload = extract_json_object_from_text(raw, {})
             if isinstance(payload, dict) and "passed" in payload:
@@ -71708,6 +72267,15 @@ body{padding:18px}
         step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
         rows = self._plan_step_evidence_records(step_id, board=bb, since_ts=since_ts)
         feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
+        # These records originate at user-input injection, not model tool calls.
+        # A changed requirement can justify a revision, never task completion.
+        plan_ids = {str(row.get("id", "")) for row in bb.get("project_todos", [])
+                    if isinstance(row, dict) and row.get("category") == "plan_step"}
+        rows.extend(
+            dict(row) for row in (bb.get("user_plan_adjustments", []) or [])
+            if isinstance(row, dict) and row.get("tool") == "user_request" and row.get("actor") == "user"
+            and (row.get("step_id") == step_id or row.get("step_id") in plan_ids)
+        )
         for index, raw in enumerate(feedback[-16:]):
             if not isinstance(raw, dict):
                 continue
@@ -71838,7 +72406,9 @@ body{padding:18px}
             "Audit a proposed rolling revision of only the OPEN subtasks under one approved plan step.\n"
             "Approve only when the cited observable evidence logically requires or materially justifies the exact additions, removals, rewrites, splits, merges, or reorderings.\n"
             "Reject speculative optimization, unrelated evidence, scope drift into another plan step, deletion of still-required work, or a reason that merely restates the proposal.\n"
-            "Completed history is protected outside this proposal. Judge the open-part revision against the approved parent step.\n"
+            "Completed history is protected outside this proposal. Judge the open-part revision against the approved parent step. "
+            "Authenticated user_request records may change requirements and take precedence over older plan details; "
+            "they do not prove work completed. Acceptance criteria must remain covered.\n"
             "Return JSON only: {\"approved\":true|false,\"confidence\":\"high|medium|low\",\"reason\":\"...\",\"unsupported_changes\":[\"...\"]}.\n\n"
             f"APPROVED PARENT STEP:\n{step_text}\n\n"
             f"REVISION REASON:\n{trim(reason, 600)}\n\n"
@@ -71850,7 +72420,7 @@ body{padding:18px}
             + ("\n".join(evidence_lines) or "(none)")
         )
         try:
-            response = self.ollama.chat(
+            response = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou are an independent execution-plan revision auditor. Reply only valid JSON."
@@ -71994,14 +72564,12 @@ body{padding:18px}
             for row in existing_rows
             if isinstance(row, dict)
             and str(row.get("status", "pending") or "pending").lower() != "completed"
-            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
         ]
         after_open = [
             self._plan_worker_content_core(row.get("content", ""))
             for row in proposed_rows
             if isinstance(row, dict)
             and str(row.get("status", "pending") or "pending").lower() != "completed"
-            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
         ]
         if before_open == after_open:
             return {"ok": True, "structural": False, "evidence_ids": [], "reason": "status-only update"}
@@ -72407,7 +72975,7 @@ body{padding:18px}
             + ("\n".join(f"- {value}" for value in evidence) or "(none)")
         )
         try:
-            response = self.ollama.chat(
+            response = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou audit Todo-tree rewrites for requirement preservation. Reply only valid JSON."
@@ -72969,11 +73537,17 @@ body{padding:18px}
         before_open, after_open, removed = self._root_todo_material_changes(existing_scope, proposed_scope)
         evidence = self._root_todo_revision_evidence(revision_evidence, board=bb)
         baseline = self._ensure_root_todo_baseline(existing_scope, board=bb)
+        # The transaction replaces only this owner's slice, but the reviewer
+        # must see the actual complete graph that will be committed. Showing a
+        # global baseline beside an owner-only proposal falsely reports every
+        # peer obligation as deleted, then tells the model to write peer IDs
+        # that the ownership guard correctly rejects.
+        peer_rows = [dict(row) for row in preserved_rows if self._todo_row_kind(row) != "system"]
         review = self._semantic_audit_root_todo_revision(
             reason=reason,
             baseline=baseline,
-            current_rows=existing_scope,
-            proposed_rows=proposed_scope,
+            current_rows=peer_rows + existing_scope,
+            proposed_rows=peer_rows + proposed_scope,
             removed_objectives=removed,
             evidence=evidence,
         )
@@ -73325,6 +73899,7 @@ body{padding:18px}
             subtask_id, _matched = _existing_match(row)
             row["subtask_id"] = subtask_id or self._stable_plan_worker_subtask_id(step_id, row)
 
+        matched_existing: list[tuple[dict, str, dict]] = []
         if trusted_restore:
             current_step_rows = [dict(row) for row in incoming_worker_rows]
         elif not target_rows:
@@ -73432,7 +74007,7 @@ body{padding:18px}
                     incoming_status = "completed"
                 if prior_status != "completed" and incoming_status == "completed":
                     since_value = float(prior.get("created_at", 0.0) or prior.get("started_at", 0.0) or 0.0)
-                    completion_candidate = {**prior, **incoming, "subtask_id": subtask_id}
+                    completion_candidate = {**prior, **incoming, "subtask_id": subtask_id, "content": prior["content"]}
                     if not self._plan_worker_completion_has_evidence(
                         active_step,
                         completion_candidate,
@@ -73718,6 +74293,24 @@ body{padding:18px}
         # the canonical N.M scheme instead of inventing a parallel set.
         if mode == "status_update":
             result = self._todo_status_update_result(result, status_update_omitted)
+            ignored_edits = [
+                str(prior.get("short_id", "") or subtask_id)
+                for incoming, subtask_id, prior in matched_existing
+                if self._plan_worker_content_core(incoming.get("content", ""))
+                and self._plan_worker_content_core(incoming.get("content", ""))
+                != self._plan_worker_content_core(prior.get("content", ""))
+                and not self._plan_worker_content_core(prior.get("content", "")).startswith(
+                    self._plan_worker_content_core(incoming.get("content", ""))
+                )
+            ] if target_rows else []
+            if ignored_edits:
+                result += (
+                    "\nCONTENT NOT REVISED: status_update preserved the stored contract for "
+                    + ", ".join(ignored_edits[:8])
+                    + ". For changed user requirements use plan_updates for affected OPEN parent contracts "
+                    "and revise_open for the full open child snapshot, including acceptance; cite the user: "
+                    "revision evidence from the live-input notice. Do not repeat checks against an obsolete contract."
+                )
         committed_rows = [row for row in self.todo.snapshot() if row.get("parent_step_id") == step_id]
         canonical = self._render_plan_worker_todo_canonical(step_id, committed_rows)
         if canonical:
@@ -74873,7 +75466,7 @@ body{padding:18px}
                 f"ACTIVE PLAN STEP:\n{step_text}\n\n"
                 f"WORK SUBTASKS BEFORE ACCEPTANCE:\n{work_text or '(none)'}"
             )
-            resp = self.ollama.chat(
+            resp = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou write one final acceptance TodoWrite subtask. Reply only valid JSON."
@@ -76061,7 +76654,7 @@ body{padding:18px}
                 f"Return JSON only: {{\"subtasks\":[\"...\" ]}} with 3-{max_items} concise items.\n\n"
                 f"ACTIVE PLAN STEP:\n{step_text}"
             )
-            resp = self.ollama.chat(
+            resp = self._todo_json_response(
                 [{"role": "user", "content": prompt}],
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou decompose one active plan step into concrete, ordered worker subtasks. Reply only valid JSON."
@@ -76951,7 +77544,11 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         route_kind = self._todo_route_kind(board=bb)
         has_plan_steps = route_kind in {"plan_single", "plan_sync"}
-        if route_kind == "pure_single":
+        if route_kind in {"pure_single", "pure_sync"}:
+            # Without an approved Plan, TodoWrite owns the canonical graph.
+            # Rebuilding a sync projection from only the currently active owner
+            # discarded peer rows and inserted a second generic roadmap.
+            # Owner-scoped writes already preserve every other owner's rows.
             return
         self._init_project_todos(bb)
         self._update_project_todo_status(bb)
@@ -77444,6 +78041,14 @@ body{padding:18px}
                     "semantic_confidence": {"type": "string", "enum": list(SEMANTIC_CONFIDENCE_CHOICES)},
                     "low_confidence_reason": {"type": "string"},
                     "inherit_previous_state": {"type": "boolean"},
+                    "followup_development": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether the latest request asks for implementation, changes, or validation "
+                            "after a completed L4 development task. Pure questions, explanations, greetings "
+                            "and thanks are false, even when they mention code or the previous project."
+                        ),
+                    },
                     "plan_change_scope": {
                         "type": "string",
                         "enum": ["preserve", "replace_entire_plan"],
@@ -77486,6 +78091,7 @@ body{padding:18px}
                         "judgement",
                         "requires_todos",
                         "inherit_previous_state",
+                        "followup_development",
                         "plan_change_scope",
                         "plan_change_evidence",
                         "requires_plan",
@@ -77588,6 +78194,8 @@ body{padding:18px}
             f"Automatic task-level ceiling is L{cap}. Do not emit or route a level above L{cap}. "
             f"If the request would normally need a higher level, choose L{cap}, keep the objective concrete, "
             "and mention in judgement that the automatic ceiling was applied. "
+            "The ceiling limits execution policy, not the user's requested deliverables; do not silently "
+            "drop requirements or replace their objective with a smaller demonstration. "
             "This cap only affects automatic classification; explicit user task-level overrides are handled elsewhere.\n"
         )
 
@@ -77656,34 +78264,12 @@ body{padding:18px}
         return out
 
     def _fallback_task_level_decision(self, goal_text: str) -> dict:
+        goal_text = self._unwrap_program_ide_task_text(goal_text)
         profile = self._infer_task_profile(goal_text)
         task_type = str(profile.get("task_type", "general") or "general")
         complexity = normalize_task_complexity(profile.get("complexity", "simple"), default="simple")
         low = str(goal_text or "").lower()
-        inherit_previous_state = False
-        if bool(self.runtime_goal_reset_pending):
-            board = self._ensure_blackboard()
-            progress = self._manager_progress_state(board)
-            has_progress = bool(
-                len(board.get("research_notes", []) or [])
-                or len(board.get("code_artifacts", {}) or {})
-                or len(board.get("execution_logs", []) or [])
-                or len(board.get("review_feedback", []) or [])
-            )
-            if has_progress and progress in {"in_progress", "almost_done", "blocked", "initializing"}:
-                inherit_previous_state = True
-        # Also inherit if there's an active high-level task regardless of goal_reset_pending
-        if not inherit_previous_state and int(self.runtime_task_level or 0) >= 3:
-            board = self._ensure_blackboard()
-            progress = self._manager_progress_state(board)
-            has_progress = bool(
-                len(board.get("research_notes", []) or [])
-                or len(board.get("code_artifacts", {}) or {})
-                or len(board.get("execution_logs", []) or [])
-                or len(board.get("review_feedback", []) or [])
-            )
-            if has_progress and progress in {"in_progress", "almost_done", "blocked", "initializing"}:
-                inherit_previous_state = True
+        inherit_previous_state = bool(self._unfinished_task_level())
         if bool(inherit_previous_state):
             board = self._ensure_blackboard()
             current_profile = self._ensure_blackboard_task_profile(board)
@@ -77861,9 +78447,11 @@ body{padding:18px}
         base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
             "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
-            "Set inherit_previous_state=true only for genuine follow-up/continuation/refinement of the same ongoing work; "
-            "set it false for a new independent objective.\n"
-            "If an approved plan is executing, default plan_change_scope='preserve' and inherit_previous_state=true. "
+            "An unfinished task retains its previous level and execution state, subject to the automatic level ceiling. "
+            "Set inherit_previous_state=true while that task is unfinished. Once the previous task is completed or "
+            "aborted, set it false and classify the latest request afresh; old artifacts and message length do not "
+            "justify retaining its level.\n"
+            "If an approved plan is executing and the task has not ended, default plan_change_scope='preserve' and inherit_previous_state=true. "
             "Feedback, current-step repair, acceptance work, and current-subtask changes preserve the roadmap. "
             "Use plan_change_scope='replace_entire_plan' only when the latest user message explicitly asks to discard, "
             "replace, or redesign the whole approved roadmap. plan_change_evidence must be the shortest exact quote "
@@ -77873,6 +78461,14 @@ body{padding:18px}
             "LEVEL SELECTION CRITERIA (choose the single best-fit level):\n"
             "Level 1 — Instant answer: pure Q&A, factual lookup, brief explanation, single-concept clarification. "
             "No file I/O, no tool use, no multi-turn needed. Budget: 2-4 rounds.\n"
+            "Greetings, thanks, and short conceptual programming questions (for example 'What is Python?', "
+            "'What is an API?' or 'Explain a function') are L1 when only an answer is requested. "
+            "A programming topic, workspace path, IDE metadata, or available skill is not an instruction to edit files. "
+            "Classify the requested action and deliverable, not isolated topic keywords.\n"
+            "AFTER A COMPLETED L4 TASK: emit followup_development=true for a new development requirement. "
+            "Choose L3 for bounded implementation/verification and L4 for coordinated multi-component work, "
+            "subject to the automatic ceiling. Pure conceptual questions or explanations remain eligible for L1 "
+            "and must use followup_development=false; do not inherit an ended task merely to answer a question.\n"
             "Level 2 — Multi-turn answer / light task: longer explanation, code snippet review, minor single-file edit, "
             "short script, quick translation or summary. Single agent, no collaboration needed. Budget: 4-8 rounds. "
             "The Todo requirement for L2 is controlled by the runtime policy below; when requires_todos=true, "
@@ -77946,6 +78542,13 @@ body{padding:18px}
     def _extract_classify_task_level_row(self, response: dict | None) -> dict:
         if not isinstance(response, dict):
             return {}
+        def valid_row(value: object) -> dict:
+            if not isinstance(value, dict):
+                return {}
+            raw = value.get("level")
+            if isinstance(raw, bool) or not re.fullmatch(r"[1-5]", str(raw).strip()):
+                return {}
+            return {**value, "level": int(raw)}
         tool_calls = response.get("tool_calls", []) if isinstance(response.get("tool_calls", []), list) else []
         for tc in tool_calls:
             fn = tc.get("function", {}) if isinstance(tc, dict) else {}
@@ -77953,16 +78556,18 @@ body{padding:18px}
                 continue
             args = fn.get("arguments", {}) if isinstance(fn, dict) else {}
             if isinstance(args, dict):
-                return dict(args)
+                parsed = valid_row(args)
+                if parsed:
+                    return parsed
             if isinstance(args, str):
                 parsed, _ = parse_tool_arguments_with_error(args)
-                if isinstance(parsed, dict):
-                    return dict(parsed)
+                parsed = valid_row(parsed)
+                if parsed:
+                    return parsed
         content = str(response.get("content", "") or "").strip()
         if content:
             parsed, _ = parse_tool_arguments_with_error(content)
-            if isinstance(parsed, dict) and parsed.get("level") is not None:
-                return dict(parsed)
+            return valid_row(parsed)
         return {}
 
     def _skill_aware_reeval_task_level(
@@ -78128,15 +78733,32 @@ body{padding:18px}
         }
 
     def _apply_runtime_task_decision(self, goal_text: str, decision: dict):
+        goal_text = self._unwrap_program_ide_task_text(goal_text)
         row = dict(decision or {})
         inherit_previous_state = _to_bool_like(row.get("inherit_previous_state", False), default=False)
         board_before_decision = self._ensure_blackboard()
-        active_plan_protected = self._approved_plan_has_unfinished_steps(board_before_decision)
+        previous_ended = self._blackboard_is_finished_or_aborted(board_before_decision)
+        unfinished_level = self._unfinished_task_level(board_before_decision)
+        # A manual level is restored before classification. On a newly reset
+        # board that preset is not evidence that an older task is still active.
+        judgement_before = board_before_decision.get("manager_judgement", {})
+        manual_fresh_submission = (
+            int(getattr(self, "user_task_level_override", 0) or 0) > 0
+            and board_before_decision.get("status") == "INITIALIZING"
+            and isinstance(judgement_before, dict)
+            and str(judgement_before.get("progress", "")).strip().lower() == "initializing"
+            and not str((board_before_decision.get("plan") or {}).get("phase", ""))
+            and not self._todo_has_plan_steps(board_before_decision)
+            and not self._single_no_plan_todo_has_rows()
+            and not any(board_before_decision.get(key) for key in ("execution_logs", "code_artifacts", "research_notes", "review_feedback"))
+        )
+        if manual_fresh_submission:
+            unfinished_level = 0
         explicit_full_replan = self._runtime_decision_requests_full_replan(goal_text, row)
         if explicit_full_replan:
             inherit_previous_state = False
             row["inherit_previous_state"] = False
-        elif active_plan_protected:
+        elif unfinished_level:
             inherit_previous_state = True
             row["inherit_previous_state"] = True
             row["requires_plan"] = False
@@ -78144,12 +78766,27 @@ body{padding:18px}
                 "status",
                 {
                     "summary": (
-                        "active approved plan preserved; latest input is scoped to the current "
-                        "parent step unless the user explicitly requests a whole-roadmap replan"
+                        "unfinished task level and execution state preserved"
                     )
                 },
             )
-        if bool(self.runtime_goal_reset_pending):
+        elif previous_ended or manual_fresh_submission:
+            inherit_previous_state = False
+            row["inherit_previous_state"] = False
+        if previous_ended:
+            previous_context = self._previous_task_context_snapshot(board_before_decision)
+            self._reset_blackboard_plan_state_locked(
+                new_goal=goal_text,
+                previous_context=previous_context,
+                clear_progress=True,
+                reset_agent_contexts=True,
+            )
+            self.runtime_authoritative_goal = goal_text
+            self.runtime_task_type = ""
+            self.runtime_task_complexity = ""
+            self.runtime_direct_objective = ""
+            self._mark_runtime_goal_reset_handled(reason="ended-task-reclassified")
+        elif bool(self.runtime_goal_reset_pending):
             if not inherit_previous_state and not explicit_full_replan:
                 self.runtime_authoritative_goal = str(goal_text or "").strip()
             if bool(inherit_previous_state):
@@ -78176,29 +78813,17 @@ body{padding:18px}
         if previous_complexity not in TASK_COMPLEXITY_LEVELS:
             previous_complexity = ""
         preserve_existing_complexity = False
-        # Complexity inheritance: if user didn't mention complexity, inherit previous level
-        previous_level = int(getattr(self, "runtime_task_level", 0) or 0)
-        if previous_level > 0 and not explicit_complexity:
-            # Inherit when: plan choice, explicit inherit flag, OR active high-level task has progress
+        # Only unfinished work can donate its previous level. Retained logs or
+        # an optimistic model continuation flag cannot revive an ended task.
+        if unfinished_level > 0 and not explicit_full_replan:
             _should_inherit = (
                 bool(inherit_previous_state)
                 or self._is_plan_choice_response(str(goal_text or ""))
                 or bool(int(getattr(self, "user_task_level_override", 0) or 0) > 0)
             )
-            if not _should_inherit and previous_level >= 3:
-                board = self._ensure_blackboard()
-                has_progress = bool(
-                    len(board.get("research_notes", []) or [])
-                    or len(board.get("code_artifacts", {}) or {})
-                    or len(board.get("execution_logs", []) or [])
-                    or len(board.get("review_feedback", []) or [])
-                )
-                progress_state = self._manager_progress_state(board)
-                if has_progress and progress_state in {"in_progress", "almost_done", "blocked", "initializing"}:
-                    _should_inherit = True
             if _should_inherit:
-                level = previous_level
-                preserve_existing_complexity = bool(previous_complexity)
+                level = unfinished_level
+                preserve_existing_complexity = bool(previous_complexity) and not explicit_complexity
         if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
             level = int(self.user_task_level_override)
         _level_floor = int(getattr(self, 'runtime_task_level_floor', 0) or 0)
@@ -78382,6 +79007,12 @@ body{padding:18px}
             requires_plan = False
         elif user_pref == "on":
             requires_plan = True
+        elif level in PLAN_MODE_ENABLED_LEVELS and str(
+            (self._ensure_blackboard().get("plan") or {}).get("phase", "")
+        ).strip().lower() in {"research", "synthesis"}:
+            # An interrupted, unapproved Plan is pending work. A continuation
+            # must finish planning before any normal execution can start.
+            requires_plan = True
         elif bool(getattr(self, "runtime_first_task_in_session", False)) and level in PLAN_MODE_ENABLED_LEVELS:
             requires_plan = True
         elif level in PLAN_MODE_ENABLED_LEVELS:
@@ -78469,6 +79100,7 @@ body{padding:18px}
         pinned_selection: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
+        goal_text = self._unwrap_program_ide_task_text(goal_text)
         # Build the current skills context for the manager prompt.
         skills_ctx = ""
         try:
@@ -78507,6 +79139,10 @@ body{padding:18px}
             f"Previous blackboard goal:\n{trim(str(self._ensure_blackboard().get('original_goal', '') or ''), 1200) or '(none)'}\n"
             f"Previous task context:\n{self._format_previous_task_context_for_prompt(max_chars=1000) or '(none)'}\n"
             f"Current blackboard progress: {self._manager_progress_state(self._ensure_blackboard())}\n\n"
+            f"Previous task ended: {self._blackboard_is_finished_or_aborted(self._ensure_blackboard()) or (not self._unfinished_task_level() and self._blackboard_is_finished_or_aborted(self._ensure_blackboard().get('previous_task_context', {})))}. "
+            f"Current task already active: {bool(self._unfinished_task_level())}. "
+            "A new initialized board is not an unfinished previous task. Inherit only an actually active task; "
+            "an ended task must not donate its old execution state.\n\n"
             f"Current runtime policy: level={int(self.runtime_task_level or 0)}, "
             f"mode={self._effective_execution_mode()}, "
             f"participants={','.join(self.runtime_participants or []) or '-'}, "
@@ -78522,8 +79158,8 @@ body{padding:18px}
             "Infer scale_preference by semantics (fast/balanced/thorough). "
             "When user preference is clear, prioritize it over your default plan. "
             "Remember: budget controls internal thought depth/round compactness, not early stop messaging. "
-            "Also decide inherit_previous_state by semantic continuity with prior blackboard state. "
-            "If this is pure continuation, keep current runtime policy unchanged.\n"
+            "The task lifecycle controls inheritance: keep an unfinished task's level even if this turn asks "
+            "an unrelated short question; once that task has ended, judge the latest request afresh.\n"
             f"User configured execution mode: {self.execution_mode}\n"
         )
         if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE:
@@ -78531,14 +79167,12 @@ body{padding:18px}
                 "IMPORTANT: User has configured Single-agent mode. "
                 "Prefer level 1-2 for simple tasks. Only escalate to level 3+ if truly complex.\n"
             )
-        prev_level = int(self.runtime_task_level or 0)
-        if prev_level > 0 and self._is_minor_followup_input(goal_text):
+        prev_level = self._unfinished_task_level()
+        if prev_level > 0:
             prompt += (
-                f"\nIMPORTANT: The previous task was classified as level {prev_level}. "
-                f"This appears to be a follow-up input, NOT a new task. "
-                f"Unless the user is clearly starting a completely different task, "
-                f"you MUST inherit the previous level={prev_level} and set inherit_previous_state=true. "
-                f"Do NOT downgrade the level for follow-up inputs.\n"
+                f"\nIMPORTANT: The unfinished task is level {prev_level}. "
+                "Keep its level (subject to the automatic ceiling), set inherit_previous_state=true, "
+                "and resume its execution state. Reclassify afresh only after it has ended.\n"
             )
         with self.lock:
             self.current_phase = "manager:classify:model-call"
@@ -78548,7 +79182,7 @@ body{padding:18px}
             [{"role": "user", "content": prompt, "ts": now_ts()}],
             tools=self._manager_task_classify_tools(),
             system=self._manager_classification_system_prompt(),
-            max_tokens=320,
+            max_tokens=min(1024, max(1, int(getattr(self, "max_output_tokens", 1024) or 1024))),
             think=False,
             stream_thinking=False,
             on_thinking_chunk=self._append_live_thinking,
@@ -78570,7 +79204,7 @@ body{padding:18px}
                 ],
                 tools=self._manager_task_classify_tools(),
                 system=self._manager_classification_system_prompt(),
-                max_tokens=220,
+                max_tokens=min(1024, max(1, int(getattr(self, "max_output_tokens", 1024) or 1024))),
                 think=False,
                 stream_thinking=False,
                 on_thinking_chunk=self._append_live_thinking,
@@ -78617,6 +79251,17 @@ body{padding:18px}
     # Continuation / follow-up detection (complexity inheritance)
     # ------------------------------------------------------------------
 
+    def _unfinished_task_level(self, board: dict | None = None) -> int:
+        """Share the submission boundary: ended work cannot donate a level."""
+        try:
+            level = int(getattr(self, "runtime_task_level", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        if level not in TASK_LEVEL_CHOICES:
+            return 0
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        return 0 if self._blackboard_is_finished_or_aborted(bb) else level
+
     _CONTINUATION_PHRASES = frozenset({
         "继续", "continue", "go", "proceed", "go ahead", "ok", "好", "好的",
         "是", "是的", "确认", "执行", "开始", "start", "yes", "do it", "run it",
@@ -78639,19 +79284,8 @@ body{padding:18px}
     )
 
     def _is_minor_followup_input(self, text: str) -> bool:
-        """Return True if *text* looks like a lightweight follow-up, not a brand-new task."""
-        t = str(text or "").strip()
-        if not t or len(t) > 80:
-            return False
-        t_lower = t.lower()
-        for prefix in self._NEW_TASK_PREFIXES:
-            if t_lower.startswith(prefix):
-                return False
-        board = self._ensure_blackboard()
-        progress = str(board.get("progress", "") or "").strip().lower()
-        if progress in ("done", "completed"):
-            return False
-        return True
+        """Only recognize explicit continuation while the prior task is open."""
+        return bool(self._unfinished_task_level() and self._is_continuation_input(text))
 
     def _is_plan_choice_response(self, text: str) -> bool:
         """Check if user text is a response to a plan proposal."""
@@ -78831,6 +79465,77 @@ body{padding:18px}
             text = f"{phase_rule}\n{text}"
         return executor, trim(text, MANAGER_INSTRUCTION_MAX_CHARS)
 
+    def _semantic_task_level_decision(
+        self,
+        goal_text: str,
+        *,
+        pinned_selection: str,
+        media_inputs_round: list[dict] | None = None,
+    ) -> dict:
+        """Semantic routing is authoritative; rules are an explicit failure fallback."""
+        goal = self._unwrap_program_ide_task_text(goal_text)
+        try:
+            decision = self._manager_classify_task_level(
+                goal,
+                pinned_selection=pinned_selection,
+                media_inputs_round=media_inputs_round,
+            )
+        except OllamaError as exc:
+            if bool(getattr(self, "cancel_requested", False)):
+                raise
+            self._emit("status", {"summary": f"semantic task classification unavailable; using bounded fallback: {trim(str(exc), 160)}"})
+            decision = self._fallback_task_level_decision(goal)
+            decision["source"] = "fallback-model-error"
+        if self._unfinished_task_level() and not self._runtime_decision_requests_full_replan(goal, decision):
+            inherited = self._fallback_task_level_decision(goal)
+            for key in ("judgement", "semantic_confidence", "low_confidence_reason"):
+                if key in decision:
+                    inherited[key] = decision[key]
+            inherited["source"] = str(decision.get("source", "manager")) + "+unfinished-inherit"
+            if decision.get("level") != inherited.get("level") or not decision.get("inherit_previous_state"):
+                inherited["judgement"] = (
+                    f"unfinished task retains L{inherited.get('level')}; "
+                    f"this turn's semantic L{decision.get('level')} cannot replace the active task level"
+                )
+            decision = inherited
+        else:
+            # Submission has already cleared a completed task's board. The
+            # classifier may call the new goal a continuation of the same
+            # project, but there is no active task whose execution can resume.
+            decision["inherit_previous_state"] = False
+        if not self._unfinished_task_level():
+            board = self._ensure_blackboard()
+            previous = (
+                self._previous_task_context_snapshot(board)
+                if self._blackboard_is_finished_or_aborted(board)
+                else board.get("previous_task_context", {})
+            )
+            previous = previous if isinstance(previous, dict) else {}
+            is_development = _to_bool_like(decision.get("followup_development", False), default=False)
+            # Older compatible classifiers may omit the new boolean. Their
+            # semantic task type can still identify an L2 implementation task;
+            # an L1 answer never becomes engineering from topic words alone.
+            if "followup_development" not in decision:
+                is_development = decision.get("task_type") in {"simple_code", "engineering"} and decision.get("level", 0) >= 2
+            if previous.get("task_level") == 4 and is_development and decision.get("level", 0) < 3:
+                decision = dict(decision)
+                decision.update(
+                    level=3, task_level=3, complexity="moderate", requires_todos=True,
+                    execution_mode=EXECUTION_MODE_SINGLE, participants=["developer"],
+                    assigned_expert="developer", round_budget=TASK_LEVEL_POLICIES[3]["round_budget"],
+                    requires_plan=True,
+                )
+                decision["source"] = str(decision.get("source", "manager")) + "+completed-L4-development"
+                decision["judgement"] = trim(
+                    str(decision.get("judgement", "")) + "; completed L4 development follow-up uses at least L3 before the automatic ceiling",
+                    220,
+                )
+        if decision.get("level") == 1:
+            decision.setdefault("task_type", "simple_qa")
+            decision.setdefault("complexity", "simple")
+            decision.setdefault("direct_objective", "Directly answer the latest user request in natural language.")
+        return self._apply_auto_task_level_ceiling_to_decision(decision, source="semantic")
+
     def _refresh_runtime_task_policy(
         self,
         *,
@@ -78846,6 +79551,7 @@ body{padding:18px}
             or self._latest_user_goal_text()
             or ""
         ).strip()
+        goal = self._unwrap_program_ide_task_text(goal)
         if not goal:
             return {}
         # --- User override short-circuit: user manually set level, skip manager ---
@@ -78872,14 +79578,10 @@ body{padding:18px}
                 ) == "auto"
                 and not self._is_continuation_input(goal)
             ):
-                semantic_row = (
-                    self._fallback_task_level_decision(goal)
-                    if FAST_START_LOCAL_CLASSIFICATION
-                    else self._manager_classify_task_level(
-                        goal,
-                        pinned_selection=pinned_selection,
-                        media_inputs_round=media_inputs_round,
-                    )
+                semantic_row = self._manager_classify_task_level(
+                    goal,
+                    pinned_selection=pinned_selection,
+                    media_inputs_round=media_inputs_round,
                 )
                 manual_requires_todos = self._resolve_todo_requirement(
                     _utlo,
@@ -78906,15 +79608,11 @@ body{padding:18px}
             }
             user_pref = str(self.plan_mode_user_preference or "auto").strip().lower()
             if user_pref == "auto":
-                plan_auto = (
-                    self._local_plan_mode_decision(goal, decision)
-                    if FAST_START_LOCAL_CLASSIFICATION
-                    else self._manager_decide_plan_mode_needed(
-                        goal,
-                        pinned_selection=pinned_selection,
-                        decision=decision,
-                        media_inputs_round=media_inputs_round,
-                    )
+                plan_auto = self._manager_decide_plan_mode_needed(
+                    goal,
+                    pinned_selection=pinned_selection,
+                    decision=decision,
+                    media_inputs_round=media_inputs_round,
                 )
                 decision["requires_plan"] = bool(plan_auto.get("requires_plan", False))
                 decision["plan_mode_reason"] = trim(
@@ -78932,7 +79630,7 @@ body{padding:18px}
             self._apply_runtime_task_decision(goal, decision)
             return dict(decision)
         # --- Continuation input short-circuit: inherit previous complexity ---
-        prev_level = int(self.runtime_task_level or 0)
+        prev_level = self._unfinished_task_level()
         if prev_level > 0 and self._is_continuation_input(goal):
             decision = {
                 "level": prev_level,
@@ -78958,12 +79656,18 @@ body{padding:18px}
                     "requires_plan": False,
                     "plan_mode_reason": "continuation input inherits execution without restarting plan mode",
                 }
+            decision = self._apply_auto_task_level_ceiling_to_decision(decision, source="continuation")
             self._apply_runtime_task_decision(goal, decision)
             return dict(decision)
         need = bool(
             force
             or self.runtime_reclassify_required
             or self.runtime_goal_reset_pending
+            or self._blackboard_is_finished_or_aborted(self._ensure_blackboard())
+            or (
+                self._auto_task_level_ceiling_value() > 0
+                and int(self.runtime_task_level or 0) > self._auto_task_level_ceiling_value()
+            )
             or int(self.runtime_task_level or 0) not in TASK_LEVEL_CHOICES
         )
         if not need:
@@ -78979,26 +79683,11 @@ body{padding:18px}
                 "inherit_previous_state": False,
                 "source": "cached",
             }
-        if FAST_START_LOCAL_CLASSIFICATION:
-            decision = self._fallback_task_level_decision(goal)
-            decision = self._apply_auto_task_level_ceiling_to_decision(
-                decision,
-                source="local-fast",
-            )
-            decision["source"] = "local-fast"
-            decision["semantic_confidence"] = "medium"
-            plan_auto = self._local_plan_mode_decision(goal, decision)
-            decision["requires_plan"] = bool(plan_auto.get("requires_plan", False))
-            decision["plan_mode_reason"] = trim(
-                str(plan_auto.get("reason", "local bounded plan decision") or "local bounded plan decision"),
-                240,
-            )
-        else:
-            decision = self._manager_classify_task_level(
-                goal,
-                pinned_selection=pinned_selection,
-                media_inputs_round=media_inputs_round,
-            )
+        decision = self._semantic_task_level_decision(
+            goal,
+            pinned_selection=pinned_selection,
+            media_inputs_round=media_inputs_round,
+        )
         self._apply_runtime_task_decision(goal, decision)
         return dict(decision or {})
 
@@ -80726,7 +81415,7 @@ body{padding:18px}
                     self.manager_context,
                     tools=self._manager_route_tools(),
                     system=self._manager_system_prompt(),
-                    max_tokens=600,
+                    max_tokens=self.max_output_tokens,
                     think=False,
                     stream_thinking=False,
                     on_thinking_chunk=self._append_live_thinking,
@@ -80776,7 +81465,7 @@ body{padding:18px}
                         self.manager_context,
                         tools=self._manager_route_tools(),
                         system=self._manager_system_prompt(),
-                        max_tokens=600,
+                        max_tokens=self.max_output_tokens,
                         think=False,
                         stream_thinking=False,
                         on_thinking_chunk=self._append_live_thinking,
@@ -82357,6 +83046,24 @@ body{padding:18px}
         )
         return row
 
+    def _required_no_plan_todo_initialization_needed(self, role: str = "") -> bool:
+        """Require a real model-authored checklist for L3+ before side effects."""
+        if self._runtime_task_level_for_todo_policy() < 3 or not self._runtime_level_requires_todos():
+            return False
+        if bool(getattr(self, "runtime_plan_mode_needed", False)) or bool(getattr(self, "runtime_plan_approved", False)):
+            return False
+        board = self._ensure_blackboard()
+        plan = board.get("plan", {}) if isinstance(board.get("plan"), dict) else {}
+        if str(plan.get("phase", "")) in {"research", "synthesis", "awaiting_choice", "executing"}:
+            return False
+        if self._todo_has_plan_steps(board):
+            return False
+        role_key = self._sanitize_agent_role(role)
+        if self._is_multi_agent_mode() and role_key in {"explorer", "developer", "reviewer"}:
+            return not any(self._todo_row_kind(row) == "flat" or row.get("owner") == role_key
+                           for row in self.todo.snapshot() if self._todo_row_kind(row) != "system")
+        return not self._single_no_plan_todo_has_rows()
+
     def _single_no_plan_todo_policy_enabled(self) -> bool:
         """Return whether the bounded single/no-plan Todo gate is enabled.
 
@@ -82382,7 +83089,7 @@ body{padding:18px}
     def _single_no_plan_todo_perception_tools(self) -> list[dict]:
         """Expose only observation tools until the mandatory L2 Todo exists.
 
-        This is a narrow, one-turn safety boundary.  It prevents a model from
+        This is a preparation boundary, without a fixed read count. It prevents a model from
         bypassing the level contract by emitting ``write_file`` before the
         normal perception-to-Todo bootstrap has had a chance to run.  MCP and
         browser tools are admitted only when their names advertise a read-only
@@ -82392,7 +83099,7 @@ body{padding:18px}
         read_names = {
             "read_file", "list_files", "search_files", "context_recall", "tool_memory",
             "task_get", "task_list", "read_from_blackboard", "check_background", "read_inbox",
-            "list_background_processes",
+            "list_background_processes", "ask_user",
             "list_teammates", "worktree_list", "worktree_status", "worktree_events",
             "query_code_library", "query_knowledge_library", "agent_web_search",
             "list_skills", "list_skill_providers", "list_skill_protocols", "scan_skills", "load_skill", "unload_skill",
@@ -82590,7 +83297,7 @@ body{padding:18px}
             "list_teammates", "worktree_list", "worktree_status", "worktree_events",
             "query_code_library", "query_knowledge_library", "agent_web_search",
             "list_skills", "list_skill_providers", "list_skill_protocols",
-            "scan_skills", "load_skill", "unload_skill",
+            "scan_skills", "load_skill", "unload_skill", "ask_user",
         }:
             return True
         if name == "bash" or name == "worktree_run":
@@ -82673,67 +83380,12 @@ body{padding:18px}
         return tools
 
     def _deterministic_bootstrap_todo_call(self) -> dict | None:
-        """Build the smallest safe Todo call from the authoritative user goal.
+        """Retired compatibility hook: task understanding must come from the model.
 
-        This is a last-resort protocol bridge, not another planner.  Explicitly
-        numbered user stages are preserved in order; otherwise one goal-bound
-        item is enough.  Returning a normal synthetic tool call lets the main
-        dispatcher perform the same validation, persistence, UI refresh, and
-        later status updates as a model-emitted TodoWrite call.
+        Missing or thinking-only output is not a readiness verdict and must
+        never fabricate an executable Todo graph from the user goal.
         """
-        goal = str(
-            self._authoritative_user_goal_for_model()
-            or self._latest_user_goal_text()
-            or ""
-        ).strip()
-        if not goal or goal.casefold() == "current task":
-            return None
-        normalized = normalize_embedded_newlines(goal)
-        numbered: list[tuple[int, str]] = []
-        stage_pattern = re.compile(
-            r"(?:^|\n|(?<=\s))(\d{1,2})[\.\)、:]\s*"
-            r"(.+?)(?=(?:\n|\s)+(?:\d{1,2})[\.\)、:]\s*|$)",
-            flags=re.DOTALL,
-        )
-        for match in stage_pattern.finditer(normalized):
-            try:
-                order = int(match.group(1))
-            except Exception:
-                continue
-            content = trim(re.sub(r"\s+", " ", str(match.group(2) or "")).strip(" -;；"), 500)
-            if content:
-                numbered.append((order, content))
-        items: list[dict] = []
-        if numbered:
-            # Preserve appearance order rather than sorting: users sometimes
-            # intentionally repeat or restart numbering in nested stages.
-            seen: set[str] = set()
-            for _, content in numbered[:40]:
-                identity = content.casefold()
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                items.append({"content": content, "status": "pending"})
-        if not items:
-            concise_goal = trim(re.sub(r"\s+", " ", normalized).strip(), 500)
-            if not concise_goal:
-                return None
-            items = [{"content": concise_goal, "status": "pending"}]
-        items[0]["status"] = "in_progress"
-        return {
-            "id": make_id("tool"),
-            "type": "function",
-            "function": {
-                "name": "TodoWriteRescue",
-                "arguments": {
-                    "items": items,
-                    "in_progress_index": 0,
-                    # Plain status_update: a bootstrap seeds an empty tree and
-                    # must never enter the audited revision path.
-                    "update_mode": "status_update",
-                },
-            },
-        }
+        return None
 
     def _single_no_plan_todo_remove_bootstrap_hints(self) -> None:
         if not isinstance(getattr(self, "messages", None), list):
@@ -82764,11 +83416,12 @@ body{padding:18px}
                 "content": (
                     "<single-no-plan-todo-bootstrap>\n"
                     f"{trim(prompt, 6000)}\n\n"
-                    "This is the planning phase after read-only perception. Use the "
+                    "This is an open preparation phase after initial observation. Use the "
                     "preceding evidence and the read-only tools available in this phase "
                     "to fill any material gaps. Once you have enough evidence, return "
-                    "exactly one TodoWrite or TodoWriteRescue call with 1-40 next actions. "
-                    "Do not call implementation tools or finish_task.\n"
+                    "one TodoWrite or TodoWriteRescue call with suitable next actions and the preparation assessment. "
+                    "Do not create a list while context is materially missing. ask_user is available for a necessary "
+                    "clarification. Do not call implementation tools or finish_task.\n"
                     "</single-no-plan-todo-bootstrap>"
                 ),
                 "ts": now_ts(),
@@ -82776,7 +83429,7 @@ body{padding:18px}
         )
         self._emit(
             "status",
-            {"summary": "single/no-plan perception complete; Todo bootstrap turn required"},
+            {"summary": "single/no-plan preparation open; continue observation until ready for Todos"},
         )
         try:
             self._persist()
@@ -82802,9 +83455,10 @@ body{padding:18px}
                     "content": (
                         "<single-no-plan-todo-bootstrap-retry>\n"
                         f"The required Todo bootstrap turn did not complete: {reason_text}. "
-                        "Retry once now. Call exactly one TodoWrite or TodoWriteRescue "
-                        "with 1-40 evidence-based items, preserving explicit ordered stages one-for-one, and exactly one in_progress item; "
-                        "do not use any implementation tool.\n"
+                        "Resolve the reported protocol problem. Continue observation or ask_user if context is missing; "
+                        "once ready, submit the model's own evidence-based TodoWrite or TodoWriteRescue and preparation "
+                        "assessment, preserving ordered stages and exactly one in_progress item. "
+                        "Do not manufacture a checklist merely to escape this phase.\n"
                         "</single-no-plan-todo-bootstrap-retry>"
                     ),
                     "ts": now_ts(),
@@ -84561,6 +85215,90 @@ body{padding:18px}
             f"Current work: {target}; continue it only if it is still appropriate."
         )
 
+    def _selected_skill_reading_gaps(self, role: str = "") -> list[dict]:
+        """Full observed workflows survive compaction as exact read coverage."""
+        gaps = []
+        hard = getattr(self, "skill_mode", "dynamic") == "hard"
+        ids = list(getattr(self, "bound_skill_ids", [])) if hard else list(self._loaded_skill_rows())
+        for skill_id in ids:
+            try:
+                row = self._prepare_skill_execution_workspace(skill_id)
+                if row.get("status") != "ready":
+                    continue
+                expected = row["files"].get("SKILL.md", "")
+                seen = any(
+                    isinstance(memory, dict) and memory.get("source_sha256") == expected
+                    and not memory.get("stale")
+                    and self._ranges_cover(memory.get("read_ranges", []), 1, int(memory.get("total_lines", 0) or 1))
+                    for memory in getattr(self, "long_content_memory", {}).values()
+                )
+                if not seen and not hard:
+                    # A short auto-loaded workflow may already have been
+                    # delivered in full in the recurring execution prompt.
+                    loaded_row = self._loaded_skill_rows().get(skill_id, {})
+                    rendered = self._loaded_skill_body_from_cache(skill_id, loaded_row)
+                    seen = bool(rendered and rendered in self._loaded_skills_context_block(for_role=role, max_chars=3500))
+                if not seen:
+                    gaps.append({"skill_id": skill_id, "workflow": row.get("authoritative_source") if hard else row["workflow"]})
+            except Exception as exc:
+                gaps.append({"skill_id": skill_id, "error": str(exc)[:300]})
+        return gaps
+
+    def _todo_preparation_guard(self, source: dict, *, role: str, existing_rows: list[dict], board: dict) -> str:
+        """Require a concise model decision, never infer readiness from a read count.
+
+        The execution model supplies the decision in the same call as the first
+        Todo graph. This adds no independent planning request and stores no
+        private reasoning. A material gap keeps observation/clarification open.
+        """
+        if not bool(getattr(self, "_task_preparation_required", False)) or self._runtime_task_level_for_todo_policy() < 1:
+            return ""
+        goal = str(self._authoritative_user_goal_for_model() or board.get("original_goal", "") or "").strip()
+        if not goal or self._blackboard_is_terminal_completion(board):
+            return ""
+        owner = self._sanitize_agent_role(role)
+        if any(str(row.get("owner", "") or "") in {"", owner} for row in existing_rows if isinstance(row, dict)):
+            return ""
+        if getattr(self, "pending_user_question", None):
+            return self._plan_control_feedback("task_preparation_pending", "An actual ask_user question is still awaiting its answer. Keep preparation open; do not turn an unanswered choice into an executable blocking Todo.")
+        preparation = source.get("preparation")
+        if isinstance(preparation, str):
+            preparation = extract_json_object_from_text(preparation, {})
+        if not isinstance(preparation, dict):
+            return self._plan_control_feedback(
+                "task_preparation_required",
+                "Before initializing Todos, understand the actual goal and current state, consider available skills, "
+                "and read selected workflows completely. Continue read-only discovery or ask_user for material gaps. "
+                "When ready, resubmit the same intended new rows (omit invented ids) with preparation="
+                '{"goal":"brief understood objective","state":"relevant observed or user-provided state",'
+                '"skills":"selection or reason no skill is relevant","basis":"user_context|observed_context|continuation",'
+                '"ready":true,"missing":[]}. One read is not proof of readiness; no fixed read count is required.')
+        goal_summary = str(preparation.get("goal", "") or "").strip()
+        state_summary = str(preparation.get("state", "") or "").strip()
+        skill_decision = str(preparation.get("skills", "") or "").strip()
+        ready = self._optional_bool_value(preparation.get("ready"))
+        missing = preparation.get("missing", [])
+        basis = str(preparation.get("basis", "") or "").strip()
+        if not isinstance(missing, list) or not all(isinstance(item, str) for item in missing):
+            return self._plan_control_feedback("task_preparation_invalid", "preparation.missing must be a list of actual unresolved context gaps.")
+        missing = [item.strip() for item in missing if item.strip()]
+        if ready is not True or missing:
+            return self._plan_control_feedback("task_preparation_pending", "Do not create a Todo graph yet. Resolve the stated gaps through observation or ask_user: " + json_dumps(missing))
+        if not all((goal_summary, state_summary, skill_decision)) or basis not in {"user_context", "observed_context", "continuation"}:
+            return self._plan_control_feedback("task_preparation_invalid", "Supply brief goal/state/skills summaries and a valid basis; do not substitute a generic planning slogan.")
+        gaps = self._selected_skill_reading_gaps(owner)
+        if gaps:
+            return self._plan_control_feedback("selected_skill_reading_required", "Complete the selected workflow reads before committing the list: " + json_dumps(gaps))
+        step = self._get_active_plan_step(board) or {}
+        record = {"goal": trim(goal_summary, 1000), "state": trim(state_summary, 1600),
+                  "skills": trim(skill_decision, 1200), "basis": basis, "ready": True,
+                  "owner": owner, "step_id": str(step.get("id", "") or ""),
+                  "goal_digest": hashlib.sha256(goal.encode("utf-8", errors="backslashreplace")).hexdigest(), "ts": now_ts()}
+        rows = [row for row in board.get("preparation_decisions", []) if isinstance(row, dict)]
+        board["preparation_decisions"] = (rows + [record])[-40:]
+        self.blackboard = board
+        return ""
+
     def _dispatch_todo_update_inner(self, args: dict, *, role: str = "", resume: bool = False) -> str:
         """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
         source = args if isinstance(args, dict) else {}
@@ -84585,6 +85323,9 @@ body{padding:18px}
         # classification, or row mutation. A bad id rejects the whole payload.
         route_before = self._todo_route_kind(role=role_key, board=bb)
         reference_rows = self._todo_route_rows(route_before, role=role_key, board=bb)
+        preparation_error = self._todo_preparation_guard(source, role=role_key, existing_rows=reference_rows, board=bb)
+        if preparation_error:
+            return preparation_error
         if route_before in {"plan_single", "plan_sync"}:
             reference_rows = [
                 {**row, "subtask_id": self._stable_plan_worker_subtask_id(active_step_id, row)}
@@ -86262,6 +87003,14 @@ body{padding:18px}
             out = self._trace_tool_result(name, args, role_guard, role_key)
             self._maybe_record_tool_memory_after_result(name, args, out, role_key)
             return out
+        if (bool(getattr(self, "running", False)) and self._required_no_plan_todo_initialization_needed(role_key or self.active_agent_role)
+            and name not in {"TodoWrite", "TodoWriteRescue", "ask_user", "compress", "stop_background_process",
+                             "finish_task", "finish_current_task", "mark_done"}
+            and self._single_no_plan_todo_is_mutation_result({"name": name, "args": args, "ok": True})):
+            return self._plan_control_feedback("todo_initialization_required",
+                f"The current role {role_key or self.active_agent_role} has no required Todo tracking. "
+                "Use TodoWrite to create your own assigned work from actual read-only observations; "
+                "another owner's rows do not count. Preserve peers and IDs. This tool was not executed.")
         try:
             # Shell-backed tools have their own timeout/state mechanism; keep
             # them on this thread so structured outcome metadata is not lost at
@@ -86455,6 +87204,20 @@ body{padding:18px}
         """Return a source-version key for safe, read-only shell commands."""
         raw = re.sub(r"\s+", " ", str(command or "").strip())
         if not raw or not self._bash_looks_like_file_read(raw):
+            return ""
+        # A script can import code, read data, query a live service or mutate
+        # files outside its own source path. The read cache tracks explicit
+        # file operands only, so treating `python check.py` as a source read
+        # can replay an obsolete test verdict after the product has changed.
+        try:
+            words = shlex.split(raw)
+        except ValueError:
+            return ""
+        if any(re.fullmatch(
+            r"(?:python(?:\d+(?:\.\d+)*)?|pypy[\d.]*|node|npx|npm|pnpm|yarn|pytest|uv|"
+            r"bash|zsh|sh|cmd|powershell|pwsh|ruby|perl|php|cargo|go|make)(?:\.exe)?",
+            word.replace("\\", "/").rsplit("/", 1)[-1], re.I,
+        ) for word in words):
             return ""
         if re.search(r"(?:^|[;&|]\s*)(?:rm|mv|cp|touch|chmod|chown|mkdir|rmdir|sed\s+-i|perl\s+-i)\b", raw, re.I):
             return ""
@@ -86685,7 +87448,7 @@ body{padding:18px}
                     "Error: hard application mode cannot read the mutable global skills store. "
                     "Use load_skill for one of the immutable bound skill ids."
                 )
-            if self.skill_mode == "hard" and str(args.get("path", "") or "").replace("\\", "/").lstrip("/").startswith("workspace/.application_skills"):
+            if self.skill_mode == "hard" and str(args.get("path", "") or "").replace("\\", "/").startswith("workspace/.application_skills"):
                 return "Error: use /workspace/.application_skills/... or .application_skills/... for the immutable application snapshot."
             try:
                 rel = self._normalize_tool_path_text(args["path"])
@@ -87891,6 +88654,28 @@ body{padding:18px}
                 break
         step_desc = trim(str(current_step.get("content", "") if current_step else "none"), 200)
         is_plan_executing = plan.get("phase") == "executing"
+        revision_note = ""
+        if is_plan_executing and current_step and str(user_text or "").strip():
+            step_id = str(current_step.get("id", "") or "")
+            adjustment_id = "user:" + hashlib.sha256(
+                (step_id + "\n" + user_text).encode("utf-8", "backslashreplace")
+            ).hexdigest()[:24]
+            adjustments = list(bb.get("user_plan_adjustments", []) or [])
+            if not any(row.get("id") == adjustment_id for row in adjustments if isinstance(row, dict)):
+                adjustments.append({
+                    "id": adjustment_id, "step_id": step_id, "kind": "user_input",
+                    "tool": "user_request", "actor": "user", "ok": True,
+                    "summary": str(user_text), "ts": float(now_ts()),
+                })
+                bb["user_plan_adjustments"] = adjustments[-40:]
+                self.blackboard = bb
+            revision_note = (
+                f"\nRequirement revision evidence: {adjustment_id}. If this changes the contract, "
+                "use TodoWrite plan_updates to update affected OPEN parent steps, plus revise_open "
+                "with revision_reason and this revision_evidence to revise the complete open child snapshot. "
+                "Preserve retained row IDs and completed evidence. Revise acceptance criteria too; "
+                "status_update does not change stored titles or contracts. Do this before repeating obsolete checks.\n"
+            )
         conflict_score = self._user_feedback_conflict_score(user_text, step_desc)
         if conflict_score >= 0.8:
             conflict_level = "HIGH"
@@ -87918,7 +88703,7 @@ body{padding:18px}
                 f"<user-feedback-merge conflict=\"{conflict_level}\" score=\"{conflict_score:.2f}\">\n"
                 f"User provided new input during plan execution: {trim(user_text, 500)}\n"
                 f"Current plan step: {step_desc}\n"
-                f"{directive}\n"
+                f"{directive}\n{revision_note}"
                 f"</user-feedback-merge>"
             )
         else:
@@ -89686,7 +90471,13 @@ body{padding:18px}
         self._emit("status", {"summary": "plan-mode: research phase started"})
         bb = self._ensure_blackboard()
         bb["status"] = "PLANNING"
-        bb["plan"] = {"phase": "research", "findings": []}
+        previous_plan = bb.get("plan", {})
+        continuing_preparation = isinstance(previous_plan, dict) and (
+            previous_plan.get("preparation_state") in {"pending", "awaiting_clarification"}
+            or previous_plan.get("phase") in {"preparation_pending", "awaiting_clarification"}
+        )
+        previous_findings = previous_plan.get("findings", []) if continuing_preparation else []
+        bb["plan"] = {"phase": "research", "findings": previous_findings}
         self.blackboard = bb
 
         # Perform one bounded, high-confidence discovery pass before research
@@ -89701,10 +90492,11 @@ body{padding:18px}
         research_prompt = self._plan_mode_research_prompt()
         self._seed_plan_mode_explorer_context(research_prompt)
 
-        productive_rounds = 0
         stale_rounds = 0
         research_sig = self._plan_mode_research_signature()
-        for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
+        preparation_ready = False
+        research_round_limit = max(1, int(getattr(self, "runtime_round_budget", 0) or self.max_agent_rounds))
+        for r in range(research_round_limit):
             if self.cancel_requested:
                 return {"status": "interrupted"}
             self._inject_pending_user_inputs()
@@ -89712,23 +90504,31 @@ body{padding:18px}
             status = str(step.get("status", "") or "")
             if status == "interrupted":
                 return {"status": "interrupted"}
+            if status == "awaiting_clarification":
+                return {"status": status}
+            if status == "ready":
+                preparation_ready = True
+                break
             if status in {"ok", "findings-only", "no-tools"}:
                 self._plan_mode_update_findings(step)
             new_sig = self._plan_mode_research_signature()
             if new_sig != research_sig:
-                productive_rounds += 1
                 stale_rounds = 0
                 research_sig = new_sig
             else:
                 stale_rounds += 1
-            if status in ("no-tools", "findings-only", "skip"):
-                break
-            if productive_rounds >= PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS:
-                self._emit("status", {"summary": "plan-mode: evidence budget satisfied; synthesizing now"})
-                break
             if stale_rounds >= PLAN_MODE_EXPLORER_STALE_ROUNDS:
-                self._emit("status", {"summary": "plan-mode: no new evidence; synthesizing current findings"})
+                self._emit("status", {"summary": "plan-mode: preparation has not demonstrated readiness; preserving research"})
                 break
+
+        if not preparation_ready:
+            bb = self._ensure_blackboard()
+            bb["status"] = "PAUSED"
+            bb["plan"]["phase"] = "research"
+            bb["plan"]["preparation_state"] = "pending"
+            self.blackboard = bb
+            self._emit("status", {"summary": "plan-mode: research paused without a readiness decision; no executable plan was fabricated"})
+            return {"status": "preparation_pending"}
 
         # Phase 2: manager synthesis of structured executable options
         # Inject pending user inputs before synthesis
@@ -89816,9 +90616,30 @@ body{padding:18px}
         self._emit("status", {"summary": "plan-mode: awaiting user choice"})
         return {"status": "awaiting_choice", "options": len(proposal.get("options", []) or [])}
 
+    @staticmethod
+    def _plan_todo_runtime_contract() -> str:
+        return (
+            "TODO RUNTIME CONTRACT: approved major steps automatically become canonical Todo rows. "
+            "Maintain current-step subtasks and statuses throughout execution; keep this tracking rule "
+            "in global_constraints, not a standalone major phase. Never append duplicate rows for "
+            "future/past major steps or activate future implementation inside a research step. "
+            "Reuse stable IDs; only executable current-step work belongs under the active parent. "
+            "Before choosing stages or subtasks, understand the actual goal/current state, consider available skills "
+            "and read selected full workflows. Continue research or clarification until material gaps are resolved. "
+            "Do not equate one observation with readiness. Choose the smallest complete set of stages that covers "
+            "dependencies and independent verification. Preparation already completed during research is context, not future work; "
+            "schedule additional research only for demonstrated remaining gaps. Include a concise preparation assessment with initial step-local Todos.\n"
+        )
+
     def _plan_mode_research_prompt(self) -> str:
         goal = self._authoritative_user_goal_for_model() or str(
             self.runtime_reclassify_goal or self._latest_user_goal_text() or ""
+        )
+        latest_input = self._latest_user_goal_text(max_chars=6000)
+        clarification_context = (
+            "## Latest User Input\n" + trim(latest_input, 6000)
+            + "\nUse this reply to resolve earlier questions while preserving the overall goal. Do not ask an already answered question again.\n\n"
+            if latest_input and latest_input.strip() != goal.strip() else ""
         )
         lang_note = model_language_instruction(self.ui_language)
         os_note = _detect_os_shell_instruction()
@@ -89847,8 +90668,10 @@ body{padding:18px}
             f"You are in plan-mode research phase. Your task is to analyze the following request "
             f"WITHOUT making any modifications.\n\n"
             f"## User Request\n{goal}\n\n"
+            f"{clarification_context}"
             f"{skills_section}"
             f"## Instructions\n"
+            f"{self._plan_todo_runtime_contract()}\n"
             f"1. Start from the user request and inspect only evidence needed to choose an executable architecture. "
             f"Use `list_skills` only when the requested artifact or workflow plausibly maps to a specialized skill.\n"
             f"2. Inspect focused workspace paths or uploaded inputs that actually exist; do not perform a generic full-directory inventory.\n"
@@ -89858,6 +90681,7 @@ body{padding:18px}
             f"6. Assess risks and note only ambiguities that materially require user input\n"
             f"7. DO NOT write, edit, or create any files. Read-only analysis only. Stop once new reads no longer change the proposed execution path.\n"
             f"8. Write only decision-relevant findings to the blackboard under 'plan_findings'. Include relevant paths/APIs, constraints, validation commands, and any loaded-skill workflow requirements. Omit empty sections and generic inventories.\n"
+            f"When the goal, necessary current state and complete selected workflows are understood, call assess_task_preparation with brief goal/state/skills summaries, basis, ready=true and missing=[]. This is the only signal to finish research. No read quota or round count implies readiness. If material user choices are missing, call ask_user and wait; otherwise continue focused observations. User-provided or recalled context can suffice without new reads.\n"
             f"9. For coding tasks, identify the test strategy:\n"
             f"   - What build/compilation commands are available? (Makefile, npm, cargo, cmake, etc.)\n"
             f"   - What test frameworks/suites exist? (pytest, jest, go test, etc.)\n"
@@ -89908,6 +90732,14 @@ body{padding:18px}
             name = str(fn.get("name", "")).strip()
             if name in PLAN_MODE_RESEARCH_TOOL_ALLOWLIST or name.startswith(MCP_TOOL_PREFIX):
                 filtered_tools.append(tool)
+        preparation_schema = next(
+            tool["function"]["parameters"]["properties"]["preparation"]
+            for tool in self._available_tools() if tool.get("function", {}).get("name") == "TodoWrite"
+        )
+        filtered_tools.append(tool_def(
+            "assess_task_preparation", "Finish research only when the actual task and selected complete workflows are understood; otherwise keep observing or ask_user.",
+            preparation_schema["properties"], ["goal", "state", "skills", "basis", "ready", "missing"],
+        ))
         if not filtered_tools:
             filtered_tools = self._tools_for_agent("explorer")
         with self.lock:
@@ -90009,6 +90841,7 @@ body{padding:18px}
             return {"status": "no-tools", "text": "", "thinking": thinking_text}
         # Execute tool calls (read-only)
         evidence_rows: list[str] = []
+        preparation_ready = False
         for tc in tool_calls:
             if self.cancel_requested:
                 return {"status": "interrupted"}
@@ -90036,12 +90869,17 @@ body{padding:18px}
                     }, mirror_to_global=False)
                     continue
             try:
-                raw_output = self._dispatch_tool(
-                    fn_name,
-                    fn_args,
-                    agent_role="explorer",
-                    tool_call_id=str(tc.get("id", "") or ""),
-                )
+                if fn_name == "assess_task_preparation":
+                    feedback = self._todo_preparation_guard({"preparation": fn_args}, role="explorer", existing_rows=[], board=self._ensure_blackboard())
+                    preparation_ready = not feedback
+                    raw_output = feedback or "Task preparation ready; synthesize from the verified context and findings."
+                else:
+                    raw_output = self._dispatch_tool(
+                        fn_name,
+                        fn_args,
+                        agent_role="explorer",
+                        tool_call_id=str(tc.get("id", "") or ""),
+                    )
             except Exception as exc:
                 raw_output = f"Error: {exc}"
             result_content = str(raw_output or "")
@@ -90075,6 +90913,18 @@ body{padding:18px}
                 "conversation_visible": canonicalize_tool_name(fn_name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                 "summary": f"plan-mode research: {fn_name}",
             })
+            if self._consume_ask_user_pause():
+                bb = self._ensure_blackboard()
+                bb["plan"]["phase"] = "research"
+                bb["plan"]["preparation_state"] = "awaiting_clarification"
+                self.blackboard = bb
+                self._enter_ask_user_paused_state("explorer")
+                return {"status": "awaiting_clarification"}
+            if preparation_ready:
+                # A ready signal closes the preparation transaction; any
+                # later calls in the batch cannot revise that evidence.
+                self._plan_mode_update_findings({"text": json_dumps(fn_args), "finding_source": "preparation"})
+                return {"status": "ready"}
         finding_text = str(text or "").strip()
         finding_source = "content"
         if not finding_text and thinking_text:
@@ -90986,6 +91836,13 @@ body{padding:18px}
         goal = self._authoritative_user_goal_for_model() or str(
             self.runtime_reclassify_goal or self._latest_user_goal_text() or ""
         )
+        latest_input = self._latest_user_goal_text(max_chars=6000)
+        preparation_context = (
+            "\n## Current Preparation Decision\n"
+            + json_dumps((bb.get("preparation_decisions") or [{}])[-1])
+            + ("\nLatest user input: " + trim(latest_input, 6000) if latest_input and latest_input.strip() != goal.strip() else "")
+            + "\nResolved questions are completed context, not future blocking phases. Plan only remaining work.\n\n"
+        )
         # Include loaded skill guidance in synthesis
         bb_skills = bb.get("loaded_skills", {})
         skills_section = ""
@@ -91005,13 +91862,14 @@ body{padding:18px}
                     "- Which tool to call (bash, read_file, write_file, etc.)\n"
                     "- Which specific file paths to use (e.g., 'Read uploaded/IEDM_.parsed.md')\n"
                     "- What output to produce at each step\n"
-                    "Decompose each skill's workflow into 3-5 substeps based on the skill's instructions.\n\n"
+                    "Use only the workflow steps required by this task and its actual dependencies; do not impose a fixed substep count.\n\n"
                 )
         synthesis_prompt = (
             f"Based on the research findings below, generate a structured plan proposal "
             f"with up to {PLAN_MODE_MAX_OPTIONS} options for the user to choose from.\n\n"
             f"## User Request\n{goal}\n\n"
             f"## Research Findings\n{trim(findings_text, 6000)}\n\n"
+            f"{preparation_context}"
             f"{skills_section}"
             f"## Instructions\n"
             f"You MUST call the submit_plan_proposal tool exactly once with:\n"
@@ -91032,7 +91890,7 @@ body{padding:18px}
             f"DO NOT invent script names like 'analyze_reports.py' or 'generate_pptx.js' that don't exist. "
             f"Use the real scripts found in /skills/ directories (e.g., project_manager.py, svg_to_pptx.py).\n"
             f"- When a loaded skill defines a specific workflow, follow that workflow's actual tools and scripts.\n"
-            f"- For complex tasks, produce 8-15 detailed steps, not 3-5 vague ones\n"
+            f"- Choose major steps from actual dependencies and ownership boundaries. Honor the user's requested stages; do not inflate a small task to meet a step-count target.\n"
             f"- Each step should be completable in 1-3 tool calls\n"
             f"- Every major step must include an explicit acceptance signal: how to know the step is done.\n"
             f"- Acceptance signals must use observable evidence such as exit code, test summary, API response, rendered output, parsed rows, numerical thresholds, or screenshot/result inspection.\n"
@@ -91041,6 +91899,7 @@ body{padding:18px}
             f"- Never combine implementation with independent testing/review in the same major step. Put independent verification in the following major step so it can have a distinct owner.\n"
             f"- A developer may run a fast local smoke check while implementing, but the independent test/review major step remains separate for complex multi-agent plans.\n"
             f"- Do not create a full research->implementation->review chain for every micro-task; add phase boundaries only when ownership or risk changes.\n"
+            f"{self._plan_todo_runtime_contract()}\n"
             f"\nSTEP STRUCTURE — MAJOR STEPS WITH SUB-STEPS:\n"
             f"Organize steps into MAJOR numbered groups. Each major step has:\n"
             f"  1) A summary title line: \"N. Summary Title\" (e.g., \"1. Project Initialization\")\n"
@@ -91071,7 +91930,7 @@ body{padding:18px}
             f"- Each major step = one array element with summary title + 2-5 sub-steps\n"
             f"- Summary title captures the THEME of that group (not just repeat the first sub-step)\n"
             f"- Sub-steps include specific file paths, commands, or expected outputs\n"
-            f"- Aim for 5-8 major steps for complex tasks, 3-5 for simpler ones\n"
+            f"- Prefer the smallest complete set of major steps that preserves research, implementation, and independent verification when needed.\n"
             f"\n"
             f"Make options meaningfully different across their END-TO-END architecture, deliverable, scope, or trade-off. "
             f"Changing only initialization folders, filenames, or the first step does not create a distinct option.\n"
@@ -91124,7 +91983,7 @@ body{padding:18px}
             synthesis_ctx,
             tools=synthesis_tools,
             system=synthesis_system,
-            max_tokens=PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS,
+            max_tokens=self.max_output_tokens,
             think=False,
             stream_thinking=False,
             on_thinking_chunk=self._append_live_thinking,
@@ -91148,7 +92007,7 @@ body{padding:18px}
             ],
             tools=synthesis_tools,
             system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
-            max_tokens=PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS,
+            max_tokens=self.max_output_tokens,
             think=False,
             stream_thinking=False,
             on_thinking_chunk=self._append_live_thinking,
@@ -91175,7 +92034,8 @@ body{padding:18px}
             f"Generate ONE simple plan for this task. You MUST call submit_plan_proposal with exactly 1 option.\n\n"
             f"Task: {goal}\n\nFindings: {trim(findings_text, 3000)}\n\n"
             f"Return a single option with id='A', an unnumbered option-level title, "
-            f"a one-sentence decision summary, and 5-10 concrete steps. "
+            f"a one-sentence decision summary, and concrete steps proportional to the task. "
+            f"{self._plan_todo_runtime_contract()}\n"
             f"Do not reuse the first step as the title or summary.\n"
             f"Do NOT answer with prose-only markdown. A response without submit_plan_proposal tool call is invalid.\n"
             f"{model_language_instruction(self.ui_language)}"
@@ -91196,7 +92056,7 @@ body{padding:18px}
                 ctx,
                 tools=self._plan_mode_synthesis_tools(),
                 system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
-                max_tokens=6000,
+                max_tokens=self.max_output_tokens,
                 think=False,
                 stream_thinking=False,
                 on_thinking_chunk=self._append_live_thinking,
@@ -91220,7 +92080,7 @@ body{padding:18px}
                 ],
                 tools=self._plan_mode_synthesis_tools(),
                 system="You MUST call submit_plan_proposal exactly once. Do not answer with plain text.",
-                max_tokens=6000,
+                max_tokens=self.max_output_tokens,
                 think=False,
                 stream_thinking=False,
                 on_thinking_chunk=self._append_live_thinking,
@@ -91753,7 +92613,7 @@ body{padding:18px}
         text = normalize_embedded_newlines(title).strip()
         if not text:
             return True
-        first = re.split(r"\s+", text, 1)[0].strip(" \t,，;；:：.。()[]{}")
+        first = re.split(r"\s+", text, maxsplit=1)[0].strip(" \t,，;；:：.。()[]{}")
         if not first:
             return True
         if re.match(r"^[A-Za-zµμ%°]+(?:[/._^·-][A-Za-z0-9µμ%°]+)+$", first):
@@ -92683,9 +93543,14 @@ body{padding:18px}
         base_level = int(current_level or 3)
         if base_level not in TASK_LEVEL_CHOICES:
             base_level = 3
-        shift = {"low": -1, "medium": 0, "high": 1}.get(str(risk or "").strip().lower(), 0)
+        # Low execution risk does not reduce the semantic scope or remove an
+        # executor/reviewer from an approved L3/L4 task. High-risk escalation
+        # still follows the automatic ceiling; explicit user levels win above.
+        shift = 1 if str(risk or "").strip().lower() == "high" else 0
         target = base_level + int(shift)
-        return max(min(TASK_LEVEL_CHOICES), min(max(TASK_LEVEL_CHOICES), int(target)))
+        target = max(min(TASK_LEVEL_CHOICES), min(max(TASK_LEVEL_CHOICES), int(target)))
+        ceiling = self._auto_task_level_ceiling_value()
+        return min(target, ceiling) if ceiling > 0 else target
 
     def _prune_planner_context_after_plan_approval(self, choice_id: str, chosen: dict, grouped_steps: list):
         planner_rows = [
@@ -93017,9 +93882,11 @@ body{padding:18px}
             self._set_runtime_phase(self._startup_phase("model-ready"))
             self._ensure_runtime_model_ready()
             pinned_selection = self._active_runtime_selection()
-            # Keep startup classification local and bounded by default. The
-            # legacy model classifier remains available behind an opt-out env.
-            goal_for_classify = self.runtime_reclassify_goal or self._latest_user_goal_text()
+            # The local pre-screen supplies hints; the policy router below
+            # still makes the semantic decision over the actual user request.
+            goal_for_classify = self._unwrap_program_ide_task_text(
+                self.runtime_reclassify_goal or self._latest_user_goal_text()
+            )
             self._set_runtime_phase(self._startup_phase("complexity-precheck"))
             try:
                 self._cached_llm_complexity = (
@@ -93372,8 +94239,9 @@ body{padding:18px}
                         f"This is continuation {consecutive_empty_action_rounds + 1} of "
                         f"{EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS} before compatibility recovery. "
                         "The prior response completed internal reasoning but emitted no TodoWrite action. "
-                        "Do not restart perception or describe the analysis; convert the existing reasoning "
-                        "and observed evidence into exactly one TodoWrite or TodoWriteRescue call now."
+                        "Use the existing observations to decide whether preparation is complete. If material context is missing, "
+                        "choose the next read-only discovery or ask_user; otherwise submit your own TodoWrite with "
+                        "the brief preparation assessment. Do not manufacture a checklist to satisfy a turn count."
                     )
                     if bootstrap_thinking_signal:
                         continuation += (
@@ -93428,7 +94296,7 @@ body{padding:18px}
                         parsed_args = raw_args
                         if not isinstance(parsed_args, dict):
                             parsed_args = parse_tool_arguments(raw_args)
-                        if self._single_no_plan_todo_is_perception_result(
+                        if call_name == "ask_user" or self._single_no_plan_todo_is_perception_result(
                             {"name": call_name, "args": parsed_args, "ok": True}
                         ):
                             # Read-only calls are deliberately allowed during
@@ -100379,7 +101247,7 @@ Object.assign(I18N['en'],{
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
       event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
-  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',event_query:'query',event_archive:'archive',event_details:'Details',event_matches:'matches',event_returned:'returned',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Assessing the goal, current state and selected workflows',event_todo_bootstrap_note:'Observe or clarify material gaps; commit Todos when the context is sufficient.',event_todo_bootstrap_retry_note:'Preparation continues; a retry does not imply that the task is ready to plan.',event_todo_bootstrap_perception:'preparation open',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',event_query:'query',event_archive:'archive',event_details:'Details',event_matches:'matches',event_returned:'returned',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
@@ -100408,7 +101276,7 @@ Object.assign(I18N['zh-CN'],{
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
       event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
-  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',event_query:'查询',event_archive:'归档',event_details:'详细内容',event_matches:'条匹配',event_returned:'条召回',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'理解目标、当前状态与已选技能流程',event_todo_bootstrap_note:'必要信息不明时继续观察或澄清，充分理解后再建立 Todo。',event_todo_bootstrap_retry_note:'系统继续准备；重试不代表任务已满足建表条件。',event_todo_bootstrap_perception:'准备中',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',event_query:'查询',event_archive:'归档',event_details:'详细内容',event_matches:'条匹配',event_returned:'条召回',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
@@ -100440,7 +101308,7 @@ Object.assign(I18N['zh-TW'],{
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
       event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
-  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',event_query:'查詢',event_archive:'歸檔',event_details:'詳細內容',event_matches:'筆匹配',event_returned:'筆召回',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'理解目標、目前狀態與已選技能流程',event_todo_bootstrap_note:'必要資訊不明時繼續觀察或釐清，充分理解後再建立 Todo。',event_todo_bootstrap_retry_note:'系統繼續準備；重試不代表任務已滿足建表條件。',event_todo_bootstrap_perception:'准备中',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',event_query:'查詢',event_archive:'歸檔',event_details:'詳細內容',event_matches:'筆匹配',event_returned:'筆召回',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
@@ -100470,7 +101338,7 @@ Object.assign(I18N['ja'],{
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
       event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
-  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',event_query:'検索',event_archive:'アーカイブ',event_details:'詳細',event_matches:'件一致',event_returned:'件取得',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'目標・現状・選択したスキルの手順を確認',event_todo_bootstrap_note:'必要な情報を観察・確認し、十分に理解してから Todo を作成します。',event_todo_bootstrap_retry_note:'準備を継続します。再試行だけでは計画の準備完了を意味しません。',event_todo_bootstrap_perception:'準備中',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',event_query:'検索',event_archive:'アーカイブ',event_details:'詳細',event_matches:'件一致',event_returned:'件取得',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
