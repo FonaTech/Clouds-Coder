@@ -34,7 +34,8 @@ def recording_client(responses=None):
         client.impl_calls.append({
             "messages": messages,
             "kwargs": kwargs,
-            "timeout": round(client._effective_request_timeout(), 3),
+            "timeout": client._effective_request_timeout(),
+            "configured_timeout": getattr(client._request_local(), "timeout", None) or client.timeout,
         })
         response = script.pop(0) if script else AMBIGUOUS
         if isinstance(response, BaseException):
@@ -107,7 +108,8 @@ class TodoLLMBudgetTests(unittest.TestCase):
         self.assertEqual(len(client.impl_calls), 5)
         self.assertEqual(attempts["denied"], 7)
         self.assertEqual(set(attempts["labels"]), {"todo_intent"})
-        self.assertTrue(all(call["timeout"] == cc.TODO_LLM_TIMEOUT_SECONDS for call in client.impl_calls))
+        self.assertTrue(all(call["configured_timeout"] == cc.TODO_LLM_TIMEOUT_SECONDS for call in client.impl_calls))
+        self.assertTrue(all(0 < call["timeout"] <= call["configured_timeout"] for call in client.impl_calls))
         self.assertTrue(all(call["kwargs"].get("no_http_retry") for call in client.impl_calls))
         self.assertFalse(str(result).startswith("Error:"))
         # status_update never shortens the tree, and says it kept the rows.
@@ -126,10 +128,13 @@ class TodoLLMBudgetTests(unittest.TestCase):
         client = recording_client()
         session.ollama = client
         session._dispatch_todo_update({"todos": reworded(3)}, role="developer")
-        self.assertEqual({call["timeout"] for call in client.impl_calls}, {cc.TODO_LLM_TIMEOUT_SECONDS})
+        self.assertEqual({call["configured_timeout"] for call in client.impl_calls}, {cc.TODO_LLM_TIMEOUT_SECONDS})
+        self.assertTrue(all(0 < call["timeout"] <= call["configured_timeout"] for call in client.impl_calls))
         client.chat([{"role": "user", "content": "main loop"}])
         # Outside the scope the client timeout and normal retries apply.
-        self.assertEqual(client.impl_calls[-1]["timeout"], client.timeout)
+        self.assertEqual(client.impl_calls[-1]["configured_timeout"], client.timeout)
+        self.assertGreater(client.impl_calls[-1]["timeout"], 0)
+        self.assertLessEqual(client.impl_calls[-1]["timeout"], client.timeout)
         self.assertNotIn("no_http_retry", client.impl_calls[-1]["kwargs"])
 
     def test_worker_text_sync_never_adds_rows_or_calls_the_model(self):
@@ -303,7 +308,7 @@ class TodoLLMBudgetTests(unittest.TestCase):
         seen = []
 
         def timed_out(req, timeout=None):
-            seen.append(round(timeout, 3))
+            seen.append((timeout, client._request_local().timeout))
             raise TimeoutError("timed out")
 
         started = time.monotonic()
@@ -314,12 +319,12 @@ class TodoLLMBudgetTests(unittest.TestCase):
         # One request per audit at the short TodoWrite socket timeout: no
         # HTTP retry, no retry delay and no shared endpoint cooldown.
         self.assertEqual(len(seen), 2)
-        for timeout in seen:
+        for timeout, configured_timeout in seen:
             # The shared deadline subtracts time spent preparing the request.
             # Scheduler load must not turn millisecond accounting into a CI failure.
             self.assertGreater(timeout, 0)
             self.assertLessEqual(timeout, cc.TODO_LLM_TIMEOUT_SECONDS)
-            self.assertAlmostEqual(timeout, cc.TODO_LLM_TIMEOUT_SECONDS, delta=0.05)
+            self.assertEqual(configured_timeout, cc.TODO_LLM_TIMEOUT_SECONDS)
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertEqual(cc.OllamaClient._endpoint_cooldowns, {})
         self.assertIn("revision rejected", rejected.lower())

@@ -441,6 +441,21 @@ class AuxiliaryCooldownTests(unittest.TestCase):
 
 
 class RequestTimeoutOverrideTests(unittest.TestCase):
+    class ControlledClock:
+        """Advance preparation time independently on each real test thread."""
+
+        def __init__(self):
+            self.local = threading.local()
+
+        def monotonic(self):
+            return getattr(self.local, "now", 1000.0)
+
+        def advance(self, seconds):
+            self.local.now = self.monotonic() + seconds
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
     def setUp(self):
         cc.OllamaClient._endpoint_cooldowns.clear()
 
@@ -450,13 +465,19 @@ class RequestTimeoutOverrideTests(unittest.TestCase):
     def test_per_call_timeout_reaches_urlopen_and_main_keeps_client_timeout(self):
         client = cc.OllamaClient("http://model.test", "demo-model", provider="openai_compat")
         self.assertGreaterEqual(client.timeout, cc.MIN_TIMEOUT_SECONDS)
+        clock = self.ControlledClock()
+        original_impl = client._chat_impl
         seen = []
 
+        def prepare_request(*args, **kwargs):
+            clock.advance(0.25)
+            return original_impl(*args, **kwargs)
+
         def fake_urlopen(req, timeout=None):
-            seen.append((message_text(req), round(timeout, 3)))
+            seen.append((message_text(req), timeout))
             return FakeResponse(OK_BODY)
 
-        with mock.patch.object(cc, "urlopen", side_effect=fake_urlopen):
+        with mock.patch.object(cc, "time", clock), mock.patch.object(client, "_chat_impl", side_effect=prepare_request), mock.patch.object(cc, "urlopen", side_effect=fake_urlopen):
             client.chat([{"role": "user", "content": "aux"}], auxiliary=True, request_timeout=6)
             client.chat([{"role": "user", "content": "main"}])
             client.chat([{"role": "user", "content": "short-main"}], request_timeout=15)
@@ -464,29 +485,37 @@ class RequestTimeoutOverrideTests(unittest.TestCase):
         self.assertEqual(
             seen,
             [
-                ("aux", 6.0),
-                ("main", client.timeout),
-                ("short-main", 15.0),
-                ("main-again", client.timeout),
+                ("aux", 5.75),
+                ("main", client.timeout - 0.25),
+                ("short-main", 14.75),
+                ("main-again", client.timeout - 0.25),
             ],
         )
-        self.assertEqual(round(client._effective_request_timeout(), 3), client.timeout)
+        self.assertEqual(client._effective_request_timeout(), client.timeout)
+        self.assertIsNone(getattr(client._request_local(), "timeout", None))
+        self.assertFalse(getattr(client._request_local(), "deadline", 0))
 
     def test_override_is_thread_local(self):
         client = cc.OllamaClient("http://model.test", "demo-model", provider="openai_compat")
         inside = threading.Event()
         leave = threading.Event()
+        clock = self.ControlledClock()
+        original_impl = client._chat_impl
         seen = {}
+
+        def prepare_request(*args, **kwargs):
+            clock.advance(0.25)
+            return original_impl(*args, **kwargs)
 
         def fake_urlopen(req, timeout=None):
             name = message_text(req)
-            seen[name] = round(timeout, 3)
+            seen[name] = timeout
             if name == "aux":
                 inside.set()
                 leave.wait(5)
             return FakeResponse(OK_BODY)
 
-        with mock.patch.object(cc, "urlopen", side_effect=fake_urlopen):
+        with mock.patch.object(cc, "time", clock), mock.patch.object(client, "_chat_impl", side_effect=prepare_request), mock.patch.object(cc, "urlopen", side_effect=fake_urlopen):
             results = {}
             aux = start_chat(client, results, "aux", auxiliary=True, request_timeout=3)
             try:
@@ -497,8 +526,29 @@ class RequestTimeoutOverrideTests(unittest.TestCase):
             finally:
                 leave.set()
                 aux.join(5)
-        self.assertEqual(seen["aux"], 3.0)
-        self.assertEqual(seen["main"], client.timeout)
+        self.assertFalse(aux.is_alive())
+        self.assertEqual(results["aux"]["content"], "ok")
+        self.assertEqual(seen["aux"], 2.75)
+        self.assertEqual(seen["main"], client.timeout - 0.25)
+        self.assertEqual(client._effective_request_timeout(), client.timeout)
+
+    def test_preparation_exhausting_deadline_prevents_network_call(self):
+        client = cc.OllamaClient("http://model.test", "demo-model", provider="openai_compat")
+        clock = self.ControlledClock()
+        original_impl = client._chat_impl
+
+        def prepare_request(*args, **kwargs):
+            clock.advance(3.25)
+            return original_impl(*args, **kwargs)
+
+        with mock.patch.object(cc, "time", clock), mock.patch.object(client, "_chat_impl", side_effect=prepare_request), mock.patch.object(cc, "urlopen") as transport:
+            with self.assertRaises(cc.OllamaError) as raised:
+                client.chat([{"role": "user", "content": "aux"}], request_timeout=3)
+        transport.assert_not_called()
+        self.assertTrue(raised.exception.deadline_exhausted)
+        self.assertEqual(client._effective_request_timeout(), client.timeout)
+        self.assertIsNone(getattr(client._request_local(), "timeout", None))
+        self.assertFalse(getattr(client._request_local(), "deadline", 0))
 
     def test_invalid_request_timeout_is_ignored(self):
         client = cc.OllamaClient("http://model.test", "demo-model", provider="openai_compat")
