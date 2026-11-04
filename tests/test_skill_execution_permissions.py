@@ -51,17 +51,61 @@ class SkillExecutionPermissionTests(unittest.TestCase):
         self.assertEqual(Path(parts[1]).resolve(), (s.files_root / 'rules.json').resolve())
         self.assertNotEqual(Path(parts[1]).resolve(), (nested / 'rules.json').resolve())
 
-    def test_hard_application_uses_writable_task_home_tmp_and_cache(self):
+    def assert_task_environment(self, backend_name):
         s = self.session
         s.skill_mode = 'hard'
         env = s._shell_process_env()
+        virtual = backend_name in {'bubblewrap', 'docker', 'podman'}
+        host_paths = {
+            'HOME': s.files_root,
+            'TMPDIR': s.files_root / '.clouds_coder/tmp',
+            'TMP': s.files_root / '.clouds_coder/tmp',
+            'TEMP': s.files_root / '.clouds_coder/tmp',
+            'XDG_CACHE_HOME': s.files_root / '.clouds_coder/cache/xdg',
+            'MPLCONFIGDIR': s.files_root / '.clouds_coder/cache/matplotlib',
+        }
         for key in ('HOME', 'TMPDIR', 'TMP', 'TEMP', 'XDG_CACHE_HOME', 'MPLCONFIGDIR'):
             with self.subTest(variable=key):
                 self.assertIn(key, tuple(env), 'Required task-local variable is absent: ' + key)
-                self.assertTrue(Path(env[key]).resolve().is_relative_to(s.files_root.resolve()))
-                self.assertTrue(Path(env[key]).is_dir())
-        self.assertNotEqual(env['TMPDIR'], tempfile.gettempdir())
+                host_path = host_paths[key].resolve()
+                self.assertTrue(host_path.is_relative_to(s.files_root.resolve()))
+                self.assertTrue(host_path.is_dir())
+                if virtual:
+                    # These paths are resolved inside the sandbox namespace,
+                    # not by pathlib on the pytest host. Its /tmp is tmpfs.
+                    expected = '/tmp' if key in {'TMPDIR', 'TMP', 'TEMP'} else (
+                        '/workspace' if key == 'HOME' else '/workspace/' + host_paths[key].relative_to(s.files_root).as_posix())
+                    self.assertEqual(env[key], expected)
+                else:
+                    self.assertEqual(Path(env[key]).resolve(), host_path)
+        if not virtual:
+            self.assertNotEqual(Path(env['TMPDIR']).resolve(), Path(tempfile.gettempdir()).resolve())
         self.assertEqual(env['PYTHONIOENCODING'], 'utf-8')
+
+    def test_hard_application_uses_writable_task_home_tmp_and_cache(self):
+        self.assert_task_environment(cc._detect_ide_sandbox_backend().get('name', ''))
+
+    def test_application_environment_contract_covers_virtual_and_host_backends(self):
+        for name in ('sandbox-exec', 'windows-job', 'bubblewrap', 'docker', 'podman'):
+            with self.subTest(backend=name), mock.patch.object(cc, '_detect_ide_sandbox_backend', return_value={'name': name}):
+                self.assert_task_environment(name)
+
+    def test_virtual_backend_tmp_is_private_and_workspace_is_bound(self):
+        s = self.session
+        s.skill_mode = 'hard'
+        for name in ('bubblewrap', 'docker', 'podman'):
+            backend = {'name': name, 'available': True, 'processes': True, 'image': 'public-test-image'}
+            with self.subTest(backend=name), mock.patch.object(cc, '_detect_ide_sandbox_backend', return_value=backend), mock.patch.object(cc.shutil, 'which', side_effect=lambda binary: '/usr/bin/' + binary), mock.patch.object(s, '_remote_runtime_read_roots', return_value=[]), mock.patch.object(s, '_remote_shared_read_mounts', return_value=[]):
+                prefix = s._workspace_sandbox_shell_prefix(s.files_root)
+            self.assertIn('--tmpfs', prefix)
+            temporary_mount = prefix[prefix.index('--tmpfs') + 1]
+            self.assertEqual(temporary_mount.split(':', 1)[0], '/tmp')
+            if name == 'bubblewrap':
+                self.assertIn(('--bind', str(s.files_root.resolve()), '/workspace'), list(zip(prefix, prefix[1:], prefix[2:])))
+                self.assertNotIn(('--bind', '/tmp', '/tmp'), list(zip(prefix, prefix[1:], prefix[2:])))
+            else:
+                self.assertIn(f'type=bind,src={s.files_root.resolve()},dst=/workspace,rw', prefix)
+                self.assertIn('--read-only', prefix)
 
     def test_selected_resources_get_a_verified_task_local_layout(self):
         s = self.session
