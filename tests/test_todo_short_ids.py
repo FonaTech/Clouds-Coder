@@ -172,15 +172,13 @@ class TodoShortIdScenarioTests(unittest.TestCase):
         names = [spec["function"]["name"] for spec in session._filter_todo_progress_tools(specs, role="developer")]
         self.assertEqual(names, ["TodoWrite", "read_file"])
 
-    def test_bootstrap_call_is_a_plain_status_update(self):
+    def test_retired_bootstrap_does_not_seed_ids_or_rows_without_a_model_decision(self):
         session = self.session(1)
         session.todo.items = []
         session.runtime_authoritative_goal = "1. Inspect\n2. Fix\n3. Test"
         call = session._deterministic_bootstrap_todo_call()
-        self.assertIsNotNone(call)
-        args = call["function"]["arguments"]
-        self.assertNotIn("revision_reason", args)
-        self.assertEqual(args.get("update_mode"), "status_update")
+        self.assertIsNone(call)
+        self.assertEqual(session.todo.items, [])
 
     def test_role_prompt_lists_ids_for_multi_agent_workers(self):
         session = self.session(2)

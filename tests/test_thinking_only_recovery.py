@@ -28,7 +28,7 @@ class ThinkingOnlyRecoveryTests(unittest.TestCase):
         session = self.bare()
         self.assertFalse(session._is_empty_action_turn("final answer", "long reasoning", []))
 
-    def test_recovery_ladder_uses_low_effort_then_forced_todo(self):
+    def test_recovery_ladder_preserves_preparation_without_forcing_todo(self):
         session = self.bare()
         calls = []
 
@@ -58,7 +58,7 @@ class ThinkingOnlyRecoveryTests(unittest.TestCase):
         self.assertEqual(calls[0]["think"], True)
         self.assertEqual(calls[0]["effort"], cc.EFFORT_LOW)
         self.assertEqual(calls[1]["think"], False)
-        self.assertEqual(calls[1]["tool_choice"], "TodoWrite")
+        self.assertNotIn("tool_choice", calls[1])
 
     def test_unknown_provider_does_not_force_tool_choice(self):
         session = self.bare(provider="ollama")
@@ -89,18 +89,11 @@ class ThinkingOnlyRecoveryTests(unittest.TestCase):
         self.assertNotIn("tool_choice", calls[0])
         self.assertNotIn("tool_choice", calls[1])
 
-    def test_deterministic_todo_preserves_numbered_stages_and_one_active(self):
+    def test_thinking_only_cannot_fabricate_a_graph_from_numbered_user_stages(self):
         session = self.bare()
         session.runtime_authoritative_goal = "1. Inspect the repository\n2. Implement the fix\n3. Run tests"
         call = session._deterministic_bootstrap_todo_call()
-        self.assertIsNotNone(call)
-        args = call["function"]["arguments"]
-        items = args["items"]
-        self.assertEqual([row["content"] for row in items], [
-            "Inspect the repository", "Implement the fix", "Run tests"
-        ])
-        self.assertEqual(sum(row.get("status") == "in_progress" for row in items), 1)
-        self.assertEqual(args["in_progress_index"], 0)
+        self.assertIsNone(call)
 
     def test_non_bootstrap_repair_only_accepts_exposed_structured_tool(self):
         session = self.bare()

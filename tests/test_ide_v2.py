@@ -2147,7 +2147,7 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         session.files_root = self.files
         session.ide_remote_sandbox_required = True
         env = session._shell_process_env()
-        expected = str(self.files / ".clouds_coder" / "tmp")
+        expected = str((self.files / ".clouds_coder" / "tmp").resolve())
         virtual = cc._detect_ide_sandbox_backend().get("name") in {
             "bubblewrap",
             "docker",
