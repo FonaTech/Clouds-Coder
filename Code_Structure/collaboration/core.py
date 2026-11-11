@@ -359,7 +359,7 @@ def transform_text_operation(incoming: object, applied: object) -> list[dict]:
             out = [{"retain": post_length}]
     return out
 
-# split-source: order=115 original-lines=1839-4554 hash=df104ac8f441e453
+# split-source: order=115 original-lines=1839-4579 hash=b37b4456950efbc9
 
 
 class CollaborationStore:
@@ -1751,6 +1751,18 @@ class CollaborationStore:
             ).fetchone()
             current = int(row["revision"]) if row else 0
             digest = hashlib.sha256(content).hexdigest()
+            if row is not None and row["frozen"] and current == int(expected_revision):
+                # The process wrote to disk before reconciliation. Reject an
+                # unauthorized overwrite, and restore the frozen document.
+                conn.execute("ROLLBACK")
+                self._atomic_write(path, bytes(row["content"]))
+                self._clear_external_write_observation(principal.project_id, rel)
+                return {
+                    "ok": False,
+                    "code": "document_frozen",
+                    "path": rel,
+                    "current_revision": current,
+                }
             if current != int(expected_revision):
                 if row is not None and hmac.compare_digest(str(row["content_hash"]), digest):
                     conn.execute("ROLLBACK")
@@ -1827,6 +1839,19 @@ class CollaborationStore:
                 self._clear_external_write_observation(principal.project_id, rel)
                 return {"ok": True, "idempotent": True, "action": "delete", "path": rel}
             current = int(row["revision"])
+            if row["frozen"] and current == int(expected_revision):
+                # Preserve the unresolved conflict and re-create its protected
+                # disk file after an already-executed child-process delete.
+                conn.execute("ROLLBACK")
+                self._atomic_write(path, bytes(row["content"]))
+                self._clear_external_write_observation(principal.project_id, rel)
+                return {
+                    "ok": False,
+                    "code": "document_frozen",
+                    "action": "delete",
+                    "path": rel,
+                    "current_revision": current,
+                }
             if current != int(expected_revision):
                 conflict = self._create_write_conflict(
                     conn, principal, rel, row, b"", "concurrent_process_delete"
@@ -3077,7 +3102,7 @@ class CollaborationStore:
             rows = conn.execute("SELECT * FROM audit_events" + where + " ORDER BY audit_id DESC LIMIT ? OFFSET ?", (*params, take, skip)).fetchall()
         return {"events": [{**dict(row), "details": _load_json(row["details_json"], {})} for row in rows], "total": total, "limit": take, "offset": skip, "chain": self.verify_audit_chain()}
 
-# split-source: order=116 original-lines=4555-4768 hash=a9249a04c1992b57
+# split-source: order=116 original-lines=4580-4793 hash=a9249a04c1992b57
 
 
 class CollaborationWriteCoordinator:
