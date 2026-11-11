@@ -309,6 +309,58 @@ class CollaborationStoreTests(unittest.TestCase):
         self.assertEqual(retried["revision"], written["revision"])
         self.assertEqual(self.store.list_conflicts(self.project["project_id"], status="open"), [])
 
+    def test_frozen_document_rejects_process_write_without_revision_change(self):
+        _, _, alice = self.approve_and_login()
+        rel = "frozen-process-write.txt"
+        self.store.write_file(alice, rel, b"base", 0)
+        self.store.write_file(alice, rel, b"current", 1)
+        with self.assertRaises(CollaborationError):
+            self.store.write_file(alice, rel, b"stale", 1)
+        coordinator = cc.CollaborationWriteCoordinator(
+            self.store, alice.project_id, alice.member_id, alice.device_id
+        )
+        path = self.store.project_workspace(self.project["project_id"]) / rel
+        with coordinator.mutation_lease():
+            before = coordinator.begin_process()
+            path.write_bytes(b"unauthorized process overwrite")
+            results = coordinator.finish_process(before)
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(results[0]["code"], "document_frozen")
+        self.assertEqual(path.read_bytes(), b"current")
+        document = self.store.read_document(self.project["project_id"], rel)
+        self.assertEqual(document["revision"], 2)
+        self.assertTrue(document["frozen"])
+        self.assertEqual(len(self.store.list_conflicts(
+            self.project["project_id"], status="open")), 1)
+
+    def test_frozen_document_rejects_process_delete_and_restores_file(self):
+        _, _, alice = self.approve_and_login()
+        rel = "frozen-process-delete.txt"
+        self.store.write_file(alice, rel, b"base", 0)
+        self.store.write_file(alice, rel, b"current", 1)
+        with self.assertRaises(CollaborationError):
+            self.store.write_file(alice, rel, b"stale", 1)
+        coordinator = cc.CollaborationWriteCoordinator(
+            self.store, alice.project_id, alice.member_id, alice.device_id
+        )
+        path = self.store.project_workspace(self.project["project_id"]) / rel
+        with coordinator.mutation_lease():
+            before = coordinator.begin_process()
+            path.unlink()
+            results = coordinator.finish_process(before)
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(results[0]["code"], "document_frozen")
+        self.assertEqual(path.read_bytes(), b"current")
+        document = self.store.read_document(self.project["project_id"], rel)
+        self.assertEqual(document["revision"], 2)
+        self.assertTrue(document["frozen"])
+        self.assertEqual(len(self.store.list_conflicts(
+            self.project["project_id"], status="open")), 1)
+
     def test_process_delete_is_committed_without_empty_conflict_branch(self):
         _, _, alice = self.approve_and_login()
         self.store.write_file(alice, "remove-me.txt", b"temporary", 0)
